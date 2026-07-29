@@ -190,7 +190,7 @@ void resetUserPositionState(const Epub& epub) {
       Storage.remove(path.c_str());
     }
   }
-  BookmarkStore::deleteForFilePath(epub.getPath(), "epub");
+  BookmarkStore::deleteForFilePath(epub.getPath(), epub.getStoreFormatKey());
 }
 
 bool loadOrCreateSection(const std::shared_ptr<Epub>& epub, GfxRenderer& renderer, const OracleLayout& layout,
@@ -264,13 +264,21 @@ bool captureProgressAndBookmark(const std::shared_ptr<Epub>& epub, GfxRenderer& 
     error = "cannot save progress";
     return false;
   }
+  ReflowReadingPosition documentProgress;
+  if (!epub->loadReadingPosition(documentProgress)) {
+    error = "cannot load saved progress through the document seam";
+    return false;
+  }
   EpubReaderUtils::Progress loadedProgress;
   if (!EpubReaderUtils::loadProgress(*epub, loadedProgress, "ORACLE")) {
     error = "cannot load saved progress";
     return false;
   }
   if (loadedProgress.spineIndex != middle.sectionIndex || loadedProgress.pageNumber != middle.pageIndex ||
-      !loadedProgress.hasPageCount || loadedProgress.pageCount != middle.pageCount) {
+      !loadedProgress.hasPageCount || loadedProgress.pageCount != middle.pageCount ||
+      documentProgress.sectionIndex != loadedProgress.spineIndex ||
+      documentProgress.pageNumber != loadedProgress.pageNumber || !documentProgress.hasPageCount ||
+      documentProgress.pageCount != loadedProgress.pageCount) {
     error = "saved progress did not round-trip";
     return false;
   }
@@ -293,13 +301,13 @@ bool captureProgressAndBookmark(const std::shared_ptr<Epub>& epub, GfxRenderer& 
   resume["framebuffer_hash"] = resumed.framebufferHash;
 
   BOOKMARKS.unload();
-  BookmarkStore::deleteForFilePath(epub->getPath(), "epub");
-  if (!BOOKMARKS.loadForBook(epub->getPath(), epub->getTitle(), epub->getAuthor(), "epub")) {
+  BookmarkStore::deleteForFilePath(epub->getPath(), epub->getStoreFormatKey());
+  if (!BOOKMARKS.loadForBook(epub->getPath(), epub->getTitle(), epub->getAuthor(), epub->getStoreFormatKey())) {
     error = "cannot initialize bookmark store";
     return false;
   }
-  const auto tocIndex = epub->getTocIndexForSpineIndex(middle.sectionIndex);
-  const std::string chapter = tocIndex >= 0 ? epub->getTocItem(tocIndex).title : std::string{};
+  const auto tocIndex = epub->getTocIndexForSectionIndex(middle.sectionIndex);
+  const std::string chapter = tocIndex >= 0 ? epub->getTocEntry(tocIndex).title : std::string{};
   if (BOOKMARKS.addBookmark(static_cast<uint16_t>(middle.sectionIndex), sectionProgress, middle.pageCount,
                             chapter.c_str(), UINT16_MAX, middle.text.c_str()) != BookmarkStore::AddResult::Added) {
     error = "cannot save bookmark";
@@ -307,7 +315,7 @@ bool captureProgressAndBookmark(const std::shared_ptr<Epub>& epub, GfxRenderer& 
     return false;
   }
   BOOKMARKS.unload();
-  if (!BOOKMARKS.loadForBook(epub->getPath(), epub->getTitle(), epub->getAuthor(), "epub") ||
+  if (!BOOKMARKS.loadForBook(epub->getPath(), epub->getTitle(), epub->getAuthor(), epub->getStoreFormatKey()) ||
       BOOKMARKS.getBookmarks().size() != 1) {
     error = "saved bookmark did not round-trip";
     BOOKMARKS.unload();
@@ -361,7 +369,23 @@ bool runEpubReflowRegressionOracle(GfxRenderer& renderer, const char* bookPath, 
     return false;
   }
 
-  const int sectionCount = epub->getSpineItemsCount();
+  constexpr ReflowCapabilitySet expectedCapabilities =
+      ReflowCapability::ExternalProgressSync | ReflowCapability::NearbyProgressSync |
+      ReflowCapability::PublisherRenderModes | ReflowCapability::EmbeddedStyles | ReflowCapability::SavedItems;
+  if (epub->getFormat() != ReflowDocumentFormat::Epub || std::strcmp(epub->getStoreFormatKey(), "epub") != 0 ||
+      epub->getCapabilities() != expectedCapabilities || !epub->hasCapability(ReflowCapability::ExternalProgressSync) ||
+      !epub->hasCapability(ReflowCapability::NearbyProgressSync) ||
+      !epub->hasCapability(ReflowCapability::PublisherRenderModes) ||
+      !epub->hasCapability(ReflowCapability::EmbeddedStyles) || !epub->hasCapability(ReflowCapability::SavedItems)) {
+    error = "EPUB reflow capabilities are not preserved";
+    return false;
+  }
+  if (epub->hasStableReferencePages() != epub->hasStablePageNumbers()) {
+    error = "EPUB reference-page capability changed";
+    return false;
+  }
+
+  const int sectionCount = epub->getSectionCount();
   if (sectionCount <= 0) {
     error = "EPUB has no sections";
     return false;
@@ -369,6 +393,13 @@ bool runEpubReflowRegressionOracle(GfxRenderer& renderer, const char* bookPath, 
   std::vector<uint16_t> pageCounts;
   pageCounts.reserve(static_cast<size_t>(sectionCount));
   for (int index = 0; index < sectionCount; ++index) {
+    const auto sectionInfo = epub->getSectionInfo(index);
+    size_t sectionSize = 0;
+    if (sectionInfo.href != epub->getSpineItem(index).href || !epub->getSectionSize(index, &sectionSize) ||
+        sectionSize != sectionInfo.byteSize || epub->getCumulativeSectionSize(index) != sectionInfo.cumulativeSize) {
+      error = "EPUB generic section metadata changed at " + std::to_string(index);
+      return false;
+    }
     uint16_t pageCount = 0;
     if (!loadOrCreateSection(epub, renderer, layout, index, pageCount, error)) {
       return false;
@@ -378,11 +409,24 @@ bool runEpubReflowRegressionOracle(GfxRenderer& renderer, const char* bookPath, 
 
   FnvPrint xhtmlHash;
   for (int index = 0; index < sectionCount; ++index) {
-    if (!epub->readItemContentsToStream(epub->getSpineItem(index).href, xhtmlHash, 1024)) {
+    ReflowResource localSection;
+    if (epub->getLocalSectionPath(index, localSection) || localSection.kind != ReflowResourceKind::Streamed ||
+        localSection.paginatorMayDelete || !epub->streamSection(index, xhtmlHash, 1024)) {
       error = "cannot stream XHTML section " + std::to_string(index);
       return false;
     }
     xhtmlHash.separator();
+  }
+
+  constexpr char kCssResource[] = "OEBPS/styles/test.css";
+  ReflowResource localResource;
+  FnvPrint resourceHash;
+  size_t resourceSize = 0;
+  if (epub->resolveResource(0, kCssResource, localResource) || localResource.kind != ReflowResourceKind::Streamed ||
+      localResource.paginatorMayDelete || !epub->streamResource(0, kCssResource, resourceHash, 256) ||
+      !epub->getResourceSize(0, kCssResource, &resourceSize) || resourceSize != resourceHash.bytes()) {
+    error = "EPUB streamed resource behavior changed";
+    return false;
   }
 
   const int middleSection = sectionCount / 2;
@@ -440,22 +484,22 @@ bool runEpubReflowRegressionOracle(GfxRenderer& renderer, const char* bookPath, 
   }
 
   JsonArray toc = oracle["selected_toc"].to<JsonArray>();
-  const int tocCount = epub->getTocItemsCount();
+  const int tocCount = epub->getTocEntryCount();
   const std::array<int, 3> selectedToc = {0, tocCount > 0 ? tocCount / 2 : 0, tocCount > 0 ? tocCount - 1 : 0};
   for (const int index : selectedToc) {
     if (index < 0 || index >= tocCount) {
       error = "EPUB does not have the required TOC entries";
       return false;
     }
-    const auto entry = epub->getTocItem(index);
+    const auto entry = epub->getTocEntry(index);
     JsonObject item = toc.add<JsonObject>();
     item["index"] = index;
     item["title"] = entry.title;
     item["href"] = entry.href;
     item["anchor"] = entry.anchor;
     item["level"] = entry.level;
-    item["spine_index"] = entry.spineIndex;
-    item["resolved_spine_index"] = epub->resolveHrefToSpineIndex(entry.href);
+    item["spine_index"] = entry.sectionIndex;
+    item["resolved_spine_index"] = epub->resolveHrefToSectionIndex(entry.href);
   }
 
   JsonObject stream = oracle["streamed_xhtml"].to<JsonObject>();

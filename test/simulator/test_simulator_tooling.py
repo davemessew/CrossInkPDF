@@ -26,7 +26,10 @@ class SimulatorToolingTest(unittest.TestCase):
 
         for required in (
             "Section",
-            "readItemContentsToStream",
+            "streamSection",
+            "streamResource",
+            "getCapabilities",
+            "loadReadingPosition",
             "EpubReaderUtils::saveProgress",
             "EpubReaderUtils::loadProgress",
             "BookmarkStore",

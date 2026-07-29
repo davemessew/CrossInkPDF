@@ -591,25 +591,25 @@ smallest failing hypothesis; do not layer speculative production changes.
 - Modify: `test/reflow_document/CMakeLists.txt`
 - Test: `test/reflow_document/LegacyPageProgressStoreTest.cpp`
 
-- [ ] Keep host coverage to the pure progress store: legacy four-byte reads,
+- [x] Keep host coverage to the pure progress store: legacy four-byte reads,
   current exact six-byte reads/writes, `.bak` recovery/rotation, invalid
   lengths, and uint16 bounds. Exercise real `Epub` spine/TOC,
   streamSection/streamResource, cache path, reference pages, and capability
   behavior through the Task 6 simulator oracle; the lightweight host harness
   does not pretend to supply Arduino/HAL/ZIP/rendering.
-- [ ] Move the legacy page-tuple codec below the activity layer into
+- [x] Move the legacy page-tuple codec below the activity layer into
   `LegacyPageProgressStore`. Leave `EpubReaderUtils` as compatibility wrappers;
   `Epub` must not depend on a `src/activities` header.
-- [ ] Make `Epub : public ReflowDocument` with no adapter allocation.
+- [x] Make `Epub : public ReflowDocument` with no adapter allocation.
   Preserve existing public EPUB methods for non-reader consumers.
-- [ ] Delegate generic section calls to existing spine methods and generic TOC
+- [x] Delegate generic section calls to existing spine methods and generic TOC
   calls to existing TOC methods. Both local-path methods return `false`; the
   existing ZIP extraction path remains active.
-- [ ] Set both sync capabilities, `PublisherRenderModes`, `EmbeddedStyles`,
+- [x] Set both sync capabilities, `PublisherRenderModes`, `EmbeddedStyles`,
   `SavedItems`, and store key `"epub"`.
-- [ ] Move the existing progress logic behind `loadReadingPosition` and
+- [x] Move the existing progress logic behind `loadReadingPosition` and
   `saveReadingPosition`; compare resulting files byte-for-byte to the baseline.
-- [ ] Run host progress-store tests and the Task 6 two-pass simulator oracle.
+- [x] Run host progress-store tests and the Task 6 two-pass simulator oracle.
   Expected: no changed EPUB hash, cache file, or behavior.
 
 ### Task 9: Migrate `Section` and the XHTML parser to the narrow source
