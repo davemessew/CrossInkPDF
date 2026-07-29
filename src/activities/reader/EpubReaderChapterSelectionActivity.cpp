@@ -7,16 +7,16 @@
 #include "components/UITheme.h"
 #include "fontIds.h"
 
-int EpubReaderChapterSelectionActivity::getTotalItems() const { return epub->getTocItemsCount(); }
+int EpubReaderChapterSelectionActivity::getTotalItems() const { return document ? document->getTocEntryCount() : 0; }
 
 void EpubReaderChapterSelectionActivity::onEnter() {
   Activity::onEnter();
 
-  if (!epub) {
+  if (!document) {
     return;
   }
 
-  selectorIndex = epub->getTocIndexForSpineIndex(currentSpineIndex);
+  selectorIndex = document->getTocIndexForSectionIndex(currentSpineIndex);
   if (selectorIndex == -1) {
     selectorIndex = 0;
   }
@@ -31,15 +31,26 @@ void EpubReaderChapterSelectionActivity::loop() {
   const int pageItems = UITheme::getInstance().getNumberOfItemsPerPage(renderer, true, false, true, false);
   const int totalItems = getTotalItems();
 
+  if (!document || totalItems <= 0) {
+    if (mappedInput.wasReleased(MappedInputManager::Button::Confirm) ||
+        mappedInput.wasReleased(MappedInputManager::Button::Back)) {
+      ActivityResult result;
+      result.isCancelled = true;
+      setResult(std::move(result));
+      finish();
+    }
+    return;
+  }
+
   if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
-    const auto tocItem = epub->getTocItem(selectorIndex);
-    if (tocItem.spineIndex == -1) {
+    const auto tocItem = document->getTocEntry(selectorIndex);
+    if (tocItem.sectionIndex == -1) {
       ActivityResult result;
       result.isCancelled = true;
       setResult(std::move(result));
       finish();
     } else {
-      setResult(ChapterResult{tocItem.spineIndex, tocItem.anchor});
+      setResult(ChapterResult{tocItem.sectionIndex, tocItem.anchor});
       finish();
     }
   } else if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
@@ -85,8 +96,9 @@ void EpubReaderChapterSelectionActivity::render(RenderLock&&) {
   const int totalItems = getTotalItems();
   GUI.drawList(renderer, Rect{screen.x, contentTop, screen.width, contentHeight}, totalItems, selectorIndex,
                [this](int index) {
-                 auto item = epub->getTocItem(index);
-                 std::string indent((item.level - 1) * 2, ' ');
+                 auto item = document->getTocEntry(index);
+                 const int indentLevel = item.level > 0 ? static_cast<int>(item.level) - 1 : 0;
+                 std::string indent(static_cast<size_t>(indentLevel * 2), ' ');
                  return indent + item.title;
                });
 

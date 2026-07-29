@@ -1,5 +1,5 @@
 #pragma once
-#include <Epub.h>
+#include <ReflowDocument.h>
 
 #include <memory>
 #include <string>
@@ -41,11 +41,11 @@ class ProgressMapper {
   /**
    * Convert CrossPoint position to KOReader format.
    *
-   * @param epub The EPUB book
+   * @param document The reflow document
    * @param pos CrossPoint position
    * @return KOReader position
    */
-  static KOReaderPosition toKOReader(const std::shared_ptr<Epub>& epub, const CrossPointPosition& pos);
+  static KOReaderPosition toKOReader(const std::shared_ptr<ReflowDocument>& document, const CrossPointPosition& pos);
 
   /**
    * Convert KOReader position to CrossPoint format.
@@ -53,13 +53,13 @@ class ProgressMapper {
    * Note: The returned pageNumber may be approximate since different
    * rendering settings produce different page counts.
    *
-   * @param epub The EPUB book
+   * @param document The reflow document
    * @param koPos KOReader position
    * @param currentSpineIndex Index of the currently open spine item (for density estimation)
    * @param totalPagesInCurrentSpine Total pages in the current spine item (for density estimation)
    * @return CrossPoint position
    */
-  static CrossPointPosition toCrossPoint(const std::shared_ptr<Epub>& epub, const KOReaderPosition& koPos,
+  static CrossPointPosition toCrossPoint(const std::shared_ptr<ReflowDocument>& document, const KOReaderPosition& koPos,
                                          int currentSpineIndex = -1, int totalPagesInCurrentSpine = 0);
 
  private:
@@ -69,5 +69,6 @@ class ProgressMapper {
    * Produces a full ancestry path such as
    * /body/DocFragment[3]/body/p[42]/text().17.
    */
-  static std::string generateXPath(const std::shared_ptr<Epub>& epub, int spineIndex, float intraSpineProgress);
+  static std::string generateXPath(const std::shared_ptr<ReflowDocument>& document, int spineIndex,
+                                   float intraSpineProgress);
 };

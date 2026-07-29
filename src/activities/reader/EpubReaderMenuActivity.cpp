@@ -10,6 +10,7 @@
 #include "CrossPointSettings.h"
 #include "EpubReaderClippingListActivity.h"
 #include "MappedInputManager.h"
+#include "ReflowCapabilityPolicy.h"
 #include "components/UITheme.h"
 #include "components/icons/settings2.h"
 #include "fontIds.h"
@@ -139,10 +140,11 @@ EpubReaderMenuActivity::EpubReaderMenuActivity(
     ReaderOptionsActivity::SaveGlobalSettingsCallback saveGlobalSettingsCallback, void* saveGlobalSettingsContext,
     ReaderOptionsActivity::GlobalSettingsEditCallback beginGlobalSettingsEditCallback,
     void* beginGlobalSettingsEditContext, const bool stablePageNumbersAvailable,
-    ReaderOptionsActivity::GlobalSettingsEditCallback endGlobalSettingsEditCallback, void* endGlobalSettingsEditContext)
+    ReaderOptionsActivity::GlobalSettingsEditCallback endGlobalSettingsEditCallback, void* endGlobalSettingsEditContext,
+    const ReflowCapabilitySet documentCapabilities)
     : Activity("EpubReaderMenu", renderer, mappedInput),
       menuItems(buildMenuItems(hasFootnotes, hasBookmarks, hasClippings, isCurrentPageBookmarked, isBookCompleted,
-                               showReadingPaceReset)),
+                               showReadingPaceReset, documentCapabilities)),
       title(title),
       pendingOrientation(currentOrientation),
       currentPage(currentPage),
@@ -160,18 +162,20 @@ EpubReaderMenuActivity::EpubReaderMenuActivity(
       endGlobalSettingsEditCallback(endGlobalSettingsEditCallback),
       endGlobalSettingsEditContext(endGlobalSettingsEditContext) {}
 
-EpubReaderMenuActivity::TabMenuItems EpubReaderMenuActivity::buildMenuItems(bool hasFootnotes, bool hasBookmarks,
-                                                                            bool hasClippings,
-                                                                            bool isCurrentPageBookmarked,
-                                                                            bool isBookCompleted,
-                                                                            bool showReadingPaceReset) {
+EpubReaderMenuActivity::TabMenuItems EpubReaderMenuActivity::buildMenuItems(
+    bool hasFootnotes, bool hasBookmarks, bool hasClippings, bool isCurrentPageBookmarked, bool isBookCompleted,
+    bool showReadingPaceReset, ReflowCapabilitySet documentCapabilities) {
   TabMenuItems items;
   auto& mainItems = items[MAIN_TAB_INDEX];
   auto& bookmarkItems = items[BOOKMARKS_TAB_INDEX];
   auto& settingsItems = items[SETTINGS_TAB_INDEX];
 
   mainItems.reserve(8 + (hasFootnotes ? 1u : 0u));
-  bookmarkItems.reserve(8 + (hasBookmarks ? 2u : 0u) + (hasClippings ? 1u : 0u));
+  const bool showExternalSync =
+      reflowSupportsMenuAction(documentCapabilities, ReflowReaderSyncAction::ExternalProgress);
+  const bool showNearbySync = reflowSupportsMenuAction(documentCapabilities, ReflowReaderSyncAction::NearbyProgress);
+  bookmarkItems.reserve(4 + (showExternalSync ? 1u : 0u) + (showNearbySync ? 1u : 0u) + (hasBookmarks ? 2u : 0u) +
+                        (hasClippings ? 1u : 0u));
   settingsItems.reserve(2 + (showReadingPaceReset ? 1u : 0u));
 
   if (hasFootnotes) {
@@ -186,8 +190,12 @@ EpubReaderMenuActivity::TabMenuItems EpubReaderMenuActivity::buildMenuItems(bool
   mainItems.push_back(
       {MenuAction::TOGGLE_COMPLETED, isBookCompleted ? StrId::STR_MARK_UNFINISHED : StrId::STR_MARK_FINISHED});
 
-  bookmarkItems.push_back({MenuAction::SYNC, StrId::STR_SYNC_PROGRESS});
-  bookmarkItems.push_back({MenuAction::NEARBY_POSITION_SYNC, StrId::STR_NEARBY_POSITION_SYNC});
+  if (showExternalSync) {
+    bookmarkItems.push_back({MenuAction::SYNC, StrId::STR_SYNC_PROGRESS});
+  }
+  if (showNearbySync) {
+    bookmarkItems.push_back({MenuAction::NEARBY_POSITION_SYNC, StrId::STR_NEARBY_POSITION_SYNC});
+  }
   bookmarkItems.push_back({MenuAction::SAVE_CLIPPING, StrId::STR_SAVE_CLIPPING});
   if (hasClippings) {
     bookmarkItems.push_back({MenuAction::VIEW_CLIPPINGS, StrId::STR_VIEW_CLIPPINGS});

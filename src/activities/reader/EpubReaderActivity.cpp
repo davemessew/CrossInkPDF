@@ -42,6 +42,7 @@
 #include "QrDisplayActivity.h"
 #include "ReaderUtils.h"
 #include "RecentBooksStore.h"
+#include "ReflowCapabilityPolicy.h"
 #include "SdCardFontSystem.h"
 #include "WordRef.h"
 #include "activities/util/ConfirmationActivity.h"
@@ -1900,7 +1901,8 @@ void EpubReaderActivity::openReaderMenu() {
           automaticPageTurnActive, getAutoPageTurnIntervalSeconds(),
           SETTINGS.statusBarTimeLeft != CrossPointSettings::STATUS_BAR_TIME_LEFT::TIME_LEFT_HIDE,
           saveReaderOptionsForBook, this, saveGlobalSettingsForBookReader, this, beginGlobalSettingsEditForBookReader,
-          this, !previewActive && epub && epub->hasStablePageNumbers(), endGlobalSettingsEditForBookReader, this),
+          this, !previewActive && epub && epub->hasStablePageNumbers(), endGlobalSettingsEditForBookReader, this,
+          epub ? epub->getCapabilities() : 0),
       [this](const ActivityResult& result) {
         if (const auto* clipping = std::get_if<ClippingJumpResult>(&result.data)) {
           applyOrientation(clipping->orientation);
@@ -2461,10 +2463,9 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
   switch (action) {
     case EpubReaderMenuActivity::MenuAction::SELECT_CHAPTER: {
       const int spineIdx = currentSpineIndex;
-      const std::string path = epub->getPath();
       pauseReadingPaceTimer("chapter_selection");
       startActivityForResult(
-          std::make_unique<EpubReaderChapterSelectionActivity>(renderer, mappedInput, epub, path, spineIdx),
+          std::make_unique<EpubReaderChapterSelectionActivity>(renderer, mappedInput, epub, spineIdx),
           [this](const ActivityResult& result) {
             if (!result.isCancelled) {
               const auto& chapterResult = std::get<ChapterResult>(result.data);
@@ -2686,6 +2687,10 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
       break;
     }
     case EpubReaderMenuActivity::MenuAction::SYNC: {
+      if (!epub || !reflowSupportsMenuAction(epub->getCapabilities(), ReflowReaderSyncAction::ExternalProgress)) {
+        requestUpdate();
+        break;
+      }
       if (activeFootnotePreview) {
         requestUpdate();
         break;
@@ -2743,6 +2748,10 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
       break;
     }
     case EpubReaderMenuActivity::MenuAction::NEARBY_POSITION_SYNC: {
+      if (!epub || !reflowSupportsMenuAction(epub->getCapabilities(), ReflowReaderSyncAction::NearbyProgress)) {
+        requestUpdate();
+        break;
+      }
       const int currentPage = section ? section->currentPage : nextPageNumber;
       const int totalPages = section ? section->pageCount : std::max(1, cachedChapterTotalPageCount);
       std::optional<uint16_t> paragraphIndex;
@@ -3176,6 +3185,10 @@ void EpubReaderActivity::executeReaderQuickAction(CrossPointSettings::LONG_PRESS
       requestUpdate();
       break;
     case CrossPointSettings::LONG_MENU_SYNC_PROGRESS:
+      if (!epub || !reflowSupportsQuickAction(epub->getCapabilities(), ReflowReaderSyncAction::ExternalProgress)) {
+        requestUpdate();
+        break;
+      }
       if (KOREADER_STORE.hasCredentials()) {
         onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction::SYNC);
       } else {

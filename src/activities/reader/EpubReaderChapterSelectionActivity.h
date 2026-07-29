@@ -1,5 +1,5 @@
 #pragma once
-#include <Epub.h>
+#include <ReflowDocument.h>
 
 #include <memory>
 
@@ -7,8 +7,7 @@
 #include "util/ButtonNavigator.h"
 
 class EpubReaderChapterSelectionActivity final : public Activity {
-  std::shared_ptr<Epub> epub;
-  std::string epubPath;
+  std::shared_ptr<ReflowDocument> document;
   ButtonNavigator buttonNavigator;
   int currentSpineIndex = 0;
   int selectorIndex = 0;
@@ -22,11 +21,10 @@ class EpubReaderChapterSelectionActivity final : public Activity {
 
  public:
   explicit EpubReaderChapterSelectionActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
-                                              const std::shared_ptr<Epub>& epub, const std::string& epubPath,
+                                              const std::shared_ptr<ReflowDocument>& document,
                                               const int currentSpineIndex)
       : Activity("EpubReaderChapterSelection", renderer, mappedInput),
-        epub(epub),
-        epubPath(epubPath),
+        document(document),
         currentSpineIndex(currentSpineIndex) {}
   void onEnter() override;
   void onExit() override;

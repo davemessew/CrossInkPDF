@@ -664,17 +664,17 @@ smallest failing hypothesis; do not layer speculative production changes.
 - Modify: `test/reflow_document/CMakeLists.txt`
 - Test: `test/reflow_document/ReflowCapabilityTest.cpp`
 
-- [ ] Add a fake EPUB-capable document and PDF-like no-sync document. Red tests
+- [x] Add a fake EPUB-capable document and PDF-like no-sync document. Red tests
   require both sync actions and quick actions for the first, none for the
   second.
-- [ ] Retarget chapter selection and section/TOC mapping to
+- [x] Retarget chapter selection and section/TOC mapping to
   `ReflowDocument`.
-- [ ] Retarget `ProgressMapper`, `ChapterXPathResolver`, and Nearby sync inputs
+- [x] Retarget `ProgressMapper`, `ChapterXPathResolver`, and Nearby sync inputs
   to `ReflowDocument`; their section streams, sizes, progress, and TOC needs are
   in the shared seam. Capability-gate invocation for PDF. Use no RTTI,
   downcast, or attempt to construct `Epub` from a PDF path.
-- [ ] Gate Nearby sync and configured quick actions using capability bits.
-- [ ] Run host tests and the EPUB oracle. Expected: existing EPUB menus and sync
+- [x] Gate Nearby sync and configured quick actions using capability bits.
+- [x] Run host tests and the EPUB oracle. Expected: existing EPUB menus and sync
   remain visible and unchanged.
 
 ### Task 11: Migrate the main EPUB reader activity without renaming it
