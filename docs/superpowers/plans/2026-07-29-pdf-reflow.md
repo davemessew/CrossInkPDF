@@ -433,21 +433,21 @@ smallest failing hypothesis; do not layer speculative production changes.
 - Modify: `src/simulator/SimulatorSmokeTest.cpp`
 - Modify: `scripts/run_simulator_smoke_test.py`
 
-- [ ] Add a pinned Ubuntu/SDL container route before capturing the baseline.
+- [x] Add a pinned Ubuntu/SDL container route before capturing the baseline.
   Its self-test must verify SDL2, compiler, clang-format 21, PlatformIO, Python,
   fonts, and a read/write mounted test filesystem. The container may build and
   run the native simulator but may not expose host serial devices.
-- [ ] Extend the simulator runner with format-neutral `--book`, `--passes`,
+- [x] Extend the simulator runner with format-neutral `--book`, `--passes`,
   `--page-turns`, and `--reflow-oracle` arguments.
-- [ ] Pin reader settings, device dimensions, orientation, font, margins,
+- [x] Pin reader settings, device dimensions, orientation, font, margins,
   status-clock inputs, input timing, semantic page targets, and initial
   progress/bookmark state. Reset the fixture filesystem before the uncached
   pass, then retain only the generated book cache for the cached pass. Compare
   reader-content frames, not preparation/status animations.
-- [ ] Capture exact oracles for section count, selected TOC tuples, href
+- [x] Capture exact oracles for section count, selected TOC tuples, href
   resolution, streamed XHTML hash, first/middle/last page text and framebuffer
   hashes, section-cache hash, progress, bookmark, and resume.
-- [ ] Run once uncached and once cached against the same temporary filesystem:
+- [x] Run once uncached and once cached against the same temporary filesystem:
 
   ```powershell
   python scripts/run_pdf_simulator_container.py --build
@@ -460,10 +460,10 @@ smallest failing hypothesis; do not layer speculative production changes.
 
   Expected: distinct uncached/cached markers and identical locked outputs.
 
-- [ ] Change one expected framebuffer hash by one digit, rerun, and confirm the
+- [x] Change one expected framebuffer hash by one digit, rerun, and confirm the
   runner fails. Restore the correct value and confirm PASS. This is the oracle's
   positive control.
-- [ ] Record the generated oracle and evidence log without staging.
+- [x] Record the generated oracle and evidence log without staging.
 
 ### Task 7: Introduce `ReflowDocument` and its host contract
 

@@ -1,0 +1,10 @@
+.git
+.pio
+.tools
+.venv
+.cache
+build
+fs_
+site/node_modules
+site/dist
+**/__pycache__

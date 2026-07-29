@@ -30,7 +30,13 @@ bool ensureMutex() {
 
   mutex = nullptr;
   if (!gMutex.compare_exchange_strong(mutex, created, std::memory_order_release, std::memory_order_acquire)) {
+#ifdef SIMULATOR
+    // The host shim creates SimMutex with new and does not expose FreeRTOS'
+    // vSemaphoreDelete compatibility function.
+    delete created;
+#else
     vSemaphoreDelete(created);
+#endif
   }
   return true;
 }

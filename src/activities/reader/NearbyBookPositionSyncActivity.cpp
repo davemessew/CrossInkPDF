@@ -543,7 +543,12 @@ NearbyBookPositionSyncActivity::NearbyBookPositionSyncActivity(GfxRenderer& rend
 
 NearbyBookPositionSyncActivity::~NearbyBookPositionSyncActivity() {
   if (eventMutex_) {
+#ifdef SIMULATOR
+    // The host shim owns SimMutex with new and has no vSemaphoreDelete API.
+    delete eventMutex_;
+#else
     vSemaphoreDelete(eventMutex_);
+#endif
     eventMutex_ = nullptr;
   }
 }

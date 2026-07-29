@@ -192,7 +192,12 @@ NearbyStatsSyncActivity::NearbyStatsSyncActivity(GfxRenderer& renderer, MappedIn
 
 NearbyStatsSyncActivity::~NearbyStatsSyncActivity() {
   if (eventMutex_) {
+#ifdef SIMULATOR
+    // The host shim owns SimMutex with new and has no vSemaphoreDelete API.
+    delete eventMutex_;
+#else
     vSemaphoreDelete(eventMutex_);
+#endif
     eventMutex_ = nullptr;
   }
 }
