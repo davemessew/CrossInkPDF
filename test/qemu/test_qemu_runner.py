@@ -27,7 +27,31 @@ class QemuRunnerTest(unittest.TestCase):
             self.assertLess(elapsed, 2.0)
             self.assertEqual(
                 paths["log"].read_text(encoding="utf-8"),
-                f"QEMU_BOOT seq=0\n{EXPECTED_MARKER}\n",
+                "\n".join(
+                    (
+                        "QEMU_BOOT seq=0",
+                        (
+                            "QEMU_STORAGE_PASS "
+                            "path=/qemu/sentinel.txt bytes=26"
+                        ),
+                        (
+                            "QEMU_FRAME_PASS "
+                            "bytes=48000 crc32=0F7C8C45"
+                        ),
+                        (
+                            "QEMU_INPUT_PASS "
+                            "button=DOWN press=1 release=1"
+                        ),
+                        "QEMU_POWER_PASS idle_ms=3000 saving=1",
+                        (
+                            "QEMU_RUNTIME heap_start=100000 "
+                            "min_free=99000 min_max_alloc=60000 "
+                            "max_alloc=1000 stack_margin=2000"
+                        ),
+                        EXPECTED_MARKER,
+                        "",
+                    )
+                ),
             )
 
     def test_valid_armed_reset_sequence_passes(self) -> None:
@@ -101,6 +125,10 @@ class QemuRunnerTest(unittest.TestCase):
             self.assertEqual(completed.returncode, 0)
             arguments = json.loads(arguments_log.read_text(encoding="utf-8"))
             self.assertEqual(arguments[0:2], ["-M", "esp32c3"])
+            self.assertIn("-icount", arguments)
+            self.assertEqual(
+                arguments[arguments.index("-icount") + 1], "3"
+            )
             self.assertIn("-nic", arguments)
             self.assertIn("none", arguments)
             self.assertIn("-nographic", arguments)
@@ -137,6 +165,8 @@ class QemuRunnerTest(unittest.TestCase):
             ("missing_marker", "missing terminal marker"),
             ("unarmed_reset", "unarmed reset"),
             ("repeated_reset", "unarmed reset"),
+            ("missing_stage", "missing required tracer marker"),
+            ("out_of_order", "out-of-order tracer marker"),
         )
         for mode, expected_error in cases:
             with self.subTest(mode=mode):
@@ -191,11 +221,53 @@ class QemuRunnerTest(unittest.TestCase):
                     "",
                     "emit('QEMU_BOOT seq=0')",
                     "if mode == 'pass':",
+                    (
+                        "    emit('QEMU_STORAGE_PASS "
+                        "path=/qemu/sentinel.txt bytes=26')"
+                    ),
+                    (
+                        "    emit('QEMU_FRAME_PASS "
+                        "bytes=48000 crc32=0F7C8C45')"
+                    ),
+                    (
+                        "    emit('QEMU_INPUT_PASS "
+                        "button=DOWN press=1 release=1')"
+                    ),
+                    (
+                        "    emit('QEMU_POWER_PASS "
+                        "idle_ms=3000 saving=1')"
+                    ),
+                    (
+                        "    emit('QEMU_RUNTIME heap_start=100000 "
+                        "min_free=99000 min_max_alloc=60000 "
+                        "max_alloc=1000 stack_margin=2000')"
+                    ),
                     "    emit('QEMU_TRACER_PASS')",
                     "    time.sleep(5)",
                     "elif mode == 'armed_reset':",
                     "    emit('QEMU_EXPECT_RESET seq=0')",
                     "    emit('QEMU_BOOT seq=1')",
+                    (
+                        "    emit('QEMU_STORAGE_PASS "
+                        "path=/qemu/sentinel.txt bytes=26')"
+                    ),
+                    (
+                        "    emit('QEMU_FRAME_PASS "
+                        "bytes=48000 crc32=0F7C8C45')"
+                    ),
+                    (
+                        "    emit('QEMU_INPUT_PASS "
+                        "button=DOWN press=1 release=1')"
+                    ),
+                    (
+                        "    emit('QEMU_POWER_PASS "
+                        "idle_ms=3000 saving=1')"
+                    ),
+                    (
+                        "    emit('QEMU_RUNTIME heap_start=100000 "
+                        "min_free=99000 min_max_alloc=60000 "
+                        "max_alloc=1000 stack_margin=2000')"
+                    ),
                     "    emit('QEMU_TRACER_PASS')",
                     "    time.sleep(5)",
                     "elif mode == 'fail_marker':",
@@ -230,6 +302,45 @@ class QemuRunnerTest(unittest.TestCase):
                     "    emit('QEMU_BOOT seq=1')",
                     "    emit('QEMU_BOOT seq=2')",
                     "    time.sleep(5)",
+                    "elif mode == 'missing_stage':",
+                    (
+                        "    emit('QEMU_STORAGE_PASS "
+                        "path=/qemu/sentinel.txt bytes=26')"
+                    ),
+                    (
+                        "    emit('QEMU_FRAME_PASS "
+                        "bytes=48000 crc32=0F7C8C45')"
+                    ),
+                    (
+                        "    emit('QEMU_INPUT_PASS "
+                        "button=DOWN press=1 release=1')"
+                    ),
+                    "    emit('QEMU_TRACER_PASS')",
+                    "    time.sleep(5)",
+                    "elif mode == 'out_of_order':",
+                    (
+                        "    emit('QEMU_FRAME_PASS "
+                        "bytes=48000 crc32=0F7C8C45')"
+                    ),
+                    (
+                        "    emit('QEMU_STORAGE_PASS "
+                        "path=/qemu/sentinel.txt bytes=26')"
+                    ),
+                    (
+                        "    emit('QEMU_INPUT_PASS "
+                        "button=DOWN press=1 release=1')"
+                    ),
+                    (
+                        "    emit('QEMU_POWER_PASS "
+                        "idle_ms=3000 saving=1')"
+                    ),
+                    (
+                        "    emit('QEMU_RUNTIME heap_start=100000 "
+                        "min_free=99000 min_max_alloc=60000 "
+                        "max_alloc=1000 stack_margin=2000')"
+                    ),
+                    "    emit('QEMU_TRACER_PASS')",
+                    "    time.sleep(5)",
                     "elif mode == 'real_command':",
                     "    import json",
                     "    from pathlib import Path",
@@ -241,6 +352,27 @@ class QemuRunnerTest(unittest.TestCase):
                     "            image = Path(argument.split(',', 1)[0][5:])",
                     "            with image.open('ab') as output:",
                     "                output.write(b'changed')",
+                    (
+                        "    emit('QEMU_STORAGE_PASS "
+                        "path=/qemu/sentinel.txt bytes=26')"
+                    ),
+                    (
+                        "    emit('QEMU_FRAME_PASS "
+                        "bytes=48000 crc32=0F7C8C45')"
+                    ),
+                    (
+                        "    emit('QEMU_INPUT_PASS "
+                        "button=DOWN press=1 release=1')"
+                    ),
+                    (
+                        "    emit('QEMU_POWER_PASS "
+                        "idle_ms=3000 saving=1')"
+                    ),
+                    (
+                        "    emit('QEMU_RUNTIME heap_start=100000 "
+                        "min_free=99000 min_max_alloc=60000 "
+                        "max_alloc=1000 stack_margin=2000')"
+                    ),
                     "    emit('QEMU_TRACER_PASS')",
                     "    time.sleep(5)",
                     "else:",

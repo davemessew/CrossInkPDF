@@ -22,6 +22,17 @@ OUTPUT_FAILURES = (
     (re.compile(r"\babort(?:\(\))?\b", re.IGNORECASE), "abort"),
     (re.compile(r"\bwatchdog\b", re.IGNORECASE), "watchdog"),
 )
+TRACER_EXPECTED_MARKER = "QEMU_TRACER_PASS"
+TRACER_MARKERS = (
+    re.compile(r"^QEMU_STORAGE_PASS path=/qemu/sentinel\.txt bytes=26$"),
+    re.compile(r"^QEMU_FRAME_PASS bytes=48000 crc32=0F7C8C45$"),
+    re.compile(r"^QEMU_INPUT_PASS button=DOWN press=1 release=1$"),
+    re.compile(r"^QEMU_POWER_PASS idle_ms=3000 saving=1$"),
+    re.compile(
+        r"^QEMU_RUNTIME heap_start=\d+ min_free=\d+ "
+        r"min_max_alloc=\d+ max_alloc=\d+ stack_margin=\d+$"
+    ),
+)
 
 
 class OutputGuard:
@@ -30,6 +41,7 @@ class OutputGuard:
         self.last_boot: int | None = None
         self.pending_reset: int | None = None
         self.reset_count = 0
+        self.tracer_marker_index = 0
 
     def inspect(self, line: str) -> tuple[str | None, bool]:
         if FAIL_MARKER.match(line):
@@ -43,6 +55,7 @@ class OutputGuard:
             error = self._accept_boot(int(boot_match.group(1)))
             if error:
                 return error, False
+            self.tracer_marker_index = 0
 
         reset_match = EXPECT_RESET_MARKER.match(line)
         if reset_match:
@@ -50,11 +63,48 @@ class OutputGuard:
             if error:
                 return error, False
 
+        tracer_error = self._accept_tracer_marker(line)
+        if tracer_error:
+            return tracer_error, False
+
         if line == self.expected_marker:
             if self.pending_reset is not None:
                 return "terminal marker arrived before armed reset", False
+            if (
+                self.expected_marker == TRACER_EXPECTED_MARKER
+                and self.tracer_marker_index != len(TRACER_MARKERS)
+            ):
+                return (
+                    "missing required tracer marker before terminal marker "
+                    f"(next index {self.tracer_marker_index})"
+                ), False
             return None, True
         return None, False
+
+    def _accept_tracer_marker(self, line: str) -> str | None:
+        if self.expected_marker != TRACER_EXPECTED_MARKER:
+            return None
+
+        matching_index = next(
+            (
+                index
+                for index, pattern in enumerate(TRACER_MARKERS)
+                if pattern.fullmatch(line)
+            ),
+            None,
+        )
+        if matching_index is None:
+            return None
+        if self.last_boot is None:
+            return "tracer marker arrived before initial QEMU boot"
+        if matching_index != self.tracer_marker_index:
+            return (
+                "out-of-order tracer marker "
+                f"(expected index {self.tracer_marker_index}, "
+                f"received {matching_index})"
+            )
+        self.tracer_marker_index += 1
+        return None
 
     def _accept_boot(self, sequence: int) -> str | None:
         if self.last_boot is None:
@@ -168,11 +218,13 @@ def _monitor(command: list[str], arguments: argparse.Namespace) -> int:
                 if item is None:
                     end_of_output = True
                 elif item:
+                    line = item.rstrip("\r\n")
+                    error, terminal = guard.inspect(line)
                     log.write(item)
                     log.flush()
-                    sys.stdout.write(item)
-                    sys.stdout.flush()
-                    error, terminal = guard.inspect(item.rstrip("\r\n"))
+                    if not (error and line == arguments.expect):
+                        sys.stdout.write(item)
+                        sys.stdout.flush()
                     if error:
                         failure = error
                         break
@@ -268,6 +320,8 @@ def _qemu_machine_command(
     return _command(executable) + [
         "-M",
         "esp32c3",
+        "-icount",
+        "3",
         "-drive",
         f"file={flash_image},if=mtd,format=raw",
         "-drive",

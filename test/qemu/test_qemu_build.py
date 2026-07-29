@@ -1,6 +1,7 @@
 import configparser
 import hashlib
 import importlib.util
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -8,8 +9,12 @@ import unittest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PLATFORMIO_INI = REPO_ROOT / "platformio.ini"
+HARDWARE_HAL_MANIFEST = REPO_ROOT / "lib" / "hal" / "library.json"
 BUILD_SCRIPT = REPO_ROOT / "scripts" / "qemu_build.py"
 NO_FLASH_SCRIPT = REPO_ROOT / "scripts" / "qemu_no_flash.py"
+QEMU_PLATFORM_STUBS = (
+    REPO_ROOT / "src" / "qemu" / "QemuPlatformStubs.cpp"
+)
 EXPECTED_OFFSETS = {
     "bootloader": 0x0,
     "partitions": 0x8000,
@@ -20,6 +25,38 @@ EXPECTED_OFFSETS = {
 
 
 class QemuBuildContractTest(unittest.TestCase):
+    def test_unemulated_adc_calibration_is_qemu_only_and_nonblocking(
+        self,
+    ) -> None:
+        parser = configparser.RawConfigParser(
+            interpolation=None, strict=False
+        )
+        parser.read(PLATFORMIO_INI, encoding="utf-8")
+        qemu_flags = parser["env:qemu-esp32c3"]["build_flags"]
+        self.assertIn(
+            "-Wl,--wrap=adc_calc_hw_calibration_code",
+            qemu_flags,
+        )
+
+        self.assertTrue(
+            QEMU_PLATFORM_STUBS.is_file(),
+            f"missing required file: {QEMU_PLATFORM_STUBS}",
+        )
+        source = QEMU_PLATFORM_STUBS.read_text(encoding="utf-8")
+        self.assertIn("#ifdef CROSSINK_QEMU", source)
+        self.assertIn(
+            "__wrap_adc_calc_hw_calibration_code",
+            source,
+        )
+        for forbidden in (
+            "malloc",
+            "new ",
+            "delay(",
+            "while (",
+            "xTaskCreate",
+        ):
+            self.assertNotIn(forbidden, source)
+
     def test_platformio_environment_isolated_from_physical_hardware(self) -> None:
         parser = configparser.RawConfigParser(interpolation=None, strict=False)
         parser.read(PLATFORMIO_INI, encoding="utf-8")
@@ -29,7 +66,20 @@ class QemuBuildContractTest(unittest.TestCase):
         self.assertEqual(section["extends"].strip(), "base")
         self.assertEqual(section["upload_protocol"].strip(), "custom")
         self.assertEqual(section["board_build.filesystem"].strip(), "littlefs")
-        self.assertEqual(section["lib_ignore"].strip(), "hal")
+        self.assertEqual(
+            section["lib_ignore"].strip(), "crossink-hardware-hal"
+        )
+
+        hardware_hal = json.loads(
+            HARDWARE_HAL_MANIFEST.read_text(encoding="utf-8")
+        )
+        self.assertEqual(hardware_hal["name"], "crossink-hardware-hal")
+        simulator_ignored = {
+            name.strip()
+            for name in parser["env:simulator"]["lib_ignore"].split(",")
+        }
+        self.assertIn("crossink-hardware-hal", simulator_ignored)
+        self.assertNotIn("hal", simulator_ignored)
 
         flags = section["build_flags"]
         self.assertIn("${base.build_flags}", flags)
@@ -48,6 +98,14 @@ class QemuBuildContractTest(unittest.TestCase):
         self.assertIn("${base.build_unflags}", unflags)
         self.assertIn("-DARDUINO_USB_MODE=1", unflags)
         self.assertIn("-DARDUINO_USB_CDC_ON_BOOT=1", unflags)
+        self.assertIn(
+            (
+                "-Wl,--wrap=panic_print_backtrace,"
+                "--wrap=panic_abort,"
+                "--wrap=bootloader_common_check_efuse_blk_validity"
+            ),
+            unflags,
+        )
 
         dependencies = section["lib_deps"]
         self.assertIn("qemu-hal=symlink://test/qemu/hal", dependencies)

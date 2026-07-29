@@ -43,12 +43,17 @@ def main() -> int:
             check=False,
         )
         combined_output = completed.stdout + completed.stderr
+        stderr_lines = completed.stderr.splitlines()
+        refused_before_platformio_output = (
+            bool(stderr_lines)
+            and stderr_lines[0] == EXPECTED_REFUSAL.rstrip("\n")
+        )
         accessed_device = any(
             pattern.search(combined_output) for pattern in DEVICE_ACCESS_PATTERNS
         )
         if (
-            completed.returncode != 2
-            or completed.stderr != EXPECTED_REFUSAL
+            completed.returncode == 0
+            or not refused_before_platformio_output
             or accessed_device
         ):
             failures.append(target)

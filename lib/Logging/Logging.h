@@ -27,7 +27,11 @@ won't trigger deprecation warnings.
 #define LOG_LEVEL 0
 #endif
 
+#ifdef CROSSINK_QEMU
+static HardwareSerial& logSerial = Serial0;
+#else
 static HWCDC& logSerial = Serial;
+#endif
 
 void logPrintf(const char* level, const char* origin, const char* format, ...);
 

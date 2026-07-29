@@ -2,9 +2,11 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
 import tarfile
 import tempfile
 import unittest
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -18,6 +20,7 @@ class QemuInstallerTest(unittest.TestCase):
         linux = module.select_asset("Linux", "x86_64")
 
         self.assertEqual(module.QEMU_VERSION, "esp_develop_9.2.2_20250817")
+        self.assertEqual(module.WINDOWS_RUNTIME_DLLS, ("libiconv-2.dll",))
         self.assertEqual(
             windows.sha256,
             "9474015f24d27acb7516955ec932e5307226bd9d6652cdc870793ed36010ab73",
@@ -70,7 +73,7 @@ class QemuInstallerTest(unittest.TestCase):
 
             install_root = directory / "install"
             executable = module.install_from_archive(
-                archive, install_root, asset
+                archive, install_root, asset, smoke_test=False
             )
 
             self.assertEqual(
@@ -88,6 +91,84 @@ class QemuInstallerTest(unittest.TestCase):
             self.assertEqual(receipt["sha256"], digest)
             self.assertEqual(
                 Path(receipt["executable"]), executable.resolve()
+            )
+
+    def test_windows_runtime_is_private_receipted_and_smoke_tested(
+        self,
+    ) -> None:
+        module = self._load_installer()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            payload = directory / "payload"
+            binary = (
+                payload
+                / "package"
+                / "qemu"
+                / "bin"
+                / "qemu-system-riscv32.exe"
+            )
+            binary.parent.mkdir(parents=True)
+            binary.write_bytes(b"qemu")
+            archive = directory / "qemu.tar.xz"
+            with tarfile.open(archive, "w:xz") as bundle:
+                bundle.add(payload / "package", arcname="package")
+            digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+            asset = module.Asset(
+                url="https://example.invalid/qemu.tar.xz",
+                sha256=digest,
+                executable_name="qemu-system-riscv32.exe",
+                platform_key="windows-x86_64",
+            )
+            runtime_directory = directory / "runtime"
+            runtime_directory.mkdir()
+            runtime = runtime_directory / "libiconv-2.dll"
+            runtime.write_bytes(b"pinned-runtime")
+            completed = subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout=(
+                    "QEMU emulator version 9.2.2 "
+                    "(esp_develop_9.2.2_20250817)\n"
+                ),
+                stderr="",
+            )
+
+            with mock.patch.object(
+                module.subprocess, "run", return_value=completed
+            ) as run:
+                install_root = directory / "install"
+                executable = module.install_from_archive(
+                    archive,
+                    install_root,
+                    asset,
+                    windows_runtime_dir=runtime_directory,
+                    smoke_test=True,
+                )
+
+            installed_runtime = executable.parent / runtime.name
+            self.assertEqual(
+                installed_runtime.read_bytes(), b"pinned-runtime"
+            )
+            receipt = json.loads(
+                (install_root / "install.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(receipt["schema_version"], 2)
+            self.assertEqual(
+                receipt["runtime_files"],
+                [
+                    {
+                        "name": runtime.name,
+                        "sha256": hashlib.sha256(
+                            b"pinned-runtime"
+                        ).hexdigest(),
+                    }
+                ],
+            )
+            run.assert_called_once()
+            smoke_command = run.call_args.args[0]
+            self.assertEqual(smoke_command[1], "--version")
+            self.assertEqual(
+                Path(smoke_command[0]).name, executable.name
             )
 
     def test_archive_path_traversal_is_rejected(self) -> None:

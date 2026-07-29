@@ -286,13 +286,14 @@ smallest failing hypothesis; do not layer speculative production changes.
 
 - Create: `src/qemu/QemuAcceptance.h`
 - Create: `src/qemu/QemuAcceptance.cpp`
+- Create: `src/qemu/QemuPlatformStubs.cpp`
 - Modify: `src/main.cpp`
 - Modify: `lib/Logging/Logging.h`
 - Modify: `src/MappedInputManager.h`
 - Modify: `src/MappedInputManager.cpp`
 - Create: `docs/qemu.md`
 
-- [ ] Add a marker-sequence test requiring:
+- [x] Add a marker-sequence test requiring:
 
   ```text
   QEMU_BOOT seq=0
@@ -304,22 +305,22 @@ smallest failing hypothesis; do not layer speculative production changes.
   QEMU_TRACER_PASS
   ```
 
-- [ ] Under `CROSSINK_QEMU`, bind logging to UART `Serial0` instead of `HWCDC`;
+- [x] Under `CROSSINK_QEMU`, bind logging to UART `Serial0` instead of `HWCDC`;
   skip the USB-enumeration delay and USB-specific `setTxTimeoutMs()` call.
   Outside that define, preserve the hardware path exactly.
-- [ ] Add `qemuAcceptanceBegin(...)` after normal setup and
+- [x] Add `qemuAcceptanceBegin(...)` after normal setup and
   `qemuAcceptanceTick()` inside the real event loop. Use `esp_rom_printf` for
   acceptance markers so success does not depend on normal logging.
-- [ ] The tracer must read the sentinel through `HalStorage`, render the fixed
+- [x] The tracer must read the sentinel through `HalStorage`, render the fixed
   framebuffer pattern (all 48,000 bytes `0xFF`, then byte zero `0x7F`; standard
   CRC32 `0F7C8C45`), inject and consume Down press/release, wait through the
   real 3000 ms idle threshold, observe power saving, and sample:
   `ESP.getFreeHeap()`, `ESP.getMinFreeHeap()`, `ESP.getMaxAllocHeap()`, and
   `uxTaskGetStackHighWaterMark(nullptr) * sizeof(StackType_t)`.
-- [ ] Broaden the existing logical injection seam in
+- [x] Broaden the existing logical injection seam in
   `MappedInputManager.h/.cpp` to `SIMULATOR || CROSSINK_QEMU`. Inject
   `MappedInputManager::Button::Down`; do not inject a raw physical GPIO index.
-- [ ] Install a repository-local Python 3.13 runtime/venv because the pinned
+- [x] Install a repository-local Python 3.13 runtime/venv because the pinned
   pioarduino platform rejects this host's Python 3.14. Initialize the pinned
   submodule:
 
@@ -345,7 +346,7 @@ smallest failing hypothesis; do not layer speculative production changes.
   Expected: all component markers followed by `QEMU_TRACER_PASS`; no panic,
   abort, watchdog reset, or restart loop.
 
-- [ ] Prove all unsafe target guards using the zero-on-expected-refusal wrapper:
+- [x] Prove all unsafe target guards using the zero-on-expected-refusal wrapper:
 
   ```powershell
   python scripts/verify_qemu_no_flash.py --pio .venv/Scripts/pio.exe
@@ -355,7 +356,7 @@ smallest failing hypothesis; do not layer speculative production changes.
   `QEMU target cannot be flashed`; logs contain no port enumeration and no
   device-writing command.
 
-- [ ] Build the unchanged hardware environment without uploading:
+- [x] Build the unchanged hardware environment without uploading:
 
   ```powershell
   .\.venv\Scripts\pio.exe run -e default
@@ -363,9 +364,21 @@ smallest failing hypothesis; do not layer speculative production changes.
 
   Expected: firmware links successfully.
 
-- [ ] Document the exact pinned QEMU install, build, run, marker, and refusal
+- [x] Document the exact pinned QEMU install, build, run, marker, and refusal
   commands in `docs/qemu.md`.
-- [ ] Stop here if QEMU does not boot. A host test is not a substitute.
+- [x] Stop here if QEMU does not boot. A host test is not a substitute.
+
+  **2026-07-29 checkpoint:** the QEMU image and unchanged hardware environment
+  build successfully, and `QEMU_NO_FLASH_PASS` is green. A QEMU-only linker
+  wrapper bypasses the ESP-IDF ADC2 global calibration constructor because the
+  emulator never completes its ADC event. The real tracer now emits
+  `QEMU_BOOT`, storage, framebuffer, and logical-input passes, then the emulated
+  Timer Group watchdog resets the CPU while FreeRTOS is idle in
+  `esp_cpu_wait_for_intr`. Espressif's documented `wdt_disable` diagnostic plus
+  an interactive monitor wake reaches the remaining power/runtime/pass markers,
+  but that is not an acceptable unattended watchdog gate. Gate A therefore
+  remains blocked; Task 5 and all PDF production work remain intentionally
+  untouched.
 
 ### Task 5: Capture the pre-PDF target resource baseline
 

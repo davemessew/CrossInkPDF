@@ -86,6 +86,9 @@ inline esp_sleep_wakeup_cause_t esp_sleep_get_wakeup_cause() { return ESP_SLEEP_
 #ifdef SIMULATOR
 #include "simulator/SimulatorSmokeTest.h"
 #endif
+#ifdef CROSSINK_QEMU
+#include "qemu/QemuAcceptance.h"
+#endif
 #include "images/LoadingIcon.h"
 #include "util/ButtonNavigator.h"
 #include "util/ScreenshotUtil.h"
@@ -689,6 +692,9 @@ void setup() {
   const esp_sleep_wakeup_cause_t rawWakeupCause = esp_sleep_get_wakeup_cause();
 
 #ifdef ENABLE_SERIAL_LOG
+#ifdef CROSSINK_QEMU
+  Serial.begin(115200);
+#else
   // Earliest possible Serial setup. The 250 ms stall before begin() lets the
   // USB Serial/JTAG peripheral finish power-on and lets the host complete USB
   // enumeration before we touch the CDC state — otherwise cold boot races
@@ -703,6 +709,7 @@ void setup() {
   Serial.begin(115200);
 #ifndef SIMULATOR
   logSerial.setTxTimeoutMs(1);  // This is a load-bearing 1. Do not modify.
+#endif
 #endif
 #endif
 
@@ -886,6 +893,9 @@ void setup() {
   // Ensure we're not still holding the power button before leaving setup
   waitForPowerRelease();
   allowSleepAt = millis() + 2000;
+#ifdef CROSSINK_QEMU
+  qemuAcceptanceBegin(mappedInputManager);
+#endif
 }
 
 void loop() {
@@ -1011,4 +1021,7 @@ void loop() {
       delay(10);
     }
   }
+#ifdef CROSSINK_QEMU
+  qemuAcceptanceTick();
+#endif
 }

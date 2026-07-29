@@ -6,6 +6,7 @@ from pathlib import Path, PurePosixPath
 import platform
 import shutil
 import stat
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -15,6 +16,7 @@ import urllib.request
 
 QEMU_VERSION = "esp_develop_9.2.2_20250817"
 RELEASE_TAG = "esp-develop-9.2.2-20250817"
+WINDOWS_RUNTIME_DLLS = ("libiconv-2.dll",)
 RELEASE_ROOT = (
     f"https://github.com/espressif/qemu/releases/download/{RELEASE_TAG}"
 )
@@ -106,8 +108,88 @@ def _locate_package_root(
     return executable.parent.parent, executable
 
 
+def _find_windows_runtime(
+    name: str, explicit_directory: Path | None
+) -> Path:
+    candidates: list[Path] = []
+    if explicit_directory is not None:
+        candidates.append(explicit_directory.resolve() / name)
+
+    configured_directory = os.environ.get(
+        "CROSSINK_QEMU_WINDOWS_RUNTIME_DIR"
+    )
+    if configured_directory:
+        candidates.append(Path(configured_directory).resolve() / name)
+
+    git_executable = shutil.which("git")
+    if git_executable:
+        git_path = Path(git_executable).resolve()
+        candidates.extend(
+            (
+                git_path.parent / name,
+                git_path.parent.parent / "mingw64" / "bin" / name,
+            )
+        )
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if resolved.is_file():
+            return resolved
+    raise RuntimeError(
+        f"Windows QEMU runtime is missing {name}; "
+        "install Git for Windows or pass --windows-runtime-dir"
+    )
+
+
+def _install_windows_runtime(
+    staged_executable: Path, explicit_directory: Path | None
+) -> list[dict[str, str]]:
+    runtime_files: list[dict[str, str]] = []
+    for name in WINDOWS_RUNTIME_DLLS:
+        destination = staged_executable.parent / name
+        if not destination.is_file():
+            source = _find_windows_runtime(name, explicit_directory)
+            shutil.copy2(source, destination)
+        runtime_files.append(
+            {"name": name, "sha256": _sha256(destination)}
+        )
+    return runtime_files
+
+
+def _smoke_test(executable: Path) -> None:
+    try:
+        completed = subprocess.run(
+            [str(executable), "--version"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RuntimeError(f"cannot start pinned QEMU: {error}") from error
+    output = completed.stdout + completed.stderr
+    if (
+        completed.returncode != 0
+        or "QEMU emulator version 9.2.2" not in output
+        or QEMU_VERSION not in output
+    ):
+        raise RuntimeError(
+            "pinned QEMU smoke test failed "
+            f"(exit {completed.returncode})"
+        )
+
+
 def install_from_archive(
-    archive: Path, install_root: Path, asset: Asset
+    archive: Path,
+    install_root: Path,
+    asset: Asset,
+    *,
+    windows_runtime_dir: Path | None = None,
+    smoke_test: bool = True,
 ) -> Path:
     actual_hash = _sha256(archive)
     if actual_hash != asset.sha256:
@@ -139,6 +221,22 @@ def install_from_archive(
         staged_qemu = temporary / "qemu"
         shutil.copytree(package_root, staged_qemu)
         relative_executable = original_executable.relative_to(package_root)
+        staged_executable = staged_qemu / relative_executable
+
+        runtime_files: list[dict[str, str]] = []
+        if asset.platform_key.startswith("windows-"):
+            runtime_files = _install_windows_runtime(
+                staged_executable, windows_runtime_dir
+            )
+        if os.name != "nt":
+            staged_executable.chmod(
+                staged_executable.stat().st_mode
+                | stat.S_IXUSR
+                | stat.S_IXGRP
+                | stat.S_IXOTH
+            )
+        if smoke_test:
+            _smoke_test(staged_executable)
 
         install_root.mkdir(parents=True, exist_ok=True)
         destination_qemu = install_root / "qemu"
@@ -147,20 +245,14 @@ def install_from_archive(
         shutil.move(str(staged_qemu), str(destination_qemu))
 
     executable = destination_qemu / relative_executable
-    if os.name != "nt":
-        executable.chmod(
-            executable.stat().st_mode
-            | stat.S_IXUSR
-            | stat.S_IXGRP
-            | stat.S_IXOTH
-        )
     receipt = {
-        "schema_version": 1,
+        "schema_version": 2,
         "version": QEMU_VERSION,
         "platform": asset.platform_key,
         "url": asset.url,
         "sha256": asset.sha256,
         "executable": str(executable.resolve()),
+        "runtime_files": runtime_files,
     }
     (install_root / "install.json").write_text(
         json.dumps(receipt, indent=2, sort_keys=True) + "\n",
@@ -198,6 +290,11 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Use an already-downloaded pinned archive",
     )
+    parser.add_argument(
+        "--windows-runtime-dir",
+        type=Path,
+        help="Directory containing the private MinGW runtime DLL",
+    )
     return parser
 
 
@@ -210,6 +307,7 @@ def main() -> int:
                 arguments.archive.resolve(),
                 arguments.install_root,
                 asset,
+                windows_runtime_dir=arguments.windows_runtime_dir,
             )
         else:
             arguments.install_root.parent.mkdir(
@@ -222,7 +320,10 @@ def main() -> int:
                 archive = Path(temporary_directory) / "qemu.tar.xz"
                 _download(asset.url, archive)
                 executable = install_from_archive(
-                    archive, arguments.install_root, asset
+                    archive,
+                    arguments.install_root,
+                    asset,
+                    windows_runtime_dir=arguments.windows_runtime_dir,
                 )
     except (OSError, RuntimeError) as error:
         sys.stderr.write(f"QEMU install failed: {error}\n")

@@ -106,6 +106,37 @@ class NoFlashWitnessTest(unittest.TestCase):
             self.assertEqual(completed.stdout, "")
             self.assertIn("unsafe target upload was not refused safely", completed.stderr)
 
+    def test_verifier_accepts_platformio_wrapped_refusal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            fake_pio = self._write_fake_pio(temporary_path)
+            invocation_log = temporary_path / "invocations.txt"
+            environment = os.environ.copy()
+            environment["FAKE_PIO_LOG"] = str(invocation_log)
+            environment["FAKE_PIO_MODE"] = "platformio_refuse"
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(VERIFIER_SCRIPT),
+                    "--pio",
+                    str(fake_pio),
+                ],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=environment,
+            )
+
+            self.assertEqual(completed.returncode, 0)
+            self.assertEqual(completed.stdout, "QEMU_NO_FLASH_PASS\n")
+            self.assertEqual(completed.stderr, "")
+            self.assertEqual(
+                invocation_log.read_text(encoding="utf-8").splitlines(),
+                list(PROHIBITED_TARGETS),
+            )
+
     @staticmethod
     def _write_fake_pio(directory: Path) -> Path:
         fake_pio = directory / "fake_pio.py"
@@ -124,6 +155,9 @@ class NoFlashWitnessTest(unittest.TestCase):
                     "if mode == 'enumerate':",
                     "    sys.stdout.write('Auto-detected: COM3\\n')",
                     "sys.stderr.write('QEMU target cannot be flashed\\n')",
+                    "if mode == 'platformio_refuse':",
+                    "    sys.stderr.write('=== [FAILED] Took 0.01 seconds ===\\n')",
+                    "    raise SystemExit(1)",
                     "raise SystemExit(2)",
                     "",
                 )
