@@ -3,6 +3,7 @@ add_executable(reflow_document_tests
   LegacyPageProgressStoreTest.cpp
   ReflowCapabilityTest.cpp
   ReflowDocumentContractTest.cpp
+  ReflowReaderProgressTest.cpp
   ReflowSectionSourceTest.cpp
 )
 

@@ -174,8 +174,9 @@ EpubReaderMenuActivity::TabMenuItems EpubReaderMenuActivity::buildMenuItems(
   const bool showExternalSync =
       reflowSupportsMenuAction(documentCapabilities, ReflowReaderSyncAction::ExternalProgress);
   const bool showNearbySync = reflowSupportsMenuAction(documentCapabilities, ReflowReaderSyncAction::NearbyProgress);
-  bookmarkItems.reserve(4 + (showExternalSync ? 1u : 0u) + (showNearbySync ? 1u : 0u) + (hasBookmarks ? 2u : 0u) +
-                        (hasClippings ? 1u : 0u));
+  const bool showSavedItems = reflowSupportsSavedItems(documentCapabilities);
+  bookmarkItems.reserve(2 + (showExternalSync ? 1u : 0u) + (showNearbySync ? 1u : 0u) + (showSavedItems ? 2u : 0u) +
+                        (showSavedItems && hasBookmarks ? 2u : 0u) + (showSavedItems && hasClippings ? 1u : 0u));
   settingsItems.reserve(2 + (showReadingPaceReset ? 1u : 0u));
 
   if (hasFootnotes) {
@@ -196,15 +197,17 @@ EpubReaderMenuActivity::TabMenuItems EpubReaderMenuActivity::buildMenuItems(
   if (showNearbySync) {
     bookmarkItems.push_back({MenuAction::NEARBY_POSITION_SYNC, StrId::STR_NEARBY_POSITION_SYNC});
   }
-  bookmarkItems.push_back({MenuAction::SAVE_CLIPPING, StrId::STR_SAVE_CLIPPING});
-  if (hasClippings) {
-    bookmarkItems.push_back({MenuAction::VIEW_CLIPPINGS, StrId::STR_VIEW_CLIPPINGS});
-  }
-  bookmarkItems.push_back(
-      {MenuAction::BOOKMARK_TOGGLE, isCurrentPageBookmarked ? StrId::STR_REMOVE_BOOKMARK : StrId::STR_ADD_BOOKMARK});
-  if (hasBookmarks) {
-    bookmarkItems.push_back({MenuAction::VIEW_BOOKMARKS, StrId::STR_VIEW_BOOKMARKS});
-    bookmarkItems.push_back({MenuAction::DELETE_BOOKMARKS, StrId::STR_DELETE_BOOKMARKS});
+  if (showSavedItems) {
+    bookmarkItems.push_back({MenuAction::SAVE_CLIPPING, StrId::STR_SAVE_CLIPPING});
+    if (hasClippings) {
+      bookmarkItems.push_back({MenuAction::VIEW_CLIPPINGS, StrId::STR_VIEW_CLIPPINGS});
+    }
+    bookmarkItems.push_back(
+        {MenuAction::BOOKMARK_TOGGLE, isCurrentPageBookmarked ? StrId::STR_REMOVE_BOOKMARK : StrId::STR_ADD_BOOKMARK});
+    if (hasBookmarks) {
+      bookmarkItems.push_back({MenuAction::VIEW_BOOKMARKS, StrId::STR_VIEW_BOOKMARKS});
+      bookmarkItems.push_back({MenuAction::DELETE_BOOKMARKS, StrId::STR_DELETE_BOOKMARKS});
+    }
   }
   bookmarkItems.push_back({MenuAction::SCREENSHOT, StrId::STR_SCREENSHOT_BUTTON});
   bookmarkItems.push_back({MenuAction::DISPLAY_QR, StrId::STR_DISPLAY_QR});

@@ -57,7 +57,7 @@ class EpubReaderMenuActivity final : public Activity {
       ReaderOptionsActivity::GlobalSettingsEditCallback endGlobalSettingsEditCallback = nullptr,
       void* endGlobalSettingsEditContext = nullptr,
       ReflowCapabilitySet documentCapabilities = ReflowCapability::ExternalProgressSync |
-                                                 ReflowCapability::NearbyProgressSync);
+                                                 ReflowCapability::NearbyProgressSync | ReflowCapability::SavedItems);
 
   void onEnter() override;
   void onExit() override;

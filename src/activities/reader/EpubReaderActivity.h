@@ -1,7 +1,7 @@
 #pragma once
-#include <Epub.h>
 #include <Epub/FootnoteEntry.h>
 #include <Epub/Section.h>
+#include <ReflowDocument.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
@@ -47,7 +47,7 @@ class EpubReaderActivity final : public Activity {
   };
 
  private:
-  std::shared_ptr<Epub> epub;
+  std::shared_ptr<ReflowDocument> document;
   std::unique_ptr<Section> section = nullptr;
   int currentSpineIndex = 0;
   int nextPageNumber = 0;
@@ -237,8 +237,9 @@ class EpubReaderActivity final : public Activity {
   void restoreSavedPosition();
 
  public:
-  explicit EpubReaderActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, std::unique_ptr<Epub> epub)
-      : Activity("EpubReader", renderer, mappedInput), epub(std::move(epub)) {}
+  explicit EpubReaderActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
+                              std::unique_ptr<ReflowDocument> document)
+      : Activity("EpubReader", renderer, mappedInput), document(std::move(document)) {}
   void onEnter() override;
   void onExit() override;
   void loop() override;
@@ -246,7 +247,7 @@ class EpubReaderActivity final : public Activity {
   bool preventAutoSleep() override { return automaticPageTurnActive; }
   bool isReaderActivity() const override { return true; }
   bool canSnapshotForSleepOverlay() const override { return true; }
-  std::string getCurrentBookPath() const override { return epub ? epub->getPath() : std::string{}; }
+  std::string getCurrentBookPath() const override { return document ? document->getPath() : std::string{}; }
   void setAutoPageTurnIntervalSeconds(uint16_t seconds);
   uint16_t getAutoPageTurnIntervalSeconds() const;
 

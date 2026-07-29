@@ -686,27 +686,27 @@ smallest failing hypothesis; do not layer speculative production changes.
 - Modify: `test/reflow_document/CMakeLists.txt`
 - Test: `test/reflow_document/ReflowReaderProgressTest.cpp`
 
-- [ ] Keep host tests at the pure fake-document/interface level. Exercise real
+- [x] Keep host tests at the pure fake-document/interface level. Exercise real
   `Epub`, `Section`, parser, and activity behavior through the Task 6 simulator
   oracle unless this task also adds complete Arduino/HAL/rendering host stubs.
   Test section loading, TOC jump, internal href, progress load/save, relayout,
   menu store key, and capability policy.
-- [ ] Replace the owned `shared_ptr<Epub>` with
+- [x] Replace the owned `shared_ptr<Epub>` with
   `shared_ptr<ReflowDocument>`, retaining class/file names to keep the diff
   bounded.
-- [ ] Replace spine calls with section calls, and use document-owned progress.
+- [x] Replace spine calls with section calls, and use document-owned progress.
   Use `getStoreFormatKey()` for bookmarks/clippings.
-- [ ] Apply publisher render modes and embedded styles only when the document
+- [x] Apply publisher render modes and embedded styles only when the document
   advertises those capabilities. EPUB retains current settings exactly; PDF
   is forced to device typography/light semantic markup even if global
   `SETTINGS.epubRenderMode` requests another mode.
-- [ ] Load bookmark/clipping stores only when `SavedItems` is advertised.
+- [x] Load bookmark/clipping stores only when `SavedItems` is advertised.
   Otherwise explicitly unload/clear prior global saved-item state before the
   document becomes interactive. EPUB remains enabled; the minimal PDF stays
   disabled until Task 21.
-- [ ] Keep the static sleep-page loader EPUB-only in this task; its
+- [x] Keep the static sleep-page loader EPUB-only in this task; its
   format-aware factory arrives with `PdfReflowDocument`.
-- [ ] Run:
+- [x] Run:
 
   ```powershell
   ctest --test-dir build/test --output-on-failure
@@ -722,9 +722,18 @@ smallest failing hypothesis; do not layer speculative production changes.
   Expected: all host tests, cached/uncached EPUB oracles, target link, and
   static analysis PASS.
 
-- [ ] Re-run QEMU tracer/resource verification. Expected: tracer PASS,
+- [x] Re-run QEMU tracer/resource verification. Expected: tracer PASS,
   environment fingerprint unchanged, and the intentional seam size delta
   reported against the original baseline. Stop if EPUB output changes.
+
+  **2026-07-29 completion:** all 121 host tests, both EPUB simulator
+  oracle passes, the default ESP32-C3 link, and cppcheck pass. QEMU emits
+  `QEMU_TRACER_PASS` and `QEMU_RESOURCE_PASS`. Cumulative shared-reflow work
+  adds 5,970 bytes of code/rodata and 0 bytes of static DRAM against the
+  original pre-PDF baseline; all runtime resource measurements are unchanged.
+  The QEMU config fingerprint was narrowed to the effective `[base]` and
+  `[env:qemu-esp32c3]` sections after its positive control exposed that native
+  simulator-only flags incorrectly invalidated the target-runtime baseline.
 
 ## Phase III — Bounded PDF Core
 
