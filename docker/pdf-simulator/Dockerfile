@@ -6,6 +6,7 @@ RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
         build-essential \
         ca-certificates \
+        cmake \
         curl \
         fontconfig \
         fonts-dejavu-core \
@@ -13,6 +14,7 @@ RUN apt-get update \
         git \
         libssl-dev \
         libsdl2-dev \
+        ninja-build \
         python3 \
         python3-venv \
     && curl --fail --location --silent --show-error \

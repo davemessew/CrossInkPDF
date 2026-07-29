@@ -8,6 +8,8 @@ test -f /usr/include/openssl/md5.h
 
 sdl_version="$(sdl2-config --version)"
 compiler_version="$(c++ --version | head -n 1)"
+cmake_version="$(cmake --version | head -n 1)"
+ninja_version="$(ninja --version)"
 format_version="$(clang-format-21 --version)"
 pio_version="$(pio --version)"
 python_version="$(python3 --version)"
@@ -20,6 +22,8 @@ esac
 echo "${format_version}" | grep -Eq 'version 21([.]| )'
 echo "${pio_version}" | grep -Fq '6.1.19'
 test -n "${compiler_version}"
+test -n "${cmake_version}"
+test -n "${ninja_version}"
 test -n "${python_version}"
 test -n "${font_match}"
 
@@ -33,5 +37,6 @@ if find /dev -maxdepth 1 \( -name 'ttyUSB*' -o -name 'ttyACM*' \) -print -quit |
   exit 1
 fi
 
-printf 'SIMULATOR_CONTAINER_PASS sdl=%s compiler=%s clang_format=%s pio=%s python=%s font=%s\n' \
-  "${sdl_version}" "${compiler_version}" "${format_version}" "${pio_version}" "${python_version}" "${font_match}"
+printf 'SIMULATOR_CONTAINER_PASS sdl=%s compiler=%s cmake=%s ninja=%s clang_format=%s pio=%s python=%s font=%s\n' \
+  "${sdl_version}" "${compiler_version}" "${cmake_version}" "${ninja_version}" \
+  "${format_version}" "${pio_version}" "${python_version}" "${font_match}"

@@ -101,6 +101,8 @@ class SimulatorToolingTest(unittest.TestCase):
             "libsdl2-dev",
             "libssl-dev",
             "build-essential",
+            "cmake",
+            "ninja-build",
             "clang-format-21",
             "fonts-dejavu-core",
             "fontconfig",
@@ -118,6 +120,11 @@ class SimulatorToolingTest(unittest.TestCase):
                 / "self-test.sh"
             ).read_text(encoding="utf-8"),
         )
+        self_test = (
+            REPO_ROOT / "docker" / "pdf-simulator" / "self-test.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn("cmake --version", self_test)
+        self.assertIn("ninja --version", self_test)
         self.assertIn("-lssl", platformio)
         self.assertIn("-lcrypto", platformio)
 
