@@ -66,17 +66,18 @@ smallest failing hypothesis; do not layer speculative production changes.
 - Create: `scripts/refuse_qemu_flash.py`
 - Create: `scripts/verify_qemu_no_flash.py`
 - Create: `scripts/check_qemu_resources.py`
-- Modify: `test/README.md`
+- Create: `scripts/run_qemu_esp32c3.py` (host process monitor; Task 3 adds target image wiring)
+- Modify: `test/README`
 
-- [ ] Add `test_no_flash.py` with a subprocess witness that executes
+- [x] Add `test_no_flash.py` with a subprocess witness that executes
   `scripts/refuse_qemu_flash.py`, expects exit code `2`, expects exactly
   `QEMU target cannot be flashed` on stderr, and rejects `COM`, `/dev/tty`,
   `serial`, `write_flash`, and imports of `serial` or `esptool`.
-- [ ] Add a verifier which runs each prohibited PlatformIO target and exits zero
+- [x] Add a verifier which runs each prohibited PlatformIO target and exits zero
   only when every command refuses with the exact message before enumeration:
   `upload`, `uploadfs`, `uploadfsota`, `erase`, `erase_upload`, and
   `download_fs`.
-- [ ] Run the no-flash test before the script exists:
+- [x] Run the no-flash test before the script exists:
 
   ```powershell
   python -m unittest discover -s test/qemu -p "test_no_flash.py" -v
@@ -84,28 +85,28 @@ smallest failing hypothesis; do not layer speculative production changes.
 
   Expected: FAIL because the refusal script is absent.
 
-- [ ] Implement `refuse_qemu_flash.py` using only `sys.stderr.write(...)` and
+- [x] Implement `refuse_qemu_flash.py` using only `sys.stderr.write(...)` and
   `raise SystemExit(2)`.
-- [ ] Add resource-check tests for every approved boundary. Each positive
+- [x] Add resource-check tests for every approved boundary. Each positive
   control changes one value by one byte:
   `text=262145`, `data+bss=12289`, PDF heap `81921`, free heap `65535`,
   largest block `49151`, allocation `32769`, and stack margin `1023`.
-- [ ] Implement `check_qemu_resources.py` with `capture` and `verify` commands.
+- [x] Implement `check_qemu_resources.py` with `capture` and `verify` commands.
   It must reject a baseline whose platform/framework/build fingerprint differs,
   use the PlatformIO RISC-V `size` executable recorded in the manifest, and
   print only one terminal `QEMU_RESOURCE_PASS` on success.
-- [ ] Parse `riscv32-esp-elf-size -A` and sum exactly:
+- [x] Parse `riscv32-esp-elf-size -A` and sum exactly:
   `.iram0.text`, `.iram0.vectors`, `.flash.text`, `.flash.rodata` for
   code/rodata; `.dram0.data`, `.dram0.bss`, `.noinit` for static DRAM. Resolve
   the absolute tool path from the PlatformIO toolchain manifest. Across multiple
   boots, use worst free-heap/largest-block/stack values, never only the final
   boot.
-- [ ] Add runner unit tests with a fake QEMU executable for pass marker, fail
+- [x] Add runner unit tests with a fake QEMU executable for pass marker, fail
   marker, panic, Guru Meditation, abort, watchdog reset, restart loop, timeout,
   unexpected exit, and missing terminal marker. The pass fake must remain alive
   after printing the marker so the test proves the host terminates it. Add one
   valid armed-reset sequence and negative unarmed/repeated-reset sequences.
-- [ ] Re-run:
+- [x] Re-run:
 
   ```powershell
   python -m unittest discover -s test/qemu -p "test_*.py" -v
@@ -113,10 +114,10 @@ smallest failing hypothesis; do not layer speculative production changes.
 
   Expected: all host safety tests PASS.
 
-- [ ] Record a non-commit checkpoint:
+- [x] Record a non-commit checkpoint:
 
   ```powershell
-  git diff -- test/qemu scripts/refuse_qemu_flash.py scripts/check_qemu_resources.py test/README.md
+  git diff -- test/qemu scripts/refuse_qemu_flash.py scripts/check_qemu_resources.py test/README
   git status --short
   ```
 
@@ -146,11 +147,11 @@ smallest failing hypothesis; do not layer speculative production changes.
 - Create: `test/qemu/data/qemu/sentinel.txt`
 - Test: `test/qemu/test_qemu_hal_contract.py`
 
-- [ ] Add a source-level contract test which compares the public types and
+- [x] Add a source-level contract test which compares the public types and
   required method signatures of `lib/hal` with `test/qemu/hal/src`; also assert
   that the QEMU HAL has one and only one 48,000-byte framebuffer and no
   persistent task creation.
-- [ ] Run it before creating the HAL:
+- [x] Run it before creating the HAL:
 
   ```powershell
   python -m unittest discover -s test/qemu -p "test_qemu_hal_contract.py" -v
@@ -158,7 +159,7 @@ smallest failing hypothesis; do not layer speculative production changes.
 
   Expected: FAIL listing the missing mirrored headers.
 
-- [ ] Implement the HAL with these fixed behaviors:
+- [x] Implement the HAL with these fixed behaviors:
 
   - `HalDisplay`: one static `uint8_t framebuffer[48000]`, deterministic CRC32,
     no display-sized heap allocation.
@@ -175,9 +176,9 @@ smallest failing hypothesis; do not layer speculative production changes.
     initially free even though LittleFS backs it. Enforce actual fixture/cache
     bytes against the `0x360000` partition and use the quota for ENOSPC tests.
 
-- [ ] Put exactly `crossink-qemu-sentinel-v1` followed by one LF in
+- [x] Put exactly `crossink-qemu-sentinel-v1` followed by one LF in
   `test/qemu/data/qemu/sentinel.txt`.
-- [ ] Re-run the contract and inspect forbidden allocations:
+- [x] Re-run the contract and inspect forbidden allocations:
 
   ```powershell
   python -m unittest discover -s test/qemu -p "test_qemu_hal_contract.py" -v
@@ -187,7 +188,7 @@ smallest failing hypothesis; do not layer speculative production changes.
   Expected: contract PASS; `rg` has no production QEMU HAL hit requiring an
   unbounded or persistent allocation.
 
-- [ ] Record the diff and status without staging.
+- [x] Record the diff and status without staging.
 
 ### Task 3: Add the PlatformIO QEMU environment and offline image builder
 
@@ -197,12 +198,12 @@ smallest failing hypothesis; do not layer speculative production changes.
 - Create: `scripts/qemu_build.py`
 - Create: `scripts/qemu_no_flash.py`
 - Create: `scripts/install_qemu_esp32c3.py`
-- Create: `scripts/run_qemu_esp32c3.py`
+- Modify: `scripts/run_qemu_esp32c3.py`
 - Create: `test/qemu/test_qemu_build.py`
 - Create: `test/qemu/test_qemu_install.py`
 - Modify: `.gitignore`
 
-- [ ] Add failing parser tests which require a `qemu-esp32c3` environment to:
+- [x] Add failing parser tests which require a `qemu-esp32c3` environment to:
 
   - extend the pinned ESP32-C3 base;
   - retain C++20, `-fno-exceptions`, linker wrappers, and 16 MiB layout;
@@ -215,7 +216,7 @@ smallest failing hypothesis; do not layer speculative production changes.
   - use LittleFS and the tiny release font omissions;
   - register `qemu-image`.
 
-- [ ] Run:
+- [x] Run:
 
   ```powershell
   python -m unittest discover -s test/qemu -p "test_qemu_build.py" -v
@@ -223,18 +224,18 @@ smallest failing hypothesis; do not layer speculative production changes.
 
   Expected: FAIL because the environment does not exist.
 
-- [ ] Add `[env:qemu-esp32c3]` to `platformio.ini`. Keep the base target,
+- [x] Add `[env:qemu-esp32c3]` to `platformio.ini`. Keep the base target,
   framework, compiler, partition table, image size, exception policy, and
   release memory model. Override `lib_deps` so physical Battery/Input/EInk/SD/
   Power SDK libraries are absent; assert the resolved dependency graph contains
   none. Copy the `tiny` font-omission flags, keep
   `CROSSPOINT_FIRMWARE_VARIANT="tiny"`, define `CROSSINK_QEMU=1`, set
   `board_build.filesystem = littlefs`, and do not define `SIMULATOR`.
-- [ ] In `scripts/qemu_no_flash.py`, inspect `COMMAND_LINE_TARGETS` before the
+- [x] In `scripts/qemu_no_flash.py`, inspect `COMMAND_LINE_TARGETS` before the
   platform's `BeforeUpload` hooks. Immediately refuse `upload`, `uploadfs`,
   `uploadfsota`, `erase`, `erase_upload`, and `download_fs` using an absolute,
   quoted `sys.executable` path. Test every target.
-- [ ] In `scripts/qemu_build.py`, register `qemu-image` and:
+- [x] In `scripts/qemu_build.py`, register `qemu-image` and:
 
   1. register after the platform builder and depend on both
      `$BUILD_DIR/${PROGNAME}.bin` and
@@ -251,7 +252,7 @@ smallest failing hypothesis; do not layer speculative production changes.
   7. emit `qemu_flash.bin` exactly 16 MiB plus `qemu_manifest.json` containing
      hashes, offsets, tool versions, and build flags.
 
-- [ ] Pin Espressif QEMU `esp_develop_9.2.2_20250817` in
+- [x] Pin Espressif QEMU `esp_develop_9.2.2_20250817` in
   `install_qemu_esp32c3.py`. For Windows verify SHA-256
   `9474015f24d27acb7516955ec932e5307226bd9d6652cdc870793ed36010ab73`
   and for Linux x64 verify
@@ -259,7 +260,7 @@ smallest failing hypothesis; do not layer speculative production changes.
   Write `install.json` and normalize the executable to
   `.tools/qemu-esp32c3/qemu/bin/qemu-system-riscv32[.exe]`; the runner reads
   this file and never relies on `PATH`. Add `/.tools/` to `.gitignore`.
-- [ ] Implement the runner command:
+- [x] Implement the runner command:
 
   ```text
   qemu-system-riscv32 -M esp32c3
@@ -276,8 +277,8 @@ smallest failing hypothesis; do not layer speculative production changes.
   `QEMU_EXPECT_RESET seq=N` followed by exactly one `QEMU_BOOT seq=N+1`;
   reject unannounced/repeated resets and cap expected sequences.
 
-- [ ] Re-run all QEMU Python tests. Expected: PASS.
-- [ ] Record the diff and status without staging.
+- [x] Re-run all QEMU Python tests. Expected: PASS.
+- [x] Record the diff and status without staging.
 
 ### Task 4: Boot the real ESP32-C3 QEMU tracer
 

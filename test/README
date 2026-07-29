@@ -10,6 +10,13 @@ in the development cycle.
 More information about PlatformIO Unit Testing:
 - https://docs.platformio.org/en/latest/advanced/unit-testing/index.html
 
+ESP32-C3 QEMU host safety tests:
+- Run `python -m unittest discover -s test/qemu -p "test_*.py" -v` from the repository root.
+- The no-flash witness requires every unsafe `qemu-esp32c3` target to stop before serial-port discovery or any device-writing command.
+- The runner tests use a fake process to cover terminal markers, fatal output, resets, timeouts, exits, and host termination after success.
+- The resource tests use a manifest-pinned absolute RISC-V `size` tool and enforce the flash, static DRAM, heap, allocation, and stack boundaries.
+- These host tests validate the safety tooling. They do not replace booting the real firmware in ESP32-C3 QEMU.
+
 Simulator smoke test:
 - Run `./scripts/run_simulator_smoke_test.py` from the repo root.
 - The script builds `env:simulator`, creates a temporary `fs_`, copies a test EPUB into it, opens common screens, renders them, drives reader page/menu input, and fails on crashes or missing success output.
