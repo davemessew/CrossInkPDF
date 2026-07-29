@@ -1,0 +1,15 @@
+{
+  "error": null,
+  "fixture": "font_size_72",
+  "geometry_order": [
+    "Typography uses device defaults."
+  ],
+  "image_hashes": {},
+  "outline_link_map": {
+    "links": [],
+    "outline": []
+  },
+  "transcript": "Typography uses device defaults.",
+  "warning": null,
+  "word_count": 4
+}

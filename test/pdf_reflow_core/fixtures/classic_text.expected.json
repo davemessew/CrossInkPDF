@@ -1,0 +1,35 @@
+{
+  "error": null,
+  "fixture": "classic_text",
+  "geometry_order": [
+    "Chapter One body. See Chapter Two.",
+    "Chapter Two body and index entry 1."
+  ],
+  "image_hashes": {},
+  "outline_link_map": {
+    "links": [
+      {
+        "page": 0,
+        "target": "page-2",
+        "text": "Chapter Two"
+      }
+    ],
+    "outline": [
+      {
+        "anchor": "page-1",
+        "level": 0,
+        "page": 0,
+        "title": "Chapter One"
+      },
+      {
+        "anchor": "page-2",
+        "level": 0,
+        "page": 1,
+        "title": "Chapter Two"
+      }
+    ]
+  },
+  "transcript": "Chapter One body. See Chapter Two. Chapter Two body and index entry 1.",
+  "warning": null,
+  "word_count": 13
+}

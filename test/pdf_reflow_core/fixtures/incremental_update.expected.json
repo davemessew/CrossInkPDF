@@ -1,0 +1,15 @@
+{
+  "error": null,
+  "fixture": "incremental_update",
+  "geometry_order": [
+    "Updated revision wins."
+  ],
+  "image_hashes": {},
+  "outline_link_map": {
+    "links": [],
+    "outline": []
+  },
+  "transcript": "Updated revision wins.",
+  "warning": null,
+  "word_count": 3
+}

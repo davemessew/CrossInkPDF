@@ -1,0 +1,15 @@
+{
+  "error": null,
+  "fixture": "linearized_hint",
+  "geometry_order": [
+    "Linearized hints are ignored."
+  ],
+  "image_hashes": {},
+  "outline_link_map": {
+    "links": [],
+    "outline": []
+  },
+  "transcript": "Linearized hints are ignored.",
+  "warning": "LinearizationHintsIgnored",
+  "word_count": 4
+}

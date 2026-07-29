@@ -758,12 +758,12 @@ smallest failing hypothesis; do not layer speculative production changes.
 - Create: `lib/PdfReflow/PdfHalIo.cpp`
 - Create: `lib/PdfReflow/PdfWorkBudget.h`
 
-- [ ] Change the host CMake project from `CXX` to `C CXX`; the PDF test target
+- [x] Change the host CMake project from `CXX` to `C CXX`; the PDF test target
   must compile the real uzlib C sources, not host zlib.
-- [ ] Write the standard-library-only generator for the approved tiny,
+- [x] Write the standard-library-only generator for the approved tiny,
   license-safe corpus. It must calculate xref offsets and SHA-256 hashes rather
   than embed hand-maintained offsets.
-- [ ] Generate at least:
+- [x] Generate at least:
   `classic_text`, `incremental_update`, `xref_stream_objstm`, `filter_matrix`,
   `tounicode_simple_and_cid`, `operators_actualtext_forms`, `hidden_ocr`,
   `hidden_ocr_visible_duplicate`, `scan_only`, `columns_table`,
@@ -772,13 +772,13 @@ smallest failing hypothesis; do not layer speculative production changes.
   `xref_prev_cycle`, `oversized_length`, `flate_bomb`, and `encrypted`.
   Each `.expected.json` contains transcript, word count, warning/error,
   geometry order, outline/link map, and relevant image hashes.
-- [ ] Add `--check`, which regenerates into a temporary directory and
+- [x] Add `--check`, which regenerates into a temporary directory and
   byte-compares every fixture, expected file, and `SHA256SUMS`.
-- [ ] In `test/pdf_reflow_core/CMakeLists.txt`, use
+- [x] In `test/pdf_reflow_core/CMakeLists.txt`, use
   `find_package(Python3 REQUIRED COMPONENTS Interpreter)` and register the
   generator `--check` command directly with `add_test`. The final CTest run
   must execute fixture determinism rather than relying on a C++ proxy.
-- [ ] Run before accepting/checkpointing generated outputs:
+- [x] Run before accepting/checkpointing generated outputs:
 
   ```powershell
   python scripts/generate_pdf_reflow_fixtures.py --check
@@ -786,22 +786,22 @@ smallest failing hypothesis; do not layer speculative production changes.
 
   Expected RED: missing or differing outputs; after generation, PASS.
 
-- [ ] Define callback-only `ByteSource`, `ByteSink`, `FixedRecordStore`,
+- [x] Define callback-only `ByteSource`, `ByteSink`, `FixedRecordStore`,
   `WorkBudget`, `Status`, `Error`, `StepState`, and `StepResult`. `PdfHalIo`
   adapts a caller-owned `HalFile`; it never opens, owns, or closes the PDF.
-- [ ] Before implementing `PdfIo`, add behavior-red byte-source tests for short
+- [x] Before implementing `PdfIo`, add behavior-red byte-source tests for short
   reads, out-of-range slices, checked addition overflow, exact
   `UnexpectedEof`/`InvalidOffset` statuses, and budget-one output equivalence.
   The red witness must call a compiling stub and fail on the wrong status, not
   only on a missing header.
-- [ ] Add checked offset/range/multiplication and fixed 16.16 matrix helpers.
-- [ ] Put approved production defaults in `PdfLimits.h`: 100,000 indirect
+- [x] Add checked offset/range/multiplication and fixed 16.16 matrix helpers.
+- [x] Put approved production defaults in `PdfLimits.h`: 100,000 indirect
   objects; 5,000 pages; 250,000 content operators/page; 10,000,000
   operators/document; 16 nested form XObjects; 64 MiB expanded required
   non-image streams; 200:1 expansion ratio; four filters; plus the approved
   bounded nesting/trailer/page-tree/CMap/image limits. Tests separately assert
   these constants.
-- [ ] Allocate workspaces once outside the hot core:
+- [x] Allocate workspaces once outside the hot core:
 
   | Workspace | Bytes |
   |---|---:|
@@ -815,11 +815,11 @@ smallest failing hypothesis; do not layer speculative production changes.
   Total must be at most 63,488 bytes; no individual allocation exceeds
   32,768 bytes.
 
-- [ ] Add `static_assert(sizeof(PdfTextRun) <= 48)` when the type appears and
+- [x] Add `static_assert(sizeof(PdfTextRun) <= 48)` when the type appears and
   `static_assert(sizeof(PdfToken) <= 128)`.
-- [ ] Add allocation interception tests proving zero hot-core heap calls after
+- [x] Add allocation interception tests proving zero hot-core heap calls after
   initialization, including failure when the interceptor is armed.
-- [ ] Run:
+- [x] Run:
 
   ```powershell
   cmake -S test -B build/test -G Ninja -DCMAKE_BUILD_TYPE=Release
