@@ -1,0 +1,55 @@
+{
+  "limits": {
+    "allocation": 32768,
+    "free_heap": 65536,
+    "largest_block": 49152,
+    "pdf_heap": 81920,
+    "stack_margin": 1024,
+    "static_dram": 12288,
+    "text": 262144
+  },
+  "measurements": {
+    "code_rodata": 5376104,
+    "max_allocation": 0,
+    "min_free_heap": 119364,
+    "min_largest_block": 114676,
+    "min_stack_margin": 14148,
+    "peak_heap": 40280,
+    "static_dram": 95896
+  },
+  "resource_fingerprint": {
+    "build_flags": [
+      "-DARDUINO_USB_CDC_ON_BOOT=1",
+      "-DARDUINO_USB_MODE=1",
+      "-DCROSSINK_QEMU=1",
+      "-DCROSSPOINT_FIRMWARE_VARIANT=\\\"tiny\\\"",
+      "-DDESTRUCTOR_CLOSES_FILE=1",
+      "-DDISABLE_FS_H_WARNING=1",
+      "-DEINK_DISPLAY_SINGLE_BUFFER_MODE=1",
+      "-DENABLE_SERIAL_LOG",
+      "-DFREEINK_DEVICE_X3=1",
+      "-DFREEINK_DEVICE_X4=1",
+      "-DLOG_LEVEL=1",
+      "-DOMIT_HUGE_FONT",
+      "-DOMIT_ITTY_BITTY_FONT",
+      "-DOMIT_TEENSY_FONT",
+      "-DOMIT_XLARGE_FONT",
+      "-DPNG_MAX_BUFFERED_PIXELS=16416",
+      "-DUSE_UTF8_LONG_NAMES=1",
+      "-DXML_CONTEXT_BYTES=1024",
+      "-DXML_GE=0",
+      "-Wl,--wrap=adc_calc_hw_calibration_code",
+      "-Wl,--wrap=panic_print_backtrace,--wrap=panic_abort,--wrap=bootloader_common_check_efuse_blk_validity",
+      "-Wno-bidi-chars",
+      "-fno-exceptions",
+      "-std=gnu++2a"
+    ],
+    "framework": "3.3.7",
+    "partition_sha256": "98e02c50532c388d85cc3b7c96d004142dc713b23368d293c881ecdcb419e44e",
+    "platform": "55.03.37",
+    "qemu_config_sha256": "b5d937948077fdad579e7e62ddfb7829367d3bdd9cfccdc68b7c09790aae08cd",
+    "qemu_hal_sha256": "fd0d8bb2acaf782f7aa6d7737515344db6303e9bd9fe206d2c6bee74c1d68656",
+    "toolchain": "14.2.0+20251107"
+  },
+  "schema_version": 1
+}

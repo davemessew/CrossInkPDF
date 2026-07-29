@@ -15,6 +15,7 @@ NO_FLASH_SCRIPT = REPO_ROOT / "scripts" / "qemu_no_flash.py"
 QEMU_PLATFORM_STUBS = (
     REPO_ROOT / "src" / "qemu" / "QemuPlatformStubs.cpp"
 )
+CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 EXPECTED_OFFSETS = {
     "bootloader": 0x0,
     "partitions": 0x8000,
@@ -25,6 +26,27 @@ EXPECTED_OFFSETS = {
 
 
 class QemuBuildContractTest(unittest.TestCase):
+    def test_windows_qemu_tracer_is_a_required_ci_gate(self) -> None:
+        workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+        qemu_start = workflow.index("  qemu-tracer:")
+        status_start = workflow.index("  test-status:")
+        qemu_job = workflow[qemu_start:status_start]
+        status_job = workflow[status_start:]
+
+        for required in (
+            "runs-on: windows-latest",
+            "submodules: recursive",
+            'python-version: "3.13"',
+            "platformio-core/archive/refs/tags/v6.1.19.zip",
+            "python scripts/install_qemu_esp32c3.py",
+            "pio run -e qemu-esp32c3 -t qemu-image",
+            "--expect QEMU_TRACER_PASS",
+            "scripts/check_qemu_resources.py verify",
+            "esp32c3-55.03.37-arduino-3.3.7.json",
+        ):
+            self.assertIn(required, qemu_job)
+        self.assertIn("      - qemu-tracer", status_job)
+
     def test_unemulated_adc_calibration_is_qemu_only_and_nonblocking(
         self,
     ) -> None:

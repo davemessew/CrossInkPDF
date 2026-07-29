@@ -7,12 +7,15 @@ from typing import Any
 
 
 PASS_MARKER = "QEMU_RESOURCE_PASS\n"
-CODE_SECTIONS = (
+REQUIRED_CODE_SECTIONS = (
     ".iram0.text",
-    ".iram0.vectors",
     ".flash.text",
     ".flash.rodata",
 )
+# IDF 5.5 folds ESP32-C3 vector input sections into .iram0.text. Older linker
+# layouts may still expose this output section, so count it when present.
+OPTIONAL_CODE_SECTIONS = (".iram0.vectors",)
+CODE_SECTIONS = REQUIRED_CODE_SECTIONS + OPTIONAL_CODE_SECTIONS
 STATIC_DRAM_SECTIONS = (
     ".dram0.data",
     ".dram0.bss",
@@ -144,7 +147,8 @@ def _read_elf_sections(
             raise ResourceCheckError(f"negative size for ELF section {section}")
         section_sizes[section] = size
 
-    missing = requested_sections.difference(section_sizes)
+    required_sections = set(REQUIRED_CODE_SECTIONS + STATIC_DRAM_SECTIONS)
+    missing = required_sections.difference(section_sizes)
     if missing:
         raise ResourceCheckError(
             "size output is missing sections " + ", ".join(sorted(missing))
@@ -210,7 +214,7 @@ def _measure(
 ) -> dict[str, int]:
     sections = _read_elf_sections(manifest, elf_path)
     measurements = {
-        "code_rodata": sum(sections[name] for name in CODE_SECTIONS),
+        "code_rodata": sum(sections.get(name, 0) for name in CODE_SECTIONS),
         "static_dram": sum(
             sections[name] for name in STATIC_DRAM_SECTIONS
         ),

@@ -65,7 +65,10 @@ python scripts/run_qemu_esp32c3.py `
 The runner copies the mutable flash and eFuse images to a temporary directory,
 starts the ESP32-C3 machine with deterministic instruction counting, rejects
 panic/reset/watchdog output, and terminates QEMU only after the requested
-terminal marker. A successful base tracer emits this ordered sequence:
+terminal marker. It uses `-icount shift=3,sleep=off`: when FreeRTOS executes
+`WFI`, QEMU advances virtual time directly to the next timer deadline instead
+of waiting for a host console event. The emulated Timer Group watchdog remains
+enabled. A successful base tracer emits this ordered sequence:
 
 ```text
 QEMU_BOOT seq=0
@@ -114,17 +117,12 @@ Keep the log, verify the manifest/image hashes, and diagnose the bootloader or
 emulator state before adding PDF code. Host-only tests do not replace this
 target-runtime gate.
 
-With the pinned pioarduino/ESP-IDF libraries, ESP-IDF also runs ADC2 hardware
+With the pinned pioarduino/ESP-IDF libraries, ESP-IDF runs ADC2 hardware
 calibration from a global constructor before `setup()`. The ESP32-C3 QEMU model
 does not complete that ADC event, so the QEMU environment links a target-only,
 nonblocking calibration wrapper. The hardware environment does not use this
 wrapper.
 
-The current unattended Gate A replay proceeds through boot, storage,
-framebuffer, and logical input, then hits an emulated Timer Group interrupt
-watchdog while the FreeRTOS idle task is in `esp_cpu_wait_for_intr`. Espressif
-documents a `wdt_disable` machine property, and it is useful for diagnosis, but
-it is deliberately absent from the acceptance runner: disabling the watchdog
-would remove the gate, and the non-interactive process still needs an external
-monitor event to leave the emulated wait-for-interrupt state. Do not treat an
-interactive diagnostic pass as `QEMU_TRACER_PASS` acceptance.
+Do not add Espressif's diagnostic `wdt_disable` machine property to the
+acceptance runner. The `sleep=off` instruction-counting mode makes unattended
+idle/timer progress correctly while preserving watchdog coverage.

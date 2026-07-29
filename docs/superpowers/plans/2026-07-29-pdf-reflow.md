@@ -336,7 +336,7 @@ smallest failing hypothesis; do not layer speculative production changes.
   `.\.venv\Scripts\pio.exe` (or `.venv/bin/pio` in Linux/container). CI must use
   Python 3.13.
 
-- [ ] Build and run the tracer:
+- [x] Build and run the tracer:
 
   ```powershell
   .\.venv\Scripts\pio.exe run -e qemu-esp32c3 -t qemu-image
@@ -368,17 +368,14 @@ smallest failing hypothesis; do not layer speculative production changes.
   commands in `docs/qemu.md`.
 - [x] Stop here if QEMU does not boot. A host test is not a substitute.
 
-  **2026-07-29 checkpoint:** the QEMU image and unchanged hardware environment
+  **2026-07-29 completion:** the QEMU image and unchanged hardware environment
   build successfully, and `QEMU_NO_FLASH_PASS` is green. A QEMU-only linker
   wrapper bypasses the ESP-IDF ADC2 global calibration constructor because the
-  emulator never completes its ADC event. The real tracer now emits
-  `QEMU_BOOT`, storage, framebuffer, and logical-input passes, then the emulated
-  Timer Group watchdog resets the CPU while FreeRTOS is idle in
-  `esp_cpu_wait_for_intr`. Espressif's documented `wdt_disable` diagnostic plus
-  an interactive monitor wake reaches the remaining power/runtime/pass markers,
-  but that is not an acceptable unattended watchdog gate. Gate A therefore
-  remains blocked; Task 5 and all PDF production work remain intentionally
-  untouched.
+  emulator never completes its ADC event. The unattended runner uses
+  `-icount shift=3,sleep=off`, which advances virtual time to the next timer
+  while FreeRTOS is in `esp_cpu_wait_for_intr`; the Timer Group watchdog remains
+  enabled. The ordered boot, storage, framebuffer, input, power, and runtime
+  markers now end in `QEMU_TRACER_PASS`. Gate A is green.
 
 ### Task 5: Capture the pre-PDF target resource baseline
 
@@ -388,7 +385,7 @@ smallest failing hypothesis; do not layer speculative production changes.
 - Modify: `scripts/check_qemu_resources.py`
 - Modify: `.github/workflows/ci.yml`
 
-- [ ] Capture only after Task 4 is green:
+- [x] Capture only after Task 4 is green:
 
   ```powershell
   python scripts/check_qemu_resources.py capture `
@@ -398,7 +395,7 @@ smallest failing hypothesis; do not layer speculative production changes.
     --out test/qemu/baselines/esp32c3-55.03.37-arduino-3.3.7.json
   ```
 
-- [ ] Verify the same build against the captured baseline and run every
+- [x] Verify the same build against the captured baseline and run every
   one-byte positive control:
 
   ```powershell
@@ -412,15 +409,15 @@ smallest failing hypothesis; do not layer speculative production changes.
 
   Expected: `QEMU_RESOURCE_PASS`; every deliberate one-byte violation fails.
 
-- [ ] Add a `windows-latest` `qemu-tracer` CI job which installs the pinned
+- [x] Add a `windows-latest` `qemu-tracer` CI job which installs the pinned
   Python 3.13, PlatformIO, and QEMU versions, initializes submodules, builds
   `qemu-image`, and runs the tracer. Add it to `test-status.needs` only after
   the local tracer is green.
-- [ ] Define the comparison fingerprint as toolchain/platform/framework
+- [x] Define the comparison fingerprint as toolchain/platform/framework
   versions, normalized flags, partition hash, and QEMU HAL/config hashes. The
   baseline source commit is informational; PDF source changes are allowed and
   measured as size deltas rather than rejected as environment drift.
-- [ ] Record the diff/status. Do not commit.
+- [x] Record the diff/status. Do not commit.
 
 ## Phase II — Shared Reflow Reader Without EPUB Regression
 

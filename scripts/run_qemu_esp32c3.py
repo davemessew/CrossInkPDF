@@ -321,7 +321,7 @@ def _qemu_machine_command(
         "-M",
         "esp32c3",
         "-icount",
-        "3",
+        "shift=3,sleep=off",
         "-drive",
         f"file={flash_image},if=mtd,format=raw",
         "-drive",

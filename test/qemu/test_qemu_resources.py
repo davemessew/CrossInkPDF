@@ -167,6 +167,37 @@ class QemuResourceCheckTest(unittest.TestCase):
             self.assertEqual(captured.stdout, "")
             self.assertIn("absolute", captured.stderr)
 
+    def test_capture_accepts_vectors_folded_into_iram_text(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            paths = self._create_inputs(Path(temporary_directory))
+            environment = self._size_environment(
+                text=1000,
+                static_dram=100,
+                omit_section=".iram0.vectors",
+            )
+
+            captured = self._run_capture(paths, environment)
+            self.assertEqual(captured.returncode, 0)
+            self.assertEqual(captured.stdout, PASS_MARKER)
+            self.assertEqual(captured.stderr, "")
+
+            baseline = json.loads(paths["baseline"].read_text(encoding="utf-8"))
+            self.assertEqual(baseline["measurements"]["code_rodata"], 1000)
+
+    def test_capture_rejects_missing_required_output_section(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            paths = self._create_inputs(Path(temporary_directory))
+            environment = self._size_environment(
+                text=1000,
+                static_dram=100,
+                omit_section=".flash.text",
+            )
+
+            captured = self._run_capture(paths, environment)
+            self.assertEqual(captured.returncode, 1)
+            self.assertEqual(captured.stdout, "")
+            self.assertIn(".flash.text", captured.stderr)
+
     def _create_inputs(self, directory: Path) -> dict[str, Path]:
         fake_size = directory / "fake_size.py"
         fake_size.write_text(
@@ -179,15 +210,19 @@ class QemuResourceCheckTest(unittest.TestCase):
                     "    raise SystemExit(9)",
                     "text = int(os.environ['QEMU_TEST_TEXT_SIZE'])",
                     "dram = int(os.environ['QEMU_TEST_DRAM_SIZE'])",
+                    "omit = os.environ.get('QEMU_TEST_OMIT_SECTION', '')",
+                    "def emit(name, size):",
+                    "    if name != omit:",
+                    "        print(f'{name} {size} 0x0')",
                     "print(f'{sys.argv[2]} :')",
                     "print('section size addr')",
-                    "print('.iram0.text 0 0x0')",
-                    "print('.iram0.vectors 0 0x0')",
-                    "print(f'.flash.text {text} 0x0')",
-                    "print('.flash.rodata 0 0x0')",
-                    "print(f'.dram0.data {dram} 0x0')",
-                    "print('.dram0.bss 0 0x0')",
-                    "print('.noinit 0 0x0')",
+                    "emit('.iram0.text', 0)",
+                    "emit('.iram0.vectors', 0)",
+                    "emit('.flash.text', text)",
+                    "emit('.flash.rodata', 0)",
+                    "emit('.dram0.data', dram)",
+                    "emit('.dram0.bss', 0)",
+                    "emit('.noinit', 0)",
                     "print('.ignored 999999 0x0')",
                     "",
                 )
@@ -250,10 +285,19 @@ class QemuResourceCheckTest(unittest.TestCase):
         )
 
     @staticmethod
-    def _size_environment(*, text: int, static_dram: int) -> dict[str, str]:
+    def _size_environment(
+        *,
+        text: int,
+        static_dram: int,
+        omit_section: str | None = None,
+    ) -> dict[str, str]:
         environment = os.environ.copy()
         environment["QEMU_TEST_TEXT_SIZE"] = str(text)
         environment["QEMU_TEST_DRAM_SIZE"] = str(static_dram)
+        if omit_section is None:
+            environment.pop("QEMU_TEST_OMIT_SECTION", None)
+        else:
+            environment["QEMU_TEST_OMIT_SECTION"] = omit_section
         return environment
 
     @staticmethod

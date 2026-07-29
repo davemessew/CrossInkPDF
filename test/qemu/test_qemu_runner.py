@@ -127,7 +127,8 @@ class QemuRunnerTest(unittest.TestCase):
             self.assertEqual(arguments[0:2], ["-M", "esp32c3"])
             self.assertIn("-icount", arguments)
             self.assertEqual(
-                arguments[arguments.index("-icount") + 1], "3"
+                arguments[arguments.index("-icount") + 1],
+                "shift=3,sleep=off",
             )
             self.assertIn("-nic", arguments)
             self.assertIn("none", arguments)
