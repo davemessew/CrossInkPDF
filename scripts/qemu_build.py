@@ -1,3 +1,4 @@
+import configparser
 import hashlib
 import json
 from pathlib import Path
@@ -112,6 +113,35 @@ def _sha256_tree(root: Path) -> str:
     return digest.hexdigest()
 
 
+def _sha256_ini_sections(path: Path, section_names: tuple[str, ...]) -> str:
+    parser = configparser.RawConfigParser(interpolation=None, strict=False)
+    if not parser.read(path, encoding="utf-8"):
+        raise RuntimeError(f"cannot read PlatformIO config: {path}")
+
+    digest = hashlib.sha256()
+
+    def update_field(value: str) -> None:
+        encoded = value.encode("utf-8")
+        digest.update(len(encoded).to_bytes(4, "big"))
+        digest.update(encoded)
+
+    for section_name in section_names:
+        if not parser.has_section(section_name):
+            raise RuntimeError(
+                f"PlatformIO config has no [{section_name}] section"
+            )
+        update_field(section_name)
+        for key, value in sorted(parser.items(section_name, raw=True)):
+            normalized_value = "\n".join(
+                " ".join(line.split())
+                for line in value.splitlines()
+                if line.strip()
+            )
+            update_field(key)
+            update_field(normalized_value)
+    return digest.hexdigest()
+
+
 def _package_version(package_dir: Path) -> str:
     for metadata_name in ("package.json", ".piopm"):
         metadata_path = package_dir / metadata_name
@@ -205,7 +235,9 @@ def _resource_fingerprint(env: Any, project_dir: Path) -> tuple[dict[str, Any], 
         "build_flags": _normalized_flags(env.get("BUILD_FLAGS", [])),
         "partition_sha256": _sha256_file(partitions),
         "qemu_hal_sha256": _sha256_tree(qemu_hal),
-        "qemu_config_sha256": _sha256_file(platformio_ini),
+        "qemu_config_sha256": _sha256_ini_sections(
+            platformio_ini, ("base", "env:qemu-esp32c3")
+        ),
     }
     tools = {
         "size": {

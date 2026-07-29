@@ -242,6 +242,59 @@ class QemuBuildContractTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "headroom"):
                 module.verify_fixture_headroom(fixtures)
 
+    def test_qemu_config_fingerprint_ignores_unrelated_environments(self) -> None:
+        module = self._load_build_module()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            config_path = Path(temporary_directory) / "platformio.ini"
+            config_path.write_text(
+                """
+[base]
+platform = pinned
+build_flags =
+  -DBASE=1
+
+[env:qemu-esp32c3]
+extends = base
+build_flags =
+  ${base.build_flags}
+  -DCROSSINK_QEMU=1
+
+[env:simulator]
+build_flags =
+  -DSIMULATOR=1
+""".lstrip(),
+                encoding="utf-8",
+            )
+            original = module._sha256_ini_sections(
+                config_path, ("base", "env:qemu-esp32c3")
+            )
+
+            config_path.write_text(
+                config_path.read_text(encoding="utf-8").replace(
+                    "-DSIMULATOR=1", "-DSIMULATOR=2"
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                module._sha256_ini_sections(
+                    config_path, ("base", "env:qemu-esp32c3")
+                ),
+                original,
+            )
+
+            config_path.write_text(
+                config_path.read_text(encoding="utf-8").replace(
+                    "-DCROSSINK_QEMU=1", "-DCROSSINK_QEMU=2"
+                ),
+                encoding="utf-8",
+            )
+            self.assertNotEqual(
+                module._sha256_ini_sections(
+                    config_path, ("base", "env:qemu-esp32c3")
+                ),
+                original,
+            )
+
     def test_scons_registration_uses_platform_builders_and_manifest(self) -> None:
         self.assertTrue(
             BUILD_SCRIPT.is_file(), f"missing required file: {BUILD_SCRIPT}"
