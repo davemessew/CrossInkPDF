@@ -474,11 +474,11 @@ smallest failing hypothesis; do not layer speculative production changes.
 - Create: `test/reflow_document/ReflowDocumentContractTest.cpp`
 - Modify: `test/CMakeLists.txt`
 
-- [ ] Scaffold only the compiling declarations, then write a behavior-red
+- [x] Scaffold only the compiling declarations, then write a behavior-red
   contract for capability-bit composition, borrowed-resource immutability, and
   virtual section/resource dispatch. The initial scaffold must compile and fail
   on wrong values/behavior; a missing header is not the red witness.
-- [ ] Run:
+- [x] Run:
 
   ```powershell
   cmake -S test -B build/test -G Ninja -DCMAKE_BUILD_TYPE=Debug
@@ -488,7 +488,7 @@ smallest failing hypothesis; do not layer speculative production changes.
 
   Expected RED: exact capability/resource behavior mismatch.
 
-- [ ] Define:
+- [x] Define:
 
   ```cpp
   enum class ReflowDocumentFormat : uint8_t { Epub, Pdf };
@@ -565,19 +565,19 @@ smallest failing hypothesis; do not layer speculative production changes.
   extraction explicitly returns true only for files the current paginator
   already owns.
 
-- [ ] Add exact document methods for path/cache identity; title/author/language;
+- [x] Add exact document methods for path/cache identity; title/author/language;
   cover/adaptive-thumbnail paths and generation (forward-declare
   `GfxRenderer`); section count/info/size; TOC hierarchy; href resolution;
   progress/percentage/reference pages; and position persistence.
 
-- [ ] Keep Arduino types out of the interface by forward-declaring `Print` and
+- [x] Keep Arduino types out of the interface by forward-declaring `Print` and
   `CssParser`. Virtual dispatch is permitted only at section/resource/document
   boundaries.
-- [ ] Test virtual destruction, format/store keys, render/sync capability bits,
+- [x] Test virtual destruction, format/store keys, render/sync capability bits,
   metadata and cover methods, TOC hierarchy, href resolution, ownership for
   local and streamed sections/resources, and semantic-position round trip using
   one fake implementation.
-- [ ] Re-run the contract. Expected: PASS.
+- [x] Re-run the contract. Expected: PASS.
 
 ### Task 8: Adapt `Epub` while preserving every serialized byte
 
