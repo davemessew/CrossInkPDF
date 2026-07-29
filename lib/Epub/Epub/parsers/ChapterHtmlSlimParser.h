@@ -21,9 +21,17 @@
 
 class Page;
 class GfxRenderer;
-class Epub;
+class ReflowSectionSource;
 
 #define MAX_WORD_SIZE 200
+
+#ifdef SIMULATOR
+enum class ChapterHtmlSlimParserSimulatorFault : uint8_t {
+  None,
+  LowMemoryAfterSourceOpen,
+  ParserBufferOom,
+};
+#endif
 
 class ChapterHtmlSlimParser {
   static constexpr uint8_t MAX_SIMPLE_TABLE_COLUMNS = 8;
@@ -32,8 +40,12 @@ class ChapterHtmlSlimParser {
   static constexpr uint8_t TABLE_CELL_PADDING = 6;
   static constexpr size_t MAX_INLINE_STYLE_DEPTH = 64;
   static constexpr size_t MAX_BLOCK_STYLE_DEPTH = 16;
+#ifdef SIMULATOR
+  inline static ChapterHtmlSlimParserSimulatorFault simulatorFault_ = ChapterHtmlSlimParserSimulatorFault::None;
+#endif
 
-  std::shared_ptr<Epub> epub;
+  ReflowSectionSource& sectionSource;
+  const int sectionIndex;
   const std::string& filepath;
   GfxRenderer& renderer;
   std::function<void(std::unique_ptr<Page>, uint16_t, uint16_t)> completePageFn;
@@ -222,8 +234,8 @@ class ChapterHtmlSlimParser {
 
  public:
   explicit ChapterHtmlSlimParser(
-      std::shared_ptr<Epub> epub, const std::string& filepath, GfxRenderer& renderer, const int fontId,
-      const float lineCompression, const bool extraParagraphSpacing, const bool forceParagraphIndents,
+      ReflowSectionSource& sectionSource, int sectionIndex, const std::string& filepath, GfxRenderer& renderer,
+      const int fontId, const float lineCompression, const bool extraParagraphSpacing, const bool forceParagraphIndents,
       const uint8_t paragraphAlignment, const uint16_t viewportWidth, const uint16_t viewportHeight,
       const bool hyphenationEnabled, const bool bionicReadingEnabled, const bool guideReadingEnabled,
       const std::function<void(std::unique_ptr<Page>, uint16_t, uint16_t)>& completePageFn, const bool embeddedStyle,
@@ -232,7 +244,8 @@ class ChapterHtmlSlimParser {
       CssParser* cssParser = nullptr, const EpubRenderMode renderMode = EpubRenderMode::CrossInkDefault,
       std::string previewAnchor = {}, const uint16_t previewMaxPages = 0)
 
-      : epub(epub),
+      : sectionSource(sectionSource),
+        sectionIndex(sectionIndex),
         filepath(filepath),
         renderer(renderer),
         fontId(fontId),
@@ -262,6 +275,9 @@ class ChapterHtmlSlimParser {
   const std::vector<std::pair<std::string, uint16_t>>& getAnchors() const { return anchorData; }
   bool wasLowMemoryFallbackTriggered() const { return lowMemoryImageFallback; }
   bool wasLowMemoryAbortTriggered() const { return lowMemoryAbort; }
+#ifdef SIMULATOR
+  static void setSimulatorFault(const ChapterHtmlSlimParserSimulatorFault fault) { simulatorFault_ = fault; }
+#endif
 
  private:
   enum class ParseStatus { More, Done, Error };

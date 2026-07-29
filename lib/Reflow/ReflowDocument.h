@@ -117,6 +117,29 @@ class ReflowSectionSource {
   virtual bool streamResource(int sectionIndex, const std::string& href, Print& out, size_t chunkSize) const = 0;
   virtual bool getResourceSize(int sectionIndex, const std::string& href, size_t* size) const = 0;
   virtual CssParser* getCssParser() const = 0;
+
+  bool getImmutableLocalSection(const int sectionIndex, ReflowResource& out) const {
+    ReflowResource candidate;
+    if (!getLocalSectionPath(sectionIndex, candidate) || candidate.kind != ReflowResourceKind::BorrowedLocalFile ||
+        candidate.localPath.empty() || candidate.paginatorMayDelete) {
+      out = ReflowResource::streamed();
+      return false;
+    }
+    out = std::move(candidate);
+    return true;
+  }
+
+  bool getImmutableLocalResource(const int sectionIndex, const std::string& href, ReflowResource& out) const {
+    ReflowResource candidate;
+    if (!resolveResource(sectionIndex, href, candidate) || candidate.kind != ReflowResourceKind::BorrowedLocalFile ||
+        candidate.localPath.empty() || candidate.paginatorMayDelete ||
+        (candidate.imageKind == ReflowImageKind::PixelCache && (candidate.width == 0 || candidate.height == 0))) {
+      out = ReflowResource::streamed();
+      return false;
+    }
+    out = std::move(candidate);
+    return true;
+  }
 };
 
 class ReflowDocument : public ReflowSectionSource {

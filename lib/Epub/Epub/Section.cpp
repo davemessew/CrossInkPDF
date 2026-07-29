@@ -85,13 +85,13 @@ size_t sectionHtmlStreamChunkSize(const bool preview) {
 }
 }  // namespace
 
-Section::Section(const std::shared_ptr<Epub>& epub, const int spineIndex, GfxRenderer& renderer,
+Section::Section(const std::shared_ptr<ReflowDocument>& document, const int sectionIndex, GfxRenderer& renderer,
                  const char* cacheSuffix)
-    : epub(epub),
-      spineIndex(spineIndex),
+    : document(document),
+      sectionIndex(sectionIndex),
       renderer(renderer),
-      filePath(epub->getCachePath() + "/sections/" + std::to_string(spineIndex) + (cacheSuffix ? cacheSuffix : "") +
-               ".bin") {}
+      filePath(document->getCachePath() + "/sections/" + std::to_string(sectionIndex) +
+               (cacheSuffix ? cacheSuffix : "") + ".bin") {}
 
 uint32_t Section::onPageComplete(std::unique_ptr<Page> page) {
   if (!file) {
@@ -275,10 +275,14 @@ bool Section::createSectionFile(const int fontId, const float lineCompression, c
                                 const std::function<void()>& popupFn, bool* imagesWereSuppressed,
                                 bool* layoutAbortedForLowMemory, const EpubRenderMode renderMode,
                                 const SectionBuildOptions buildOptions) {
-  const auto localPath = epub->getSpineItem(spineIndex).href;
-  const auto htmlDir = epub->getCachePath() + "/html";
-  const auto htmlPath = htmlDir + "/" + std::to_string(spineIndex) + ".html";
-  const auto tmpHtmlPath = htmlDir + "/.tmp_" + std::to_string(spineIndex) + ".html";
+  const auto localPath = document->getSectionInfo(sectionIndex).href;
+  if (localPath.empty()) {
+    LOG_ERR("SCT", "Section %d has no source href", sectionIndex);
+    return false;
+  }
+  const auto htmlDir = document->getCachePath() + "/html";
+  const auto htmlPath = htmlDir + "/" + std::to_string(sectionIndex) + ".html";
+  const auto tmpHtmlPath = htmlDir + "/.tmp_" + std::to_string(sectionIndex) + ".html";
   const auto tmpSectionPath = filePath + ".tmp";
   pageCount = 0;
   if (layoutAbortedForLowMemory) *layoutAbortedForLowMemory = false;
@@ -287,31 +291,38 @@ bool Section::createSectionFile(const int fontId, const float lineCompression, c
   LOG_DBG("SCT",
           "Create section start: spine=%d mode=%u preview=%u viewport=%ux%u image=%u bionic=%u guide=%u free=%u "
           "maxAlloc=%u",
-          spineIndex, static_cast<unsigned>(renderMode), buildOptions.isPreview() ? 1U : 0U, viewportWidth,
+          sectionIndex, static_cast<unsigned>(renderMode), buildOptions.isPreview() ? 1U : 0U, viewportWidth,
           viewportHeight, imageRendering, effectiveBionicReadingEnabled, effectiveGuideReadingEnabled,
           ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 
   // Create cache directory if it doesn't exist
   {
-    const auto sectionsDir = epub->getCachePath() + "/sections";
+    const auto sectionsDir = document->getCachePath() + "/sections";
     Storage.mkdir(sectionsDir.c_str());
   }
+
+  ReflowResource borrowedSection;
+  const bool usesBorrowedSection = document->getImmutableLocalSection(sectionIndex, borrowedSection);
 
   // Reuse the previously unzipped HTML if we already have it. The unzipped HTML is keyed only on the
   // book (it lives in the per-book cache dir), not on render settings, so it survives the invalidation
   // that wipes the layout (.bin) caches when font/margin/orientation change -- rebuilds then skip zip
   // inflation entirely. It's promoted by an atomic rename as soon as the inflate succeeds (below), so
   // future rebuilds can skip the multi-second inflate. If htmlPath exists it is known-complete.
-  const bool reusedHtml = Storage.exists(htmlPath.c_str());
+  const bool reusedHtml = !usesBorrowedSection && Storage.exists(htmlPath.c_str());
   bool htmlCached = reusedHtml;
+  bool tempHtmlMayDelete = false;
   const auto cleanupTempHtml = [&]() {
-    if (!htmlCached && Storage.exists(tmpHtmlPath.c_str())) {
+    if (tempHtmlMayDelete && Storage.exists(tmpHtmlPath.c_str())) {
       Storage.remove(tmpHtmlPath.c_str());
     }
   };
-  if (reusedHtml) {
+  if (usesBorrowedSection) {
+    LOG_DBG("SCT", "Parsing borrowed local HTML %s", borrowedSection.localPath.c_str());
+  } else if (reusedHtml) {
     LOG_DBG("SCT", "Reusing cached HTML %s", htmlPath.c_str());
   } else {
+    tempHtmlMayDelete = true;
     Storage.mkdir(htmlDir.c_str());
 
     // Retry logic for SD card timing issues
@@ -335,7 +346,7 @@ bool Section::createSectionFile(const int fontId, const float lineCompression, c
       const size_t htmlStreamChunkSize = sectionHtmlStreamChunkSize(buildOptions.isPreview());
       {
         auto zipInflateScratch = acquireSectionZipInflateScratch(renderer, fontId, "section one-shot HTML inflate");
-        streamed = epub->readItemContentsToStream(localPath, tmpHtml, htmlStreamChunkSize);
+        streamed = document->streamSection(sectionIndex, tmpHtml, htmlStreamChunkSize);
       }
       fileSize = tmpHtml.size();
       // Explicitly close() file before calling Storage.remove()
@@ -360,11 +371,13 @@ bool Section::createSectionFile(const int fontId, const float lineCompression, c
     // lets future section rebuilds skip re-inflation. If the rename fails we just parse the temp.
     if (Storage.rename(tmpHtmlPath.c_str(), htmlPath.c_str())) {
       htmlCached = true;
+      tempHtmlMayDelete = false;
     } else {
       LOG_DBG("SCT", "Failed to promote HTML cache; parsing from temp");
     }
   }
-  const std::string& parsePath = htmlCached ? htmlPath : tmpHtmlPath;
+  const std::string& parsePath =
+      usesBorrowedSection ? borrowedSection.localPath : (htmlCached ? htmlPath : tmpHtmlPath);
 
   if (Storage.exists(tmpSectionPath.c_str())) {
     Storage.remove(tmpSectionPath.c_str());
@@ -400,11 +413,11 @@ bool Section::createSectionFile(const int fontId, const float lineCompression, c
   // Derive the content base directory and image cache path prefix for the parser
   size_t lastSlash = localPath.find_last_of('/');
   std::string contentBase = (lastSlash != std::string::npos) ? localPath.substr(0, lastSlash + 1) : "";
-  std::string imageBasePath = epub->getCachePath() + "/img_" + std::to_string(spineIndex) + "_";
+  std::string imageBasePath = document->getCachePath() + "/img_" + std::to_string(sectionIndex) + "_";
 
   CssParser* cssParser = nullptr;
   if (embeddedStyle) {
-    cssParser = epub->getCssParser();
+    cssParser = document->getCssParser();
     if (cssParser) {
       const auto cssHeapBefore = MemoryBudget::snapshot();
       const bool cssLoaded = cssParser->loadFromCache();
@@ -423,11 +436,11 @@ bool Section::createSectionFile(const int fontId, const float lineCompression, c
 
   // Collect TOC anchors for this spine so the parser can insert page breaks at chapter boundaries
   std::vector<std::string> tocAnchors;
-  const int startTocIndex = buildOptions.isPreview() ? -1 : epub->getTocIndexForSpineIndex(spineIndex);
+  const int startTocIndex = buildOptions.isPreview() ? -1 : document->getTocIndexForSectionIndex(sectionIndex);
   if (startTocIndex >= 0) {
-    for (int i = startTocIndex; i < epub->getTocItemsCount(); i++) {
-      auto entry = epub->getTocItem(i);
-      if (entry.spineIndex != spineIndex) break;
+    for (int i = startTocIndex; i < document->getTocEntryCount(); i++) {
+      auto entry = document->getTocEntry(i);
+      if (entry.sectionIndex != sectionIndex) break;
       if (!entry.anchor.empty()) {
         tocAnchors.push_back(std::move(entry.anchor));
       }
@@ -435,9 +448,9 @@ bool Section::createSectionFile(const int fontId, const float lineCompression, c
   }
 
   ChapterHtmlSlimParser visitor(
-      epub, parsePath, renderer, fontId, lineCompression, extraParagraphSpacing, forceParagraphIndents,
-      paragraphAlignment, viewportWidth, viewportHeight, hyphenationEnabled, effectiveBionicReadingEnabled,
-      effectiveGuideReadingEnabled,
+      *document, sectionIndex, parsePath, renderer, fontId, lineCompression, extraParagraphSpacing,
+      forceParagraphIndents, paragraphAlignment, viewportWidth, viewportHeight, hyphenationEnabled,
+      effectiveBionicReadingEnabled, effectiveGuideReadingEnabled,
       [this, &lut, &lutCapacity, &lutCount, &pageCompletionFailed, layoutAbortedForLowMemory](
           std::unique_ptr<Page> page, const uint16_t paragraphIndex, const uint16_t listItemIndex) {
         if (pageCompletionFailed) {
@@ -463,10 +476,10 @@ bool Section::createSectionFile(const int fontId, const float lineCompression, c
       },
       embeddedStyle, contentBase, imageBasePath, imageRendering, std::move(tocAnchors), popupFn, cssParser, renderMode,
       buildOptions.isPreview() ? std::string(buildOptions.previewAnchor) : std::string{}, buildOptions.previewMaxPages);
-  Hyphenator::setPreferredLanguage(epub->getLanguage());
-  LOG_DBG("SCT", "Parser start: spine=%d free=%u maxAlloc=%u", spineIndex, ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+  Hyphenator::setPreferredLanguage(document->getLanguage());
+  LOG_DBG("SCT", "Parser start: spine=%d free=%u maxAlloc=%u", sectionIndex, ESP.getFreeHeap(), ESP.getMaxAllocHeap());
   const bool success = visitor.parseAndBuildPages();
-  LOG_DBG("SCT", "Parser done: spine=%d success=%u pages=%u free=%u maxAlloc=%u", spineIndex, success, pageCount,
+  LOG_DBG("SCT", "Parser done: spine=%d success=%u pages=%u free=%u maxAlloc=%u", sectionIndex, success, pageCount,
           ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 
   if (imagesWereSuppressed) *imagesWereSuppressed = visitor.wasLowMemoryFallbackTriggered();
@@ -474,7 +487,7 @@ bool Section::createSectionFile(const int fontId, const float lineCompression, c
     *layoutAbortedForLowMemory = *layoutAbortedForLowMemory || visitor.wasLowMemoryAbortTriggered();
   }
 
-  if (!htmlCached) {
+  if (tempHtmlMayDelete) {
     if (success || pageCompletionFailed) {
       // Promote the freshly unzipped HTML to the persistent cache so future rebuilds (e.g. after a
       // settings change invalidates the layout caches) can skip zip inflation. If promotion fails,
@@ -483,9 +496,11 @@ bool Section::createSectionFile(const int fontId, const float lineCompression, c
         LOG_DBG("SCT", "Failed to promote HTML cache, removing temp");
         Storage.remove(tmpHtmlPath.c_str());
       }
+      tempHtmlMayDelete = false;
     } else {
       // Parse failed on a freshly unzipped file -- discard it rather than caching a bad source.
       Storage.remove(tmpHtmlPath.c_str());
+      tempHtmlMayDelete = false;
     }
   }
 
@@ -590,13 +605,17 @@ bool Section::createSectionFile(const int fontId, const float lineCompression, c
   if (cssParser) {
     cssParser->clear();
   }
-  LOG_DBG("SCT", "Create section done: spine=%d pages=%u free=%u maxAlloc=%u", spineIndex, pageCount, ESP.getFreeHeap(),
-          ESP.getMaxAllocHeap());
+  LOG_DBG("SCT", "Create section done: spine=%d pages=%u free=%u maxAlloc=%u", sectionIndex, pageCount,
+          ESP.getFreeHeap(), ESP.getMaxAllocHeap());
   return true;
 }
 
 bool Section::hasHtmlCache() const {
-  const std::string htmlPath = epub->getCachePath() + "/html/" + std::to_string(spineIndex) + ".html";
+  ReflowResource borrowedSection;
+  if (document->getImmutableLocalSection(sectionIndex, borrowedSection)) {
+    return Storage.exists(borrowedSection.localPath.c_str());
+  }
+  const std::string htmlPath = document->getCachePath() + "/html/" + std::to_string(sectionIndex) + ".html";
   return Storage.exists(htmlPath.c_str());
 }
 

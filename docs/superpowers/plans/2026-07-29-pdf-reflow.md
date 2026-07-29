@@ -623,29 +623,29 @@ smallest failing hypothesis; do not layer speculative production changes.
 - Modify: `test/reflow_document/CMakeLists.txt`
 - Test: `test/reflow_document/ReflowSectionSourceTest.cpp`
 
-- [ ] Add pure fake-source contract tests plus simulator oracles with one
+- [x] Add pure fake-source contract tests plus simulator oracles with one
   ZIP-like streamed source and one loose local XHTML source. For the local
   source, assert no second copy is written before parsing.
-- [ ] Change `Section` ownership from `shared_ptr<Epub>` to
+- [x] Change `Section` ownership from `shared_ptr<Epub>` to
   `shared_ptr<ReflowDocument>`.
-- [ ] Change `ChapterHtmlSlimParser` to hold `ReflowSectionSource&` plus section
+- [x] Change `ChapterHtmlSlimParser` to hold `ReflowSectionSource&` plus section
   index rather than a copied EPUB `shared_ptr`.
-- [ ] Resolve images through a resource result containing local path,
+- [x] Resolve images through a resource result containing local path,
   ownership kind, encoded/pixel-cache kind, dimensions, and delete permission;
   preserve the current EPUB stream path when no local resource is exposed.
-- [ ] Treat borrowed PDF XHTML/images as immutable. Parser promotion, retry,
+- [x] Treat borrowed PDF XHTML/images as immutable. Parser promotion, retry,
   low-memory cleanup, decode failure, cancellation, and OOM must never rename,
   truncate, or remove a borrowed generation file. Add a simulator fault witness
   for every cleanup exit.
-- [ ] Make `Section::hasHtmlCache()` recognize a borrowed local XHTML source
+- [x] Make `Section::hasHtmlCache()` recognize a borrowed local XHTML source
   without classifying it as an EPUB-owned `cache/html/...` file. EPUB must
   retain its existing HTML promotion/retry path exactly.
-- [ ] Keep `SECTION_FILE_VERSION = 44`, all header/LUT offsets, Page
+- [x] Keep `SECTION_FILE_VERSION = 44`, all header/LUT offsets, Page
   serialization, HTML cache names, image names, CSS behavior, TOC anchor
   insertion, and retries unchanged.
-- [ ] Test that EPUB never enters the direct-local branches and PDF borrowed
+- [x] Test that EPUB never enters the direct-local branches and PDF borrowed
   resources never report `paginatorMayDelete=true`.
-- [ ] Run host tests and both EPUB simulator passes. Expected: byte-identical.
+- [x] Run host tests and both EPUB simulator passes. Expected: byte-identical.
 
 ### Task 10: Migrate supporting reader consumers and capability gates
 

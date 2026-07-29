@@ -1,10 +1,13 @@
 #pragma once
+
+#include <HalStorage.h>
+#include <ReflowDocument.h>
+
 #include <functional>
 #include <memory>
 #include <optional>
 #include <string>
 
-#include "Epub.h"
 #include "EpubRenderMode.h"
 
 class Page;
@@ -18,8 +21,8 @@ struct SectionBuildOptions {
 };
 
 class Section {
-  std::shared_ptr<Epub> epub;
-  const int spineIndex;
+  std::shared_ptr<ReflowDocument> document;
+  const int sectionIndex;
   GfxRenderer& renderer;
   std::string filePath;
   HalFile file;
@@ -33,7 +36,7 @@ class Section {
   uint16_t pageCount = 0;
   int currentPage = 0;
 
-  explicit Section(const std::shared_ptr<Epub>& epub, int spineIndex, GfxRenderer& renderer,
+  explicit Section(const std::shared_ptr<ReflowDocument>& document, int sectionIndex, GfxRenderer& renderer,
                    const char* cacheSuffix = "");
   ~Section() = default;
   bool loadSectionFile(int fontId, float lineCompression, bool extraParagraphSpacing, bool forceParagraphIndents,

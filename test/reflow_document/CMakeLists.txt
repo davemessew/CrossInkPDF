@@ -2,6 +2,7 @@ add_executable(reflow_document_tests
   ${REPO_ROOT}/lib/Reflow/LegacyPageProgressStore.cpp
   LegacyPageProgressStoreTest.cpp
   ReflowDocumentContractTest.cpp
+  ReflowSectionSourceTest.cpp
 )
 
 target_link_libraries(reflow_document_tests PRIVATE

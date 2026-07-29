@@ -6,6 +6,7 @@
 #include <Epub.h>
 #include <Epub/Page.h>
 #include <Epub/Section.h>
+#include <Epub/parsers/ChapterHtmlSlimParser.h>
 #include <GfxRenderer.h>
 #include <HalStorage.h>
 #include <Print.h>
@@ -17,10 +18,12 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "BookmarkStore.h"
 #include "CrossPointSettings.h"
+#include "activities/RenderLock.h"
 #include "activities/reader/EpubReaderUtils.h"
 #include "activities/reader/ReaderUtils.h"
 #include "components/UITheme.h"
@@ -64,6 +67,139 @@ class FnvPrint final : public Print {
  private:
   uint64_t hash_ = FNV_OFFSET;
   size_t bytes_ = 0;
+};
+
+class LooseLocalReflowDocument final : public ReflowDocument {
+ public:
+  LooseLocalReflowDocument(std::string documentPath, std::string cachePath, std::string sectionPath,
+                           std::string imagePath)
+      : documentPath_(std::move(documentPath)),
+        cachePath_(std::move(cachePath)),
+        sectionPath_(std::move(sectionPath)),
+        imagePath_(std::move(imagePath)),
+        imageHref_(imagePath_.empty() || imagePath_.front() != '/' ? imagePath_ : imagePath_.substr(1)) {}
+
+  ReflowDocumentFormat getFormat() const override { return ReflowDocumentFormat::Pdf; }
+  const char* getStoreFormatKey() const override { return "pdf"; }
+  ReflowCapabilitySet getCapabilities() const override { return 0; }
+  const std::string& getPath() const override { return documentPath_; }
+  const std::string& getCachePath() const override { return cachePath_; }
+  const std::string& getTitle() const override { return title_; }
+  const std::string& getAuthor() const override { return author_; }
+  const std::string& getLanguage() const override { return language_; }
+  std::string getCoverBmpPath(const bool) const override { return {}; }
+  bool generateCoverBmp(const bool, const GfxRenderer*, const int) const override { return false; }
+  std::string getThumbBmpPath() const override { return {}; }
+  std::string getThumbBmpPath(const int, const int) const override { return {}; }
+  std::string getAdaptiveThumbBmpPath(const int, const int) const override { return {}; }
+  bool generateThumbBmp(const int, const int, const GfxRenderer*, const int) const override { return false; }
+  bool generateAdaptiveThumbBmp(const int, const int, const GfxRenderer*, const int) const override { return false; }
+
+  bool getLocalSectionPath(const int sectionIndex, ReflowResource& out) const override {
+    ++localSectionQueries_;
+    if (sectionIndex != 0) {
+      out = ReflowResource::streamed();
+      return false;
+    }
+    out = ReflowResource::borrowedLocalFile(sectionPath_, ReflowImageKind::EncodedImage);
+    return true;
+  }
+
+  bool streamSection(const int, Print&, const size_t) const override {
+    ++sectionStreams_;
+    return false;
+  }
+
+  bool resolveResource(const int sectionIndex, const std::string& href, ReflowResource& out) const override {
+    ++resourceQueries_;
+    if (sectionIndex != 0 || href != imageHref_) {
+      out = ReflowResource::streamed();
+      return false;
+    }
+    out = ReflowResource::borrowedLocalFile(imagePath_, ReflowImageKind::EncodedImage);
+    return true;
+  }
+
+  bool streamResource(const int, const std::string&, Print&, const size_t) const override {
+    ++resourceStreams_;
+    return false;
+  }
+
+  bool getResourceSize(const int, const std::string&, size_t*) const override { return false; }
+  CssParser* getCssParser() const override { return nullptr; }
+  int getSectionCount() const override { return 1; }
+
+  ReflowSectionInfo getSectionInfo(const int sectionIndex) const override {
+    if (sectionIndex != 0) {
+      return {};
+    }
+    return {
+        .href = sectionPath_,
+        .title = title_,
+        .tocIndex = 0,
+    };
+  }
+
+  bool getSectionSize(const int sectionIndex, size_t* size) const override {
+    if (sectionIndex != 0 || size == nullptr) {
+      return false;
+    }
+    *size = 0;
+    return true;
+  }
+
+  size_t getCumulativeSectionSize(const int) const override { return 0; }
+  size_t getDocumentSize() const override { return 0; }
+  int getSectionIndexForTextReference() const override { return 0; }
+  int getTocEntryCount() const override { return 1; }
+
+  ReflowTocEntry getTocEntry(const int tocIndex) const override {
+    if (tocIndex != 0) {
+      return {};
+    }
+    return {
+        .title = title_,
+        .href = sectionPath_,
+        .sectionIndex = 0,
+    };
+  }
+
+  int getSectionIndexForTocIndex(const int tocIndex) const override { return tocIndex == 0 ? 0 : -1; }
+  int getTocIndexForSectionIndex(const int sectionIndex) const override { return sectionIndex == 0 ? 0 : -1; }
+  int resolveHrefToSectionIndex(const std::string& href) const override { return href == sectionPath_ ? 0 : -1; }
+  float calculateSizeProgress(const int, const float sectionProgress) const override { return sectionProgress; }
+  float calculateProgress(const int, const float sectionProgress) const override { return sectionProgress; }
+
+  bool resolveProgressPercentToSection(const int percent, int& sectionIndex, float& sectionProgress) const override {
+    sectionIndex = 0;
+    sectionProgress = static_cast<float>(percent) / 100.0f;
+    return percent >= 0 && percent <= 100;
+  }
+
+  bool hasStableReferencePages() const override { return false; }
+  bool resolveReferencePage(const int, const float, uint32_t&, uint32_t&) const override { return false; }
+  uint32_t getTotalWordCount() const override { return 0; }
+  bool loadReadingPosition(ReflowReadingPosition&) const override { return false; }
+  bool saveReadingPosition(const ReflowReadingPosition&) const override { return false; }
+
+  int localSectionQueries() const { return localSectionQueries_; }
+  int sectionStreams() const { return sectionStreams_; }
+  int resourceQueries() const { return resourceQueries_; }
+  int resourceStreams() const { return resourceStreams_; }
+
+ private:
+  std::string documentPath_;
+  std::string cachePath_;
+  std::string sectionPath_;
+  std::string imagePath_;
+  std::string imageHref_;
+  std::string title_ = "Loose local XHTML";
+  std::string author_ = "CrossInk simulator";
+  std::string language_ = "en";
+  mutable int localSectionQueries_ = 0;
+  mutable int sectionStreams_ = 0;
+  mutable int resourceQueries_ = 0;
+  mutable int resourceStreams_ = 0;
 };
 
 struct OracleLayout {
@@ -128,7 +264,24 @@ bool hashFile(const std::string& path, uint64_t& hash, size_t& bytes, std::strin
   return true;
 }
 
+bool writeOracleFile(const std::string& path, const std::string& contents, std::string& error) {
+  FsFile file;
+  if (!Storage.openFileForWrite("ORACLE", path, file)) {
+    error = "cannot create oracle file " + path;
+    return false;
+  }
+  const size_t written = file.write(contents.data(), contents.size());
+  const bool synced = written == contents.size() && file.sync();
+  const bool closed = file.close();
+  if (!synced || !closed) {
+    error = "cannot persist oracle file " + path;
+    return false;
+  }
+  return true;
+}
+
 void pinReaderSettings(GfxRenderer& renderer) {
+  RenderLock renderLock;
   SETTINGS.uiTheme = CrossPointSettings::UI_THEME::CLASSIC;
   SETTINGS.fontFamily = CrossPointSettings::FONT_FAMILY::LEXENDDECA;
   SETTINGS.fontSize = CrossPointSettings::FONT_SIZE::MEDIUM;
@@ -334,6 +487,117 @@ bool captureProgressAndBookmark(const std::shared_ptr<Epub>& epub, GfxRenderer& 
   return true;
 }
 
+bool verifyLooseLocalSource(const char* passName, GfxRenderer& renderer, const OracleLayout& layout,
+                            std::string& error) {
+  const std::string root = std::string(CACHE_ROOT) + "/loose_source_" + passName;
+  const std::string generatedDir = root + "/generated";
+  const std::string cachePath = root + "/cache";
+  const std::string sourcePath = generatedDir + "/section-0.xhtml";
+  const std::string imagePath = generatedDir + "/invalid.jpg";
+  const std::string htmlPath = cachePath + "/html/0.html";
+  const std::string tempHtmlPath = cachePath + "/html/.tmp_0.html";
+
+  if (!Storage.mkdir(generatedDir.c_str()) || !Storage.mkdir(cachePath.c_str())) {
+    error = "cannot create loose-source oracle directories";
+    return false;
+  }
+
+  std::string xhtml =
+      "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+      "<html xmlns=\"http://www.w3.org/1999/xhtml\"><body>"
+      "<h1 id=\"preview\">Loose local source</h1>"
+      "<p>This XHTML is immutable generation-owned input.</p>"
+      "<img src=\"invalid.jpg\" alt=\"invalid borrowed image\"/>";
+  for (int i = 0; i < 240; ++i) {
+    xhtml += "<p>Preview cancellation must leave this borrowed source unchanged.</p>";
+  }
+  xhtml += "</body></html>";
+
+  if (!writeOracleFile(sourcePath, xhtml, error) || !writeOracleFile(imagePath, "not a valid jpeg payload", error)) {
+    return false;
+  }
+
+  uint64_t sourceHashBefore = FNV_OFFSET;
+  uint64_t imageHashBefore = FNV_OFFSET;
+  size_t sourceBytesBefore = 0;
+  size_t imageBytesBefore = 0;
+  if (!hashFile(sourcePath, sourceHashBefore, sourceBytesBefore, error) ||
+      !hashFile(imagePath, imageHashBefore, imageBytesBefore, error)) {
+    return false;
+  }
+
+  auto document = std::make_shared<LooseLocalReflowDocument>(root + "/fixture.pdf", cachePath, sourcePath, imagePath);
+  Section section(document, 0, renderer, "_loose");
+  if (!section.hasHtmlCache() || Storage.exists(htmlPath.c_str()) || Storage.exists(tempHtmlPath.c_str())) {
+    error = "borrowed local section was not recognized without an HTML cache copy";
+    return false;
+  }
+  if (!section.createSectionFile(
+          SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(), SETTINGS.extraParagraphSpacing,
+          SETTINGS.forceParagraphIndents, SETTINGS.paragraphAlignment, layout.width, layout.height,
+          SETTINGS.hyphenationEnabled, false, SETTINGS.imageRendering, SETTINGS.bionicReadingEnabled,
+          SETTINGS.guideReadingEnabled, nullptr, nullptr, nullptr, EpubRenderMode::CrossInkDefault)) {
+    error = "cannot paginate loose local XHTML";
+    return false;
+  }
+
+  Section previewSection(document, 0, renderer, "_preview");
+  const SectionBuildOptions previewOptions = {
+      .previewAnchor = "preview",
+      .previewMaxPages = 1,
+  };
+  if (!previewSection.createSectionFile(
+          SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(), SETTINGS.extraParagraphSpacing,
+          SETTINGS.forceParagraphIndents, SETTINGS.paragraphAlignment, layout.width, layout.height,
+          SETTINGS.hyphenationEnabled, false, SETTINGS.imageRendering, SETTINGS.bionicReadingEnabled,
+          SETTINGS.guideReadingEnabled, nullptr, nullptr, nullptr, EpubRenderMode::CrossInkDefault, previewOptions)) {
+    error = "cannot exercise preview stop on loose local XHTML";
+    return false;
+  }
+
+  bool lowMemoryAbort = false;
+  ChapterHtmlSlimParser::setSimulatorFault(ChapterHtmlSlimParserSimulatorFault::LowMemoryAfterSourceOpen);
+  Section lowMemorySection(document, 0, renderer, "_low_memory");
+  if (lowMemorySection.createSectionFile(
+          SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(), SETTINGS.extraParagraphSpacing,
+          SETTINGS.forceParagraphIndents, SETTINGS.paragraphAlignment, layout.width, layout.height,
+          SETTINGS.hyphenationEnabled, false, SETTINGS.imageRendering, SETTINGS.bionicReadingEnabled,
+          SETTINGS.guideReadingEnabled, nullptr, nullptr, &lowMemoryAbort, EpubRenderMode::CrossInkDefault) ||
+      !lowMemoryAbort) {
+    error = "loose local XHTML low-memory fault did not abort safely";
+    return false;
+  }
+
+  ChapterHtmlSlimParser::setSimulatorFault(ChapterHtmlSlimParserSimulatorFault::ParserBufferOom);
+  Section oomSection(document, 0, renderer, "_oom");
+  if (oomSection.createSectionFile(
+          SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(), SETTINGS.extraParagraphSpacing,
+          SETTINGS.forceParagraphIndents, SETTINGS.paragraphAlignment, layout.width, layout.height,
+          SETTINGS.hyphenationEnabled, false, SETTINGS.imageRendering, SETTINGS.bionicReadingEnabled,
+          SETTINGS.guideReadingEnabled, nullptr, nullptr, nullptr, EpubRenderMode::CrossInkDefault)) {
+    error = "loose local XHTML parser-buffer OOM did not abort";
+    return false;
+  }
+
+  uint64_t sourceHashAfter = FNV_OFFSET;
+  uint64_t imageHashAfter = FNV_OFFSET;
+  size_t sourceBytesAfter = 0;
+  size_t imageBytesAfter = 0;
+  if (!hashFile(sourcePath, sourceHashAfter, sourceBytesAfter, error) ||
+      !hashFile(imagePath, imageHashAfter, imageBytesAfter, error)) {
+    return false;
+  }
+
+  if (sourceHashAfter != sourceHashBefore || sourceBytesAfter != sourceBytesBefore ||
+      imageHashAfter != imageHashBefore || imageBytesAfter != imageBytesBefore || Storage.exists(htmlPath.c_str()) ||
+      Storage.exists(tempHtmlPath.c_str()) || document->sectionStreams() != 0 || document->resourceStreams() != 0 ||
+      document->localSectionQueries() < 5 || document->resourceQueries() < 1) {
+    error = "borrowed local source was copied, streamed, or mutated";
+    return false;
+  }
+  return true;
+}
+
 }  // namespace
 
 bool runEpubReflowRegressionOracle(GfxRenderer& renderer, const char* bookPath, const char* passName,
@@ -516,6 +780,9 @@ bool runEpubReflowRegressionOracle(GfxRenderer& renderer, const char* bookPath, 
   cache["fnv1a64"] = hashHex(sectionCacheHash);
 
   if (!captureProgressAndBookmark(epub, renderer, layout, middle, oracle, error)) {
+    return false;
+  }
+  if (!verifyLooseLocalSource(passName, renderer, layout, error)) {
     return false;
   }
 
