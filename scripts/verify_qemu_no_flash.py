@@ -1,8 +1,10 @@
 import argparse
+import os
 from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 
 
 EXPECTED_REFUSAL = "QEMU target cannot be flashed\n"
@@ -34,29 +36,46 @@ def main() -> int:
     arguments = parser.parse_args()
 
     failures: list[str] = []
-    for target in PROHIBITED_TARGETS:
-        completed = subprocess.run(
-            _pio_command(arguments.pio)
-            + ["run", "-e", "qemu-esp32c3", "-t", target],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        combined_output = completed.stdout + completed.stderr
-        stderr_lines = completed.stderr.splitlines()
-        refused_before_platformio_output = (
-            bool(stderr_lines)
-            and stderr_lines[0] == EXPECTED_REFUSAL.rstrip("\n")
-        )
-        accessed_device = any(
-            pattern.search(combined_output) for pattern in DEVICE_ACCESS_PATTERNS
-        )
-        if (
-            completed.returncode == 0
-            or not refused_before_platformio_output
-            or accessed_device
-        ):
-            failures.append(target)
+    with tempfile.TemporaryDirectory(
+        prefix="crossink-qemu-no-flash-"
+    ) as temporary_directory:
+        isolation_root = Path(temporary_directory)
+        for target in PROHIBITED_TARGETS:
+            environment = os.environ.copy()
+            environment["PLATFORMIO_BUILD_DIR"] = str(
+                (isolation_root / target / "build").resolve()
+            )
+            completed = subprocess.run(
+                _pio_command(arguments.pio)
+                + [
+                    "run",
+                    "--disable-auto-clean",
+                    "-e",
+                    "qemu-esp32c3",
+                    "-t",
+                    target,
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                env=environment,
+            )
+            combined_output = completed.stdout + completed.stderr
+            stderr_lines = completed.stderr.splitlines()
+            refused_before_platformio_output = (
+                bool(stderr_lines)
+                and stderr_lines[0] == EXPECTED_REFUSAL.rstrip("\n")
+            )
+            accessed_device = any(
+                pattern.search(combined_output)
+                for pattern in DEVICE_ACCESS_PATTERNS
+            )
+            if (
+                completed.returncode == 0
+                or not refused_before_platformio_output
+                or accessed_device
+            ):
+                failures.append(target)
 
     if failures:
         for target in failures:
