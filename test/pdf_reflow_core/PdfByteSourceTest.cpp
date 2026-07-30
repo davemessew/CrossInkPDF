@@ -112,6 +112,10 @@ TEST(PdfLimitsTest, ProductionBoundsMatchApprovedEnvelope) {
   EXPECT_EQ(PdfLimits::MaxExpandedRequiredStreamBytes, 64ULL * 1024ULL * 1024ULL);
   EXPECT_EQ(PdfLimits::MaxExpansionRatio, 200u);
   EXPECT_EQ(PdfLimits::MaxFiltersPerStream, 4u);
+  EXPECT_EQ(PdfLimits::MaxXrefFieldBytes, 8u);
+  EXPECT_EQ(PdfLimits::MaxXrefEntryBytes, 24u);
+  EXPECT_EQ(PdfLimits::MaxXrefIndexPairs, 64u);
+  EXPECT_EQ(PdfLimits::XrefMergeEntries, 64u);
   EXPECT_EQ(PdfLimits::MaxImagePixels, 16000000u);
   EXPECT_EQ(PdfLimits::MaxDecodedImageRowBytes, 8192u);
   EXPECT_LE(PdfLimits::TotalWorkspaceBytes, 63488u);

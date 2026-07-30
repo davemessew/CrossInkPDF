@@ -28,3 +28,5 @@ PdfStatus pdfReadExact(const PdfByteSource& source, uint64_t offset, uint8_t* de
 PdfStatus pdfWriteExact(const PdfByteSink& sink, const uint8_t* source, size_t length);
 PdfStatus pdfReadRecord(const PdfFixedRecordStore& store, uint32_t ordinal, void* record);
 PdfStatus pdfWriteRecord(const PdfFixedRecordStore& store, uint32_t ordinal, const void* record);
+PdfByteSource pdfByteStoreSource(PdfByteStore& store);
+PdfByteSink pdfByteStoreSink(PdfByteStore& store);

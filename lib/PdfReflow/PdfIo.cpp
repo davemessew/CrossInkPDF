@@ -23,6 +23,23 @@ PdfStatus readByteRange(void* context, const uint64_t offset, uint8_t* destinati
   return range.parent.readAt(range.parent.context, parentOffset, destination, requested, bytesRead);
 }
 
+PdfStatus readByteStore(void* context, const uint64_t offset, uint8_t* destination, const size_t requested,
+                        size_t* bytesRead) {
+  if (context == nullptr) {
+    return PdfStatus::failure(PdfError::InvalidArgument, offset);
+  }
+  auto& store = *static_cast<PdfByteStore*>(context);
+  return store.readAt(store.context, offset, destination, requested, bytesRead);
+}
+
+PdfStatus writeByteStore(void* context, const uint8_t* source, const size_t requested, size_t* bytesWritten) {
+  if (context == nullptr) {
+    return PdfStatus::failure(PdfError::InvalidArgument);
+  }
+  auto& store = *static_cast<PdfByteStore*>(context);
+  return store.write(store.context, source, requested, bytesWritten);
+}
+
 }  // namespace
 
 PdfStatus pdfInitializeByteRange(const PdfByteSource& parent, const uint64_t offset, const uint64_t length,
@@ -138,4 +155,19 @@ PdfStatus pdfWriteRecord(const PdfFixedRecordStore& store, const uint32_t ordina
     return PdfStatus::failure(PdfError::InvalidOffset, ordinal);
   }
   return store.write(store.context, ordinal, record, store.recordSize);
+}
+
+PdfByteSource pdfByteStoreSource(PdfByteStore& store) {
+  if (!store.valid()) {
+    return {};
+  }
+  const uint64_t size = store.size(store.context);
+  if (size > store.capacity) {
+    return {};
+  }
+  return {&store, size, readByteStore};
+}
+
+PdfByteSink pdfByteStoreSink(PdfByteStore& store) {
+  return store.valid() ? PdfByteSink{&store, writeByteStore} : PdfByteSink{};
 }

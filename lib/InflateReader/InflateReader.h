@@ -86,6 +86,7 @@ class InflateReader {
   // Useful for advanced streaming setups where the callback needs access to the
   // uzlib struct directly (e.g. updating source/source_limit).
   uzlib_uncomp* raw() { return &decomp; }
+  bool usesExternalDictionary() const { return ringBuffer != nullptr && !ownsRingBuffer; }
 
  private:
   uzlib_uncomp decomp = {};

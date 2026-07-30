@@ -6,7 +6,9 @@ add_executable(PdfReflowCoreTest
   ${REPO_ROOT}/lib/PdfReflow/PdfObjectParser.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfObjectResolver.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfPageTree.cpp
+  ${REPO_ROOT}/lib/PdfReflow/PdfStreamDecoder.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfXref.cpp
+  ${REPO_ROOT}/lib/InflateReader/InflateReader.cpp
   ${REPO_ROOT}/lib/uzlib/src/tinflate.c
   ${REPO_ROOT}/lib/uzlib/src/uzlib_checksums.c
   PdfTestIo.cpp
@@ -14,12 +16,14 @@ add_executable(PdfReflowCoreTest
   PdfLexerObjectTest.cpp
   PdfXrefResolverTest.cpp
   PdfPageTreeTest.cpp
+  PdfStreamDecoderTest.cpp
   PdfFixtureIntegrationTest.cpp
   PdfAllocationTest.cpp
 )
 
 target_include_directories(PdfReflowCoreTest PRIVATE
   ${REPO_ROOT}/lib/PdfReflow
+  ${REPO_ROOT}/lib/InflateReader
   ${REPO_ROOT}/lib/uzlib/src
 )
 

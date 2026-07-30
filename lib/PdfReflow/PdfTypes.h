@@ -12,8 +12,14 @@ enum class PdfError : uint8_t {
   BudgetExhausted,
   LimitExceeded,
   Unsupported,
+  UnsupportedFilter,
+  UnsupportedEncoding,
+  ExpansionLimit,
   Malformed,
   Encrypted,
+  NoReadableText,
+  InsufficientMemory,
+  InsufficientStorage,
   Cancelled,
 };
 
@@ -25,9 +31,7 @@ struct PdfStatus {
   constexpr explicit operator bool() const { return ok(); }
 
   static constexpr PdfStatus success() { return {}; }
-  static constexpr PdfStatus failure(const PdfError error, const uint64_t offset = 0) {
-    return {error, offset};
-  }
+  static constexpr PdfStatus failure(const PdfError error, const uint64_t offset = 0) { return {error, offset}; }
 };
 
 enum class PdfStepState : uint8_t {
@@ -82,6 +86,22 @@ struct PdfFixedRecordStore {
   WriteFn write = nullptr;
 
   constexpr bool valid() const { return recordSize != 0 && read != nullptr && write != nullptr; }
+};
+
+struct PdfByteStore {
+  using ResetFn = PdfStatus (*)(void* context);
+  using SizeFn = uint64_t (*)(void* context);
+  using ReadAtFn = PdfByteSource::ReadAtFn;
+  using WriteFn = PdfByteSink::WriteFn;
+
+  void* context = nullptr;
+  uint64_t capacity = 0;
+  ResetFn reset = nullptr;
+  SizeFn size = nullptr;
+  ReadAtFn readAt = nullptr;
+  WriteFn write = nullptr;
+
+  constexpr bool valid() const { return reset != nullptr && size != nullptr && readAt != nullptr && write != nullptr; }
 };
 
 enum class PdfTokenKind : uint8_t {

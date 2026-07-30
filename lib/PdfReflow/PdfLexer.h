@@ -10,6 +10,7 @@ class PdfLexer {
  public:
   PdfLexer(const PdfByteSource& source, uint8_t* sourceBuffer, size_t sourceBufferSize);
 
+  void setSource(const PdfByteSource& source, uint64_t offset = 0);
   void reset(uint64_t offset = 0);
   PdfStepResult next(PdfToken& token, PdfWorkBudget& budget);
   bool unread(const PdfToken& token);

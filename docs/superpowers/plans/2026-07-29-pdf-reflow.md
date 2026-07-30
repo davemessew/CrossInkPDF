@@ -911,28 +911,28 @@ smallest failing hypothesis; do not layer speculative production changes.
 - Test: `test/pdf_reflow_core/PdfStreamDecoderTest.cpp`
 - Test: `test/pdf_reflow_core/PdfXrefResolverTest.cpp`
 
-- [ ] Add red tests for raw, ASCIIHex, ASCII85, Flate, ASCIIHex→Flate,
+- [x] Add red tests for raw, ASCIIHex, ASCII85, Flate, ASCIIHex→Flate,
   ASCII85→Flate, one supported four-stage chain, and fifth-filter rejection.
   Cover ASCII85 `z`, `~>`, and whitespace; ASCIIHex odd nibble and terminator;
   every input/output split; truncated zlib/Adler data; expanded-byte cap; and
   200:1 expansion-ratio cap.
-- [ ] Assert a required LZW-only content stream returns `UnsupportedFilter`
+- [x] Assert a required LZW-only content stream returns `UnsupportedFilter`
   without committing output; an optional LZW image may be omitted with warning.
-- [ ] Use `InflateReader::initWithExternalDictionary` with the caller-owned
+- [x] Use `InflateReader::initWithExternalDictionary` with the caller-owned
   32 KiB dictionary. A test must fail if the hidden-allocating `init(true)` path
   is used.
-- [ ] Add `/W`, sparse `/Index`, xref stream, object stream, and compressed
+- [x] Add `/W`, sparse `/Index`, xref stream, object stream, and compressed
   object tests. For each test-only limit, the same small fixture passes at `N`
   and fails at `N-1`; separately assert approved production constants.
-- [ ] Reuse the fixed-record 64-entry external merge pattern from
+- [x] Reuse the fixed-record 64-entry external merge pattern from
   `lib/FileIndex/FileIndex.cpp`; do not retain object-count-sized arrays.
-- [ ] Xref merge writes may be sequential while parsing, but close the source
+- [x] Xref merge writes may be sequential while parsing, but close the source
   at a verified boundary before reading/merging spill runs; close all spill
   readers before reopening/seeking the source. Exercise this phase with the
   single-reader fake.
-- [ ] Implement newest-revision wins and safe object-stream resolution with
+- [x] Implement newest-revision wins and safe object-stream resolution with
   recursion/cycle checks.
-- [ ] Run:
+- [x] Run:
 
   ```powershell
   cmake --build build/test --target PdfReflowCoreTest

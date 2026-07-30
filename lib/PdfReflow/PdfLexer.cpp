@@ -72,6 +72,11 @@ PdfTokenKind classifyWord(const PdfToken& token) {
 PdfLexer::PdfLexer(const PdfByteSource& source, uint8_t* sourceBuffer, const size_t sourceBufferSize)
     : source_(source), sourceBuffer_(sourceBuffer), sourceBufferSize_(sourceBufferSize) {}
 
+void PdfLexer::setSource(const PdfByteSource& source, const uint64_t offset) {
+  source_ = source;
+  reset(offset);
+}
+
 void PdfLexer::reset(const uint64_t offset) {
   bufferedBytes_ = 0;
   bufferPosition_ = 0;

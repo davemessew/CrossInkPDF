@@ -188,6 +188,62 @@ def make_incremental_update() -> Fixture:
     return Fixture(bytes(output), "Updated revision wins.", ("Updated revision wins.",))
 
 
+def make_incremental_xref_stream() -> Fixture:
+    base = ClassicPdf()
+    base.add(1, b"<< /Type /Catalog /Pages 2 0 R >>")
+    base.add(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
+    base.add(
+        3,
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+    )
+    base.add(4, stream(b"BT /F1 12 Tf 72 720 Td (Older classic revision.) Tj ET"))
+    base.add(5, font_object())
+    base_bytes, previous_xref = base.render()
+
+    output = bytearray(base_bytes)
+    offsets: dict[int, int] = {}
+    for number, body in (
+        (
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            b"/Resources << /Font << /F1 5 0 R >> >> /Contents 6 0 R >>",
+        ),
+        (
+            6,
+            stream(
+                b"BT /F1 12 Tf 72 720 Td "
+                b"(Updated xref stream wins.) Tj ET"
+            ),
+        ),
+    ):
+        offsets[number] = len(output)
+        output.extend(f"{number} 0 obj\n".encode("ascii") + body + b"\nendobj\n")
+    xref_offset = len(output)
+
+    def entry(entry_type: int, field2: int, field3: int) -> bytes:
+        return bytes([entry_type]) + struct.pack(">I", field2) + struct.pack(">H", field3)
+
+    xref_data = b"".join(
+        (
+            entry(1, offsets[3], 0),
+            entry(1, offsets[6], 0),
+            entry(1, xref_offset, 0),
+        )
+    )
+    xref_stream = stream(
+        zlib.compress(xref_data, 9),
+        (
+            f"/Type /XRef /Size 8 /Root 1 0 R /Prev {previous_xref} "
+            "/W [1 4 2] /Index [3 1 6 2] /Filter /FlateDecode"
+        ).encode("ascii"),
+    )
+    output.extend(b"7 0 obj\n" + xref_stream + b"\nendobj\n")
+    output.extend(f"startxref\n{xref_offset}\n%%EOF\n".encode("ascii"))
+    text = "Updated xref stream wins."
+    return Fixture(bytes(output), text, (text,))
+
+
 def make_xref_stream_objstm() -> Fixture:
     content = b"BT /F1 12 Tf 72 720 Td (Compressed object stream text.) Tj ET"
     compressed_objects = (
@@ -206,8 +262,11 @@ def make_xref_stream_objstm() -> Fixture:
         object_data.extend(body + b" ")
     index = b" ".join(f"{number} {offset}".encode("ascii") for number, offset in index_entries) + b" "
     object_stream = stream(
-        index + object_data,
-        f"/Type /ObjStm /N {len(compressed_objects)} /First {len(index)}".encode("ascii"),
+        zlib.compress(index + object_data, 9),
+        (
+            f"/Type /ObjStm /N {len(compressed_objects)} "
+            f"/First {len(index)} /Filter /FlateDecode"
+        ).encode("ascii"),
     )
 
     output = bytearray(PDF_HEADER)
@@ -226,8 +285,9 @@ def make_xref_stream_objstm() -> Fixture:
     entries.append(entry(1, xref_offset, 0))
     xref_data = b"".join(entries)
     xref_stream = stream(
-        xref_data,
-        b"/Type /XRef /Size 8 /Root 1 0 R /W [1 4 2] /Index [0 8]",
+        zlib.compress(xref_data, 9),
+        b"/Type /XRef /Size 8 /Root 1 0 R /W [1 4 2] "
+        b"/Index [0 2 2 3 5 3] /Filter /FlateDecode",
     )
     output.extend(b"7 0 obj\n" + xref_stream + b"\nendobj\n")
     output.extend(f"startxref\n{xref_offset}\n%%EOF\n".encode("ascii"))
@@ -612,6 +672,7 @@ def build_fixtures() -> dict[str, Fixture]:
     fixtures = {
         "classic_text": make_classic_text(),
         "incremental_update": make_incremental_update(),
+        "incremental_xref_stream": make_incremental_xref_stream(),
         "xref_stream_objstm": make_xref_stream_objstm(),
         "filter_matrix": make_filter_matrix(),
         "tounicode_simple_and_cid": make_tounicode_simple_and_cid(),
