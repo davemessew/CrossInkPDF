@@ -5975,6 +5975,9 @@ ScreenshotInfo EpubReaderActivity::getScreenshotInfo() const {
   ScreenshotInfo info;
   info.readerType = ScreenshotInfo::ReaderType::Epub;
   if (document) {
+    if (document->getFormat() == ReflowDocumentFormat::Pdf) {
+      info.readerType = ScreenshotInfo::ReaderType::Pdf;
+    }
     snprintf(info.title, sizeof(info.title), "%s", document->getTitle().c_str());
     info.spineIndex = currentSpineIndex;
   }
