@@ -9,8 +9,12 @@
 #include <string>
 
 #include "PdfCacheStore.h"
+#include "PdfLayoutWordIndex.h"
 #include "PdfMetadataStore.h"
 #include "PdfOutline.h"
+#include "PdfProgressStore.h"
+#include "PdfSavedItemWordMap.h"
+#include "PdfSavedItemsStore.h"
 
 class PdfReflowDocument : public ReflowDocument {
  public:
@@ -20,7 +24,9 @@ class PdfReflowDocument : public ReflowDocument {
 
   ReflowDocumentFormat getFormat() const override { return ReflowDocumentFormat::Pdf; }
   const char* getStoreFormatKey() const override { return "pdf"; }
-  ReflowCapabilitySet getCapabilities() const override { return 0; }
+  ReflowCapabilitySet getCapabilities() const override {
+    return savedItemsReady_ ? reflowCapabilityMask(ReflowCapability::SavedItems) : 0;
+  }
 
   const std::string& getPath() const override { return sourcePath_; }
   const std::string& getCachePath() const override { return cacheRoot_; }
@@ -61,6 +67,20 @@ class PdfReflowDocument : public ReflowDocument {
   uint32_t getTotalWordCount() const override;
   bool loadReadingPosition(ReflowReadingPosition& position) const override;
   bool saveReadingPosition(const ReflowReadingPosition& position) const override;
+  PdfStatus loadPdfSavedItems(PdfSavedItemsBuffer* output) const;
+  PdfStatus savePdfSavedItems(const PdfSavedItem* items, uint16_t count) const;
+  PdfStatus validatePdfSavedItem(const PdfSavedItem& item) const;
+  PdfStatus mapPdfSavedItem(const std::string& sectionCachePath, uint32_t layoutFingerprint,
+                            const PdfSavedItem& item, PdfSavedItemPageRange* pages) const;
+  PdfStatus pdfSavedItemsLayoutFingerprint(const std::string& sectionCachePath, uint32_t* fingerprint) const;
+  bool validateLayoutWordIndex(const std::string& sectionCachePath, int sectionIndex,
+                               uint16_t pageCount) const override;
+  bool removeLayoutWordIndex(const std::string& sectionCachePath) const override;
+  bool readLayoutWordRange(const std::string& sectionCachePath, uint16_t pageCount, uint16_t page,
+                           ReflowPageSemanticRange& range) const override;
+  bool findLayoutWordPage(const std::string& sectionCachePath, const char* blockAnchor, uint32_t blockWordOffset,
+                          uint32_t globalWordOrdinal, uint16_t& page) const override;
+  bool findLayoutWordCursor(const std::string& sectionCachePath, uint32_t wordCursor, uint16_t& page) const override;
 
   bool getLocalSectionPath(int sectionIndex, ReflowResource& out) const override;
   bool streamSection(int sectionIndex, Print& out, size_t chunkSize) const override;
@@ -82,6 +102,18 @@ class PdfReflowDocument : public ReflowDocument {
     PdfByteSource source() { return {this, size, read}; }
   };
 
+  struct SavedItemMapSource {
+    const PdfReflowDocument* document = nullptr;
+    const std::string* sectionCachePath = nullptr;
+    ManifestSource file{};
+    PdfLayoutWordIndexInfo info{};
+    bool inspected = false;
+
+    static PdfStatus inspect(void* context, uint16_t sectionIndex, PdfLayoutWordIndexInfo* info);
+    static PdfStatus readRanges(void* context, uint16_t sectionIndex, uint16_t firstPage, uint16_t count,
+                                PdfLayoutWordRange* ranges);
+  };
+
   static PdfStatus validateRequiredFile(void* context, const PdfRequiredFileRecord& record);
   static PdfStatus captureMetadataSection(void* context, uint16_t index, const PdfMetadataSection& record);
   static PdfStatus validateOutlineEntry(void* context, uint16_t index, const PdfOutlineEntry& record);
@@ -92,6 +124,9 @@ class PdfReflowDocument : public ReflowDocument {
   bool formatSectionHref(int sectionIndex, char* output, size_t capacity) const;
   bool formatSectionPath(int sectionIndex, char* output, size_t capacity) const;
   bool streamCachedFile(const std::string& path, uint64_t fileSize, Print& out, size_t chunkSize) const;
+  bool formatLayoutWordIndexPath(const std::string& sectionCachePath, char destination[PDF_CACHE_PATH_CAPACITY]) const;
+  bool openLayoutWordIndex(const char* path, ManifestSource& source) const;
+  bool closeLayoutWordIndex(ManifestSource& source) const;
   void resetLoadedState();
   void deriveFallbackTitle();
 
@@ -108,17 +143,27 @@ class PdfReflowDocument : public ReflowDocument {
   PdfMetadata metadata_{};
   PdfRequiredFileRecord metadataRecord_{};
   PdfRequiredFileRecord outlineRecord_{};
+  PdfProgressStore progressStore_{};
+  PdfSavedItemsStore savedItemsStore_{};
   std::unique_ptr<PdfMetadataSection[]> sections_;
   std::unique_ptr<uint8_t[]> ioWorkspace_;
   std::array<uint32_t, PdfMetadataLimits::MaxSections> manifestSectionSizes_{};
   std::array<uint8_t, (PdfMetadataLimits::MaxSections + 7) / 8> manifestSectionSeen_{};
   mutable PdfOutlineEntry cachedOutlineEntry_{};
   mutable int cachedOutlineIndex_ = -1;
+  // PDF-only four-record decode window: kept off the 4 KiB reader task stack
+  // and reused for every page lookup.
+  mutable std::array<PdfLayoutWordRange, 4> layoutWordWindow_{};
+  mutable std::array<char, PDF_CACHE_PATH_CAPACITY> layoutWordIndexPath_{};
+  mutable uint16_t layoutWordWindowStart_ = 0;
+  mutable uint8_t layoutWordWindowCount_ = 0;
+  mutable bool layoutWordIndexAvailable_ = false;
   uint32_t validationGeneration_ = 0;
   uint32_t requiredFilesSeen_ = 0;
   uint32_t xhtmlFilesSeen_ = 0;
   uint16_t metadataFilesSeen_ = 0;
   uint16_t outlineFilesSeen_ = 0;
   bool loaded_ = false;
+  bool savedItemsReady_ = false;
   PdfStatus status_{};
 };

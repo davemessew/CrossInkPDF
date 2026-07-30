@@ -457,7 +457,7 @@ TEST(ReflowDocumentContract, VirtualDispatchCoversMetadataNavigationResourcesAnd
     EXPECT_TRUE(loaded.hasSemanticPosition);
     EXPECT_EQ(loaded.globalWordOrdinal, 421u);
     EXPECT_EQ(loaded.blockWordOffset, 17u);
-    EXPECT_EQ(loaded.blockAnchor, "block-23");
+    EXPECT_STREQ(loaded.blockAnchor, "block-23");
   }
   EXPECT_TRUE(destroyed);
 }

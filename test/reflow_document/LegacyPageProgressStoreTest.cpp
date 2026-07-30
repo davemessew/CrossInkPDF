@@ -108,7 +108,7 @@ TEST(LegacyPageProgressStore, LoadsLegacyFourByteTupleAndPageSentinel) {
   EXPECT_FALSE(position.hasSemanticPosition);
   EXPECT_EQ(position.globalWordOrdinal, 0u);
   EXPECT_EQ(position.blockWordOffset, 0u);
-  EXPECT_TRUE(position.blockAnchor.empty());
+  EXPECT_EQ(position.blockAnchor[0], '\0');
 }
 
 TEST(LegacyPageProgressStore, LoadsCurrentExactSixByteTuple) {

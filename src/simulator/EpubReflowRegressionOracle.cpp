@@ -9,6 +9,9 @@
 #include <Epub/parsers/ChapterHtmlSlimParser.h>
 #include <GfxRenderer.h>
 #include <HalStorage.h>
+#include <PdfHalIo.h>
+#include <PdfLayoutWordIndex.h>
+#include <PdfWordCounter.h>
 #include <Print.h>
 
 #include <algorithm>
@@ -72,12 +75,13 @@ class FnvPrint final : public Print {
 class LooseLocalReflowDocument final : public ReflowDocument {
  public:
   LooseLocalReflowDocument(std::string documentPath, std::string cachePath, std::string sectionPath,
-                           std::string imagePath)
+                           std::string imagePath, const uint32_t wordCount)
       : documentPath_(std::move(documentPath)),
         cachePath_(std::move(cachePath)),
         sectionPath_(std::move(sectionPath)),
         imagePath_(std::move(imagePath)),
-        imageHref_(imagePath_.empty() || imagePath_.front() != '/' ? imagePath_ : imagePath_.substr(1)) {}
+        imageHref_(imagePath_.empty() || imagePath_.front() != '/' ? imagePath_ : imagePath_.substr(1)),
+        wordCount_(wordCount) {}
 
   ReflowDocumentFormat getFormat() const override { return ReflowDocumentFormat::Pdf; }
   const char* getStoreFormatKey() const override { return "pdf"; }
@@ -136,6 +140,8 @@ class LooseLocalReflowDocument final : public ReflowDocument {
     return {
         .href = sectionPath_,
         .title = title_,
+        .firstWordOrdinal = 0,
+        .wordCount = wordCount_,
         .tocIndex = 0,
     };
   }
@@ -178,9 +184,88 @@ class LooseLocalReflowDocument final : public ReflowDocument {
 
   bool hasStableReferencePages() const override { return false; }
   bool resolveReferencePage(const int, const float, uint32_t&, uint32_t&) const override { return false; }
-  uint32_t getTotalWordCount() const override { return 0; }
+  uint32_t getTotalWordCount() const override { return wordCount_; }
   bool loadReadingPosition(ReflowReadingPosition&) const override { return false; }
   bool saveReadingPosition(const ReflowReadingPosition&) const override { return false; }
+
+  bool validateLayoutWordIndex(const std::string& sectionCachePath, const int sectionIndex,
+                               const uint16_t pageCount) const override {
+    if (sectionIndex != 0) {
+      return false;
+    }
+    HalFile file;
+    const std::string path = sectionCachePath + ".pwi";
+    if (!Storage.openFileForRead("ORACLE", path, file)) {
+      return false;
+    }
+    PdfLayoutWordIndexInfo info;
+    const PdfStatus status = pdfInspectLayoutWordIndex(pdfHalByteSource(file), &info);
+    file.close();
+    return status.ok() && info.sectionIndex == 0 && info.pageCount == pageCount && info.firstGlobalWordOrdinal == 0 &&
+           info.sectionWordCount == wordCount_;
+  }
+
+  bool removeLayoutWordIndex(const std::string& sectionCachePath) const override {
+    const std::string path = sectionCachePath + ".pwi";
+    return !Storage.exists(path.c_str()) || Storage.remove(path.c_str());
+  }
+
+  bool readLayoutWordRange(const std::string& sectionCachePath, const uint16_t pageCount, const uint16_t page,
+                           ReflowPageSemanticRange& range) const override {
+    range = {};
+    if (page >= pageCount) {
+      return false;
+    }
+    HalFile file;
+    const std::string path = sectionCachePath + ".pwi";
+    if (!Storage.openFileForRead("ORACLE", path, file)) {
+      return false;
+    }
+    PdfLayoutWordRange decoded;
+    const PdfStatus status = pdfReadLayoutWordRange(pdfHalByteSource(file), page, &decoded);
+    file.close();
+    if (!status) {
+      return false;
+    }
+    range.firstGlobalWordOrdinal = decoded.firstGlobalWordOrdinal;
+    range.lastGlobalWordOrdinal = decoded.lastGlobalWordOrdinal;
+    range.firstBlockWordOffset = decoded.firstBlockWordOffset;
+    range.wordCursor = decoded.wordCursor;
+    range.valid = decoded.valid;
+    std::memcpy(range.blockAnchor, decoded.blockAnchor, sizeof(range.blockAnchor));
+    return true;
+  }
+
+  bool findLayoutWordPage(const std::string& sectionCachePath, const char* blockAnchor, const uint32_t blockWordOffset,
+                          const uint32_t globalWordOrdinal, uint16_t& page) const override {
+    HalFile file;
+    const std::string path = sectionCachePath + ".pwi";
+    if (!Storage.openFileForRead("ORACLE", path, file)) {
+      return false;
+    }
+    const PdfByteSource source = pdfHalByteSource(file);
+    PdfStatus status = PdfStatus::failure(PdfError::InvalidOffset);
+    if (blockAnchor && blockAnchor[0] != '\0') {
+      status = pdfFindLayoutAnchor(source, blockAnchor, blockWordOffset, &page);
+    }
+    if (!status) {
+      status = pdfFindLayoutPage(source, globalWordOrdinal, &page);
+    }
+    file.close();
+    return status.ok();
+  }
+
+  bool findLayoutWordCursor(const std::string& sectionCachePath, const uint32_t wordCursor,
+                            uint16_t& page) const override {
+    HalFile file;
+    const std::string path = sectionCachePath + ".pwi";
+    if (!Storage.openFileForRead("ORACLE", path, file)) {
+      return false;
+    }
+    const PdfStatus status = pdfFindLayoutCursor(pdfHalByteSource(file), wordCursor, &page);
+    file.close();
+    return status.ok();
+  }
 
   int localSectionQueries() const { return localSectionQueries_; }
   int sectionStreams() const { return sectionStreams_; }
@@ -193,6 +278,7 @@ class LooseLocalReflowDocument final : public ReflowDocument {
   std::string sectionPath_;
   std::string imagePath_;
   std::string imageHref_;
+  uint32_t wordCount_ = 0;
   std::string title_ = "Loose local XHTML";
   std::string author_ = "CrossInk simulator";
   std::string language_ = "en";
@@ -412,7 +498,7 @@ void appendFrame(JsonObject destination, const FrameOracle& frame) {
 }
 
 bool captureProgressAndBookmark(const std::shared_ptr<Epub>& epub, GfxRenderer& renderer, const OracleLayout& layout,
-                                const FrameOracle& middle, JsonDocument& oracle, std::string& error) {
+                                 const FrameOracle& middle, JsonDocument& oracle, std::string& error) {
   if (!EpubReaderUtils::saveProgress(*epub, middle.sectionIndex, middle.pageIndex, middle.pageCount)) {
     error = "cannot save progress";
     return false;
@@ -487,8 +573,269 @@ bool captureProgressAndBookmark(const std::shared_ptr<Epub>& epub, GfxRenderer& 
   return true;
 }
 
+bool verifySplitWordProducer(const std::string& root, const std::string& cachePath, GfxRenderer& renderer,
+                             std::string& error) {
+  const std::string sourcePath = root + "/generated/split-section.xhtml";
+  std::string xhtml =
+      "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+      "<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><p id=\"b00000000\">lead ";
+  xhtml.append(199, 'A');
+  xhtml += " tail</p></body></html>";
+  if (!writeOracleFile(sourcePath, xhtml, error)) {
+    return false;
+  }
+
+  const int fontId = SETTINGS.getReaderFontId();
+  const float lineCompression = SETTINGS.getReaderLineCompression();
+  const int lineHeight = std::max(1, static_cast<int>(renderer.getLineHeight(fontId) * lineCompression + 0.5F));
+  const int textWidth = renderer.getTextWidth(fontId, "AAAAAAAA");
+  if (textWidth <= 0 || textWidth > UINT16_MAX || lineHeight <= 0 || lineHeight > UINT16_MAX / 2) {
+    error = "split-word producer viewport is outside uint16 bounds";
+    return false;
+  }
+
+  auto document =
+      std::make_shared<LooseLocalReflowDocument>(root + "/split-fixture.pdf", cachePath, sourcePath, "", 3);
+  Section oneLine(document, 0, renderer, "_split_one_line");
+  if (!oneLine.createSectionFile(
+          fontId, lineCompression, false, false, CrossPointSettings::LEFT_ALIGN, static_cast<uint16_t>(textWidth),
+          static_cast<uint16_t>(lineHeight), true, false, CrossPointSettings::IMAGES_SUPPRESS, false, false, nullptr,
+          nullptr, nullptr, EpubRenderMode::Light) ||
+      oneLine.pageCount < 4) {
+    error = "split-word producer did not force one-line pagination";
+    return false;
+  }
+
+  ReflowPageSemanticRange savedSplitRange;
+  bool foundExactOverlap = false;
+  for (uint16_t page = 0; page + 1U < oneLine.pageCount; ++page) {
+    const auto left = oneLine.getSemanticRangeForPage(page);
+    const auto right = oneLine.getSemanticRangeForPage(static_cast<uint16_t>(page + 1U));
+    if (!left || !right || !left->valid || !right->valid || left->firstGlobalWordOrdinal != 1 ||
+        left->lastGlobalWordOrdinal != 1 || right->firstGlobalWordOrdinal != 1 ||
+        right->lastGlobalWordOrdinal != 1 || left->wordCursor != 2 || right->wordCursor != 2 ||
+        left->firstBlockWordOffset != 1 || right->firstBlockWordOffset != 1 ||
+        std::strcmp(left->blockAnchor, "b00000000") != 0 ||
+        std::strcmp(right->blockAnchor, "b00000000") != 0) {
+      continue;
+    }
+    const uint32_t overlapFirst = std::max(left->firstGlobalWordOrdinal, right->firstGlobalWordOrdinal);
+    const uint32_t overlapLast = std::min(left->lastGlobalWordOrdinal, right->lastGlobalWordOrdinal);
+    if (overlapFirst == 1 && overlapLast == 1) {
+      savedSplitRange = *right;
+      foundExactOverlap = true;
+      break;
+    }
+  }
+  if (!foundExactOverlap) {
+    error = "producer sidecar did not preserve the exact one-word split overlap";
+    return false;
+  }
+
+  Section twoLines(document, 0, renderer, "_split_two_lines");
+  if (!twoLines.createSectionFile(
+          fontId, lineCompression, false, false, CrossPointSettings::LEFT_ALIGN, static_cast<uint16_t>(textWidth),
+          static_cast<uint16_t>(lineHeight * 2), true, false, CrossPointSettings::IMAGES_SUPPRESS, false, false,
+          nullptr, nullptr, nullptr, EpubRenderMode::Light) ||
+      twoLines.pageCount == 0 || twoLines.pageCount >= oneLine.pageCount) {
+    error = "split-word relayout did not change pagination";
+    return false;
+  }
+
+  const auto semanticPage =
+      twoLines.getPageForSemanticPosition(savedSplitRange.blockAnchor, savedSplitRange.firstBlockWordOffset,
+                                          savedSplitRange.firstGlobalWordOrdinal);
+  const auto semanticRange =
+      semanticPage ? twoLines.getSemanticRangeForPage(*semanticPage) : std::optional<ReflowPageSemanticRange>{};
+  if (!semanticRange || !semanticRange->valid || semanticRange->firstGlobalWordOrdinal > 1 ||
+      semanticRange->lastGlobalWordOrdinal < 1 || std::strcmp(semanticRange->blockAnchor, "b00000000") != 0 ||
+      semanticRange->firstBlockWordOffset > savedSplitRange.firstBlockWordOffset) {
+    error = "split-word semantic tuple did not resume after changed pagination";
+    return false;
+  }
+
+  const auto cursorPage = twoLines.getPageForSemanticCursor(savedSplitRange.wordCursor);
+  const auto cursorRange =
+      cursorPage ? twoLines.getSemanticRangeForPage(*cursorPage) : std::optional<ReflowPageSemanticRange>{};
+  if (!cursorRange || !cursorRange->valid || cursorRange->firstGlobalWordOrdinal > 2 ||
+      cursorRange->lastGlobalWordOrdinal < 2) {
+    error = "split-word cursor did not resume after changed pagination";
+    return false;
+  }
+  return true;
+}
+
+bool verifyTableSemanticProducer(const std::string& root, const std::string& cachePath, GfxRenderer& renderer,
+                                 std::string& error) {
+  constexpr uint32_t GRID_ROWS = 6;
+  constexpr uint32_t WORDS_PER_CELL = 2;
+  constexpr uint32_t GRID_COLUMNS = 2;
+  const int fontId = SETTINGS.getReaderFontId();
+  const float lineCompression = SETTINGS.getReaderLineCompression();
+  const int lineHeight = std::max(1, static_cast<int>(renderer.getLineHeight(fontId) * lineCompression + 0.5F));
+  const int viewportWidth = renderer.getScreenWidth() - 40;
+  const int fragmentViewportHeight = lineHeight + 13;
+  if (viewportWidth <= 80 || viewportWidth > UINT16_MAX || fragmentViewportHeight <= 0 ||
+      fragmentViewportHeight > UINT16_MAX) {
+    error = "table semantic producer viewport is outside uint16 bounds";
+    return false;
+  }
+
+  const std::string gridSourcePath = root + "/generated/table-grid.xhtml";
+  std::string grid =
+      "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+      "<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><table>";
+  for (uint32_t row = 0; row < GRID_ROWS; ++row) {
+    char leftAnchor[16] = {};
+    char rightAnchor[16] = {};
+    std::snprintf(leftAnchor, sizeof(leftAnchor), "b%08lu", static_cast<unsigned long>(row * GRID_COLUMNS));
+    std::snprintf(rightAnchor, sizeof(rightAnchor), "b%08lu",
+                  static_cast<unsigned long>(row * GRID_COLUMNS + 1U));
+    grid += "<tr><td id=\"";
+    grid += leftAnchor;
+    grid += "\">left alpha</td><td id=\"";
+    grid += rightAnchor;
+    grid += "\">right beta</td></tr>";
+  }
+  grid += "</table></body></html>";
+  if (!writeOracleFile(gridSourcePath, grid, error)) {
+    return false;
+  }
+
+  constexpr uint32_t GRID_WORD_COUNT = GRID_ROWS * GRID_COLUMNS * WORDS_PER_CELL;
+  auto gridDocument =
+      std::make_shared<LooseLocalReflowDocument>(root + "/table-grid.pdf", cachePath, gridSourcePath, "",
+                                                 GRID_WORD_COUNT);
+  Section gridSection(gridDocument, 0, renderer, "_table_grid");
+  if (!gridSection.createSectionFile(
+          fontId, lineCompression, false, false, CrossPointSettings::LEFT_ALIGN,
+          static_cast<uint16_t>(viewportWidth), static_cast<uint16_t>(fragmentViewportHeight), false, false,
+          CrossPointSettings::IMAGES_SUPPRESS, false, false, nullptr, nullptr, nullptr,
+          EpubRenderMode::CrossInkDefault) ||
+      gridSection.pageCount < GRID_ROWS) {
+    error = "multi-page table fragment semantic sidecar did not finish";
+    return false;
+  }
+  const auto gridLast =
+      gridSection.getSemanticRangeForPage(static_cast<uint16_t>(gridSection.pageCount - 1U));
+  if (!gridLast || gridLast->wordCursor != GRID_WORD_COUNT) {
+    error = "multi-page table fragment semantic sidecar has an incomplete cursor";
+    return false;
+  }
+  for (uint32_t row = 0; row < GRID_ROWS; ++row) {
+    char anchor[16] = {};
+    std::snprintf(anchor, sizeof(anchor), "b%08lu", static_cast<unsigned long>(row * GRID_COLUMNS));
+    const uint32_t ordinal = row * GRID_COLUMNS * WORDS_PER_CELL;
+    const auto page = gridSection.getPageForSemanticPosition(anchor, 0, ordinal);
+    const auto range = page ? gridSection.getSemanticRangeForPage(*page) : std::optional<ReflowPageSemanticRange>{};
+    if (!range || !range->valid || range->firstGlobalWordOrdinal > ordinal ||
+        range->lastGlobalWordOrdinal < ordinal || range->firstBlockWordOffset != 0 ||
+        std::strcmp(range->blockAnchor, anchor) != 0) {
+      error = "table fragment cell block did not retain its exact anchor and offset";
+      return false;
+    }
+  }
+
+  const int semanticFragmentWidth = renderer.getTextWidth(fontId, "AAAAAAAA") + 12;
+  const int semanticFragmentHeight = lineHeight * 8 + 13;
+  if (semanticFragmentWidth <= 32 || semanticFragmentWidth > UINT16_MAX || semanticFragmentHeight <= 0 ||
+      semanticFragmentHeight > UINT16_MAX) {
+    error = "table split-semantic witness viewport is outside uint16 bounds";
+    return false;
+  }
+  const std::string semanticSourcePath = root + "/generated/table-semantic-flags.xhtml";
+  constexpr char SEMANTIC_TABLE_XHTML[] =
+      "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+      "<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><table>"
+      "<tr><td id=\"b00000000\">join<em>ed</em></td></tr>"
+      "<tr><td id=\"b00000001\">lead AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA tail</td></tr>"
+      "</table></body></html>";
+  if (!writeOracleFile(semanticSourcePath, SEMANTIC_TABLE_XHTML, error)) {
+    return false;
+  }
+  constexpr uint32_t SEMANTIC_TABLE_WORD_COUNT = 4;
+  auto semanticDocument =
+      std::make_shared<LooseLocalReflowDocument>(root + "/table-semantic-flags.pdf", cachePath,
+                                                 semanticSourcePath, "", SEMANTIC_TABLE_WORD_COUNT);
+  Section semanticSection(semanticDocument, 0, renderer, "_table_semantic_flags");
+  if (!semanticSection.createSectionFile(
+          fontId, lineCompression, false, false, CrossPointSettings::LEFT_ALIGN,
+          static_cast<uint16_t>(semanticFragmentWidth), static_cast<uint16_t>(semanticFragmentHeight), false, false,
+          CrossPointSettings::IMAGES_SUPPRESS, false, false, nullptr, nullptr, nullptr,
+          EpubRenderMode::CrossInkDefault) ||
+      semanticSection.pageCount == 0) {
+    error = "table fragment lost inline-attachment or split-continuation semantics";
+    return false;
+  }
+  auto semanticPage = semanticSection.loadPageFromSectionFile();
+  const bool usedTableFragment =
+      semanticPage &&
+      std::any_of(semanticPage->elements.begin(), semanticPage->elements.end(),
+                  [](const std::shared_ptr<PageElement>& element) {
+                    return element && element->getTag() == TAG_PageTableFragment;
+                  });
+  const auto semanticLast =
+      semanticSection.getSemanticRangeForPage(static_cast<uint16_t>(semanticSection.pageCount - 1U));
+  const auto longCellPage = semanticSection.getPageForSemanticPosition("b00000001", 0, 1);
+  const auto longCellRange =
+      longCellPage ? semanticSection.getSemanticRangeForPage(*longCellPage)
+                   : std::optional<ReflowPageSemanticRange>{};
+  if (!usedTableFragment || !semanticLast || semanticLast->wordCursor != SEMANTIC_TABLE_WORD_COUNT ||
+      !longCellRange || !longCellRange->valid || longCellRange->firstGlobalWordOrdinal > 1 ||
+      longCellRange->lastGlobalWordOrdinal < 3) {
+    error = "table fragment semantic flags did not preserve the exact four-word cursor";
+    return false;
+  }
+
+  const std::string fallbackSourcePath = root + "/generated/table-fallback.xhtml";
+  constexpr char FALLBACK_XHTML[] =
+      "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+      "<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><table>"
+      "<tr><td id=\"b00000000\">zero alpha</td><td id=\"b00000001\">one beta</td></tr>"
+      "<tr><td id=\"b00000002\" colspan=\"2\">two gamma</td><td id=\"b00000003\">three delta</td></tr>"
+      "</table></body></html>";
+  if (!writeOracleFile(fallbackSourcePath, FALLBACK_XHTML, error)) {
+    return false;
+  }
+  constexpr uint32_t FALLBACK_WORD_COUNT = 8;
+  auto fallbackDocument =
+      std::make_shared<LooseLocalReflowDocument>(root + "/table-fallback.pdf", cachePath, fallbackSourcePath, "",
+                                                 FALLBACK_WORD_COUNT);
+  Section fallbackSection(fallbackDocument, 0, renderer, "_table_fallback");
+  if (!fallbackSection.createSectionFile(
+          fontId, lineCompression, false, false, CrossPointSettings::LEFT_ALIGN,
+          static_cast<uint16_t>(viewportWidth), static_cast<uint16_t>(lineHeight), false, false,
+          CrossPointSettings::IMAGES_SUPPRESS, false, false, nullptr, nullptr, nullptr,
+          EpubRenderMode::CrossInkDefault) ||
+      fallbackSection.pageCount < 4) {
+    error = "table paragraph fallback semantic sidecar did not finish";
+    return false;
+  }
+  const auto fallbackLast =
+      fallbackSection.getSemanticRangeForPage(static_cast<uint16_t>(fallbackSection.pageCount - 1U));
+  if (!fallbackLast || fallbackLast->wordCursor != FALLBACK_WORD_COUNT) {
+    error = "table paragraph fallback semantic sidecar has an incomplete cursor";
+    return false;
+  }
+  for (uint32_t cell = 0; cell < 4; ++cell) {
+    char anchor[16] = {};
+    std::snprintf(anchor, sizeof(anchor), "b%08lu", static_cast<unsigned long>(cell));
+    const uint32_t ordinal = cell * WORDS_PER_CELL;
+    const auto page = fallbackSection.getPageForSemanticPosition(anchor, 0, ordinal);
+    const auto range =
+        page ? fallbackSection.getSemanticRangeForPage(*page) : std::optional<ReflowPageSemanticRange>{};
+    if (!range || !range->valid || range->firstGlobalWordOrdinal > ordinal ||
+        range->lastGlobalWordOrdinal < ordinal || range->firstBlockWordOffset != 0 ||
+        std::strcmp(range->blockAnchor, anchor) != 0) {
+      error = "table paragraph fallback cell did not retain its exact anchor and offset";
+      return false;
+    }
+  }
+  return true;
+}
+
 bool verifyLooseLocalSource(const char* passName, GfxRenderer& renderer, const OracleLayout& layout,
-                            std::string& error) {
+                              std::string& error) {
   const std::string root = std::string(CACHE_ROOT) + "/loose_source_" + passName;
   const std::string generatedDir = root + "/generated";
   const std::string cachePath = root + "/cache";
@@ -502,14 +849,21 @@ bool verifyLooseLocalSource(const char* passName, GfxRenderer& renderer, const O
     return false;
   }
 
+  constexpr char HEADING_TEXT[] = "Loose local source";
+  constexpr char INTRO_TEXT[] = "This XHTML is immutable generation-owned input.";
+  constexpr char IMAGE_FALLBACK_TEXT[] = "[Image: invalid borrowed image]";
+  constexpr char REPEATED_TEXT[] = "Preview cancellation must leave this borrowed source unchanged.";
   std::string xhtml =
       "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
-      "<html xmlns=\"http://www.w3.org/1999/xhtml\"><body>"
-      "<h1 id=\"preview\">Loose local source</h1>"
-      "<p>This XHTML is immutable generation-owned input.</p>"
-      "<img src=\"invalid.jpg\" alt=\"invalid borrowed image\"/>";
+      "<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><h1 id=\"preview\">";
+  xhtml += HEADING_TEXT;
+  xhtml += "</h1><p>";
+  xhtml += INTRO_TEXT;
+  xhtml += "</p><img src=\"invalid.jpg\" alt=\"invalid borrowed image\"/>";
   for (int i = 0; i < 240; ++i) {
-    xhtml += "<p>Preview cancellation must leave this borrowed source unchanged.</p>";
+    xhtml += "<p>";
+    xhtml += REPEATED_TEXT;
+    xhtml += "</p>";
   }
   xhtml += "</body></html>";
 
@@ -526,7 +880,29 @@ bool verifyLooseLocalSource(const char* passName, GfxRenderer& renderer, const O
     return false;
   }
 
-  auto document = std::make_shared<LooseLocalReflowDocument>(root + "/fixture.pdf", cachePath, sourcePath, imagePath);
+  PdfWordCounter wordCounter;
+  if (!wordCounter.consume(reinterpret_cast<const uint8_t*>(HEADING_TEXT), sizeof(HEADING_TEXT) - 1) ||
+      !wordCounter.consume(reinterpret_cast<const uint8_t*>(" "), 1) ||
+      !wordCounter.consume(reinterpret_cast<const uint8_t*>(INTRO_TEXT), sizeof(INTRO_TEXT) - 1) ||
+      !wordCounter.consume(reinterpret_cast<const uint8_t*>(" "), 1) ||
+      !wordCounter.consume(reinterpret_cast<const uint8_t*>(IMAGE_FALLBACK_TEXT), sizeof(IMAGE_FALLBACK_TEXT) - 1)) {
+    error = "cannot count loose-source semantic words";
+    return false;
+  }
+  for (int i = 0; i < 240; ++i) {
+    if (!wordCounter.consume(reinterpret_cast<const uint8_t*>(" "), 1) ||
+        !wordCounter.consume(reinterpret_cast<const uint8_t*>(REPEATED_TEXT), sizeof(REPEATED_TEXT) - 1)) {
+      error = "cannot count repeated loose-source semantic words";
+      return false;
+    }
+  }
+  if (!wordCounter.finish()) {
+    error = "cannot finish loose-source semantic word count";
+    return false;
+  }
+
+  auto document = std::make_shared<LooseLocalReflowDocument>(root + "/fixture.pdf", cachePath, sourcePath, imagePath,
+                                                             wordCounter.words());
   Section section(document, 0, renderer, "_loose");
   if (!section.hasHtmlCache() || Storage.exists(htmlPath.c_str()) || Storage.exists(tempHtmlPath.c_str())) {
     error = "borrowed local section was not recognized without an HTML cache copy";
@@ -542,6 +918,16 @@ bool verifyLooseLocalSource(const char* passName, GfxRenderer& renderer, const O
   }
 
   const uint16_t mediumPageCount = section.pageCount;
+  const uint16_t mediumSemanticPage = mediumPageCount / 2U;
+  const auto mediumSemantic = section.getSemanticRangeForPage(mediumSemanticPage);
+  const auto mediumLastSemantic = mediumPageCount == 0
+                                      ? std::optional<ReflowPageSemanticRange>{}
+                                      : section.getSemanticRangeForPage(static_cast<uint16_t>(mediumPageCount - 1U));
+  if (!mediumSemantic || !mediumSemantic->valid || !mediumLastSemantic || !mediumLastSemantic->valid ||
+      mediumLastSemantic->lastGlobalWordOrdinal + 1U != wordCounter.words()) {
+    error = "medium-font PDF semantic sidecar is incomplete";
+    return false;
+  }
   {
     RenderLock renderLock;
     SETTINGS.fontSize = CrossPointSettings::FONT_SIZE::LARGE;
@@ -554,13 +940,30 @@ bool verifyLooseLocalSource(const char* passName, GfxRenderer& renderer, const O
       SETTINGS.hyphenationEnabled, false, SETTINGS.imageRendering, SETTINGS.bionicReadingEnabled,
       SETTINGS.guideReadingEnabled, nullptr, nullptr, nullptr, EpubRenderMode::CrossInkDefault);
   const uint16_t largePageCount = largeFontSection.pageCount;
+  const auto largeSemanticPage = largeFontSection.getPageForSemanticPosition(
+      mediumSemantic->blockAnchor, mediumSemantic->firstBlockWordOffset, mediumSemantic->firstGlobalWordOrdinal);
+  const auto largeSemantic = largeSemanticPage ? largeFontSection.getSemanticRangeForPage(*largeSemanticPage)
+                                               : std::optional<ReflowPageSemanticRange>{};
+  const auto largeLastSemantic =
+      largePageCount == 0 ? std::optional<ReflowPageSemanticRange>{}
+                          : largeFontSection.getSemanticRangeForPage(static_cast<uint16_t>(largePageCount - 1U));
   {
     RenderLock renderLock;
     SETTINGS.fontSize = CrossPointSettings::FONT_SIZE::MEDIUM;
     UITheme::getInstance().reload();
   }
-  if (!largeFontCreated || largePageCount == 0 || largePageCount == mediumPageCount) {
+  if (!largeFontCreated || largePageCount == 0 || largePageCount == mediumPageCount || !largeSemantic ||
+      !largeSemantic->valid || mediumSemantic->firstGlobalWordOrdinal < largeSemantic->firstGlobalWordOrdinal ||
+      mediumSemantic->firstGlobalWordOrdinal > largeSemantic->lastGlobalWordOrdinal || !largeLastSemantic ||
+      !largeLastSemantic->valid || largeLastSemantic->lastGlobalWordOrdinal + 1U != wordCounter.words()) {
     error = "device font-size positive control did not alter loose-source pagination";
+    return false;
+  }
+
+  if (!verifySplitWordProducer(root, cachePath, renderer, error)) {
+    return false;
+  }
+  if (!verifyTableSemanticProducer(root, cachePath, renderer, error)) {
     return false;
   }
 
@@ -689,6 +1092,16 @@ bool runEpubReflowRegressionOracle(GfxRenderer& renderer, const char* bookPath, 
     }
     uint16_t pageCount = 0;
     if (!loadOrCreateSection(epub, renderer, layout, index, pageCount, error)) {
+      return false;
+    }
+    const std::string semanticSidecar = epub->getCachePath() + "/sections/" + std::to_string(index) + ".bin.pwi";
+    if (Storage.exists(semanticSidecar.c_str())) {
+      error = "EPUB unexpectedly produced a PDF semantic sidecar";
+      return false;
+    }
+    const std::string semanticSidecarTemp = semanticSidecar + ".tmp";
+    if (Storage.exists(semanticSidecarTemp.c_str())) {
+      error = "EPUB unexpectedly produced a temporary PDF semantic sidecar";
       return false;
     }
     pageCounts.push_back(pageCount);

@@ -9,8 +9,10 @@ add_executable(PdfNavigationTest
   ${REPO_ROOT}/lib/PdfReflow/PdfCacheManifest.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfBuildCheckpoint.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfCacheStore.cpp
+  ${REPO_ROOT}/lib/PdfReflow/PdfLayoutWordIndex.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfMetadataStore.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfOutline.cpp
+  ${REPO_ROOT}/lib/PdfReflow/PdfProgressStore.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfReflowDocument.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfSemanticWriter.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfUnicode.cpp

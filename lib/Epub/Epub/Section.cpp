@@ -7,8 +7,14 @@
 #include <Logging.h>
 #include <Memory.h>
 #include <MemoryBudget.h>
+#include <PdfCacheIo.h>
+#include <PdfHalIo.h>
+#include <PdfLayoutWordIndex.h>
+#include <PdfWordCounter.h>
 #include <ScratchWorkspace.h>
 #include <Serialization.h>
+
+#include <cstring>
 
 #include "Epub/css/CssParser.h"
 #include "Page.h"
@@ -85,6 +91,258 @@ size_t sectionHtmlStreamChunkSize(const bool preview) {
 }
 }  // namespace
 
+struct Section::PdfPageBuildContext {
+  Section& section;
+  std::unique_ptr<PageLutEntry[]>& lut;
+  uint16_t& lutCapacity;
+  uint16_t& lutCount;
+  bool& pageCompletionFailed;
+  bool* layoutAbortedForLowMemory;
+  HalFile sidecarFile;
+  PdfLayoutWordIndexWriter writer;
+  PdfWordCounter wordCounter;
+  PdfLayoutWordRange pageRange{};
+  uint32_t sectionFirstWordOrdinal = 0;
+  uint32_t nextGlobalWordOrdinal = 0;
+  uint32_t wordsExtractedInBlock = 0;
+  size_t scannedPageElements = 0;
+  char currentBlockAnchor[PDF_LAYOUT_WORD_ANCHOR_BYTES] = {};
+  char finalPath[PDF_CACHE_PATH_CAPACITY] = {};
+  char tempPath[PDF_CACHE_PATH_CAPACITY] = {};
+  bool blockHasToken = false;
+  bool promoted = false;
+
+  PdfPageBuildContext(Section& section, std::unique_ptr<PageLutEntry[]>& lut, uint16_t& lutCapacity, uint16_t& lutCount,
+                      bool& pageCompletionFailed, bool* layoutAbortedForLowMemory)
+      : section(section),
+        lut(lut),
+        lutCapacity(lutCapacity),
+        lutCount(lutCount),
+        pageCompletionFailed(pageCompletionFailed),
+        layoutAbortedForLowMemory(layoutAbortedForLowMemory) {}
+
+  ~PdfPageBuildContext() {
+    if (sidecarFile) {
+      sidecarFile.close();
+    }
+    if (!promoted && tempPath[0] != '\0' && Storage.exists(tempPath)) {
+      Storage.remove(tempPath);
+    }
+  }
+
+  bool initialize(const std::string& sectionCachePath, const int sectionIndex, const ReflowSectionInfo& info) {
+    const int finalLength = std::snprintf(finalPath, sizeof(finalPath), "%s.pwi", sectionCachePath.c_str());
+    const int tempLength = finalLength > 0 && static_cast<size_t>(finalLength) < sizeof(finalPath)
+                               ? std::snprintf(tempPath, sizeof(tempPath), "%s.tmp", finalPath)
+                               : -1;
+    if (tempLength <= 0 || static_cast<size_t>(tempLength) >= sizeof(tempPath)) {
+      LOG_ERR("SCT", "PDF semantic sidecar path exceeds fixed capacity");
+      return false;
+    }
+    if (Storage.exists(tempPath)) {
+      Storage.remove(tempPath);
+    }
+    if (!Storage.openFileForWrite("SCT", tempPath, sidecarFile)) {
+      LOG_ERR("SCT", "Failed to create PDF semantic sidecar");
+      return false;
+    }
+    const PdfStatus status = writer.begin(pdfHalByteSink(sidecarFile), static_cast<uint16_t>(sectionIndex),
+                                          info.firstWordOrdinal, info.wordCount);
+    if (!status) {
+      LOG_ERR("SCT", "Failed to start PDF semantic sidecar (%u)", static_cast<unsigned>(status.error));
+      return false;
+    }
+    sectionFirstWordOrdinal = info.firstWordOrdinal;
+    nextGlobalWordOrdinal = info.firstWordOrdinal;
+    return true;
+  }
+
+  bool beginTextBlock(const char* const anchor, const size_t anchorLength) {
+    wordCounter.reset();
+    wordsExtractedInBlock = 0;
+    blockHasToken = false;
+    std::memset(currentBlockAnchor, 0, sizeof(currentBlockAnchor));
+    if (anchor != nullptr && anchorLength < sizeof(currentBlockAnchor)) {
+      std::memcpy(currentBlockAnchor, anchor, anchorLength);
+    }
+    return true;
+  }
+
+  bool trackLine(const TextBlock& line) {
+    const uint32_t wordsBefore = wordCounter.words();
+    bool beginsWithSplitContinuation = false;
+    for (uint16_t index = 0; index < line.wordCount(); ++index) {
+      const uint8_t flags = line.wordFlags(index);
+      const bool attaches =
+          (flags & (TextBlock::WORD_FLAG_SEMANTIC_ATTACHES | TextBlock::WORD_FLAG_SEMANTIC_SPLIT_CONTINUATION)) != 0;
+      if (index == 0) {
+        beginsWithSplitContinuation = (flags & TextBlock::WORD_FLAG_SEMANTIC_SPLIT_CONTINUATION) != 0;
+      }
+      if (blockHasToken && !attaches) {
+        static constexpr uint8_t separator = ' ';
+        const PdfStatus status = wordCounter.consume(&separator, 1);
+        if (!status) {
+          LOG_ERR("SCT", "Failed to separate PDF layout words at byte %llu",
+                  static_cast<unsigned long long>(status.offset));
+          return false;
+        }
+      }
+      const PdfStatus status =
+          wordCounter.consume(reinterpret_cast<const uint8_t*>(line.wordText(index)), line.wordTextLen(index));
+      if (!status) {
+        LOG_ERR("SCT", "Failed to count PDF layout words at byte %llu", static_cast<unsigned long long>(status.offset));
+        return false;
+      }
+      blockHasToken = true;
+    }
+
+    const uint32_t wordsAfter = wordCounter.words();
+    const uint32_t addedWords = wordsAfter - wordsBefore;
+    if (addedWords == 0 && !beginsWithSplitContinuation) {
+      return true;
+    }
+    if (addedWords > UINT32_MAX - nextGlobalWordOrdinal) {
+      LOG_ERR("SCT", "PDF semantic word ordinal overflow");
+      return false;
+    }
+    const uint32_t firstOrdinal = beginsWithSplitContinuation && nextGlobalWordOrdinal > sectionFirstWordOrdinal
+                                      ? nextGlobalWordOrdinal - 1U
+                                      : nextGlobalWordOrdinal;
+    const uint32_t lastOrdinal = addedWords == 0 ? firstOrdinal : nextGlobalWordOrdinal + addedWords - 1U;
+    if (!pageRange.valid) {
+      pageRange.valid = true;
+      pageRange.firstGlobalWordOrdinal = firstOrdinal;
+      pageRange.firstBlockWordOffset = beginsWithSplitContinuation && wordsExtractedInBlock != 0
+                                           ? wordsExtractedInBlock - 1U
+                                           : wordsExtractedInBlock;
+      std::memcpy(pageRange.blockAnchor, currentBlockAnchor, sizeof(pageRange.blockAnchor));
+    }
+    pageRange.lastGlobalWordOrdinal = lastOrdinal;
+    nextGlobalWordOrdinal += addedWords;
+    wordsExtractedInBlock = wordsAfter;
+    return true;
+  }
+
+  bool scanNewPageLines(const Page* const page) {
+    if (page == nullptr) {
+      return true;
+    }
+    if (scannedPageElements > page->elements.size()) {
+      LOG_ERR("SCT", "PDF semantic page cursor moved backwards");
+      return false;
+    }
+    for (size_t index = scannedPageElements; index < page->elements.size(); ++index) {
+      const auto& element = page->elements[index];
+      if (element && element->getTag() == TAG_PageLine) {
+        const auto& line = static_cast<const PageLine&>(*element);
+        if (line.getBlock() && !trackLine(*line.getBlock())) {
+          return false;
+        }
+      }
+    }
+    scannedPageElements = page->elements.size();
+    return true;
+  }
+
+  bool finishTextBlock(const Page* const page) {
+    if (!scanNewPageLines(page)) {
+      return false;
+    }
+    if (blockHasToken) {
+      const PdfStatus status = wordCounter.finish();
+      if (!status) {
+        LOG_ERR("SCT", "Failed to finalize PDF word tracking at byte %llu",
+                static_cast<unsigned long long>(status.offset));
+        return false;
+      }
+    }
+    return true;
+  }
+
+  bool appendPage(const Page* const page) {
+    if (page == nullptr || !scanNewPageLines(page)) {
+      return false;
+    }
+    pageRange.wordCursor = nextGlobalWordOrdinal;
+    const PdfStatus status = writer.append(pageRange);
+    if (!status) {
+      LOG_ERR("SCT", "Failed PDF semantic page %u (%u): range=%lu-%lu", lutCount, static_cast<unsigned>(status.error),
+              static_cast<unsigned long>(pageRange.firstGlobalWordOrdinal),
+              static_cast<unsigned long>(pageRange.lastGlobalWordOrdinal));
+      return false;
+    }
+    pageRange = {};
+    scannedPageElements = 0;
+    return true;
+  }
+
+  bool finishSidecar() {
+    const PdfStatus status = writer.finish();
+    if (!status || !sidecarFile.sync()) {
+      LOG_ERR("SCT", "Failed to finalize PDF semantic sidecar (%u)", static_cast<unsigned>(status.error));
+      return false;
+    }
+    sidecarFile.close();
+    return true;
+  }
+
+  bool promoteSidecar() {
+    if (Storage.exists(finalPath) && !Storage.remove(finalPath)) {
+      LOG_ERR("SCT", "Failed to replace prior PDF semantic sidecar");
+      return false;
+    }
+    if (!Storage.rename(tempPath, finalPath)) {
+      LOG_ERR("SCT", "Failed to promote PDF semantic sidecar into place");
+      return false;
+    }
+    promoted = true;
+    return true;
+  }
+};
+
+void Section::completePdfPage(void* const context, std::unique_ptr<Page> page, const uint16_t paragraphIndex,
+                              const uint16_t listItemIndex) {
+  auto& build = *static_cast<PdfPageBuildContext*>(context);
+  if (build.pageCompletionFailed) {
+    return;
+  }
+  if (!build.appendPage(page.get())) {
+    build.pageCompletionFailed = true;
+    return;
+  }
+  if (build.lutCount == UINT16_MAX) {
+    LOG_ERR("SCT", "Section page count exceeded cache format limit");
+    build.pageCompletionFailed = true;
+    return;
+  }
+  if (!ensurePageLutCapacity(build.lut, build.lutCapacity, build.lutCount)) {
+    LOG_ERR("SCT", "Failed to grow section page LUT from %u entries", build.lutCapacity);
+    if (build.layoutAbortedForLowMemory) {
+      *build.layoutAbortedForLowMemory = true;
+    }
+    build.pageCompletionFailed = true;
+    return;
+  }
+  const uint32_t fileOffset = build.section.onPageComplete(std::move(page));
+  if (fileOffset == 0) {
+    build.pageCompletionFailed = true;
+    return;
+  }
+  build.lut[build.lutCount++] = {fileOffset, paragraphIndex, listItemIndex};
+}
+
+bool Section::finishPdfTextBlock(void* const context, const Page* const currentPage) {
+  return static_cast<PdfPageBuildContext*>(context)->finishTextBlock(currentPage);
+}
+
+bool Section::beginPdfTextBlock(void* const context, const char* const anchor, const size_t anchorLength) {
+  return static_cast<PdfPageBuildContext*>(context)->beginTextBlock(anchor, anchorLength);
+}
+
+bool Section::trackPdfTextLine(void* const context, const TextBlock* const line) {
+  return line != nullptr && static_cast<PdfPageBuildContext*>(context)->trackLine(*line);
+}
+
 Section::Section(const std::shared_ptr<ReflowDocument>& document, const int sectionIndex, GfxRenderer& renderer,
                  const char* cacheSuffix)
     : document(document),
@@ -92,6 +350,10 @@ Section::Section(const std::shared_ptr<ReflowDocument>& document, const int sect
       renderer(renderer),
       filePath(document->getCachePath() + "/sections/" + std::to_string(sectionIndex) +
                (cacheSuffix ? cacheSuffix : "") + ".bin") {}
+
+bool Section::usesPdfWordIndex() const {
+  return document->getFormat() == ReflowDocumentFormat::Pdf && filePath.find("_fn_") == std::string::npos;
+}
 
 uint32_t Section::onPageComplete(std::unique_ptr<Page> page) {
   if (!file) {
@@ -247,12 +509,36 @@ bool Section::loadSectionFile(const int fontId, const float lineCompression, con
 
   // Explicit close() required: member variable persists beyond function scope
   file.close();
+  if (usesPdfWordIndex()) {
+    if (!document->validateLayoutWordIndex(filePath, sectionIndex, pageCount)) {
+      LOG_ERR("SCT", "PDF semantic sidecar invalid for section %d", sectionIndex);
+      clearCache();
+      return false;
+    }
+  }
   LOG_DBG("SCT", "Deserialization succeeded: %d pages", pageCount);
   return true;
 }
 
 // Your updated class method (assuming you are using the 'SD' object, which is a wrapper for a specific filesystem)
 bool Section::clearCache() const {
+  if (usesPdfWordIndex()) {
+    const bool hasSection = Storage.exists(filePath.c_str());
+    bool removed = true;
+    if (hasSection && !Storage.remove(filePath.c_str())) {
+      LOG_ERR("SCT", "Failed to clear cache");
+      removed = false;
+    }
+    if (!document->removeLayoutWordIndex(filePath)) {
+      LOG_ERR("SCT", "Failed to clear PDF semantic sidecar");
+      removed = false;
+    }
+    if (removed) {
+      LOG_DBG("SCT", hasSection ? "Cache cleared successfully" : "Cache does not exist, no action needed");
+    }
+    return removed;
+  }
+
   if (!Storage.exists(filePath.c_str())) {
     LOG_DBG("SCT", "Cache does not exist, no action needed");
     return true;
@@ -447,35 +733,68 @@ bool Section::createSectionFile(const int fontId, const float lineCompression, c
     }
   }
 
-  ChapterHtmlSlimParser visitor(
-      *document, sectionIndex, parsePath, renderer, fontId, lineCompression, extraParagraphSpacing,
-      forceParagraphIndents, paragraphAlignment, viewportWidth, viewportHeight, hyphenationEnabled,
-      effectiveBionicReadingEnabled, effectiveGuideReadingEnabled,
-      [this, &lut, &lutCapacity, &lutCount, &pageCompletionFailed, layoutAbortedForLowMemory](
-          std::unique_ptr<Page> page, const uint16_t paragraphIndex, const uint16_t listItemIndex) {
-        if (pageCompletionFailed) {
-          return;
+  const bool semanticPositionEnabled = usesPdfWordIndex() && !buildOptions.isPreview();
+  std::unique_ptr<PdfPageBuildContext> pdfBuild;
+  std::function<void(std::unique_ptr<Page>, uint16_t, uint16_t)> completePage;
+  ChapterHtmlPaginationHooks paginationHooks;
+  if (semanticPositionEnabled) {
+    const ReflowSectionInfo sectionInfo = document->getSectionInfo(sectionIndex);
+    // This single PDF-only allocation keeps the writer, counter, and fixed path
+    // buffers alive across parser callbacks without enlarging Section or parser.
+    pdfBuild = makeUniqueNoThrow<PdfPageBuildContext>(*this, lut, lutCapacity, lutCount, pageCompletionFailed,
+                                                      layoutAbortedForLowMemory);
+    if (!pdfBuild || !pdfBuild->initialize(filePath, sectionIndex, sectionInfo)) {
+      LOG_ERR("SCT", "Failed to allocate or initialize PDF semantic build context");
+      if (!pdfBuild && layoutAbortedForLowMemory) {
+        *layoutAbortedForLowMemory = true;
+      }
+      file.close();
+      Storage.remove(tmpSectionPath.c_str());
+      cleanupTempHtml();
+      return false;
+    }
+    static const ChapterHtmlPaginationVtable pdfPaginationVtable = {
+        completePdfPage,
+        finishPdfTextBlock,
+        beginPdfTextBlock,
+        trackPdfTextLine,
+    };
+    paginationHooks = {pdfBuild.get(), &pdfPaginationVtable};
+  } else {
+    completePage = [this, &lut, &lutCapacity, &lutCount, &pageCompletionFailed, layoutAbortedForLowMemory](
+                       std::unique_ptr<Page> page, const uint16_t paragraphIndex, const uint16_t listItemIndex) {
+      if (pageCompletionFailed) {
+        return;
+      }
+      if (lutCount == UINT16_MAX) {
+        LOG_ERR("SCT", "Section page count exceeded cache format limit");
+        pageCompletionFailed = true;
+        return;
+      }
+      if (!ensurePageLutCapacity(lut, lutCapacity, lutCount)) {
+        LOG_ERR("SCT", "Failed to grow section page LUT from %u entries", lutCapacity);
+        if (layoutAbortedForLowMemory) {
+          *layoutAbortedForLowMemory = true;
         }
-        if (lutCount == UINT16_MAX) {
-          LOG_ERR("SCT", "Section page count exceeded cache format limit");
-          pageCompletionFailed = true;
-          return;
-        }
-        if (!ensurePageLutCapacity(lut, lutCapacity, lutCount)) {
-          LOG_ERR("SCT", "Failed to grow section page LUT from %u entries", lutCapacity);
-          if (layoutAbortedForLowMemory) *layoutAbortedForLowMemory = true;
-          pageCompletionFailed = true;
-          return;
-        }
-        const uint32_t fileOffset = this->onPageComplete(std::move(page));
-        if (fileOffset == 0) {
-          pageCompletionFailed = true;
-          return;
-        }
-        lut[lutCount++] = {fileOffset, paragraphIndex, listItemIndex};
-      },
-      embeddedStyle, contentBase, imageBasePath, imageRendering, std::move(tocAnchors), popupFn, cssParser, renderMode,
-      buildOptions.isPreview() ? std::string(buildOptions.previewAnchor) : std::string{}, buildOptions.previewMaxPages);
+        pageCompletionFailed = true;
+        return;
+      }
+      const uint32_t fileOffset = onPageComplete(std::move(page));
+      if (fileOffset == 0) {
+        pageCompletionFailed = true;
+        return;
+      }
+      lut[lutCount++] = {fileOffset, paragraphIndex, listItemIndex};
+    };
+  }
+
+  ChapterHtmlSlimParser visitor(*document, sectionIndex, parsePath, renderer, fontId, lineCompression,
+                                extraParagraphSpacing, forceParagraphIndents, paragraphAlignment, viewportWidth,
+                                viewportHeight, hyphenationEnabled, effectiveBionicReadingEnabled,
+                                effectiveGuideReadingEnabled, std::move(completePage), embeddedStyle, contentBase,
+                                imageBasePath, imageRendering, std::move(tocAnchors), popupFn, cssParser, renderMode,
+                                buildOptions.isPreview() ? std::string(buildOptions.previewAnchor) : std::string{},
+                                buildOptions.previewMaxPages, paginationHooks);
   Hyphenator::setPreferredLanguage(document->getLanguage());
   LOG_DBG("SCT", "Parser start: spine=%d free=%u maxAlloc=%u", sectionIndex, ESP.getFreeHeap(), ESP.getMaxAllocHeap());
   const bool success = visitor.parseAndBuildPages();
@@ -502,6 +821,10 @@ bool Section::createSectionFile(const int fontId, const float lineCompression, c
       Storage.remove(tmpHtmlPath.c_str());
       tempHtmlMayDelete = false;
     }
+  }
+
+  if (pdfBuild && success && !pageCompletionFailed && !pdfBuild->finishSidecar()) {
+    pageCompletionFailed = true;
   }
 
   if (!success || pageCompletionFailed) {
@@ -602,6 +925,22 @@ bool Section::createSectionFile(const int fontId, const float lineCompression, c
     }
     return false;
   }
+  if (pdfBuild && !pdfBuild->promoteSidecar()) {
+    Storage.remove(filePath.c_str());
+    if (cssParser) {
+      cssParser->clear();
+    }
+    return false;
+  }
+  if (pdfBuild && !document->validateLayoutWordIndex(filePath, sectionIndex, pageCount)) {
+    LOG_ERR("SCT", "Promoted PDF semantic sidecar failed validation");
+    Storage.remove(filePath.c_str());
+    document->removeLayoutWordIndex(filePath);
+    if (cssParser) {
+      cssParser->clear();
+    }
+    return false;
+  }
   if (cssParser) {
     cssParser->clear();
   }
@@ -646,6 +985,38 @@ std::unique_ptr<Page> Section::loadPageFromSectionFile() {
   auto page = Page::deserialize(file);
   file.close();
   return page;
+}
+
+std::optional<ReflowPageSemanticRange> Section::getSemanticRangeForPage(const uint16_t page) {
+  if (!usesPdfWordIndex() || page >= pageCount) {
+    return std::nullopt;
+  }
+  file.close();
+  ReflowPageSemanticRange range;
+  return document->readLayoutWordRange(filePath, pageCount, page, range) ? std::optional<ReflowPageSemanticRange>(range)
+                                                                         : std::nullopt;
+}
+
+std::optional<uint16_t> Section::getPageForSemanticPosition(const char* const blockAnchor,
+                                                            const uint32_t blockWordOffset,
+                                                            const uint32_t globalWordOrdinal) {
+  if (!usesPdfWordIndex()) {
+    return std::nullopt;
+  }
+  file.close();
+  uint16_t page = 0;
+  return document->findLayoutWordPage(filePath, blockAnchor, blockWordOffset, globalWordOrdinal, page)
+             ? std::optional<uint16_t>(page)
+             : std::nullopt;
+}
+
+std::optional<uint16_t> Section::getPageForSemanticCursor(const uint32_t wordCursor) {
+  if (!usesPdfWordIndex()) {
+    return std::nullopt;
+  }
+  file.close();
+  uint16_t page = 0;
+  return document->findLayoutWordCursor(filePath, wordCursor, page) ? std::optional<uint16_t>(page) : std::nullopt;
 }
 
 std::string Section::getTextFromSectionFile() {

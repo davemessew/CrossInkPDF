@@ -8,6 +8,8 @@
 #include <limits>
 
 #include "Memory.h"
+#include "PdfLayoutWordIndex.h"
+#include "PdfProgressStore.h"
 #include "PdfSourceIdentity.h"
 
 namespace {
@@ -119,6 +121,9 @@ void PdfReflowDocument::resetLoadedState() {
   metadata_ = {};
   metadataRecord_ = {};
   outlineRecord_ = {};
+  progressStore_ = {};
+  savedItemsStore_ = {};
+  savedItemsReady_ = false;
   metadataPath_.clear();
   outlinePath_.clear();
   sections_.reset();
@@ -126,6 +131,11 @@ void PdfReflowDocument::resetLoadedState() {
   manifestSectionSeen_.fill(0);
   cachedOutlineEntry_ = {};
   cachedOutlineIndex_ = -1;
+  layoutWordWindow_.fill({});
+  layoutWordIndexPath_.fill('\0');
+  layoutWordWindowStart_ = 0;
+  layoutWordWindowCount_ = 0;
+  layoutWordIndexAvailable_ = false;
   validationGeneration_ = 0;
   requiredFilesSeen_ = 0;
   xhtmlFilesSeen_ = 0;
@@ -415,6 +425,17 @@ PdfStatus PdfReflowDocument::loadCompletedCache() {
     resetLoadedState();
     return status_;
   }
+  status_ = progressStore_.initialize(io_, cacheRoot_.c_str(), sourceIdentity_, metadata_.totalWords);
+  if (!status_) {
+    resetLoadedState();
+    return status_;
+  }
+  status_ = savedItemsStore_.initialize(io_, cacheRoot_.c_str(), sourceIdentity_, metadata_.totalWords);
+  if (!status_) {
+    resetLoadedState();
+    return status_;
+  }
+  savedItemsReady_ = true;
   title_.assign(metadata_.title, metadata_.titleLength);
   author_.assign(metadata_.author, metadata_.authorLength);
   language_.assign(metadata_.language, metadata_.languageLength);
@@ -591,7 +612,14 @@ float PdfReflowDocument::calculateSizeProgress(const int sectionIndex, const flo
 }
 
 float PdfReflowDocument::calculateProgress(const int sectionIndex, const float sectionProgress) const {
-  return calculateSizeProgress(sectionIndex, sectionProgress);
+  if (!loaded_ || !sections_ || sectionIndex < 0 || sectionIndex >= metadata_.sectionCount ||
+      metadata_.totalWords == 0) {
+    return 0.0F;
+  }
+  const uint32_t priorWords = sections_[sectionIndex].firstWordOrdinal;
+  const float reached = static_cast<float>(priorWords) +
+                        static_cast<float>(sections_[sectionIndex].wordCount) * clampUnit(sectionProgress);
+  return clampUnit(reached / static_cast<float>(metadata_.totalWords));
 }
 
 bool PdfReflowDocument::resolveProgressPercentToSection(const int percent, int& sectionIndex,
@@ -600,24 +628,301 @@ bool PdfReflowDocument::resolveProgressPercentToSection(const int percent, int& 
     return false;
   }
   const float target =
-      static_cast<float>(getDocumentSize()) * (static_cast<float>(std::clamp(percent, 0, 100)) / 100.0F);
+      static_cast<float>(metadata_.totalWords) * (static_cast<float>(std::clamp(percent, 0, 100)) / 100.0F);
   sectionIndex = metadata_.sectionCount - 1;
   for (uint16_t index = 0; index < metadata_.sectionCount; ++index) {
-    if (target <= static_cast<float>(sections_[index].cumulativeSize)) {
+    const uint64_t sectionEnd =
+        static_cast<uint64_t>(sections_[index].firstWordOrdinal) + static_cast<uint64_t>(sections_[index].wordCount);
+    if (target <= static_cast<float>(sectionEnd)) {
       sectionIndex = index;
       break;
     }
   }
-  const uint32_t prior = sectionIndex == 0 ? 0 : sections_[sectionIndex - 1].cumulativeSize;
-  const uint32_t size = sections_[sectionIndex].byteSize;
-  sectionProgress = size == 0 ? 0.0F : clampUnit((target - static_cast<float>(prior)) / static_cast<float>(size));
+  const uint32_t prior = sections_[sectionIndex].firstWordOrdinal;
+  const uint32_t words = sections_[sectionIndex].wordCount;
+  sectionProgress = words == 0 ? 0.0F : clampUnit((target - static_cast<float>(prior)) / static_cast<float>(words));
   return true;
 }
 
 bool PdfReflowDocument::resolveReferencePage(int, float, uint32_t&, uint32_t&) const { return false; }
 uint32_t PdfReflowDocument::getTotalWordCount() const { return loaded_ ? manifest_.totalWords : 0; }
-bool PdfReflowDocument::loadReadingPosition(ReflowReadingPosition&) const { return false; }
-bool PdfReflowDocument::saveReadingPosition(const ReflowReadingPosition&) const { return false; }
+bool PdfReflowDocument::loadReadingPosition(ReflowReadingPosition& position) const {
+  if (!loaded_) {
+    return false;
+  }
+  return progressStore_.load(&position).ok();
+}
+
+bool PdfReflowDocument::saveReadingPosition(const ReflowReadingPosition& position) const {
+  if (!loaded_) {
+    return false;
+  }
+  return progressStore_.save(position).ok();
+}
+
+PdfStatus PdfReflowDocument::loadPdfSavedItems(PdfSavedItemsBuffer* const output) const {
+  return savedItemsReady_ ? savedItemsStore_.load(output) : PdfStatus::failure(PdfError::InvalidArgument);
+}
+
+PdfStatus PdfReflowDocument::savePdfSavedItems(const PdfSavedItem* const items, const uint16_t count) const {
+  return savedItemsReady_ ? savedItemsStore_.save(items, count) : PdfStatus::failure(PdfError::InvalidArgument);
+}
+
+PdfStatus PdfReflowDocument::validatePdfSavedItem(const PdfSavedItem& item) const {
+  return savedItemsReady_ ? savedItemsStore_.validate(item) : PdfStatus::failure(PdfError::InvalidArgument);
+}
+
+PdfStatus PdfReflowDocument::SavedItemMapSource::inspect(void* const context, const uint16_t sectionIndex,
+                                                        PdfLayoutWordIndexInfo* const info) {
+  if (context == nullptr || info == nullptr) return PdfStatus::failure(PdfError::InvalidArgument);
+  auto& source = *static_cast<SavedItemMapSource*>(context);
+  if (source.document == nullptr || source.sectionCachePath == nullptr) {
+    return PdfStatus::failure(PdfError::InvalidArgument);
+  }
+  if (!source.inspected) {
+    PdfStatus status = pdfInspectLayoutWordIndex(source.file.source(), &source.info);
+    if (!status) {
+      return status;
+    }
+    source.inspected = true;
+  }
+  if (source.info.sectionIndex != sectionIndex) return PdfStatus::failure(PdfError::Malformed);
+  *info = source.info;
+  return PdfStatus::success();
+}
+
+PdfStatus PdfReflowDocument::SavedItemMapSource::readRanges(void* const context, const uint16_t sectionIndex,
+                                                           const uint16_t firstPage, const uint16_t count,
+                                                           PdfLayoutWordRange* const ranges) {
+  if (context == nullptr || ranges == nullptr) return PdfStatus::failure(PdfError::InvalidArgument);
+  auto& source = *static_cast<SavedItemMapSource*>(context);
+  if (!source.inspected || source.info.sectionIndex != sectionIndex || firstPage >= source.info.pageCount ||
+      count == 0 || count > static_cast<uint16_t>(source.info.pageCount - firstPage)) {
+    return PdfStatus::failure(PdfError::InvalidOffset, firstPage);
+  }
+  return pdfReadValidatedLayoutWordRanges(source.file.source(), source.info, firstPage, count, ranges);
+}
+
+PdfStatus PdfReflowDocument::mapPdfSavedItem(const std::string& sectionCachePath,
+                                             const uint32_t layoutFingerprint, const PdfSavedItem& item,
+                                             PdfSavedItemPageRange* const pages) const {
+  if (!savedItemsReady_ || sectionCachePath.empty()) return PdfStatus::failure(PdfError::InvalidArgument);
+  if (!formatLayoutWordIndexPath(sectionCachePath, layoutWordIndexPath_.data())) {
+    return PdfStatus::failure(PdfError::LimitExceeded);
+  }
+  SavedItemMapSource context;
+  context.document = this;
+  context.sectionCachePath = &sectionCachePath;
+  if (!openLayoutWordIndex(layoutWordIndexPath_.data(), context.file)) {
+    return PdfStatus::failure(PdfError::IoFailure);
+  }
+  const PdfSavedItemWordIndexSource source{
+      &context,
+      SavedItemMapSource::inspect,
+      SavedItemMapSource::readRanges,
+      layoutFingerprint,
+  };
+  PdfStatus status = pdfMapSavedItemWordRange(source, item, pages);
+  if (!closeLayoutWordIndex(context.file) && status) status = PdfStatus::failure(PdfError::IoFailure);
+  return status;
+}
+
+PdfStatus PdfReflowDocument::pdfSavedItemsLayoutFingerprint(const std::string& sectionCachePath,
+                                                            uint32_t* const fingerprint) const {
+  if (!savedItemsReady_ || sectionCachePath.empty() || fingerprint == nullptr) {
+    return PdfStatus::failure(PdfError::InvalidArgument);
+  }
+  *fingerprint = 0;
+  char path[PDF_CACHE_PATH_CAPACITY]{};
+  if (!formatLayoutWordIndexPath(sectionCachePath, path)) {
+    return PdfStatus::failure(PdfError::LimitExceeded);
+  }
+  ManifestSource source;
+  if (!openLayoutWordIndex(path, source)) return PdfStatus::failure(PdfError::IoFailure);
+
+  // Do not CRC the complete sidecar: each fixed-size record carries its own CRC,
+  // and a payload plus its updated CRC has a fixed CRC residue. FNV-1a still
+  // distinguishes same-size relayouts while keeping this cold-path scan bounded.
+  constexpr uint32_t kFnv32Offset = 2166136261U;
+  constexpr uint32_t kFnv32Prime = 16777619U;
+  uint8_t workspace[64];
+  uint64_t offset = 0;
+  uint32_t hash = kFnv32Offset;
+  PdfStatus status = PdfStatus::success();
+  while (offset < source.size) {
+    const size_t requested = static_cast<size_t>(std::min<uint64_t>(sizeof(workspace), source.size - offset));
+    size_t bytesRead = 0;
+    status = io_.read(io_.context, source.handle, offset, workspace, requested, &bytesRead);
+    if (!status || bytesRead != requested) {
+      if (status) status = PdfStatus::failure(PdfError::UnexpectedEof, offset + bytesRead);
+      break;
+    }
+    for (size_t index = 0; index < bytesRead; ++index) {
+      hash = (hash ^ workspace[index]) * kFnv32Prime;
+    }
+    offset += bytesRead;
+  }
+  if (!closeLayoutWordIndex(source) && status) status = PdfStatus::failure(PdfError::IoFailure);
+  if (status) *fingerprint = hash == 0 ? 1U : hash;
+  return status;
+}
+
+bool PdfReflowDocument::formatLayoutWordIndexPath(const std::string& sectionCachePath,
+                                                  char destination[PDF_CACHE_PATH_CAPACITY]) const {
+  const int length = std::snprintf(destination, PDF_CACHE_PATH_CAPACITY, "%s.pwi", sectionCachePath.c_str());
+  return length > 0 && static_cast<size_t>(length) < PDF_CACHE_PATH_CAPACITY;
+}
+
+bool PdfReflowDocument::openLayoutWordIndex(const char* const path, ManifestSource& source) const {
+  source = {};
+  source.io = &io_;
+  PdfStatus status = io_.open(io_.context, path, PdfCacheOpenMode::Read, &source.handle);
+  PdfCacheFileMetadata metadata;
+  if (status) {
+    status = io_.metadata(io_.context, source.handle, &metadata);
+  }
+  if (!status || metadata.directory || metadata.symlinkLike) {
+    closeLayoutWordIndex(source);
+    return false;
+  }
+  source.size = metadata.size;
+  return true;
+}
+
+bool PdfReflowDocument::closeLayoutWordIndex(ManifestSource& source) const {
+  PdfStatus status = PdfStatus::success();
+  if (source.handle.valid()) {
+    status = io_.close(io_.context, &source.handle);
+  }
+  source = {};
+  return status.ok();
+}
+
+bool PdfReflowDocument::validateLayoutWordIndex(const std::string& sectionCachePath, const int sectionIndex,
+                                                const uint16_t pageCount) const {
+  layoutWordIndexAvailable_ = false;
+  layoutWordWindowCount_ = 0;
+  char path[PDF_CACHE_PATH_CAPACITY]{};
+  if (!loaded_ || !sections_ || sectionIndex < 0 || sectionIndex >= metadata_.sectionCount ||
+      !formatLayoutWordIndexPath(sectionCachePath, path)) {
+    return false;
+  }
+  ManifestSource source;
+  if (!openLayoutWordIndex(path, source)) {
+    return false;
+  }
+  PdfLayoutWordIndexInfo info;
+  const PdfStatus status = pdfInspectLayoutWordIndex(source.source(), &info);
+  const bool closed = closeLayoutWordIndex(source);
+  const auto& section = sections_[sectionIndex];
+  if (!status || !closed || info.sectionIndex != sectionIndex || info.pageCount != pageCount ||
+      info.firstGlobalWordOrdinal != section.firstWordOrdinal || info.sectionWordCount != section.wordCount) {
+    return false;
+  }
+  std::memcpy(layoutWordIndexPath_.data(), path, sizeof(path));
+  layoutWordIndexAvailable_ = true;
+  return true;
+}
+
+bool PdfReflowDocument::removeLayoutWordIndex(const std::string& sectionCachePath) const {
+  char path[PDF_CACHE_PATH_CAPACITY]{};
+  if (!formatLayoutWordIndexPath(sectionCachePath, path)) {
+    return false;
+  }
+  const PdfStatus status = io_.remove(io_.context, path, false);
+  if (!status && status.error != PdfError::InvalidOffset) {
+    return false;
+  }
+  if (std::strcmp(layoutWordIndexPath_.data(), path) == 0) {
+    layoutWordIndexAvailable_ = false;
+    layoutWordWindowCount_ = 0;
+    layoutWordIndexPath_.fill('\0');
+  }
+  return true;
+}
+
+bool PdfReflowDocument::readLayoutWordRange(const std::string& sectionCachePath, const uint16_t pageCount,
+                                            const uint16_t page, ReflowPageSemanticRange& range) const {
+  range = {};
+  char path[PDF_CACHE_PATH_CAPACITY]{};
+  if (!layoutWordIndexAvailable_ || page >= pageCount || !formatLayoutWordIndexPath(sectionCachePath, path) ||
+      std::strcmp(layoutWordIndexPath_.data(), path) != 0) {
+    return false;
+  }
+  if (layoutWordWindowCount_ == 0 || page < layoutWordWindowStart_ ||
+      page >= static_cast<uint16_t>(layoutWordWindowStart_ + layoutWordWindowCount_)) {
+    constexpr uint16_t windowPages = 4;
+    const uint16_t windowStart = static_cast<uint16_t>(page - page % windowPages);
+    const uint16_t windowCount = std::min<uint16_t>(windowPages, pageCount - windowStart);
+    // The decode target is shared scratch. Invalidate its published metadata
+    // before any refill can partially overwrite it.
+    layoutWordWindowCount_ = 0;
+    ManifestSource source;
+    if (!openLayoutWordIndex(path, source)) {
+      return false;
+    }
+    const PdfStatus status =
+        pdfReadLayoutWordRanges(source.source(), windowStart, windowCount, layoutWordWindow_.data());
+    const bool closed = closeLayoutWordIndex(source);
+    if (!status || !closed) {
+      return false;
+    }
+    layoutWordWindowStart_ = windowStart;
+    layoutWordWindowCount_ = static_cast<uint8_t>(windowCount);
+  }
+  const auto& decoded = layoutWordWindow_[page - layoutWordWindowStart_];
+  range.firstGlobalWordOrdinal = decoded.firstGlobalWordOrdinal;
+  range.lastGlobalWordOrdinal = decoded.lastGlobalWordOrdinal;
+  range.firstBlockWordOffset = decoded.firstBlockWordOffset;
+  range.wordCursor = decoded.wordCursor;
+  range.valid = decoded.valid;
+  std::memcpy(range.blockAnchor, decoded.blockAnchor, sizeof(range.blockAnchor));
+  return true;
+}
+
+bool PdfReflowDocument::findLayoutWordPage(const std::string& sectionCachePath, const char* const blockAnchor,
+                                           const uint32_t blockWordOffset, const uint32_t globalWordOrdinal,
+                                           uint16_t& page) const {
+  char path[PDF_CACHE_PATH_CAPACITY]{};
+  if (!layoutWordIndexAvailable_ || !formatLayoutWordIndexPath(sectionCachePath, path) ||
+      std::strcmp(layoutWordIndexPath_.data(), path) != 0) {
+    return false;
+  }
+  ManifestSource source;
+  if (!openLayoutWordIndex(path, source)) {
+    return false;
+  }
+  PdfStatus status = PdfStatus::failure(PdfError::InvalidOffset);
+  if (blockAnchor && blockAnchor[0] != '\0') {
+    PdfLayoutWordRange anchorRange;
+    status = pdfFindLayoutAnchor(source.source(), blockAnchor, blockWordOffset, &page, &anchorRange);
+    if (status && (!anchorRange.valid || globalWordOrdinal < anchorRange.firstGlobalWordOrdinal ||
+                   globalWordOrdinal > anchorRange.lastGlobalWordOrdinal)) {
+      status = PdfStatus::failure(PdfError::InvalidOffset, globalWordOrdinal);
+    }
+  }
+  if (!status) {
+    status = pdfFindLayoutPage(source.source(), globalWordOrdinal, &page);
+  }
+  const bool closed = closeLayoutWordIndex(source);
+  return status.ok() && closed;
+}
+
+bool PdfReflowDocument::findLayoutWordCursor(const std::string& sectionCachePath, const uint32_t wordCursor,
+                                             uint16_t& page) const {
+  char path[PDF_CACHE_PATH_CAPACITY]{};
+  if (!layoutWordIndexAvailable_ || !formatLayoutWordIndexPath(sectionCachePath, path) ||
+      std::strcmp(layoutWordIndexPath_.data(), path) != 0) {
+    return false;
+  }
+  ManifestSource source;
+  if (!openLayoutWordIndex(path, source)) {
+    return false;
+  }
+  const PdfStatus status = pdfFindLayoutCursor(source.source(), wordCursor, &page);
+  const bool closed = closeLayoutWordIndex(source);
+  return status.ok() && closed;
+}
 
 bool PdfReflowDocument::getLocalSectionPath(const int sectionIndex, ReflowResource& out) const {
   char path[PDF_CACHE_PATH_CAPACITY]{};

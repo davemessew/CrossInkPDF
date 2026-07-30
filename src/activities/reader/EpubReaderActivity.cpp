@@ -12,6 +12,8 @@
 #include <Logging.h>
 #include <Memory.h>
 #include <MemoryBudget.h>
+#include <PdfLayoutWordIndex.h>
+#include <PdfReflowDocument.h>
 
 #include <algorithm>
 #include <array>
@@ -83,7 +85,23 @@ constexpr uint8_t BOOK_PROGRESS_ESTIMATE_FLOOR_PERCENT = 90;
 constexpr uint16_t FOOTNOTE_PREVIEW_MAX_PAGES = 3;
 constexpr uint8_t PUBLISHER_PAGE_NUMBER_LEFT_MARGIN_MIN = 15;
 constexpr int PUBLISHER_PAGE_NUMBER_X = 5;
+bool pdfSavedItemsLayoutFingerprint(PdfReflowDocument& document, const std::string& cachePath,
+                                    uint32_t& fingerprint) {
+  const PdfStatus status = document.pdfSavedItemsLayoutFingerprint(cachePath, &fingerprint);
+  if (!status) {
+    LOG_ERR("ERS", "PDF saved-item layout fingerprint unavailable (%u)", static_cast<unsigned>(status.error));
+    return false;
+  }
+  return true;
+}
 
+struct PdfSelectableWordSemantic {
+  uint32_t globalWordOrdinal = 0;
+  uint32_t blockWordOffset = 0;
+  uint16_t sectionPage = 0;
+  uint16_t pageWordIndex = 0;
+  char blockAnchor[PDF_SAVED_ITEM_ANCHOR_BYTES] = {};
+};
 uint32_t pagesCentipages(const float pages) {
   if (pages <= 0.0f) {
     return 0;
@@ -1145,7 +1163,36 @@ bool EpubReaderActivity::resetBookReaderSettings(const std::string& filePath) {
 
 float EpubReaderActivity::getCurrentBookProgressPercent() const {
   const int totalPages = section ? section->pageCount : 0;
-  if (activeFootnotePreview || !document || !section || totalPages == 0 || document->getDocumentSize() == 0) {
+  if (activeFootnotePreview || !document || !section || totalPages == 0) {
+    return 0.0f;
+  }
+
+  if (document->getFormat() == ReflowDocumentFormat::Pdf) {
+    const uint32_t totalWords = document->getTotalWordCount();
+    if (totalWords == 0) {
+      return 0.0f;
+    }
+    uint32_t wordCursor = 0;
+    bool hasWordCursor = false;
+    if (pdfProgressState && pdfProgressState->semanticRangeSectionIndex == currentSpineIndex &&
+        pdfProgressState->semanticRangePageNumber == section->currentPage) {
+      wordCursor = pdfProgressState->currentPageSemanticRange.wordCursor;
+      hasWordCursor = wordCursor <= totalWords;
+    } else if (pdfProgressState && pdfProgressState->hasLastKnownWordCursor) {
+      wordCursor = pdfProgressState->lastKnownWordCursor;
+      hasWordCursor = wordCursor <= totalWords;
+    }
+    if (hasWordCursor) {
+      float progress = 0.0F;
+      if (pdfCalculateWordCursorProgress(wordCursor, totalWords, &progress)) {
+        return progress * 100.0F;
+      }
+    }
+    // PDF progress is semantic-only. A sidecar read error must never silently
+    // substitute a page-fraction estimate.
+    return 0.0F;
+  }
+  if (document->getDocumentSize() == 0) {
     return 0.0f;
   }
 
@@ -1717,12 +1764,261 @@ void EpubReaderActivity::endGlobalSettingsEditForBookReader(void* ctx) {
   static_cast<EpubReaderActivity*>(ctx)->endGlobalSettingsEdit();
 }
 
+PdfStatus EpubReaderActivity::loadPdfSavedItems(void* const context, PdfSavedItemsBuffer* const output) {
+  return static_cast<PdfReflowDocument*>(context)->loadPdfSavedItems(output);
+}
+
+PdfStatus EpubReaderActivity::savePdfSavedItems(void* const context, const PdfSavedItem* const items,
+                                                const uint16_t count) {
+  return static_cast<PdfReflowDocument*>(context)->savePdfSavedItems(items, count);
+}
+
+PdfStatus EpubReaderActivity::validatePdfSavedItem(void* const context, const PdfSavedItem& item) {
+  return static_cast<PdfReflowDocument*>(context)->validatePdfSavedItem(item);
+}
+
+bool EpubReaderActivity::countPdfBookmarks(void*, uint16_t* const output) {
+  if (output == nullptr || BOOKMARKS.getBookmarks().size() > UINT16_MAX) return false;
+  *output = static_cast<uint16_t>(BOOKMARKS.getBookmarks().size());
+  return true;
+}
+
+bool EpubReaderActivity::readPdfBookmarkId(void*, const uint16_t index, uint16_t* const output) {
+  if (output == nullptr || index >= BOOKMARKS.getBookmarks().size()) return false;
+  *output = BOOKMARKS.getBookmarks()[index].paragraphIndex;
+  return true;
+}
+
+PdfSavedItemsLegacyMutationResult EpubReaderActivity::addPdfBookmark(void* const context, const uint16_t itemId) {
+  auto& self = *static_cast<EpubReaderActivity*>(context);
+  const BookmarkStore::AddResult result =
+      BOOKMARKS.addPdfBookmark(self.pdfBookmarkLegacyMutation.spineIndex, self.pdfBookmarkLegacyMutation.progress,
+                               self.pdfBookmarkLegacyMutation.chapterTitle, itemId,
+                               self.pdfBookmarkLegacyMutation.snippet);
+  if (result == BookmarkStore::AddResult::Added) return PdfSavedItemsLegacyMutationResult::Applied;
+  if (result == BookmarkStore::AddResult::LimitReached || result == BookmarkStore::AddResult::InvalidItemId) {
+    return PdfSavedItemsLegacyMutationResult::Rejected;
+  }
+  return PdfSavedItemsLegacyMutationResult::Ambiguous;
+}
+
+PdfSavedItemsLegacyMutationResult EpubReaderActivity::removePdfBookmark(void*, const uint16_t itemId) {
+  const auto& bookmarks = BOOKMARKS.getBookmarks();
+  const bool present = std::any_of(bookmarks.begin(), bookmarks.end(),
+                                   [itemId](const Bookmark& bookmark) { return bookmark.paragraphIndex == itemId; });
+  if (!present) return PdfSavedItemsLegacyMutationResult::Rejected;
+  return BOOKMARKS.removePdfBookmark(itemId) ? PdfSavedItemsLegacyMutationResult::Applied
+                                             : PdfSavedItemsLegacyMutationResult::Ambiguous;
+}
+
+PdfSavedItemsLegacyMutationResult EpubReaderActivity::clearPdfBookmarks(void*) {
+  if (BOOKMARKS.getBookmarks().empty()) return PdfSavedItemsLegacyMutationResult::Rejected;
+  return BOOKMARKS.clearPdfBookmarks() ? PdfSavedItemsLegacyMutationResult::Applied
+                                       : PdfSavedItemsLegacyMutationResult::Ambiguous;
+}
+
+bool EpubReaderActivity::countPdfClippings(void*, uint16_t* const output) {
+  if (output == nullptr || CLIPPINGS.getClippings().size() > UINT16_MAX) return false;
+  *output = static_cast<uint16_t>(CLIPPINGS.getClippings().size());
+  return true;
+}
+
+bool EpubReaderActivity::readPdfClippingId(void*, const uint16_t index, uint16_t* const output) {
+  if (output == nullptr || index >= CLIPPINGS.getClippings().size()) return false;
+  *output = CLIPPINGS.getClippings()[index].paragraphIndex;
+  return true;
+}
+
+PdfSavedItemsLegacyMutationResult EpubReaderActivity::addPdfClipping(void* const context, const uint16_t itemId) {
+  auto& self = *static_cast<EpubReaderActivity*>(context);
+  const auto& pending = self.pdfClippingLegacyMutation;
+  if (pending.text == nullptr) return PdfSavedItemsLegacyMutationResult::Rejected;
+  const ClippingStore::AddResult result =
+      CLIPPINGS.addPdfClipping(pending.spineIndex, pending.startPage, pending.endPage, pending.pageCount,
+                               pending.startWordIndex, pending.endWordIndex, pending.wordCount, pending.chapterTitle,
+                               itemId, *pending.text);
+  if (result == ClippingStore::AddResult::Added) return PdfSavedItemsLegacyMutationResult::Applied;
+  if (result == ClippingStore::AddResult::LimitReached) return PdfSavedItemsLegacyMutationResult::Rejected;
+  return PdfSavedItemsLegacyMutationResult::Ambiguous;
+}
+
+PdfSavedItemsLegacyMutationResult EpubReaderActivity::removePdfClipping(void*, const uint16_t itemId) {
+  const auto& clippings = CLIPPINGS.getClippings();
+  const bool present = std::any_of(clippings.begin(), clippings.end(),
+                                   [itemId](const Clipping& clipping) { return clipping.paragraphIndex == itemId; });
+  if (!present) return PdfSavedItemsLegacyMutationResult::Rejected;
+  return CLIPPINGS.removePdfClipping(itemId) ? PdfSavedItemsLegacyMutationResult::Applied
+                                             : PdfSavedItemsLegacyMutationResult::Ambiguous;
+}
+
+PdfSavedItemsLegacyMutationResult EpubReaderActivity::clearPdfClippings(void*) {
+  if (CLIPPINGS.getClippings().empty()) return PdfSavedItemsLegacyMutationResult::Rejected;
+  return CLIPPINGS.clearPdfClippings() ? PdfSavedItemsLegacyMutationResult::Applied
+                                       : PdfSavedItemsLegacyMutationResult::Ambiguous;
+}
+
+bool EpubReaderActivity::removePdfBookmarkFromList(void* const context, const uint16_t itemId) {
+  auto& self = *static_cast<EpubReaderActivity*>(context);
+  const PdfSavedItemsSessionResult result = self.pdfSavedItemsSession.remove(PdfSavedItemKind::Bookmark, itemId);
+  self.reloadPdfSavedItemsAfterMutation(result);
+  return result == PdfSavedItemsSessionResult::Applied;
+}
+
+bool EpubReaderActivity::removePdfClippingFromList(void* const context, const uint16_t itemId) {
+  auto& self = *static_cast<EpubReaderActivity*>(context);
+  const PdfSavedItemsSessionResult result = self.pdfSavedItemsSession.remove(PdfSavedItemKind::Clipping, itemId);
+  self.reloadPdfSavedItemsAfterMutation(result);
+  return result == PdfSavedItemsSessionResult::Applied;
+}
+
+const ReflowPageSemanticRange* EpubReaderActivity::currentPdfPageSemanticRange() const {
+  if (!document || document->getFormat() != ReflowDocumentFormat::Pdf || !section || !pdfProgressState ||
+      pdfProgressState->semanticRangeSectionIndex != currentSpineIndex ||
+      pdfProgressState->semanticRangePageNumber != section->currentPage ||
+      !pdfProgressState->currentPageSemanticRange.valid) {
+    return nullptr;
+  }
+  return &pdfProgressState->currentPageSemanticRange;
+}
+
+const PdfSavedItem* EpubReaderActivity::currentPdfPageBookmark() const {
+  const ReflowPageSemanticRange* const range = currentPdfPageSemanticRange();
+  if (range == nullptr || currentSpineIndex < 0 || currentSpineIndex > UINT16_MAX) return nullptr;
+  return pdfSavedItemsSession.findBookmarkInPage(static_cast<uint16_t>(currentSpineIndex),
+                                                 range->firstGlobalWordOrdinal, range->lastGlobalWordOrdinal);
+}
+
+bool EpubReaderActivity::supportsSavedItems() const {
+  if (!document || !reflowSupportsSavedItems(document->getCapabilities())) return false;
+  if (document->getFormat() != ReflowDocumentFormat::Pdf) return true;
+  return pdfSavedItemStorage && pdfSavedItemsSession.supports(PdfSavedItemKind::Bookmark) &&
+         pdfSavedItemsSession.supports(PdfSavedItemKind::Clipping);
+}
+
+bool EpubReaderActivity::initializePdfSavedItems() {
+  if (!document || document->getFormat() != ReflowDocumentFormat::Pdf ||
+      !reflowSupportsSavedItems(document->getCapabilities())) {
+    return false;
+  }
+  pdfSavedItemStorage = makeUniqueNoThrow<PdfSavedItem[]>(PDF_SAVED_ITEMS_MAX_RECORDS);
+  if (!pdfSavedItemStorage) {
+    LOG_ERR("ERS", "Failed to allocate PDF saved-item records (%u bytes)",
+            static_cast<unsigned>(PDF_SAVED_ITEMS_MAX_RECORDS * sizeof(PdfSavedItem)));
+    return false;
+  }
+  pdfSavedItemsBuffer = {
+      pdfSavedItemStorage.get(),
+      PDF_SAVED_ITEMS_MAX_RECORDS,
+      0,
+  };
+  auto* const pdf = static_cast<PdfReflowDocument*>(document.get());
+  const PdfSavedItemsPersistence persistence{
+      pdf,
+      loadPdfSavedItems,
+      savePdfSavedItems,
+      validatePdfSavedItem,
+  };
+  const PdfSavedItemsLegacyAccess bookmarks{
+      this,
+      countPdfBookmarks,
+      readPdfBookmarkId,
+      addPdfBookmark,
+      removePdfBookmark,
+      clearPdfBookmarks,
+  };
+  const PdfSavedItemsLegacyAccess clippings{
+      this,
+      countPdfClippings,
+      readPdfClippingId,
+      addPdfClipping,
+      removePdfClipping,
+      clearPdfClippings,
+  };
+  const PdfStatus status = pdfSavedItemsSession.begin(&pdfSavedItemsBuffer, persistence, bookmarks, clippings);
+  if (!status || !pdfSavedItemsSession.supports(PdfSavedItemKind::Bookmark) ||
+      !pdfSavedItemsSession.supports(PdfSavedItemKind::Clipping) ||
+      (pdfSavedItemsSession.dirty() && !pdfSavedItemsSession.flush())) {
+    LOG_ERR("ERS", "PDF saved items unavailable (%u)", static_cast<unsigned>(status.error));
+    pdfSavedItemsSession = {};
+    pdfSavedItemsBuffer = {};
+    pdfSavedItemStorage.reset();
+    return false;
+  }
+  return true;
+}
+
+bool EpubReaderActivity::reloadPdfSavedItemsAfterMutation(const PdfSavedItemsSessionResult result) {
+  if (result != PdfSavedItemsSessionResult::ReloadRequired) return false;
+  LOG_ERR("ERS", "Reloading PDF saved items after an ambiguous durable mutation");
+  pdfSavedItemsSession = {};
+  pdfSavedItemsBuffer = {};
+  pdfSavedItemStorage.reset();
+  const bool bookmarksReloaded = BOOKMARKS.reloadPdfFromDisk();
+  const bool clippingsReloaded = CLIPPINGS.reloadPdfFromDisk();
+  if (!bookmarksReloaded || !clippingsReloaded) {
+    LOG_ERR("ERS", "Cannot trust PDF compatibility stores after ambiguous mutation");
+    BOOKMARKS.unload();
+    CLIPPINGS.unload();
+    return true;
+  }
+  if (!initializePdfSavedItems()) {
+    LOG_ERR("ERS", "PDF saved items remain unavailable after reload");
+    BOOKMARKS.unload();
+    CLIPPINGS.unload();
+  }
+  return true;
+}
+
+bool EpubReaderActivity::applyPendingPdfSavedItemJump() {
+  if (!section || !document || document->getFormat() != ReflowDocumentFormat::Pdf) return false;
+  PdfSavedItem item;
+  if (!pdfSavedItemsSession.pendingJump(&item) || item.sectionIndex != static_cast<uint16_t>(currentSpineIndex)) {
+    return false;
+  }
+  auto& pdfDocument = *static_cast<PdfReflowDocument*>(document.get());
+  uint32_t fingerprint = 0;
+  if (!pdfSavedItemsLayoutFingerprint(pdfDocument, section->getCacheFilePath(), fingerprint)) {
+    pdfSavedItemsSession.resolvePendingJump(false);
+    return false;
+  }
+  PdfSavedItemPageRange pages;
+  const PdfStatus status = pdfDocument.mapPdfSavedItem(section->getCacheFilePath(), fingerprint, item, &pages);
+  if (!status) {
+    pdfSavedItemsSession.resolvePendingJump(false);
+    LOG_ERR("ERS", "PDF saved-item map pending retry (%u)", static_cast<unsigned>(status.error));
+    return false;
+  }
+  section->currentPage = pages.startPage;
+  nextPageNumber = pages.startPage;
+  pendingPageJump.reset();
+  pendingParagraphIndex = UINT16_MAX;
+  pendingClippingIndex = UINT16_MAX;
+  pendingPercentJump = false;
+  pdfSavedItemsSession.resolvePendingJump(true);
+  if (APP_STATE.pendingBookmarkParagraphIndex == item.itemId &&
+      APP_STATE.pendingBookmarkSpine == item.sectionIndex) {
+    APP_STATE.pendingBookmarkSpine = UINT16_MAX;
+    APP_STATE.pendingBookmarkProgress = -1.0F;
+    APP_STATE.pendingBookmarkParagraphIndex = UINT16_MAX;
+    APP_STATE.pendingClippingIndex = UINT16_MAX;
+    APP_STATE.saveToFile();
+  }
+  return true;
+}
+
 void EpubReaderActivity::onEnter() {
   Activity::onEnter();
   pageLoadRetryCount = 0;
 
   if (!document) {
     return;
+  }
+
+  if (document->getFormat() == ReflowDocumentFormat::Pdf) {
+    pdfProgressState = makeUniqueNoThrow<PdfReaderProgressState>();
+    if (!pdfProgressState) {
+      LOG_ERR("ERS", "Failed to allocate bounded PDF progress state");
+    }
   }
 
   captureGlobalReaderSettings();
@@ -1738,14 +2034,29 @@ void EpubReaderActivity::onEnter() {
 
   BOOKMARKS.unload();
   CLIPPINGS.unload();
-  const bool supportsSavedItems = reflowSupportsSavedItems(document->getCapabilities());
-  if (supportsSavedItems) {
+  const bool documentSupportsSavedItems = reflowSupportsSavedItems(document->getCapabilities());
+  bool legacySavedItemsLoaded = false;
+  if (documentSupportsSavedItems) {
     const char* storeFormatKey = document->getStoreFormatKey();
-    BOOKMARKS.loadForBook(document->getPath(), document->getTitle(), document->getAuthor(), storeFormatKey);
-    CLIPPINGS.loadForBook(document->getPath(), document->getTitle(), document->getAuthor(), storeFormatKey);
+    const bool bookmarksLoaded =
+        BOOKMARKS.loadForBook(document->getPath(), document->getTitle(), document->getAuthor(), storeFormatKey);
+    const bool clippingsLoaded =
+        CLIPPINGS.loadForBook(document->getPath(), document->getTitle(), document->getAuthor(), storeFormatKey);
+    legacySavedItemsLoaded = bookmarksLoaded && clippingsLoaded;
+    if (!legacySavedItemsLoaded) {
+      LOG_ERR("ERS", "Failed to load saved-item compatibility stores");
+      BOOKMARKS.unload();
+      CLIPPINGS.unload();
+    }
+  }
+  if (legacySavedItemsLoaded && document->getFormat() == ReflowDocumentFormat::Pdf &&
+      !initializePdfSavedItems()) {
+    BOOKMARKS.unload();
+    CLIPPINGS.unload();
   }
 
-  if (supportsSavedItems && APP_STATE.pendingBookmarkSpine != UINT16_MAX && APP_STATE.pendingBookmarkProgress >= 0.0f) {
+  if (supportsSavedItems() && APP_STATE.pendingBookmarkSpine != UINT16_MAX &&
+      APP_STATE.pendingBookmarkProgress >= 0.0f) {
     // Resume from a bookmark selected on the Home screen
     currentSpineIndex = APP_STATE.pendingBookmarkSpine;
     pendingSpineProgress = APP_STATE.pendingBookmarkProgress;
@@ -1753,13 +2064,25 @@ void EpubReaderActivity::onEnter() {
     pendingClippingIndex = APP_STATE.pendingClippingIndex;
     pendingPercentJump = true;
     cachedSpineIndex = currentSpineIndex;
-
-    // Clear the pending jump
-    APP_STATE.pendingBookmarkSpine = UINT16_MAX;
-    APP_STATE.pendingBookmarkProgress = -1.0f;
-    APP_STATE.pendingBookmarkParagraphIndex = UINT16_MAX;
-    APP_STATE.pendingClippingIndex = UINT16_MAX;
-    APP_STATE.saveToFile();
+    if (document->getFormat() == ReflowDocumentFormat::Pdf) {
+      const PdfSavedItemKind kind =
+          APP_STATE.pendingClippingIndex == UINT16_MAX ? PdfSavedItemKind::Bookmark : PdfSavedItemKind::Clipping;
+      const PdfSavedItemsSessionResult queued =
+          pdfSavedItemsSession.queueJump(kind, APP_STATE.pendingBookmarkParagraphIndex);
+      if (queued != PdfSavedItemsSessionResult::Applied) {
+        LOG_ERR("ERS", "Cannot queue persisted PDF saved-item jump (%u)", static_cast<unsigned>(queued));
+        pendingPercentJump = false;
+        pendingParagraphIndex = UINT16_MAX;
+        pendingClippingIndex = UINT16_MAX;
+      }
+    } else {
+      // EPUB keeps its historical consume-on-open behavior byte-for-byte.
+      APP_STATE.pendingBookmarkSpine = UINT16_MAX;
+      APP_STATE.pendingBookmarkProgress = -1.0f;
+      APP_STATE.pendingBookmarkParagraphIndex = UINT16_MAX;
+      APP_STATE.pendingClippingIndex = UINT16_MAX;
+      APP_STATE.saveToFile();
+    }
   } else {
     ReflowReadingPosition progress;
     if (document->loadReadingPosition(progress)) {
@@ -1769,6 +2092,18 @@ void EpubReaderActivity::onEnter() {
       if (progress.hasPageCount) {
         cachedChapterPageNumber = progress.pageNumber;
         cachedChapterTotalPageCount = progress.pageCount;
+      }
+      if (pdfProgressState) {
+        pdfProgressState->seedPersistedPosition(progress.sectionIndex, progress.pageNumber);
+        if (progress.hasSemanticPosition || progress.hasWordCursor) {
+          if (pdfProgressState->cacheExactPosition(progress)) {
+            pdfProgressState->hasLastKnownWordCursor = true;
+            pdfProgressState->lastKnownWordCursor = progress.wordCursor;
+            pendingRelayoutReposition = true;
+          } else {
+            LOG_ERR("ERS", "Ignoring invalid persisted PDF exact position");
+          }
+        }
       }
       LOG_DBG("ERS", "Loaded cache: %d, %d", currentSpineIndex, nextPageNumber);
     }
@@ -1859,11 +2194,27 @@ void EpubReaderActivity::onExit() {
   // pre-footnote position so the book reopens at the link origin, not the footnote.
   if (footnoteDepth > 0 && document) {
     const SavedPosition& origin = savedPositions[0];
-    saveProgress(origin.spineIndex, origin.pageNumber, 0);
+    const bool isPdf = document->getFormat() == ReflowDocumentFormat::Pdf;
+    const bool saved = isPdf && origin.exactPdfOrigin.valid
+                           ? document->saveReadingPosition(origin.exactPdfOrigin.position)
+                           : saveProgress(origin.spineIndex, origin.pageNumber, 0, isPdf);
+    if (!saved) {
+      LOG_ERR("ERS", "Failed to save reader position on footnote exit");
+    }
+  } else if (document && document->getFormat() == ReflowDocumentFormat::Pdf && section && !activeFootnotePreview) {
+    if (!saveProgress(currentSpineIndex, section->currentPage, section->pageCount, true)) {
+      LOG_ERR("ERS", "Failed to save PDF reader position on exit");
+    }
   }
 
+  if (pdfSavedItemStorage && !pdfSavedItemsSession.flush()) {
+    LOG_ERR("ERS", "Failed to flush PDF saved items on reader exit");
+  }
+  pdfSavedItemsSession = {};
+  pdfSavedItemsBuffer = {};
   BOOKMARKS.unload();
   CLIPPINGS.unload();
+  pdfSavedItemStorage.reset();
   section.reset();
 
   if (pendingReadFolderMove && document) {
@@ -1890,6 +2241,7 @@ void EpubReaderActivity::openReaderMenu() {
   int bookmarkPageCount = 1;
   bool isBookCompleted;
   bool previewActive = false;
+  bool pdfPageBookmarked = false;
   {
     // Serialize EPUB metadata/file access with the render task.
     RenderLock lock(*this);
@@ -1901,17 +2253,24 @@ void EpubReaderActivity::openReaderMenu() {
     bookmarkPageCount = totalPages > 0 ? totalPages : 1;
     isBookCompleted = stats.isCompleted;
     bookProgress = getCurrentBookProgressPercent();
+    if (!previewActive && document && document->getFormat() == ReflowDocumentFormat::Pdf) {
+      pdfPageBookmarked = currentPdfPageBookmark() != nullptr;
+    }
   }
   const int bookProgressPercent = clampPercent(static_cast<int>(bookProgress + 0.5f));
-  const bool supportsSavedItems = document && reflowSupportsSavedItems(document->getCapabilities());
+  const bool savedItemsEnabled = supportsSavedItems();
+  const bool currentPageBookmarked =
+      document && document->getFormat() == ReflowDocumentFormat::Pdf
+          ? pdfPageBookmarked
+          : BOOKMARKS.hasBookmarkForPage(bmSpine, bmProgress, bookmarkPageCount);
 
   pauseReadingPaceTimer("reader_menu");
   startActivityForResult(
       std::make_unique<EpubReaderMenuActivity>(
           renderer, mappedInput, document->getTitle(), currentPage, totalPages, bookProgressPercent,
           SETTINGS.orientation, !previewActive && !currentPageFootnotes.empty(),
-          supportsSavedItems && !BOOKMARKS.getBookmarks().empty(), supportsSavedItems && CLIPPINGS.hasClippings(),
-          supportsSavedItems && !previewActive && BOOKMARKS.hasBookmarkForPage(bmSpine, bmProgress, bookmarkPageCount),
+          savedItemsEnabled && !BOOKMARKS.getBookmarks().empty(), savedItemsEnabled && CLIPPINGS.hasClippings(),
+          savedItemsEnabled && !previewActive && currentPageBookmarked,
           isBookCompleted, automaticPageTurnActive, getAutoPageTurnIntervalSeconds(),
           SETTINGS.statusBarTimeLeft != CrossPointSettings::STATUS_BAR_TIME_LEFT::TIME_LEFT_HIDE,
           saveReaderOptionsForBook, this, saveGlobalSettingsForBookReader, this, beginGlobalSettingsEditForBookReader,
@@ -1919,7 +2278,7 @@ void EpubReaderActivity::openReaderMenu() {
           this, document ? document->getCapabilities() : 0),
       [this](const ActivityResult& result) {
         if (const auto* clipping = std::get_if<ClippingJumpResult>(&result.data)) {
-          if (!document || !reflowSupportsSavedItems(document->getCapabilities())) {
+          if (!supportsSavedItems()) {
             resumeReadingPaceTimer("reader_menu_return");
             requestUpdate();
             return;
@@ -1928,10 +2287,11 @@ void EpubReaderActivity::openReaderMenu() {
           if (clipping->settingsChanged) {
             sdFontSystem.ensureLoaded(renderer);
             RenderLock lock(*this);
-            if (section) {
-              cacheCurrentSectionPosition();
+            if (!section || cacheCurrentSectionPosition()) {
+              section.reset();  // Force re-layout with changed reader settings
+            } else {
+              LOG_ERR("ERS", "Reader settings relayout aborted because the exact PDF position could not be captured");
             }
-            section.reset();  // Force re-layout with changed reader settings
           }
           handleClippingJump(*clipping);
           requestUpdate();
@@ -1949,10 +2309,11 @@ void EpubReaderActivity::openReaderMenu() {
         if (menu->settingsChanged) {
           sdFontSystem.ensureLoaded(renderer);
           RenderLock lock(*this);
-          if (section) {
-            cacheCurrentSectionPosition();
+          if (!section || cacheCurrentSectionPosition()) {
+            section.reset();  // Force re-layout with changed reader settings
+          } else {
+            LOG_ERR("ERS", "Reader settings relayout aborted because the exact PDF position could not be captured");
           }
-          section.reset();  // Force re-layout with changed reader settings
         }
         resumeReadingPaceTimer("reader_menu_return");
         if (!result.isCancelled) {
@@ -2125,6 +2486,7 @@ void EpubReaderActivity::loop() {
         onGoHome();
         return;
       case EndOfBookOptions::Action::LastPage:
+        acceptPdfNavigation();
         currentSpineIndex = std::max(document->getSectionCount() - 1, 0);
         nextPageNumber = 0;
         pendingPageJump = std::numeric_limits<uint16_t>::max();
@@ -2256,6 +2618,7 @@ void EpubReaderActivity::loop() {
           if (nextLongPressed) {
             onGoHome();
           } else {
+            acceptPdfNavigation();
             currentSpineIndex = document->getSectionCount() - 1;
             nextPageNumber = 0;
             pendingPageJump = std::numeric_limits<uint16_t>::max();
@@ -2266,6 +2629,7 @@ void EpubReaderActivity::loop() {
 
         {
           RenderLock lock(*this);
+          acceptPdfNavigation();
           nextPageNumber = 0;
           currentSpineIndex = nextLongPressed ? currentSpineIndex + 1 : currentSpineIndex - 1;
           section.reset();
@@ -2319,6 +2683,7 @@ void EpubReaderActivity::loop() {
     if (nextTriggered) {
       onGoHome();
     } else {
+      acceptPdfNavigation();
       currentSpineIndex = document->getSectionCount() - 1;
       nextPageNumber = 0;
       pendingPageJump = std::numeric_limits<uint16_t>::max();
@@ -2340,6 +2705,7 @@ void EpubReaderActivity::loop() {
 
   if (skipChapter) {
     if (!nextTriggered && section && section->currentPage > 0) {
+      acceptPdfNavigation();
       section->currentPage = 0;
       requestUpdate();
       return;
@@ -2348,6 +2714,11 @@ void EpubReaderActivity::loop() {
     // We don't want to delete the section mid-render, so grab the semaphore
     {
       RenderLock lock(*this);
+      const int targetSpineIndex =
+          nextTriggered ? currentSpineIndex + 1 : (currentSpineIndex > 0 ? currentSpineIndex - 1 : currentSpineIndex);
+      if (targetSpineIndex != currentSpineIndex) {
+        acceptPdfNavigation();
+      }
       nextPageNumber = 0;
       if (nextTriggered) {
         currentSpineIndex++;
@@ -2411,6 +2782,7 @@ void EpubReaderActivity::jumpToPercent(int percent) {
   float locationSpineProgress = 0.0f;
   if (document->resolveProgressPercentToSection(percent, locationSpineIndex, locationSpineProgress)) {
     clearFootnotePreviewState();
+    acceptPdfNavigation();
     currentSpineIndex = locationSpineIndex;
     pendingSpineProgress = locationSpineProgress;
     nextPageNumber = 0;
@@ -2460,6 +2832,7 @@ void EpubReaderActivity::jumpToPercent(int percent) {
 
   // Reset state so render() reloads and repositions on the target spine.
   clearFootnotePreviewState();
+  acceptPdfNavigation();
   currentSpineIndex = targetSpineIndex;
   nextPageNumber = 0;
   pendingPercentJump = true;
@@ -2468,12 +2841,37 @@ void EpubReaderActivity::jumpToPercent(int percent) {
 }
 
 void EpubReaderActivity::handleClippingJump(const ClippingJumpResult& clipping) {
-  if (!document || !reflowSupportsSavedItems(document->getCapabilities())) {
+  if (!supportsSavedItems()) {
     requestUpdate();
     return;
   }
   RenderLock lock(*this);
   clearFootnotePreviewState();
+  if (document && document->getFormat() == ReflowDocumentFormat::Pdf) {
+    const PdfSavedItemsSessionResult queued =
+        pdfSavedItemsSession.queueJump(PdfSavedItemKind::Clipping, clipping.paragraphIndex);
+    PdfSavedItem item;
+    if (queued != PdfSavedItemsSessionResult::Applied || !pdfSavedItemsSession.pendingJump(&item)) {
+      LOG_ERR("ERS", "Cannot queue PDF clipping jump (%u)", static_cast<unsigned>(queued));
+      requestUpdate();
+      return;
+    }
+    acceptPdfNavigation();
+    const int priorSpineIndex = currentSpineIndex;
+    currentSpineIndex = item.sectionIndex;
+    pendingParagraphIndex = item.itemId;
+    pendingClippingIndex = clipping.clippingIndex;
+    pendingPercentJump = false;
+    if (!section || priorSpineIndex != currentSpineIndex || !applyPendingPdfSavedItemJump()) {
+      section.reset();
+      nextPageNumber =
+          (item.flags & PDF_SAVED_ITEM_HAS_FALLBACK_PAGES) != 0 ? item.fallbackStartPage : 0;
+    }
+    armReadingPaceWarmup("pdf_clipping_jump");
+    pauseReadingPaceTimer("pdf_clipping_jump");
+    return;
+  }
+  acceptPdfNavigation();
   currentSpineIndex = clipping.spineIndex;
   pendingPageJump = clipping.page;
   pendingParagraphIndex = clipping.paragraphIndex;
@@ -2484,7 +2882,7 @@ void EpubReaderActivity::handleClippingJump(const ClippingJumpResult& clipping) 
 }
 
 void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction action) {
-  const bool supportsSavedItems = document && reflowSupportsSavedItems(document->getCapabilities());
+  const bool savedItemsEnabled = supportsSavedItems();
   switch (action) {
     case EpubReaderMenuActivity::MenuAction::SELECT_CHAPTER: {
       const int spineIdx = currentSpineIndex;
@@ -2497,6 +2895,7 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
               RenderLock lock(*this);
 
               clearFootnotePreviewState();
+              acceptPdfNavigation();
               currentSpineIndex = chapterResult.spineIndex;
 
               // If anchor is not empty, it will be used later to calculate the page number.
@@ -2579,7 +2978,7 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
       break;
     }
     case EpubReaderMenuActivity::MenuAction::SAVE_CLIPPING: {
-      if (!supportsSavedItems) {
+      if (!savedItemsEnabled) {
         requestUpdate();
         break;
       }
@@ -2638,7 +3037,8 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
                 uint16_t backupSpine = currentSpineIndex;
                 uint16_t backupPage = section->currentPage;
                 const int backupPageCount = section->pageCount;
-                if (!saveProgress(backupSpine, backupPage, backupPageCount)) {
+                if (!saveProgress(backupSpine, backupPage, backupPageCount,
+                                  document->getFormat() == ReflowDocumentFormat::Pdf)) {
                   LOG_ERR("ERS", "Failed to save progress before cache clear");
                 }
                 stats.save(document->getCachePath());
@@ -2750,7 +3150,8 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
 
         // Persist current position so the reader resumes at the right page on return.
         // goToReader() depends on this file, so abort the sync if the write fails.
-        if (!saveProgress(currentSpineIndex, currentPage, totalPages)) {
+        if (!saveProgress(currentSpineIndex, currentPage, totalPages,
+                          document->getFormat() == ReflowDocumentFormat::Pdf)) {
           LOG_ERR("KOSync", "Aborting sync because current progress could not be saved");
           pendingSyncSaveError = true;
           requestUpdate();
@@ -2803,7 +3204,8 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
       std::string localChapterName = (tocIdx >= 0) ? document->getTocEntry(tocIdx).title : "";
       const std::string savedEpubPath = document->getPath();
 
-      if (!saveProgress(currentSpineIndex, currentPage, totalPages)) {
+      if (!saveProgress(currentSpineIndex, currentPage, totalPages,
+                        document->getFormat() == ReflowDocumentFormat::Pdf)) {
         LOG_ERR("NBPS", "Aborting nearby position sync because current progress could not be saved");
         pendingSyncSaveError = true;
         requestUpdate();
@@ -2827,7 +3229,7 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
       break;
     }
     case EpubReaderMenuActivity::MenuAction::BOOKMARK_TOGGLE: {
-      if (!supportsSavedItems) {
+      if (!savedItemsEnabled) {
         requestUpdate();
         break;
       }
@@ -2835,7 +3237,81 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
       if (activeFootnotePreview || !section || bookmarkPageCount == 0 || section->pageCount == 0) break;
       const uint16_t spine = static_cast<uint16_t>(currentSpineIndex);
       const float progress = static_cast<float>(section->currentPage) / static_cast<float>(bookmarkPageCount);
+      if (document->getFormat() == ReflowDocumentFormat::Pdf) {
+        const uint16_t currentPage = static_cast<uint16_t>(section->currentPage);
+        const ReflowPageSemanticRange* const semantic = currentPdfPageSemanticRange();
+        if (semantic == nullptr || semantic->firstGlobalWordOrdinal >= document->getTotalWordCount()) {
+          LOG_ERR("ERS", "Cannot mutate PDF bookmark without an exact semantic page range");
+          requestUpdate();
+          break;
+        }
 
+        const PdfSavedItem* const existing = currentPdfPageBookmark();
+        if (existing != nullptr) {
+          const PdfSavedItemsSessionResult result =
+              pdfSavedItemsSession.remove(PdfSavedItemKind::Bookmark, existing->itemId);
+          if (result != PdfSavedItemsSessionResult::Applied) {
+            reloadPdfSavedItemsAfterMutation(result);
+            LOG_ERR("ERS", "Failed to remove PDF bookmark (%u)", static_cast<unsigned>(result));
+            requestUpdate();
+            break;
+          }
+          bookmarkFeedbackType = BookmarkFeedbackType::Removed;
+        } else {
+          const char* chapterTitle = nullptr;
+          std::string titleStr;
+          const int tocIndex = document->getTocIndexForSectionIndex(currentSpineIndex);
+          if (tocIndex != -1) {
+            titleStr = document->getTocEntry(tocIndex).title;
+            chapterTitle = titleStr.c_str();
+          }
+          char snippet[BOOKMARK_SNIPPET_MAX] = {};
+          if (auto page = section->loadPageFromSectionFile()) {
+            buildBookmarkSnippet(*page, snippet, sizeof(snippet));
+          }
+
+          PdfSavedItem item{};
+          item.kind = PdfSavedItemKind::Bookmark;
+          item.flags = PDF_SAVED_ITEM_HAS_START_SEMANTIC | PDF_SAVED_ITEM_HAS_FALLBACK_PAGES;
+          item.timestamp = millis();
+          item.startGlobalWordOrdinal = semantic->firstGlobalWordOrdinal;
+          item.startBlockWordOffset = semantic->firstBlockWordOffset;
+          item.sectionIndex = spine;
+          item.fallbackStartPage = currentPage;
+          item.fallbackEndPage = currentPage;
+          item.fallbackPageCount = static_cast<uint16_t>(bookmarkPageCount);
+          auto& pdfDocument = *static_cast<PdfReflowDocument*>(document.get());
+          if (!pdfSavedItemsLayoutFingerprint(pdfDocument, section->getCacheFilePath(),
+                                              item.fallbackLayoutFingerprint)) {
+            requestUpdate();
+            break;
+          }
+          std::memcpy(item.startBlockAnchor, semantic->blockAnchor, sizeof(item.startBlockAnchor));
+
+          pdfBookmarkLegacyMutation = {
+              spine,
+              progress,
+              chapterTitle,
+              snippet,
+          };
+          const PdfSavedItemsSessionResult result = pdfSavedItemsSession.add(item, nullptr);
+          pdfBookmarkLegacyMutation = {};
+          if (result == PdfSavedItemsSessionResult::LimitReached) {
+            bookmarkFeedbackType = BookmarkFeedbackType::LimitReached;
+          } else if (result == PdfSavedItemsSessionResult::Applied) {
+            bookmarkFeedbackType = BookmarkFeedbackType::Added;
+          } else {
+            reloadPdfSavedItemsAfterMutation(result);
+            LOG_ERR("ERS", "Failed to add PDF bookmark (%u)", static_cast<unsigned>(result));
+            requestUpdate();
+            break;
+          }
+        }
+        pendingBookmarkFeedback = true;
+        bookmarkFeedbackShowTime = millis();
+        requestUpdate();
+        break;
+      }
       if (BOOKMARKS.hasBookmarkForPage(spine, progress, bookmarkPageCount)) {
         BOOKMARKS.removeBookmarkForPage(spine, progress, bookmarkPageCount);
         bookmarkFeedbackType = BookmarkFeedbackType::Removed;
@@ -2866,18 +3342,48 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
       break;
     }
     case EpubReaderMenuActivity::MenuAction::VIEW_BOOKMARKS: {
-      if (!supportsSavedItems) {
+      if (!savedItemsEnabled) {
         requestUpdate();
         break;
       }
       pauseReadingPaceTimer("bookmark_list");
       startActivityForResult(
-          std::make_unique<EpubReaderBookmarkListActivity>(renderer, mappedInput, BOOKMARKS.getBookmarks()),
+          std::make_unique<EpubReaderBookmarkListActivity>(
+              renderer, mappedInput, BOOKMARKS.getBookmarks(),
+              document && document->getFormat() == ReflowDocumentFormat::Pdf ? removePdfBookmarkFromList : nullptr,
+              this),
           [this](const ActivityResult& result) {
             if (!result.isCancelled) {
               const auto& bm = std::get<BookmarkResult>(result.data);
               RenderLock lock(*this);
               clearFootnotePreviewState();
+              if (document && document->getFormat() == ReflowDocumentFormat::Pdf) {
+                const uint16_t itemId = bm.paragraphIndex;
+                const PdfSavedItemsSessionResult queued =
+                    pdfSavedItemsSession.queueJump(PdfSavedItemKind::Bookmark, itemId);
+                PdfSavedItem item;
+                if (queued != PdfSavedItemsSessionResult::Applied || !pdfSavedItemsSession.pendingJump(&item)) {
+                  LOG_ERR("ERS", "Cannot queue PDF bookmark jump (%u)", static_cast<unsigned>(queued));
+                  requestUpdate();
+                  return;
+                }
+                acceptPdfNavigation();
+                const int priorSpineIndex = currentSpineIndex;
+                pendingParagraphIndex = itemId;
+                currentSpineIndex = item.sectionIndex;
+                cachedSpineIndex = currentSpineIndex;
+                pendingPercentJump = false;
+                if (!section || priorSpineIndex != currentSpineIndex || !applyPendingPdfSavedItemJump()) {
+                  section.reset();
+                  nextPageNumber =
+                      (item.flags & PDF_SAVED_ITEM_HAS_FALLBACK_PAGES) != 0 ? item.fallbackStartPage : 0;
+                }
+                armReadingPaceWarmup("pdf_bookmark_jump");
+                pauseReadingPaceTimer("pdf_bookmark_jump");
+                requestUpdate();
+                return;
+              }
+              acceptPdfNavigation();
               if (section && currentSpineIndex == bm.spineIndex) {
                 bool resolved = false;
                 if (bm.paragraphIndex != UINT16_MAX) {
@@ -2915,13 +3421,16 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
       break;
     }
     case EpubReaderMenuActivity::MenuAction::VIEW_CLIPPINGS: {
-      if (!supportsSavedItems) {
+      if (!savedItemsEnabled) {
         requestUpdate();
         break;
       }
       pauseReadingPaceTimer("clipping_list");
       startActivityForResult(
-          std::make_unique<EpubReaderClippingListActivity>(renderer, mappedInput, CLIPPINGS.getClippings()),
+          std::make_unique<EpubReaderClippingListActivity>(
+              renderer, mappedInput, CLIPPINGS.getClippings(),
+              document && document->getFormat() == ReflowDocumentFormat::Pdf ? removePdfClippingFromList : nullptr,
+              this),
           [this](const ActivityResult& result) {
             if (!result.isCancelled) {
               const auto& clipping = std::get<ClippingJumpResult>(result.data);
@@ -2934,7 +3443,7 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
       break;
     }
     case EpubReaderMenuActivity::MenuAction::DELETE_BOOKMARKS: {
-      if (!supportsSavedItems) {
+      if (!savedItemsEnabled) {
         requestUpdate();
         break;
       }
@@ -2945,7 +3454,16 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
                                                  document ? document->getTitle() : std::string{}),
           [this](const ActivityResult& result) {
             if (!result.isCancelled) {
-              BOOKMARKS.clearAll();
+              if (document && document->getFormat() == ReflowDocumentFormat::Pdf) {
+                const PdfSavedItemsSessionResult clearResult =
+                    pdfSavedItemsSession.clear(PdfSavedItemKind::Bookmark);
+                if (clearResult != PdfSavedItemsSessionResult::Applied) {
+                  reloadPdfSavedItemsAfterMutation(clearResult);
+                  LOG_ERR("ERS", "Failed to clear PDF bookmarks (%u)", static_cast<unsigned>(clearResult));
+                }
+              } else {
+                BOOKMARKS.clearAll();
+              }
             }
             resumeReadingPaceTimer(result.isCancelled ? "delete_bookmarks_cancel" : "delete_bookmarks_return");
             requestUpdate();
@@ -2972,10 +3490,11 @@ void EpubReaderActivity::reindexCurrentSection() {
   {
     RenderLock lock(*this);
     GUI.drawPopup(renderer, tr(STR_INDEXING));
-    if (section) {
-      cacheCurrentSectionPosition();
+    if (!section || cacheCurrentSectionPosition()) {
+      section.reset();
+    } else {
+      LOG_ERR("ERS", "Reindex aborted because the exact PDF position could not be captured");
     }
-    section.reset();
   }
   requestUpdate();
 }
@@ -2983,7 +3502,8 @@ void EpubReaderActivity::reindexCurrentSection() {
 void EpubReaderActivity::openFileTransfer() {
   pauseReadingPaceTimer("file_transfer");
   if (document && section) {
-    saveProgress(currentSpineIndex, section->currentPage, section->pageCount);
+    saveProgress(currentSpineIndex, section->currentPage, section->pageCount,
+                 document->getFormat() == ReflowDocumentFormat::Pdf);
   }
 
   activityManager.goToFileTransfer(document ? document->getPath() : std::string{});
@@ -3008,13 +3528,14 @@ void EpubReaderActivity::openAutoPageTurnIntervalPicker(const bool ignoreInitial
 }
 
 void EpubReaderActivity::startClipSelection() {
-  if (!section || !document || !reflowSupportsSavedItems(document->getCapabilities())) {
+  if (!section || !supportsSavedItems()) {
     requestUpdate();
     return;
   }
 
   ReaderViewportLayout layout{};
   std::vector<WordRef> words;
+  std::vector<PdfSelectableWordSemantic> pdfSemanticWords;
   int readerFontId = 0;
   int startPage = 0;
   std::string bookTitle;
@@ -3050,12 +3571,53 @@ void EpubReaderActivity::startClipSelection() {
       return;
     }
     words.reserve(maxSelectableWords);
+    const bool pdfSelection = document->getFormat() == ReflowDocumentFormat::Pdf;
+    if (pdfSelection) {
+      pdfSemanticWords.reserve(maxSelectableWords);
+    }
     bool wordLimitLogged = false;
+    uint32_t previousSemanticCursor = 0;
+    bool hasPreviousSemanticCursor = false;
+    if (pdfSelection && startPage > 0) {
+      const auto previousRange = section->getSemanticRangeForPage(static_cast<uint16_t>(startPage - 1));
+      if (!previousRange) {
+        LOG_ERR("CLIP", "Cannot read prior PDF semantic cursor");
+        section->currentPage = startPage;
+        requestUpdate();
+        return;
+      }
+      previousSemanticCursor = previousRange->wordCursor;
+      hasPreviousSemanticCursor = true;
+    }
 
     for (int pageIdx = 0; pageIdx < pagesToLoad; ++pageIdx) {
       section->currentPage = startPage + pageIdx;
       auto page = section->loadPageFromSectionFile();
       if (!page) break;
+      std::optional<ReflowPageSemanticRange> pageSemanticRange;
+      uint32_t expectedSemanticWords = 0;
+      uint32_t semanticUniqueWords = 0;
+      uint32_t lastSemanticOrdinal = 0;
+      bool hasSemanticOrdinal = false;
+      if (pdfSelection) {
+        pageSemanticRange = section->getSemanticRangeForPage(static_cast<uint16_t>(section->currentPage));
+        if (!pageSemanticRange || !pageSemanticRange->valid) {
+          LOG_ERR("CLIP", "Cannot read PDF semantic range for selection page %d", section->currentPage);
+          pdfSemanticWords.clear();
+          break;
+        }
+        if (!hasPreviousSemanticCursor) {
+          previousSemanticCursor = pageSemanticRange->firstGlobalWordOrdinal;
+          hasPreviousSemanticCursor = true;
+        }
+        if (pageSemanticRange->wordCursor < previousSemanticCursor) {
+          LOG_ERR("CLIP", "PDF semantic cursor moved backwards during clipping");
+          pdfSemanticWords.clear();
+          break;
+        }
+        expectedSemanticWords = pageSemanticRange->wordCursor - previousSemanticCursor;
+        lastSemanticOrdinal = pageSemanticRange->firstGlobalWordOrdinal;
+      }
 
       for (const auto& element : page->elements) {
         if (element->getTag() != TAG_PageLine) continue;
@@ -3100,12 +3662,54 @@ void EpubReaderActivity::startClipSelection() {
           word.style = textStyle;
           word.endsWithInsertedHyphen = block.wordEndsWithInsertedHyphen(i);
           word.lineIsRtl = block.getBlockStyle().isRtl;
+          if (pdfSelection) {
+            const uint8_t semanticFlags = block.wordFlags(i);
+            const bool attaches =
+                (semanticFlags & (TextBlock::WORD_FLAG_SEMANTIC_ATTACHES |
+                                  TextBlock::WORD_FLAG_SEMANTIC_SPLIT_CONTINUATION)) != 0;
+            uint32_t ordinal = pageSemanticRange->firstGlobalWordOrdinal;
+            if (attaches) {
+              ordinal = hasSemanticOrdinal ? lastSemanticOrdinal : pageSemanticRange->firstGlobalWordOrdinal;
+            } else {
+              ordinal = previousSemanticCursor + semanticUniqueWords;
+              ++semanticUniqueWords;
+              lastSemanticOrdinal = ordinal;
+              hasSemanticOrdinal = true;
+            }
+            PdfSelectableWordSemantic semanticWord;
+            semanticWord.globalWordOrdinal = ordinal;
+            semanticWord.blockWordOffset =
+                pageSemanticRange->firstBlockWordOffset +
+                (ordinal >= pageSemanticRange->firstGlobalWordOrdinal
+                     ? ordinal - pageSemanticRange->firstGlobalWordOrdinal
+                     : 0);
+            semanticWord.sectionPage = static_cast<uint16_t>(section->currentPage);
+            semanticWord.pageWordIndex = word.pageWordIndex;
+            std::memcpy(semanticWord.blockAnchor, pageSemanticRange->blockAnchor,
+                        sizeof(semanticWord.blockAnchor));
+            pdfSemanticWords.push_back(semanticWord);
+          }
           words.push_back(std::move(word));
         }
+      }
+      if (pdfSelection) {
+        if (semanticUniqueWords != expectedSemanticWords) {
+          LOG_ERR("CLIP", "PDF semantic clipping count mismatch: rendered=%lu sidecar=%lu",
+                  static_cast<unsigned long>(semanticUniqueWords),
+                  static_cast<unsigned long>(expectedSemanticWords));
+          pdfSemanticWords.clear();
+          break;
+        }
+        previousSemanticCursor = pageSemanticRange->wordCursor;
       }
     }
 
     section->currentPage = startPage;
+    if (pdfSelection && (pdfSemanticWords.empty() || pdfSemanticWords.size() != words.size())) {
+      LOG_ERR("CLIP", "PDF semantic clipping map unavailable");
+      requestUpdate();
+      return;
+    }
 
     auto endsWithHyphen = [](const std::string& word) { return !word.empty() && word.back() == '-'; };
     const int indentThreshold = renderer.getLineHeight(readerFontId) / 2;
@@ -3143,10 +3747,93 @@ void EpubReaderActivity::startClipSelection() {
       std::make_unique<ClipSelectionActivity>(renderer, mappedInput, std::move(words), readerFontId, *section,
                                               startPage, layout.marginTop, layout.marginLeft),
       [this, bookTitle = std::move(bookTitle), author = std::move(author),
+       pdfSemanticWords = std::move(pdfSemanticWords),
        chapterTitle = std::move(chapterTitle)](const ActivityResult& result) {
         if (!result.isCancelled) {
           const auto& clip = std::get<ClippingResult>(result.data);
           if (!clip.text.empty()) {
+            if (document && document->getFormat() == ReflowDocumentFormat::Pdf) {
+              const auto findSemantic = [&pdfSemanticWords](const uint16_t page, const uint16_t pageWordIndex) {
+                return std::find_if(pdfSemanticWords.begin(), pdfSemanticWords.end(),
+                                    [page, pageWordIndex](const PdfSelectableWordSemantic& semantic) {
+                                      return semantic.sectionPage == page && semantic.pageWordIndex == pageWordIndex;
+                                    });
+              };
+              const auto start = findSemantic(clip.sectionPage, clip.startPageWordIndex);
+              const auto end = findSemantic(clip.endSectionPage, clip.endPageWordIndex);
+              if (start == pdfSemanticWords.end() || end == pdfSemanticWords.end() ||
+                  end->globalWordOrdinal < start->globalWordOrdinal) {
+                LOG_ERR("CLIP", "Selected PDF clipping has no exact semantic endpoints");
+                drawToast(renderer, tr(STR_CLIPPING_FAILED));
+                delay(1000);
+                resumeReadingPaceTimer("clip_selection_return");
+                requestUpdate();
+                return;
+              }
+
+              PdfSavedItem item{};
+              item.kind = PdfSavedItemKind::Clipping;
+              item.flags = PDF_SAVED_ITEM_HAS_START_SEMANTIC | PDF_SAVED_ITEM_HAS_END_SEMANTIC |
+                           PDF_SAVED_ITEM_HAS_FALLBACK_PAGES;
+              item.timestamp = millis();
+              item.startGlobalWordOrdinal = start->globalWordOrdinal;
+              item.endGlobalWordOrdinal = end->globalWordOrdinal;
+              item.startBlockWordOffset = start->blockWordOffset;
+              item.endBlockWordOffset = end->blockWordOffset;
+              item.sectionIndex = static_cast<uint16_t>(currentSpineIndex);
+              item.fallbackStartPage = clip.sectionPage;
+              item.fallbackEndPage = clip.endSectionPage;
+              item.fallbackPageCount = clip.sectionPageCount;
+              auto& pdfDocument = *static_cast<PdfReflowDocument*>(document.get());
+              if (!pdfSavedItemsLayoutFingerprint(pdfDocument, section->getCacheFilePath(),
+                                                  item.fallbackLayoutFingerprint)) {
+                drawToast(renderer, tr(STR_CLIPPING_FAILED));
+                delay(1000);
+                resumeReadingPaceTimer("clip_selection_return");
+                requestUpdate();
+                return;
+              }
+              std::memcpy(item.startBlockAnchor, start->blockAnchor, sizeof(item.startBlockAnchor));
+              std::memcpy(item.endBlockAnchor, end->blockAnchor, sizeof(item.endBlockAnchor));
+
+              pdfClippingLegacyMutation = {
+                  static_cast<uint16_t>(currentSpineIndex),
+                  clip.sectionPage,
+                  clip.endSectionPage,
+                  clip.sectionPageCount,
+                  clip.startPageWordIndex,
+                  clip.endPageWordIndex,
+                  clip.wordCount,
+                  chapterTitle.c_str(),
+                  &clip.text,
+              };
+              uint16_t assignedItemId = 0;
+              const PdfSavedItemsSessionResult addResult = pdfSavedItemsSession.add(item, &assignedItemId);
+              pdfClippingLegacyMutation = {};
+              bool exported = false;
+              if (addResult == PdfSavedItemsSessionResult::Applied) {
+                exported = ClippingsManager::saveClipping(bookTitle, author, chapterTitle,
+                                                          static_cast<int>(clip.sectionPage) + 1, clip.text);
+                if (!exported) {
+                  const PdfSavedItemsSessionResult rollback =
+                      pdfSavedItemsSession.remove(PdfSavedItemKind::Clipping, assignedItemId);
+                  if (rollback != PdfSavedItemsSessionResult::Applied) {
+                    reloadPdfSavedItemsAfterMutation(rollback);
+                    LOG_ERR("CLIP", "Failed to roll back PDF clipping after export failure");
+                  }
+                }
+              } else {
+                reloadPdfSavedItemsAfterMutation(addResult);
+              }
+              const bool saved = addResult == PdfSavedItemsSessionResult::Applied && exported;
+              drawToast(renderer, addResult == PdfSavedItemsSessionResult::LimitReached
+                                      ? tr(STR_CLIPPING_LIMIT_REACHED)
+                                      : saved ? tr(STR_CLIPPING_SAVED) : tr(STR_CLIPPING_FAILED));
+              delay(1000);
+              resumeReadingPaceTimer("clip_selection_return");
+              requestUpdate();
+              return;
+            }
             const size_t clippingIndex = CLIPPINGS.getClippings().size();
             const auto addResult =
                 CLIPPINGS.addClipping(static_cast<uint16_t>(currentSpineIndex), clip.sectionPage, clip.endSectionPage,
@@ -3222,7 +3909,7 @@ void EpubReaderActivity::executeReaderQuickAction(CrossPointSettings::LONG_PRESS
       reindexCurrentSection();
       break;
     case CrossPointSettings::LONG_MENU_TOGGLE_BOOKMARK:
-      if (document && reflowSupportsSavedItems(document->getCapabilities())) {
+      if (supportsSavedItems()) {
         onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction::BOOKMARK_TOGGLE);
       } else {
         requestUpdate();
@@ -3299,7 +3986,7 @@ void EpubReaderActivity::executeReaderQuickAction(CrossPointSettings::LONG_PRESS
       activityManager.goToFileBrowser(document ? document->getPath() : "");
       break;
     case CrossPointSettings::LONG_MENU_CREATE_CLIPPING:
-      if (document && reflowSupportsSavedItems(document->getCapabilities())) {
+      if (supportsSavedItems()) {
         startClipSelection();
       } else {
         requestUpdate();
@@ -3668,8 +4355,9 @@ void EpubReaderActivity::applyOrientation(const uint8_t orientation) {
     RenderLock lock(*this);
 
     // Preserve current reading position only when we need a live re-layout.
-    if (rendererChanged && section) {
-      cacheCurrentSectionPosition();
+    if (rendererChanged && section && !cacheCurrentSectionPosition()) {
+      LOG_ERR("ERS", "Orientation relayout aborted because the exact PDF position could not be captured");
+      return;
     }
 
     if (settingsChanged) {
@@ -3720,10 +4408,11 @@ void EpubReaderActivity::setAutoPageTurnIntervalSeconds(uint16_t seconds) {
   if (statusBarHeight == 0 || statusBarHeight == UITheme::getInstance().getProgressBarHeight()) {
     // Preserve current reading position so we can restore after reflow.
     RenderLock lock(*this);
-    if (section) {
-      cacheCurrentSectionPosition();
+    if (!section || cacheCurrentSectionPosition()) {
+      section.reset();
+    } else {
+      LOG_ERR("ERS", "Auto-turn relayout aborted because the exact PDF position could not be captured");
     }
-    section.reset();
   }
 }
 
@@ -3744,6 +4433,8 @@ void EpubReaderActivity::pageTurn(bool isForwardTurn, const char* source) {
     requestUpdate();
     return;
   }
+  const int startingSpineIndex = currentSpineIndex;
+  const int startingPage = section ? section->currentPage : -1;
   if (isForwardTurn) {
     uint32_t forwardReadSeconds = 0;
     const bool shouldRecordForwardRead = forwardPageReadElapsed(forwardReadSeconds, source);
@@ -3788,6 +4479,12 @@ void EpubReaderActivity::pageTurn(bool isForwardTurn, const char* source) {
         section.reset();
       }
     }
+  }
+  if (pdfProgressState &&
+      (currentSpineIndex != startingSpineIndex || (section && section->currentPage != startingPage))) {
+    // Once the reader explicitly moves, the new exact tuple may replace a
+    // previously unresolved resume tuple.
+    acceptPdfNavigation();
   }
   lastPageTurnTime = millis();
   requestUpdate();
@@ -3977,8 +4674,7 @@ void EpubReaderActivity::render(RenderLock&& lock) {
                   origin.pageNumber);
           pendingAnchor.clear();
           pendingPageJump.reset();
-          currentSpineIndex = origin.spineIndex;
-          nextPageNumber = origin.pageNumber;
+          applySavedNavigationPosition(origin);
           armReadingPaceWarmup("footnote_preview_failed_restore");
           requestUpdate();
           return;
@@ -4038,7 +4734,16 @@ void EpubReaderActivity::render(RenderLock&& lock) {
       return;
     }
 
-    if (pendingPageJump.has_value()) {
+    PdfSavedItem pendingPdfItem;
+    const bool hasPendingPdfSavedItem =
+        document->getFormat() == ReflowDocumentFormat::Pdf && pdfSavedItemsSession.pendingJump(&pendingPdfItem);
+    if (hasPendingPdfSavedItem) {
+      if (!applyPendingPdfSavedItemJump()) {
+        // Keep both the stable ID and session request for the next render. A
+        // transient sidecar read must not degrade into a page/percentage jump.
+        nextPageNumber = section->currentPage;
+      }
+    } else if (pendingPageJump.has_value()) {
       section->currentPage = *pendingPageJump;
       if (pendingClippingIndex != UINT16_MAX && pendingClippingIndex < CLIPPINGS.getClippings().size()) {
         const Clipping& clipping = CLIPPINGS.getClippings()[pendingClippingIndex];
@@ -4079,7 +4784,7 @@ void EpubReaderActivity::render(RenderLock&& lock) {
       pendingFootnotePreviewAnchor.clear();
     }
 
-    if (pendingPercentJump && section->pageCount > 0) {
+    if (!hasPendingPdfSavedItem && pendingPercentJump && section->pageCount > 0) {
       // Apply the pending percent jump now that we know the new section's page count.
       int newPage = static_cast<int>(pendingSpineProgress * static_cast<float>(section->pageCount));
       if (newPage >= section->pageCount) {
@@ -4114,6 +4819,7 @@ void EpubReaderActivity::render(RenderLock&& lock) {
   }
 
   applyDeferredReposition();
+  refreshCurrentPageSemanticRange();
 
   renderer.clearScreen(ReaderUtils::readerBackgroundColor());
 
@@ -4181,8 +4887,7 @@ void EpubReaderActivity::render(RenderLock&& lock) {
     LOG_DBG("ERS", "Rendered page in %dms", millis() - start);
   }
   if (!activeFootnotePreview) {
-    if (!saveProgress(currentSpineIndex, section->currentPage, section->pageCount) &&
-        document->getFormat() != ReflowDocumentFormat::Pdf) {
+    if (!saveProgress(currentSpineIndex, section->currentPage, section->pageCount)) {
       pendingSyncSaveError = true;
     }
     queueCompletionPromptIfNeeded();
@@ -4197,14 +4902,84 @@ void EpubReaderActivity::render(RenderLock&& lock) {
 }
 
 bool EpubReaderActivity::applyDeferredReposition() {
-  if (cachedChapterTotalPageCount == 0 || !section) {
+  const bool hasPdfPosition =
+      pdfProgressState && (pdfProgressState->cachedHasSemanticPosition || pdfProgressState->cachedHasWordCursor);
+  if ((!hasPdfPosition && cachedChapterTotalPageCount == 0) || !section) {
+    return false;
+  }
+  if (hasPdfPosition && currentSpineIndex != cachedSpineIndex) {
+    // Cross-section footnote previews deliberately keep the origin tuple alive.
+    // Do not consume it while a transient preview section is on screen.
     return false;
   }
 
   bool changed = false;
   if (currentSpineIndex == cachedSpineIndex) {
+    if (hasPdfPosition && !pdfProgressState->shouldAttemptExactRestore()) {
+      // The bounded retries are exhausted. Keep the original tuple and save
+      // suppression intact, but stop spending CPU on repeated sidecar scans.
+      pendingRelayoutReposition = false;
+      return false;
+    }
+    const int originalPage = section->currentPage;
+    const bool pageCountChanged = cachedChapterTotalPageCount > 0 && section->pageCount != cachedChapterTotalPageCount;
+    bool restoredFromSemantic = false;
+    if (pdfProgressState && pdfProgressState->cachedHasSemanticPosition) {
+      const auto semanticPage = section->getPageForSemanticPosition(pdfProgressState->cachedBlockAnchor,
+                                                                    pdfProgressState->cachedBlockWordOffset,
+                                                                    pdfProgressState->cachedGlobalWordOrdinal);
+      if (semanticPage) {
+        section->currentPage = *semanticPage;
+        restoredFromSemantic = true;
+        LOG_DBG("ERS", "Resolved PDF semantic word %lu to page %u",
+                static_cast<unsigned long>(pdfProgressState->cachedGlobalWordOrdinal), *semanticPage);
+      }
+    }
+
+    if (!restoredFromSemantic && pdfProgressState && pdfProgressState->cachedHasWordCursor) {
+      bool restoredExactEmptyPage = false;
+      if (cachedChapterTotalPageCount == section->pageCount && cachedChapterPageNumber >= 0 &&
+          cachedChapterPageNumber < section->pageCount) {
+        const auto storedPageRange = section->getSemanticRangeForPage(static_cast<uint16_t>(cachedChapterPageNumber));
+        if (storedPageRange && !storedPageRange->valid &&
+            storedPageRange->wordCursor == pdfProgressState->cachedWordCursor) {
+          section->currentPage = cachedChapterPageNumber;
+          restoredExactEmptyPage = true;
+        }
+      }
+      if (!restoredExactEmptyPage) {
+        const auto cursorPage = section->getPageForSemanticCursor(pdfProgressState->cachedWordCursor);
+        if (cursorPage) {
+          section->currentPage = *cursorPage;
+          restoredExactEmptyPage = true;
+        }
+      }
+      if (restoredExactEmptyPage) {
+        restoredFromSemantic = true;
+        LOG_DBG("ERS", "Resolved PDF word cursor %lu to page %d",
+                static_cast<unsigned long>(pdfProgressState->cachedWordCursor), section->currentPage);
+      }
+    }
+
+    if (hasPdfPosition && !restoredFromSemantic) {
+      const PdfDeferredRestoreAction action = pdfProgressState->noteDeferredRestoreFailure();
+      if (action == PdfDeferredRestoreAction::RetryExact) {
+        // Keep the exact PDF tuple alive for one bounded retry. Rendering may
+        // continue at the stored safe page, but it must not persist or replace
+        // that tuple with an EPUB-style approximation in the meantime.
+        pendingRelayoutReposition = true;
+        requestUpdate();
+        return false;
+      }
+      LOG_ERR("ERS", "PDF exact resume unavailable; keeping safe stored page without approximate remapping");
+      pendingRelayoutReposition = false;
+      return false;
+    } else if (restoredFromSemantic && pdfProgressState) {
+      pdfProgressState->noteDeferredRestoreSuccess();
+    }
+
     bool restoredFromParagraph = false;
-    if (cachedPageParagraphIndex != UINT16_MAX) {
+    if (!hasPdfPosition && !restoredFromSemantic && cachedPageParagraphIndex != UINT16_MAX) {
       if (const auto paragraphPage = section->getPageForParagraphIndex(cachedPageParagraphIndex)) {
         uint16_t newStartPage = *paragraphPage;
         if (newStartPage >= section->pageCount) {
@@ -4231,19 +5006,24 @@ bool EpubReaderActivity::applyDeferredReposition() {
 
         section->currentPage = newStartPage + newOffset;
         restoredFromParagraph = true;
-        changed = true;
         LOG_DBG("ERS", "Resolved cached paragraph %u offset %u/%u to page %d (span %u)", cachedPageParagraphIndex,
                 oldOffset, oldSpan, section->currentPage, newSpan);
       }
     }
 
-    if (!restoredFromParagraph && section->pageCount != cachedChapterTotalPageCount) {
+    if (!hasPdfPosition && !restoredFromSemantic && !restoredFromParagraph && cachedChapterTotalPageCount > 0 &&
+        section->pageCount != cachedChapterTotalPageCount) {
       const int newPage =
           reflowPageForRelayout(cachedChapterPageNumber, cachedChapterTotalPageCount, section->pageCount);
       if (newPage != section->currentPage) {
         section->currentPage = newPage;
         changed = true;
       }
+    }
+
+    changed = section->currentPage != originalPage;
+    if (hasPdfPosition && pdfProgressState && (changed || pageCountChanged)) {
+      pdfProgressState->markPositionDirty();
     }
   }
 
@@ -4253,10 +5033,14 @@ bool EpubReaderActivity::applyDeferredReposition() {
   cachedPageParagraphIndex = UINT16_MAX;
   cachedPageParagraphOffset = 0;
   cachedPageParagraphSpan = 0;
+  if (pdfProgressState) {
+    pdfProgressState->clearCachedExactPosition();
+  }
   return changed;
 }
 
-bool EpubReaderActivity::saveProgress(int spineIndex, int currentPage, int pageCount) {
+bool EpubReaderActivity::saveProgress(const int spineIndex, const int currentPage, const int pageCount,
+                                      const bool force) {
   if (activeFootnotePreview) {
     return true;
   }
@@ -4268,12 +5052,146 @@ bool EpubReaderActivity::saveProgress(int spineIndex, int currentPage, int pageC
   position.pageNumber = currentPage;
   position.pageCount = pageCount;
   position.hasPageCount = pageCount > 0;
-  return document->saveReadingPosition(position);
+  const bool isPdf = document->getFormat() == ReflowDocumentFormat::Pdf;
+  uint32_t now = 0;
+  if (isPdf) {
+    if (!pdfProgressState) {
+      LOG_ERR("ERS", "Cannot save PDF progress without progress state");
+      return false;
+    }
+    if (!force && pdfProgressState->shouldDeferSaveForRestoreRetry()) {
+      return true;
+    }
+    now = millis();
+    if (!pdfProgressState->shouldAttemptSave(spineIndex, currentPage, now, force)) {
+      return true;
+    }
+
+    std::optional<ReflowPageSemanticRange> semantic;
+    if (section && spineIndex == currentSpineIndex && currentPage >= 0 && currentPage < section->pageCount) {
+      if (pdfProgressState->semanticRangeSectionIndex == spineIndex &&
+          pdfProgressState->semanticRangePageNumber == currentPage) {
+        semantic = pdfProgressState->currentPageSemanticRange;
+      } else {
+        semantic = section->getSemanticRangeForPage(static_cast<uint16_t>(currentPage));
+        if (!semantic) {
+          semantic = section->getSemanticRangeForPage(static_cast<uint16_t>(currentPage));
+        }
+      }
+    }
+    if (!semantic) {
+      pdfProgressState->recordSaveAttempt(spineIndex, currentPage, now, false);
+      LOG_ERR("ERS", "Failed to read exact PDF word cursor for progress save");
+      return false;
+    }
+
+    if (!pdfPopulateReadingPositionFromRange(*semantic, &position)) {
+      pdfProgressState->recordSaveAttempt(spineIndex, currentPage, now, false);
+      LOG_ERR("ERS", "Invalid PDF semantic range for progress save");
+      return false;
+    }
+    pdfProgressState->hasLastKnownWordCursor = true;
+    pdfProgressState->lastKnownWordCursor = semantic->wordCursor;
+  }
+
+  const bool saved = document->saveReadingPosition(position);
+  if (isPdf) {
+    pdfProgressState->recordSaveAttempt(spineIndex, currentPage, now, saved);
+    if (!saved) {
+      LOG_ERR("ERS", "Failed to persist PDF reader position");
+    }
+  }
+  return saved;
 }
 
-void EpubReaderActivity::cacheCurrentSectionPosition() {
-  if (activeFootnotePreview) {
+void EpubReaderActivity::acceptPdfNavigation() {
+  if (!pdfProgressState || !document || document->getFormat() != ReflowDocumentFormat::Pdf) {
     return;
+  }
+
+  pdfProgressState->acceptNavigation(&pendingRelayoutReposition);
+  cachedChapterPageNumber = 0;
+  cachedChapterTotalPageCount = 0;
+  cachedPageParagraphIndex = UINT16_MAX;
+  cachedPageParagraphOffset = 0;
+  cachedPageParagraphSpan = 0;
+}
+
+void EpubReaderActivity::refreshCurrentPageSemanticRange() {
+  if (!pdfProgressState) {
+    return;
+  }
+  pdfProgressState->currentPageSemanticRange = {};
+  pdfProgressState->semanticRangeSectionIndex = -1;
+  pdfProgressState->semanticRangePageNumber = -1;
+  if (!document || document->getFormat() != ReflowDocumentFormat::Pdf || !section || section->currentPage < 0 ||
+      section->currentPage >= section->pageCount) {
+    return;
+  }
+  auto range = section->getSemanticRangeForPage(static_cast<uint16_t>(section->currentPage));
+  if (!range) {
+    range = section->getSemanticRangeForPage(static_cast<uint16_t>(section->currentPage));
+  }
+  if (!range) {
+    LOG_ERR("ERS", "Failed to refresh PDF page word cursor");
+    return;
+  }
+  pdfProgressState->currentPageSemanticRange = *range;
+  pdfProgressState->semanticRangeSectionIndex = currentSpineIndex;
+  pdfProgressState->semanticRangePageNumber = section->currentPage;
+  pdfProgressState->hasLastKnownWordCursor = true;
+  pdfProgressState->lastKnownWordCursor = range->wordCursor;
+}
+
+bool EpubReaderActivity::cacheCurrentSectionPosition() {
+  if (activeFootnotePreview) {
+    return true;
+  }
+  if (pdfProgressState && document && document->getFormat() == ReflowDocumentFormat::Pdf) {
+    if (!section || section->currentPage < 0 || section->currentPage >= section->pageCount) {
+      LOG_ERR("ERS", "Cannot capture PDF relayout position outside the current section");
+      return false;
+    }
+    if (pdfProgressState->shouldDeferSaveForRestoreRetry()) {
+      // The visible page may only be the safe fallback shown after an exact
+      // restore failure. Do not read or adopt any range until that restore is
+      // accepted or succeeds.
+      LOG_ERR("ERS", "Cannot capture PDF relayout position while exact restore is unresolved");
+      return false;
+    }
+    const uint16_t currentPage = static_cast<uint16_t>(section->currentPage);
+    bool captured = false;
+    if (pdfProgressState->semanticRangeSectionIndex == currentSpineIndex &&
+        pdfProgressState->semanticRangePageNumber == section->currentPage) {
+      captured = pdfProgressState->cacheRelayoutCapture(&pdfProgressState->currentPageSemanticRange, nullptr, nullptr);
+    }
+    if (!captured) {
+      const auto firstRead = section->getSemanticRangeForPage(currentPage);
+      const auto secondRead = firstRead ? std::optional<ReflowPageSemanticRange>{}
+                                        : section->getSemanticRangeForPage(currentPage);
+      captured = pdfProgressState->cacheRelayoutCapture(
+          nullptr, firstRead ? &*firstRead : nullptr, secondRead ? &*secondRead : nullptr);
+    }
+    if (!captured) {
+      // Preserve the previous exact tuple and unresolved-save guard. Replacing
+      // either with a partial read would make a later relayout irreversible.
+      LOG_ERR("ERS", "Failed to capture exact PDF relayout position; preserving previous tuple");
+      return false;
+    }
+
+    cachedSpineIndex = currentSpineIndex;
+    cachedChapterPageNumber = section->currentPage;
+    cachedChapterTotalPageCount = section->pageCount;
+    pendingRelayoutReposition = true;
+    cachedPageParagraphIndex = UINT16_MAX;
+    cachedPageParagraphOffset = 0;
+    cachedPageParagraphSpan = 0;
+    nextPageNumber = section->currentPage;
+    return true;
+  }
+
+  if (!section) {
+    return false;
   }
   cachedSpineIndex = currentSpineIndex;
   cachedChapterPageNumber = section->currentPage;
@@ -4311,6 +5229,7 @@ void EpubReaderActivity::cacheCurrentSectionPosition() {
       cachedPageParagraphSpan = std::max<uint16_t>(1, paragraphEndPage - paragraphStartPage);
     }
   }
+  return true;
 }
 
 void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fontId, const int orientedMarginTop,
@@ -4539,7 +5458,7 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
 
 void EpubReaderActivity::drawClippingHighlights(const Page& page, const int fontId, const int orientedMarginTop,
                                                 const int orientedMarginLeft) const {
-  if (!section || !document || !reflowSupportsSavedItems(document->getCapabilities()) || !CLIPPINGS.hasClippings()) {
+  if (!section || !supportsSavedItems() || !CLIPPINGS.hasClippings()) {
     return;
   }
 
@@ -4549,11 +5468,54 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
                                   section->currentPage >= 0 && section->currentPage < section->pageCount;
   const uint16_t currentPage = canUseStoredRanges ? static_cast<uint16_t>(section->currentPage) : 0;
   const uint16_t currentPageCount = canUseStoredRanges ? static_cast<uint16_t>(section->pageCount) : 0;
+  const bool pdfDocument = document->getFormat() == ReflowDocumentFormat::Pdf;
+  const ReflowPageSemanticRange* pdfPageSemanticRange = nullptr;
+  if (pdfDocument) {
+    if (!canUseStoredRanges || !pdfProgressState ||
+        pdfProgressState->semanticRangeSectionIndex != currentSpineIndex ||
+        pdfProgressState->semanticRangePageNumber != section->currentPage ||
+        !pdfProgressState->currentPageSemanticRange.valid) {
+      return;
+    }
+    pdfPageSemanticRange = &pdfProgressState->currentPageSemanticRange;
+  }
   for (const Clipping& clipping : CLIPPINGS.getClippings()) {
     if (clipping.spineIndex != static_cast<uint16_t>(currentSpineIndex)) {
       continue;
     }
     ClippingPageMatch match;
+    if (pdfDocument) {
+      const PdfSavedItem* const saved =
+          pdfSavedItemsSession.find(PdfSavedItemKind::Clipping, clipping.paragraphIndex);
+      if (saved == nullptr || !canUseStoredRanges) {
+        continue;
+      }
+      PdfSavedItemPageWordMapper mapper;
+      if (!mapper.begin(*saved, static_cast<uint16_t>(currentSpineIndex),
+                        pdfPageSemanticRange->firstGlobalWordOrdinal,
+                        pdfPageSemanticRange->lastGlobalWordOrdinal)) {
+        continue;
+      }
+      forEachVisiblePageWord(page, [&mapper](const uint16_t pageWordIndex, const PageLine&,
+                                            const TextBlock& block, const size_t index) {
+        const uint8_t flags = block.wordFlags(static_cast<uint16_t>(index));
+        const bool attaches =
+            (flags & (TextBlock::WORD_FLAG_SEMANTIC_ATTACHES |
+                      TextBlock::WORD_FLAG_SEMANTIC_SPLIT_CONTINUATION)) != 0;
+        mapper.addWord(pageWordIndex, attaches);
+        return true;
+      });
+      PdfSavedItemPageWordRange semanticMatch;
+      if (mapper.finish(&semanticMatch)) {
+        match.startWord = semanticMatch.startWord;
+        match.endWord = semanticMatch.endWord;
+        matches[matchCount++] = match;
+        if (matchCount >= matches.size()) {
+          break;
+        }
+      }
+      continue;
+    }
     const bool matchedStoredRange =
         canUseStoredRanges && findClippingStoredRangeOnPage(page, clipping, currentPage, currentPageCount, match);
     const bool shouldSearchText = !canUseStoredRanges || clipping.pageCount != currentPageCount ||
@@ -4671,8 +5633,10 @@ void EpubReaderActivity::renderStatusBar() const {
   const float rawProgress =
       (totalPageCount > 0) ? (static_cast<float>(section->currentPage) / static_cast<float>(totalPageCount)) : 0.0f;
   const bool bookmarked =
-      !activeFootnotePreview && document && reflowSupportsSavedItems(document->getCapabilities()) &&
-      BOOKMARKS.hasBookmarkForPage(static_cast<uint16_t>(currentSpineIndex), rawProgress, bookmarkPageCount);
+      !activeFootnotePreview && supportsSavedItems() &&
+      (document->getFormat() == ReflowDocumentFormat::Pdf
+           ? currentPdfPageBookmark() != nullptr
+           : BOOKMARKS.hasBookmarkForPage(static_cast<uint16_t>(currentSpineIndex), rawProgress, bookmarkPageCount));
   char timeLeftLabel[24] = {};
   const char* timeLeft =
       (!activeFootnotePreview && formatTimeLeftLabel(timeLeftLabel, sizeof(timeLeftLabel))) ? timeLeftLabel : nullptr;
@@ -4704,16 +5668,92 @@ void EpubReaderActivity::clearFootnotePreviewState() {
   activeFootnotePreview = false;
 }
 
+bool EpubReaderActivity::captureSavedPosition(SavedPosition& savedPosition) {
+  if (!section) {
+    return false;
+  }
+
+  SavedPosition captured{};
+  captured.spineIndex = currentSpineIndex;
+  captured.pageNumber = section->currentPage;
+  if (!document || document->getFormat() != ReflowDocumentFormat::Pdf) {
+    savedPosition = captured;
+    return true;
+  }
+
+  // Nested links opened from a preview have only a transient preview page.
+  // Keep that page fallback in its own stack entry; the exact root entry at
+  // index zero remains untouched for back, build failure, and forced exit.
+  if (activeFootnotePreview) {
+    savedPosition = captured;
+    return true;
+  }
+
+  if (pdfProgressState && pdfProgressState->shouldDeferSaveForRestoreRetry() &&
+      (pdfProgressState->cachedHasSemanticPosition || pdfProgressState->cachedHasWordCursor)) {
+    ReflowReadingPosition unresolved;
+    unresolved.sectionIndex = cachedSpineIndex;
+    unresolved.pageNumber = cachedChapterPageNumber;
+    unresolved.pageCount = cachedChapterTotalPageCount;
+    unresolved.hasPageCount = cachedChapterTotalPageCount > 0;
+    unresolved.hasSemanticPosition = pdfProgressState->cachedHasSemanticPosition;
+    unresolved.hasWordCursor = pdfProgressState->cachedHasWordCursor;
+    unresolved.globalWordOrdinal = pdfProgressState->cachedGlobalWordOrdinal;
+    unresolved.blockWordOffset = pdfProgressState->cachedBlockWordOffset;
+    unresolved.wordCursor = pdfProgressState->cachedWordCursor;
+    std::memcpy(unresolved.blockAnchor, pdfProgressState->cachedBlockAnchor, sizeof(unresolved.blockAnchor));
+    captured.spineIndex = unresolved.sectionIndex;
+    captured.pageNumber = unresolved.pageNumber;
+    captured.exactPdfOrigin.position = unresolved;
+    captured.exactPdfOrigin.valid = true;
+    savedPosition = captured;
+    return true;
+  }
+
+  if (section->currentPage < 0 || section->currentPage >= section->pageCount) {
+    return false;
+  }
+  std::optional<ReflowPageSemanticRange> range;
+  if (pdfProgressState && pdfProgressState->semanticRangeSectionIndex == currentSpineIndex &&
+      pdfProgressState->semanticRangePageNumber == section->currentPage) {
+    range = pdfProgressState->currentPageSemanticRange;
+  } else {
+    range = section->getSemanticRangeForPage(static_cast<uint16_t>(section->currentPage));
+    if (!range) {
+      range = section->getSemanticRangeForPage(static_cast<uint16_t>(section->currentPage));
+    }
+  }
+  if (!range ||
+      !captured.exactPdfOrigin.capture(*range, currentSpineIndex, section->currentPage, section->pageCount)) {
+    return false;
+  }
+
+  savedPosition = captured;
+  return true;
+}
+
+void EpubReaderActivity::applySavedNavigationPosition(const SavedPosition& savedPosition) {
+  acceptPdfNavigation();
+  currentSpineIndex = savedPosition.spineIndex;
+  nextPageNumber = savedPosition.pageNumber;
+  if (!pdfProgressState || !savedPosition.exactPdfOrigin.valid) {
+    return;
+  }
+
+  const ReflowReadingPosition& exact = savedPosition.exactPdfOrigin.position;
+  if (!pdfProgressState->cacheExactPosition(exact)) {
+    LOG_ERR("ERS", "Saved PDF footnote origin is invalid");
+    return;
+  }
+  cachedSpineIndex = exact.sectionIndex;
+  cachedChapterPageNumber = exact.pageNumber;
+  cachedChapterTotalPageCount = exact.pageCount;
+  pendingRelayoutReposition = true;
+}
+
 void EpubReaderActivity::navigateToHref(const std::string& hrefStr, const bool savePosition) {
   pageLoadRetryCount = 0;
   if (!document) return;
-
-  // Push current position onto saved stack
-  if (savePosition && section && footnoteDepth < MAX_FOOTNOTE_DEPTH) {
-    savedPositions[footnoteDepth] = {currentSpineIndex, section->currentPage};
-    footnoteDepth++;
-    LOG_DBG("ERS", "Saved position [%d]: spine %d, page %d", footnoteDepth, currentSpineIndex, section->currentPage);
-  }
 
   // Extract fragment anchor (e.g. "#note1" or "chapter2.xhtml#note1")
   std::string anchor;
@@ -4734,13 +5774,25 @@ void EpubReaderActivity::navigateToHref(const std::string& hrefStr, const bool s
 
   if (targetSpineIndex < 0) {
     LOG_DBG("ERS", "Could not resolve href: %s", hrefStr.c_str());
-    if (savePosition && footnoteDepth > 0) footnoteDepth--;  // undo push
     return;
   }
 
   {
     RenderLock lock(*this);
     const bool useFootnotePreview = savePosition && shouldUseFootnotePreview(targetSpineIndex, anchor);
+    if (savePosition && section && footnoteDepth < MAX_FOOTNOTE_DEPTH) {
+      SavedPosition origin;
+      if (!captureSavedPosition(origin)) {
+        LOG_ERR("ERS", "Cannot navigate without an exact PDF footnote origin");
+        return;
+      }
+      savedPositions[footnoteDepth] = origin;
+      footnoteDepth++;
+      LOG_DBG("ERS", "Saved position [%d]: spine %d, page %d", footnoteDepth, origin.spineIndex, origin.pageNumber);
+    }
+    if (!useFootnotePreview) {
+      acceptPdfNavigation();
+    }
     pendingAnchor = anchor;
     pendingFootnotePreviewAnchor = useFootnotePreview ? anchor : std::string{};
     activeFootnotePreview = false;
@@ -4764,8 +5816,7 @@ void EpubReaderActivity::restoreSavedPosition() {
     RenderLock lock(*this);
     clearFootnotePreviewState();
     pendingAnchor.clear();
-    currentSpineIndex = pos.spineIndex;
-    nextPageNumber = pos.pageNumber;
+    applySavedNavigationPosition(pos);
     section.reset();
   }
   armReadingPaceWarmup("saved_position_restore");
@@ -4931,9 +5982,17 @@ ScreenshotInfo EpubReaderActivity::getScreenshotInfo() const {
     const int totalPages = section->pageCount;
     info.currentPage = section->currentPage + 1;
     info.totalPages = totalPages;
-    if (document && document->getDocumentSize() > 0 && totalPages > 0) {
-      const float chapterProgress = static_cast<float>(section->currentPage) / static_cast<float>(totalPages);
-      int pct = static_cast<int>(document->calculateProgress(currentSpineIndex, chapterProgress) * 100.0f + 0.5f);
+    if (document && totalPages > 0) {
+      float progressPercent = 0.0F;
+      if (document->getFormat() == ReflowDocumentFormat::Pdf) {
+        progressPercent = getCurrentBookProgressPercent();
+      } else if (document->getDocumentSize() > 0) {
+        // Preserve the original EPUB screenshot calculation, including its
+        // behavior while a footnote preview is active.
+        const float chapterProgress = static_cast<float>(section->currentPage) / static_cast<float>(totalPages);
+        progressPercent = document->calculateProgress(currentSpineIndex, chapterProgress) * 100.0F;
+      }
+      int pct = static_cast<int>(progressPercent + 0.5F);
       if (pct < 0) pct = 0;
       if (pct > 100) pct = 100;
       info.progressPercent = pct;

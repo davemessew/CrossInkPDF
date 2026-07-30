@@ -14,6 +14,8 @@
 #include "EndOfBookOptions.h"
 #include "EpubReaderMenuActivity.h"
 #include "GlobalReadingStats.h"
+#include "PdfReaderProgressState.h"
+#include "PdfSavedItemsSession.h"
 #include "activities/Activity.h"
 
 struct ToastRect {
@@ -66,6 +68,32 @@ class EpubReaderActivity final : public Activity {
   uint16_t cachedPageParagraphIndex = UINT16_MAX;
   uint16_t cachedPageParagraphOffset = 0;
   uint16_t cachedPageParagraphSpan = 0;
+  // Allocated once only for PDF. Ordinary EPUB readers carry just this pointer
+  // and never allocate or initialize PDF progress state.
+  std::unique_ptr<PdfReaderProgressState> pdfProgressState;
+  // PDF-only: 128 fixed PSIT records are too large for the 4 KiB reader task
+  // stack. Allocate this one 7,168-byte block once in onEnter(), reuse it for
+  // the session, and release it in onExit(). EPUB leaves the pointer null.
+  std::unique_ptr<PdfSavedItem[]> pdfSavedItemStorage;
+  PdfSavedItemsBuffer pdfSavedItemsBuffer{};
+  PdfSavedItemsSession pdfSavedItemsSession;
+  struct PdfBookmarkLegacyMutation {
+    uint16_t spineIndex = 0;
+    float progress = 0.0F;
+    const char* chapterTitle = nullptr;
+    const char* snippet = nullptr;
+  } pdfBookmarkLegacyMutation;
+  struct PdfClippingLegacyMutation {
+    uint16_t spineIndex = 0;
+    uint16_t startPage = 0;
+    uint16_t endPage = 0;
+    uint16_t pageCount = 0;
+    uint16_t startWordIndex = 0;
+    uint16_t endWordIndex = 0;
+    uint16_t wordCount = 0;
+    const char* chapterTitle = nullptr;
+    const std::string* text = nullptr;
+  } pdfClippingLegacyMutation;
   unsigned long lastPageTurnTime = 0UL;
   unsigned long pageTurnDuration = 0UL;
   unsigned long pageShownAtMs = 0UL;
@@ -148,7 +176,9 @@ class EpubReaderActivity final : public Activity {
   struct SavedPosition {
     int spineIndex;
     int pageNumber;
+    PdfExactReadingOrigin exactPdfOrigin;
   };
+  static_assert(sizeof(SavedPosition) <= 56, "footnote return position exceeded its bounded allocation");
   static constexpr int MAX_FOOTNOTE_DEPTH = 3;
   SavedPosition savedPositions[MAX_FOOTNOTE_DEPTH] = {};
   int footnoteDepth = 0;
@@ -160,12 +190,37 @@ class EpubReaderActivity final : public Activity {
   bool shouldUseFootnotePreview(int targetSpineIndex, const std::string& anchor) const;
   std::string footnotePreviewCacheSuffix(EpubRenderMode renderMode, const std::string& anchor) const;
   void clearFootnotePreviewState();
+  bool captureSavedPosition(SavedPosition& savedPosition);
+  void applySavedNavigationPosition(const SavedPosition& savedPosition);
   // Remap the cached relative reading position once the section's real page count is known
   // (used after a settings change re-paginates a chapter). Returns true if currentPage moved.
   // No-op when pagination is unchanged (plain resume).
   bool applyDeferredReposition();
-  bool saveProgress(int spineIndex, int currentPage, int pageCount);
-  void cacheCurrentSectionPosition();
+  bool saveProgress(int spineIndex, int currentPage, int pageCount, bool force = false);
+  void acceptPdfNavigation();
+  bool cacheCurrentSectionPosition();
+  void refreshCurrentPageSemanticRange();
+  const ReflowPageSemanticRange* currentPdfPageSemanticRange() const;
+  const PdfSavedItem* currentPdfPageBookmark() const;
+  bool supportsSavedItems() const;
+  bool initializePdfSavedItems();
+  bool reloadPdfSavedItemsAfterMutation(PdfSavedItemsSessionResult result);
+  bool applyPendingPdfSavedItemJump();
+  static PdfStatus loadPdfSavedItems(void* context, PdfSavedItemsBuffer* output);
+  static PdfStatus savePdfSavedItems(void* context, const PdfSavedItem* items, uint16_t count);
+  static PdfStatus validatePdfSavedItem(void* context, const PdfSavedItem& item);
+  static bool countPdfBookmarks(void* context, uint16_t* output);
+  static bool readPdfBookmarkId(void* context, uint16_t index, uint16_t* output);
+  static PdfSavedItemsLegacyMutationResult addPdfBookmark(void* context, uint16_t itemId);
+  static PdfSavedItemsLegacyMutationResult removePdfBookmark(void* context, uint16_t itemId);
+  static PdfSavedItemsLegacyMutationResult clearPdfBookmarks(void* context);
+  static bool countPdfClippings(void* context, uint16_t* output);
+  static bool readPdfClippingId(void* context, uint16_t index, uint16_t* output);
+  static PdfSavedItemsLegacyMutationResult addPdfClipping(void* context, uint16_t itemId);
+  static PdfSavedItemsLegacyMutationResult removePdfClipping(void* context, uint16_t itemId);
+  static PdfSavedItemsLegacyMutationResult clearPdfClippings(void* context);
+  static bool removePdfBookmarkFromList(void* context, uint16_t itemId);
+  static bool removePdfClippingFromList(void* context, uint16_t itemId);
   void pauseReadingPaceTimer(const char* reason = "unknown");
   void resumeReadingPaceTimer(const char* reason = "unknown");
   void armReadingPaceWarmup(const char* reason = "unknown");

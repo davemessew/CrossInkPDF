@@ -50,6 +50,17 @@ enum class ReflowImageKind : uint8_t {
   PixelCache,
 };
 
+inline constexpr size_t REFLOW_SEMANTIC_ANCHOR_BYTES = 10;
+
+struct ReflowPageSemanticRange {
+  uint32_t firstGlobalWordOrdinal = 0;
+  uint32_t lastGlobalWordOrdinal = 0;
+  uint32_t firstBlockWordOffset = 0;
+  uint32_t wordCursor = 0;
+  char blockAnchor[REFLOW_SEMANTIC_ANCHOR_BYTES] = {};
+  bool valid = false;
+};
+
 struct ReflowResource {
   ReflowResourceKind kind = ReflowResourceKind::Streamed;
   ReflowImageKind imageKind = ReflowImageKind::EncodedImage;
@@ -102,9 +113,11 @@ struct ReflowReadingPosition {
   int pageCount = 0;
   bool hasPageCount = false;
   bool hasSemanticPosition = false;
+  bool hasWordCursor = false;
   uint32_t globalWordOrdinal = 0;
   uint32_t blockWordOffset = 0;
-  std::string blockAnchor;
+  uint32_t wordCursor = 0;
+  char blockAnchor[REFLOW_SEMANTIC_ANCHOR_BYTES] = {};
 };
 
 class ReflowSectionSource {
@@ -193,4 +206,16 @@ class ReflowDocument : public ReflowSectionSource {
   virtual uint32_t getTotalWordCount() const = 0;
   virtual bool loadReadingPosition(ReflowReadingPosition& position) const = 0;
   virtual bool saveReadingPosition(const ReflowReadingPosition& position) const = 0;
+
+  // Optional fixed-record page/word index used by PDF reflow. The default
+  // implementations keep EPUB documents entirely outside this storage path.
+  virtual bool validateLayoutWordIndex(const std::string&, int, uint16_t) const { return false; }
+  virtual bool removeLayoutWordIndex(const std::string&) const { return true; }
+  virtual bool readLayoutWordRange(const std::string&, uint16_t, uint16_t, ReflowPageSemanticRange&) const {
+    return false;
+  }
+  virtual bool findLayoutWordPage(const std::string&, const char*, uint32_t, uint32_t, uint16_t&) const {
+    return false;
+  }
+  virtual bool findLayoutWordCursor(const std::string&, uint32_t, uint16_t&) const { return false; }
 };

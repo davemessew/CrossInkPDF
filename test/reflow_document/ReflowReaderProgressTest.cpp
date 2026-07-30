@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <string>
 
 #include "Reflow/ReflowCapabilityPolicy.h"
@@ -165,7 +166,7 @@ TEST(ReflowReaderProgress, PreservesSemanticPositionAndUsesIntegerRelayoutMappin
   saved.hasSemanticPosition = true;
   saved.globalWordOrdinal = 77;
   saved.blockWordOffset = 4;
-  saved.blockAnchor = "paragraph-8";
+  std::memcpy(saved.blockAnchor, "block-8", sizeof("block-8"));
 
   ASSERT_TRUE(document.saveReadingPosition(saved));
   ReflowReadingPosition loaded;
@@ -173,7 +174,7 @@ TEST(ReflowReaderProgress, PreservesSemanticPositionAndUsesIntegerRelayoutMappin
   EXPECT_EQ(loaded.sectionIndex, 1);
   EXPECT_EQ(loaded.globalWordOrdinal, 77U);
   EXPECT_EQ(loaded.blockWordOffset, 4U);
-  EXPECT_EQ(loaded.blockAnchor, "paragraph-8");
+  EXPECT_STREQ(loaded.blockAnchor, "block-8");
   EXPECT_EQ(reflowPageForRelayout(loaded.pageNumber, loaded.pageCount, 20), 6);
   EXPECT_EQ(reflowPageForRelayout(99, 10, 4), 3);
   EXPECT_EQ(document.calculateProgress(1, 0.5F), 0.625F);

@@ -9,9 +9,15 @@
 
 class EpubReaderClippingListActivity final : public Activity {
  public:
+  using DeleteCallback = bool (*)(void* context, uint16_t itemId);
+
   EpubReaderClippingListActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
-                                 std::vector<Clipping> clippings)
-      : Activity("EpubClippingList", renderer, mappedInput), clippings(std::move(clippings)) {}
+                                 std::vector<Clipping> clippings, DeleteCallback deleteCallback = nullptr,
+                                 void* deleteContext = nullptr)
+      : Activity("EpubClippingList", renderer, mappedInput),
+        clippings(std::move(clippings)),
+        deleteCallback(deleteCallback),
+        deleteContext(deleteContext) {}
 
   void onEnter() override;
   void loop() override;
@@ -28,6 +34,8 @@ class EpubReaderClippingListActivity final : public Activity {
   int detailLinesPerPage = 0;
   bool longPressConfirmHandled = false;
   bool detailMode = false;
+  DeleteCallback deleteCallback = nullptr;
+  void* deleteContext = nullptr;
 
   int getPageItems() const;
   int getDetailTextWidth() const;

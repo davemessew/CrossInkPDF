@@ -12,6 +12,7 @@
 
 class Page;
 class GfxRenderer;
+class TextBlock;
 
 struct SectionBuildOptions {
   const char* previewAnchor = nullptr;
@@ -26,11 +27,18 @@ class Section {
   GfxRenderer& renderer;
   std::string filePath;
   HalFile file;
+  struct PdfPageBuildContext;
   bool writeSectionFileHeader(int fontId, float lineCompression, bool extraParagraphSpacing, bool forceParagraphIndents,
                               uint8_t paragraphAlignment, uint16_t viewportWidth, uint16_t viewportHeight,
                               bool hyphenationEnabled, bool embeddedStyle, uint8_t imageRendering,
                               bool bionicReadingEnabled, bool guideReadingEnabled, EpubRenderMode renderMode);
   uint32_t onPageComplete(std::unique_ptr<Page> page);
+  bool usesPdfWordIndex() const;
+  static void completePdfPage(void* context, std::unique_ptr<Page> page, uint16_t paragraphIndex,
+                              uint16_t listItemIndex);
+  static bool finishPdfTextBlock(void* context, const Page* currentPage);
+  static bool beginPdfTextBlock(void* context, const char* anchor, size_t anchorLength);
+  static bool trackPdfTextLine(void* context, const TextBlock* line);
 
  public:
   uint16_t pageCount = 0;
@@ -76,4 +84,12 @@ class Section {
 
   // Look up the running list-item index for the given rendered page.
   std::optional<uint16_t> getListItemIndexForPage(uint16_t page) const;
+
+  // PDF-only, fixed-record semantic positions. EPUB sections never create or
+  // read this sidecar, so their v44 cache bytes remain unchanged.
+  std::optional<ReflowPageSemanticRange> getSemanticRangeForPage(uint16_t page);
+  std::optional<uint16_t> getPageForSemanticPosition(const char* blockAnchor, uint32_t blockWordOffset,
+                                                     uint32_t globalWordOrdinal);
+  std::optional<uint16_t> getPageForSemanticCursor(uint32_t wordCursor);
+  const std::string& getCacheFilePath() const { return filePath; }
 };

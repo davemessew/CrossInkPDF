@@ -1,9 +1,9 @@
 # File Formats
 
-These formats describe the SD-card cache files under `/.crosspoint/epub_<hash>/`.
-All POD fields are written in the ESP32 little-endian representation used by
-`Serialization.h`; strings are length-prefixed UTF-8 unless a format notes a
-fixed-size char buffer.
+These formats describe CrossInk's SD-card cache files, including the EPUB cache
+under `/.crosspoint/epub_<hash>/` and the PDF reflow cache under
+`/.crosspoint/pdf_<hash>/`. All POD fields are little-endian; strings are
+length-prefixed UTF-8 unless a format notes a fixed-size char buffer.
 
 ## `book.bin`
 
@@ -140,6 +140,63 @@ struct ReaderSettingsBin {
 };
 ```
 
+## PDF `saved_items.a` / `saved_items.b`
+
+### PSIT Version 1
+
+PDF bookmarks and clippings use two CRC-protected slots in the book's
+`/.crosspoint/pdf_<hash>/` cache root. The slots are alternated by sequence
+number so a failed or interrupted SD-card write cannot overwrite the last
+confirmed state. A write whose final durability is uncertain remains
+quarantined for that process and is retried in the same slot with the same
+sequence; it is not deleted. After a reboot, a complete CRC-valid slot may be
+accepted even if the preceding run did not observe a successful close.
+
+The fixed 80-byte header is:
+
+- `[0-3]` magic `PSIT`
+- `[4-5]` version (`1`)
+- `[6-7]` header size (`80`)
+- `[8-9]` record size (`56`)
+- `[10-11]` total record count (`uint16_t`, maximum `128`)
+- `[12-13]` bookmark count (`uint16_t`, maximum `64`)
+- `[14-15]` clipping count (`uint16_t`, maximum `64`)
+- `[16-19]` monotonic sequence (`uint32_t`)
+- `[20-23]` flags (`bit0=source modification time is known`)
+- `[24-31]` source file size (`uint64_t`)
+- `[32-39]` source modification time (`uint64_t`, used only when flag bit 0 is set)
+- `[40-47]` source head fingerprint (`uint64_t`)
+- `[48-55]` source tail fingerprint (`uint64_t`)
+- `[56-59]` document total word count (`uint32_t`)
+- `[60-63]` aggregate record CRC-32 (`uint32_t`, seed zero)
+- `[64-67]` header CRC-32 over bytes `[0-63]`
+- `[68-79]` reserved zero bytes
+
+Each 56-byte record is:
+
+- `[0-1]` stable nonzero item ID (`uint16_t`)
+- `[2]` kind (`1=bookmark`, `2=clipping`)
+- `[3]` flags (`bit0=start semantic position`, `bit1=end semantic position`,
+  `bit2=fallback pages`)
+- `[4-7]` timestamp (`uint32_t`)
+- `[8-11]` start global word ordinal (`uint32_t`)
+- `[12-15]` end global word ordinal (`uint32_t`; zero for bookmarks)
+- `[16-19]` start in-block word offset (`uint32_t`)
+- `[20-23]` end in-block word offset (`uint32_t`; zero for bookmarks)
+- `[24-25]` semantic section index (`uint16_t`)
+- `[26-27]` fallback start page (`uint16_t`)
+- `[28-29]` fallback end page (`uint16_t`)
+- `[30-31]` fallback page count (`uint16_t`)
+- `[32-41]` fixed start-block anchor (`char[10]`, NUL-terminated)
+- `[42-51]` fixed end-block anchor (`char[10]`, NUL-terminated; empty for bookmarks)
+- `[52-55]` exact layout fingerprint (`uint32_t`)
+
+Fallback pages are valid only when flag bit 2 is set, the stored page count
+matches, and the nonzero layout fingerprint exactly matches the current
+layout. Otherwise CrossInk resolves the semantic anchors and word ordinals or
+fails safely instead of jumping to a similarly sized but different layout.
+The exact file size is `80 + recordCount * 56`, with a maximum of 7,248 bytes.
+
 ## `/.crosspoint/clippings/<bookType>_<crc32(path)>.bin`
 
 ### Version 1
@@ -150,9 +207,9 @@ no separate highlight file. The file lives in `/.crosspoint/clippings/` instead
 of the EPUB render-cache directory so clearing/rebuilding layout cache does not
 delete user clippings.
 
-The current implementation only writes EPUB clipping files, so `bookType` is
-`epub`. The numeric suffix is `uzlib_crc32()` of the book's SD-card path, for
-example:
+The current implementation writes EPUB clipping files and PDF saved-item
+compatibility files, so `bookType` is `epub` or `pdf`. The numeric suffix is
+`uzlib_crc32()` of the book's SD-card path, for example:
 
 ```text
 /.crosspoint/clippings/epub_1234567890.bin

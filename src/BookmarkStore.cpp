@@ -2,10 +2,12 @@
 
 #include <HalStorage.h>
 #include <Logging.h>
+#include <Memory.h>
 #include <Serialization.h>
 #include <uzlib.h>
 
 #include <algorithm>
+#include <cstring>
 #include <functional>
 #include <limits>
 
@@ -19,6 +21,9 @@ constexpr uint16_t MAX_BOOKMARKS = 1024;
 constexpr size_t INITIAL_BOOKMARK_RESERVE = 8;
 constexpr char BOOKMARKS_DIR[] = "/.crosspoint/bookmarks";
 constexpr char READ_FOLDER[] = "/Read";
+constexpr char PDF_TRANSACTION_TEMP_SUFFIX[] = ".tmp";
+constexpr char PDF_TRANSACTION_BACKUP_SUFFIX[] = ".bak";
+constexpr char PDF_STORE_PREFIX[] = "/.crosspoint/bookmarks/pdf_";
 
 struct BookmarkFileHeader {
   std::string title;
@@ -28,6 +33,82 @@ struct BookmarkFileHeader {
   uint16_t count = 0;
 };
 
+struct PdfBookmarkMigrationScratch {
+  BookmarkStore store;
+  std::vector<Bookmark> primary;
+  std::vector<Bookmark> secondary;
+  std::string sourceCurrentPath;
+  std::string sourceLegacyPath;
+  std::string destinationCurrentPath;
+  std::string destinationLegacyPath;
+};
+static_assert(sizeof(PdfBookmarkMigrationScratch) <= 512);
+
+struct PdfBookmarkLoadScratch {
+  BookmarkStore candidate;
+  std::vector<Bookmark> legacyBookmarks;
+  std::string currentPath;
+  std::string legacyPath;
+};
+static_assert(sizeof(PdfBookmarkLoadScratch) <= 320);
+
+bool readExpectedBytes(FsFile& file, const void* const expected, const size_t length) {
+  const auto* expectedBytes = static_cast<const uint8_t*>(expected);
+  uint8_t actual[64];
+  size_t offset = 0;
+  while (offset < length) {
+    const size_t chunk = std::min(sizeof(actual), length - offset);
+    if (file.read(actual, chunk) != static_cast<int>(chunk) ||
+        std::memcmp(actual, expectedBytes + offset, chunk) != 0) {
+      return false;
+    }
+    offset += chunk;
+  }
+  return true;
+}
+
+template <typename T>
+bool readExpectedPod(FsFile& file, const T& expected) {
+  return readExpectedBytes(file, &expected, sizeof(expected));
+}
+
+bool readExpectedString(FsFile& file, const std::string& expected) {
+  const uint32_t length = static_cast<uint32_t>(expected.size());
+  return readExpectedPod(file, length) && readExpectedBytes(file, expected.data(), expected.size());
+}
+
+const Bookmark* pdfBookmarkAt(const std::vector<Bookmark>& bookmarks, const Bookmark* const appended,
+                              const size_t removeIndex, const size_t logicalIndex) {
+  size_t candidate = 0;
+  for (size_t index = 0; index < bookmarks.size(); ++index) {
+    if (index == removeIndex) continue;
+    if (candidate++ == logicalIndex) return &bookmarks[index];
+  }
+  return appended != nullptr && candidate == logicalIndex ? appended : nullptr;
+}
+
+size_t pdfBookmarkCount(const std::vector<Bookmark>& bookmarks, const Bookmark* const appended,
+                        const size_t removeIndex, const bool clear) {
+  if (clear) return 0;
+  return bookmarks.size() - static_cast<size_t>(removeIndex < bookmarks.size()) +
+         static_cast<size_t>(appended != nullptr);
+}
+
+bool isPdfStorePath(const std::string& path) {
+  return path.compare(0, sizeof(PDF_STORE_PREFIX) - 1U, PDF_STORE_PREFIX) == 0;
+}
+
+bool hasSuffix(const char* const value, const char* const suffix) {
+  if (value == nullptr || suffix == nullptr) return false;
+  const size_t valueLength = std::strlen(value);
+  const size_t suffixLength = std::strlen(suffix);
+  return valueLength >= suffixLength && std::memcmp(value + valueLength - suffixLength, suffix, suffixLength) == 0;
+}
+
+bool isPdfTransactionArtifact(const char* const name) {
+  return hasSuffix(name, PDF_TRANSACTION_TEMP_SUFFIX) || hasSuffix(name, PDF_TRANSACTION_BACKUP_SUFFIX);
+}
+
 std::string currentStoreFilePathForBook(const std::string& filePath, const std::string& bookType) {
   const uint32_t crc = uzlib_crc32(filePath.data(), static_cast<unsigned int>(filePath.size()), 0);
   return std::string(BOOKMARKS_DIR) + "/" + bookType + "_" + std::to_string(crc) + ".bin";
@@ -36,6 +117,21 @@ std::string currentStoreFilePathForBook(const std::string& filePath, const std::
 std::string legacyStoreFilePathForBook(const std::string& filePath, const std::string& bookType) {
   return std::string(BOOKMARKS_DIR) + "/" + bookType + "_" + std::to_string(std::hash<std::string>{}(filePath)) +
          ".bin";
+}
+
+bool pdfBookmarkStoreFilePathForBook(const std::string& filePath, const bool legacy, std::string& output) {
+  constexpr size_t PATH_CAPACITY = 64;
+  char path[PATH_CAPACITY];
+  const unsigned long long hash = legacy ? static_cast<unsigned long long>(std::hash<std::string>{}(filePath))
+                                         : static_cast<unsigned long long>(uzlib_crc32(
+                                               filePath.data(), static_cast<unsigned int>(filePath.size()), 0));
+  const int written = snprintf(path, sizeof(path), "%s/pdf_%llu.bin", BOOKMARKS_DIR, hash);
+  if (written < 0 || static_cast<size_t>(written) >= sizeof(path)) {
+    LOG_ERR("BKS", "PDF bookmark store path exceeds %u bytes", static_cast<unsigned>(sizeof(path)));
+    return false;
+  }
+  output.assign(path, static_cast<size_t>(written));
+  return true;
 }
 
 bool readBookmarkCount(FsFile& file, const uint8_t version, uint16_t& count) {
@@ -54,15 +150,19 @@ bool readBookmarkCount(FsFile& file, const uint8_t version, uint16_t& count) {
   return false;
 }
 
-bool bookmarksMatchIdentity(const Bookmark& a, const Bookmark& b) {
+bool bookmarksMatchIdentity(const Bookmark& a, const Bookmark& b, const bool stablePdfIds) {
+  if (stablePdfIds) {
+    return a.paragraphIndex != 0 && a.paragraphIndex != UINT16_MAX && a.paragraphIndex == b.paragraphIndex;
+  }
   return a.spineIndex == b.spineIndex && a.progress == b.progress;
 }
 
-bool mergeBookmarks(std::vector<Bookmark>& dst, const std::vector<Bookmark>& src) {
+bool mergeBookmarks(std::vector<Bookmark>& dst, const std::vector<Bookmark>& src, const bool stablePdfIds) {
   bool mergedAny = false;
   for (const auto& bookmark : src) {
-    const auto it = std::find_if(dst.begin(), dst.end(),
-                                 [&](const Bookmark& existing) { return bookmarksMatchIdentity(existing, bookmark); });
+    const auto it = std::find_if(dst.begin(), dst.end(), [&](const Bookmark& existing) {
+      return bookmarksMatchIdentity(existing, bookmark, stablePdfIds);
+    });
     if (it != dst.end()) {
       continue;
     }
@@ -85,6 +185,26 @@ bool deleteBookmarkStorePath(const std::string& path, const std::string& reasonT
     return false;
   }
   return true;
+}
+
+bool deletePdfBookmarkStorePaths(const std::string& currentPath, const std::string& legacyPath) {
+  const std::string currentBackup = currentPath + PDF_TRANSACTION_BACKUP_SUFFIX;
+  const std::string currentTemporary = currentPath + PDF_TRANSACTION_TEMP_SUFFIX;
+  const std::string legacyBackup = legacyPath + PDF_TRANSACTION_BACKUP_SUFFIX;
+  const std::string legacyTemporary = legacyPath + PDF_TRANSACTION_TEMP_SUFFIX;
+
+  // Delete rollback material first and the authoritative canonical path last.
+  // Any failure before that last step leaves a recoverable committed state.
+  if (!deleteBookmarkStorePath(currentBackup, "PDF backup") ||
+      !deleteBookmarkStorePath(currentTemporary, "PDF temporary")) {
+    return false;
+  }
+  if (legacyPath != currentPath && (!deleteBookmarkStorePath(legacyBackup, "legacy PDF backup") ||
+                                    !deleteBookmarkStorePath(legacyTemporary, "legacy PDF temporary") ||
+                                    !deleteBookmarkStorePath(legacyPath, "legacy PDF canonical"))) {
+    return false;
+  }
+  return deleteBookmarkStorePath(currentPath, "PDF canonical");
 }
 
 std::string fileNameFromPath(const std::string& path) {
@@ -169,7 +289,7 @@ bool readBookmarkFileHeader(const std::string& fullPath, const char* name, Bookm
     f.close();
     return false;
   }
-  uint8_t version;
+  uint8_t version = 0;
   serialization::readPod(f, version);
   if (version != LEGACY_VERSION && version != COUNT_U16_VERSION && version != PARAGRAPH_ANCHOR_VERSION &&
       version != VERSION) {
@@ -214,13 +334,94 @@ bool readBookmarkFileHeader(const std::string& fullPath, const char* name, Bookm
 
 BookmarkStore BookmarkStore::instance;
 
-bool BookmarkStore::loadForBook(const std::string& filePath, const std::string& title, const std::string& author,
-                                const std::string& bookType) {
-  if (bookType != "epub" && bookType != "xtc" && bookType != "txt") {
-    LOG_ERR("BKS", "Unknown book type: %s", bookType.c_str());
+bool BookmarkStore::loadPdfForBook(const std::string& filePath, const std::string& title, const std::string& author) {
+  // This cold path needs a Store, a second record vector, and two path owners.
+  // Keep the fixed control state off the task stack in one checked allocation.
+  auto scratch = makeUniqueNoThrow<PdfBookmarkLoadScratch>();
+  if (!scratch) {
+    LOG_ERR("BKS", "Out of memory allocating %u-byte PDF bookmark load scratch",
+            static_cast<unsigned>(sizeof(PdfBookmarkLoadScratch)));
+    return false;
+  }
+  if (!pdfBookmarkStoreFilePathForBook(filePath, false, scratch->currentPath) ||
+      !pdfBookmarkStoreFilePathForBook(filePath, true, scratch->legacyPath)) {
     return false;
   }
 
+  BookmarkStore& candidate = scratch->candidate;
+  candidate.bookFilePath = filePath;
+  candidate.bookTitle = title;
+  candidate.bookAuthor = author;
+  candidate.dirty = false;
+  if (candidate.bookmarks.capacity() < INITIAL_BOOKMARK_RESERVE) {
+    candidate.bookmarks.reserve(INITIAL_BOOKMARK_RESERVE);
+  }
+
+  candidate.storeFilePath = scratch->currentPath;
+  if (!candidate.recoverPdfTransaction()) {
+    LOG_ERR("BKS", "Failed to recover PDF bookmark transaction: %s", scratch->currentPath.c_str());
+    return false;
+  }
+  if (scratch->legacyPath != scratch->currentPath) {
+    candidate.storeFilePath = scratch->legacyPath;
+    if (!candidate.recoverPdfTransaction()) {
+      LOG_ERR("BKS", "Failed to recover legacy PDF bookmark transaction: %s", scratch->legacyPath.c_str());
+      return false;
+    }
+  }
+
+  const bool hasCurrentFile = Storage.exists(scratch->currentPath.c_str());
+  const bool hasLegacyFile = scratch->legacyPath != scratch->currentPath && Storage.exists(scratch->legacyPath.c_str());
+  bool needsRewrite = false;
+  if (hasCurrentFile && !candidate.readFromFile(scratch->currentPath, candidate.bookmarks, needsRewrite)) {
+    LOG_ERR("BKS", "Failed to load canonical PDF bookmark file: %s", scratch->currentPath.c_str());
+    return false;
+  }
+
+  bool legacyNeedsRewrite = false;
+  bool mergedLegacyBookmarks = false;
+  if (hasLegacyFile) {
+    if (!candidate.readFromFile(scratch->legacyPath, scratch->legacyBookmarks, legacyNeedsRewrite)) {
+      LOG_ERR("BKS", "Failed to load legacy PDF bookmark file: %s", scratch->legacyPath.c_str());
+      return false;
+    }
+    mergedLegacyBookmarks = mergeBookmarks(candidate.bookmarks, scratch->legacyBookmarks, true);
+  }
+
+  if (!hasCurrentFile && !hasLegacyFile) {
+    candidate.storeFilePath = scratch->currentPath;
+  } else {
+    if (hasLegacyFile && (!hasCurrentFile || mergedLegacyBookmarks || legacyNeedsRewrite || needsRewrite)) {
+      candidate.storeFilePath = scratch->currentPath;
+      if (!candidate.writePdfTransaction(nullptr, std::numeric_limits<size_t>::max(), false)) {
+        return false;
+      }
+      needsRewrite = false;
+    } else if (needsRewrite) {
+      candidate.storeFilePath = scratch->currentPath;
+      if (!candidate.writePdfTransaction(nullptr, std::numeric_limits<size_t>::max(), false)) {
+        return false;
+      }
+      needsRewrite = false;
+    }
+
+    if (hasLegacyFile && !deletePdfBookmarkStorePaths(scratch->legacyPath, scratch->legacyPath)) {
+      return false;
+    }
+    candidate.storeFilePath = scratch->currentPath;
+  }
+
+  bookmarks = std::move(candidate.bookmarks);
+  bookFilePath = std::move(candidate.bookFilePath);
+  bookTitle = std::move(candidate.bookTitle);
+  bookAuthor = std::move(candidate.bookAuthor);
+  storeFilePath = std::move(candidate.storeFilePath);
+  dirty = false;
+  return true;
+}
+
+bool BookmarkStore::loadLegacyForBook(const std::string& filePath, const std::string& title, const std::string& author,
+                                      const std::string& bookType) {
   bookFilePath = filePath;
   bookTitle = title;
   bookAuthor = author;
@@ -231,6 +432,10 @@ bool BookmarkStore::loadForBook(const std::string& filePath, const std::string& 
   }
 
   storeFilePath = currentStoreFilePathForBook(filePath, bookType);
+  if (bookType == "pdf" && !recoverPdfTransaction()) {
+    LOG_ERR("BKS", "Failed to recover PDF bookmark transaction: %s", storeFilePath.c_str());
+    return false;
+  }
   const std::string legacyStoreFilePath = legacyStoreFilePathForBook(filePath, bookType);
   const bool hasCurrentFile = Storage.exists(storeFilePath.c_str());
   const bool hasLegacyFile = legacyStoreFilePath != storeFilePath && Storage.exists(legacyStoreFilePath.c_str());
@@ -280,7 +485,7 @@ bool BookmarkStore::loadForBook(const std::string& filePath, const std::string& 
     bool legacyNeedsRewrite = false;
     std::vector<Bookmark> legacyBookmarks;
     if (readFromFile(legacyStoreFilePath, legacyBookmarks, legacyNeedsRewrite)) {
-      const bool mergedLegacyBookmarks = mergeBookmarks(bookmarks, legacyBookmarks);
+      const bool mergedLegacyBookmarks = mergeBookmarks(bookmarks, legacyBookmarks, bookType == "pdf");
       loadedAny = true;
       bool canDeleteLegacyFile = currentLoaded;
 
@@ -311,6 +516,26 @@ bool BookmarkStore::loadForBook(const std::string& filePath, const std::string& 
   }
 
   return true;
+}
+
+bool BookmarkStore::loadForBook(const std::string& filePath, const std::string& title, const std::string& author,
+                                const std::string& bookType) {
+  if (bookType != "epub" && bookType != "pdf" && bookType != "xtc" && bookType != "txt") {
+    LOG_ERR("BKS", "Unknown book type: %s", bookType.c_str());
+    return false;
+  }
+  if (bookType == "pdf") {
+    return loadPdfForBook(filePath, title, author);
+  }
+  return loadLegacyForBook(filePath, title, author, bookType);
+}
+
+bool BookmarkStore::reloadPdfFromDisk() {
+  if (bookFilePath.empty() || !isPdfStorePath(storeFilePath)) {
+    LOG_ERR("BKS", "Cannot reload a PDF bookmark store before it is loaded");
+    return false;
+  }
+  return loadPdfForBook(bookFilePath, bookTitle, bookAuthor);
 }
 
 void BookmarkStore::unload() {
@@ -354,6 +579,71 @@ BookmarkStore::AddResult BookmarkStore::addBookmark(uint16_t spineIndex, float p
   return AddResult::Added;
 }
 
+BookmarkStore::AddResult BookmarkStore::addPdfBookmark(const uint16_t spineIndex, const float progress,
+                                                       const char* const chapterTitle, const uint16_t itemId,
+                                                       const char* const snippet) {
+  if (!isPdfStorePath(storeFilePath)) {
+    return AddResult::SaveFailed;
+  }
+  if (itemId == 0 || itemId == UINT16_MAX ||
+      std::any_of(bookmarks.begin(), bookmarks.end(),
+                  [itemId](const Bookmark& bookmark) { return bookmark.paragraphIndex == itemId; })) {
+    return AddResult::InvalidItemId;
+  }
+  if (bookmarks.size() >= PDF_BOOKMARK_MAX_PER_BOOK) {
+    LOG_ERR("BKS", "PDF bookmark limit (%u) reached", PDF_BOOKMARK_MAX_PER_BOOK);
+    return AddResult::LimitReached;
+  }
+  if (storeFilePath.empty()) {
+    return AddResult::SaveFailed;
+  }
+
+  Bookmark bookmark{};
+  bookmark.spineIndex = spineIndex;
+  bookmark.progress = progress;
+  bookmark.timestamp = 0;
+  snprintf(bookmark.chapterTitle, sizeof(bookmark.chapterTitle), "%s", chapterTitle ? chapterTitle : "");
+  bookmark.paragraphIndex = itemId;
+  snprintf(bookmark.snippet, sizeof(bookmark.snippet), "%s", snippet ? snippet : "");
+
+  if (bookmarks.size() == bookmarks.capacity()) {
+    bookmarks.reserve(bookmarks.size() + 1);
+  }
+  if (!writePdfTransaction(&bookmark, std::numeric_limits<size_t>::max(), false)) {
+    return AddResult::SaveFailed;
+  }
+  bookmarks.push_back(bookmark);
+  dirty = false;
+  return AddResult::Added;
+}
+
+bool BookmarkStore::removePdfBookmark(const uint16_t itemId) {
+  if (!isPdfStorePath(storeFilePath)) return false;
+  const auto found = std::find_if(bookmarks.begin(), bookmarks.end(),
+                                  [itemId](const Bookmark& bookmark) { return bookmark.paragraphIndex == itemId; });
+  if (found == bookmarks.end()) return false;
+
+  const size_t removeIndex = static_cast<size_t>(found - bookmarks.begin());
+  if (!writePdfTransaction(nullptr, removeIndex, false)) {
+    return false;
+  }
+  bookmarks.erase(found);
+  dirty = false;
+  return true;
+}
+
+bool BookmarkStore::clearPdfBookmarks() {
+  if (!isPdfStorePath(storeFilePath)) return false;
+  std::string legacyPath;
+  if (!pdfBookmarkStoreFilePathForBook(bookFilePath, true, legacyPath)) return false;
+  if (!deletePdfBookmarkStorePaths(storeFilePath, legacyPath)) {
+    return false;
+  }
+  bookmarks.clear();
+  dirty = false;
+  return true;
+}
+
 void BookmarkStore::removeBookmarkForPage(uint16_t spineIndex, float pageProgress, int pageCount) {
   if (pageCount <= 0) return;
   float pageSlice = 1.0f / static_cast<float>(pageCount);
@@ -365,6 +655,10 @@ void BookmarkStore::removeBookmarkForPage(uint16_t spineIndex, float pageProgres
   });
   if (it == bookmarks.end()) return;
 
+  if (isPdfStorePath(storeFilePath)) {
+    removePdfBookmark(it->paragraphIndex);
+    return;
+  }
   bookmarks.erase(it);
   dirty = true;
   saveToFile();
@@ -372,6 +666,9 @@ void BookmarkStore::removeBookmarkForPage(uint16_t spineIndex, float pageProgres
 
 bool BookmarkStore::removeBookmarkAt(size_t index) {
   if (index >= bookmarks.size()) return false;
+  if (isPdfStorePath(storeFilePath)) {
+    return removePdfBookmark(bookmarks[index].paragraphIndex);
+  }
 
   bookmarks.erase(bookmarks.begin() + index);
   dirty = true;
@@ -401,6 +698,10 @@ void BookmarkStore::saveToFile() {
 }
 
 void BookmarkStore::clearAll() {
+  if (isPdfStorePath(storeFilePath)) {
+    clearPdfBookmarks();
+    return;
+  }
   if (!storeFilePath.empty() && Storage.exists(storeFilePath.c_str())) {
     if (!Storage.remove(storeFilePath.c_str())) {
       LOG_ERR("BKS", "Failed to delete bookmark file");
@@ -435,7 +736,7 @@ bool BookmarkStore::readFromFile(const std::string& path, std::vector<Bookmark>&
     return false;
   }
 
-  uint8_t version;
+  uint8_t version = 0;
   serialization::readPod(f, version);
   if (version != LEGACY_VERSION && version != COUNT_U16_VERSION && version != PARAGRAPH_ANCHOR_VERSION &&
       version != VERSION) {
@@ -520,7 +821,11 @@ bool BookmarkStore::readFromFile(const std::string& path, std::vector<Bookmark>&
     loadedBookmarks.push_back(bm);
   }
 
-  f.close();
+  const bool closed = f.close();
+  if (!closed && isPdfStorePath(path)) {
+    LOG_ERR("BKS", "Failed to close PDF bookmark file after read: %s", path.c_str());
+    return false;
+  }
   out = std::move(loadedBookmarks);
   needsRewrite = version != VERSION;
   return true;
@@ -556,34 +861,363 @@ bool BookmarkStore::writeToFile() const {
   return true;
 }
 
-void BookmarkStore::deleteForFilePath(const std::string& filePath, const std::string& bookType) {
+bool BookmarkStore::writePdfTransaction(const Bookmark* const appended, const size_t removeIndex,
+                                        const bool clear) const {
+  if (storeFilePath.empty()) {
+    LOG_ERR("BKS", "Cannot persist PDF bookmarks without a store path");
+    return false;
+  }
+  if (!isPdfStorePath(storeFilePath)) {
+    LOG_ERR("BKS", "Refusing PDF bookmark mutation for a non-PDF store");
+    return false;
+  }
+
+  const std::string temporaryPath = storeFilePath + PDF_TRANSACTION_TEMP_SUFFIX;
+  const std::string backupPath = storeFilePath + PDF_TRANSACTION_BACKUP_SUFFIX;
+  if (!Storage.exists(storeFilePath.c_str()) && Storage.exists(backupPath.c_str()) &&
+      !Storage.rename(backupPath.c_str(), storeFilePath.c_str())) {
+    LOG_ERR("BKS", "Failed to restore PDF bookmark backup before mutation: %s", backupPath.c_str());
+    return false;
+  }
+  if (Storage.exists(temporaryPath.c_str()) && !Storage.remove(temporaryPath.c_str())) {
+    LOG_ERR("BKS", "Failed to remove stale PDF bookmark transaction: %s", temporaryPath.c_str());
+    return false;
+  }
+  if (Storage.exists(backupPath.c_str()) && !Storage.remove(backupPath.c_str())) {
+    LOG_ERR("BKS", "Failed to remove stale PDF bookmark backup: %s", backupPath.c_str());
+    return false;
+  }
+
+  Storage.mkdir(BOOKMARKS_DIR);
+  FsFile file;
+  if (!Storage.openFileForWrite("BKS", temporaryPath, file)) {
+    LOG_ERR("BKS", "Failed to open PDF bookmark transaction: %s", temporaryPath.c_str());
+    return false;
+  }
+
+  const size_t logicalCount = pdfBookmarkCount(bookmarks, appended, removeIndex, clear);
+  if (logicalCount > PDF_BOOKMARK_MAX_PER_BOOK) {
+    LOG_ERR("BKS", "PDF bookmark transaction count exceeds limit: %u", static_cast<unsigned>(logicalCount));
+    if (!file.close()) {
+      LOG_ERR("BKS", "Failed to close rejected PDF bookmark transaction: %s", temporaryPath.c_str());
+    }
+    Storage.remove(temporaryPath.c_str());
+    return false;
+  }
+  const uint16_t count = static_cast<uint16_t>(logicalCount);
+  bool wrote = serialization::tryWritePod(file, VERSION) && serialization::tryWritePod(file, count) &&
+               serialization::tryWriteString(file, bookTitle) && serialization::tryWriteString(file, bookAuthor) &&
+               serialization::tryWriteString(file, bookFilePath);
+  for (size_t index = 0; wrote && index < logicalCount; ++index) {
+    const Bookmark* const bookmark = pdfBookmarkAt(bookmarks, appended, removeIndex, index);
+    wrote = bookmark != nullptr && serialization::tryWritePod(file, bookmark->spineIndex) &&
+            serialization::tryWritePod(file, bookmark->progress) &&
+            serialization::tryWritePod(file, bookmark->timestamp) &&
+            file.write(reinterpret_cast<const uint8_t*>(bookmark->chapterTitle), sizeof(bookmark->chapterTitle)) ==
+                sizeof(bookmark->chapterTitle) &&
+            serialization::tryWritePod(file, bookmark->paragraphIndex) &&
+            file.write(reinterpret_cast<const uint8_t*>(bookmark->snippet), sizeof(bookmark->snippet)) ==
+                sizeof(bookmark->snippet);
+  }
+
+  file.flush();
+  const bool synced = file.sync();
+  const bool closed = file.close();
+  if (!wrote || !synced || !closed) {
+    LOG_ERR("BKS", "Failed to durably write PDF bookmark transaction: %s", temporaryPath.c_str());
+    Storage.remove(temporaryPath.c_str());
+    return false;
+  }
+  if (!verifyPdfTransaction(temporaryPath, appended, removeIndex, clear)) {
+    LOG_ERR("BKS", "PDF bookmark transaction readback failed: %s", temporaryPath.c_str());
+    Storage.remove(temporaryPath.c_str());
+    return false;
+  }
+
+  const bool hadCanonical = Storage.exists(storeFilePath.c_str());
+  if (hadCanonical && !Storage.rename(storeFilePath.c_str(), backupPath.c_str())) {
+    LOG_ERR("BKS", "Failed to back up PDF bookmark store: %s", storeFilePath.c_str());
+    Storage.remove(temporaryPath.c_str());
+    return false;
+  }
+  if (!Storage.rename(temporaryPath.c_str(), storeFilePath.c_str())) {
+    LOG_ERR("BKS", "Failed to promote PDF bookmark transaction: %s", temporaryPath.c_str());
+    if (hadCanonical && !Storage.rename(backupPath.c_str(), storeFilePath.c_str())) {
+      LOG_ERR("BKS", "Failed to roll back PDF bookmark transaction: %s", backupPath.c_str());
+    }
+    return false;
+  }
+
+  if (hadCanonical && Storage.exists(backupPath.c_str()) && !Storage.remove(backupPath.c_str())) {
+    // The new canonical file is already durable. Recovery treats it as authoritative
+    // and removes this backup on the next load or mutation.
+    LOG_ERR("BKS", "Failed to remove committed PDF bookmark backup: %s", backupPath.c_str());
+  }
+  return true;
+}
+
+bool BookmarkStore::verifyPdfTransaction(const std::string& path, const Bookmark* const appended,
+                                         const size_t removeIndex, const bool clear) const {
+  FsFile file;
+  if (!Storage.openFileForRead("BKS", path, file)) {
+    return false;
+  }
+
+  const size_t logicalCount = pdfBookmarkCount(bookmarks, appended, removeIndex, clear);
+  const uint16_t count = static_cast<uint16_t>(logicalCount);
+  bool matches = readExpectedPod(file, VERSION) && readExpectedPod(file, count) &&
+                 readExpectedString(file, bookTitle) && readExpectedString(file, bookAuthor) &&
+                 readExpectedString(file, bookFilePath);
+  for (size_t index = 0; matches && index < logicalCount; ++index) {
+    const Bookmark* const bookmark = pdfBookmarkAt(bookmarks, appended, removeIndex, index);
+    matches = bookmark != nullptr && readExpectedPod(file, bookmark->spineIndex) &&
+              readExpectedPod(file, bookmark->progress) && readExpectedPod(file, bookmark->timestamp) &&
+              readExpectedBytes(file, bookmark->chapterTitle, sizeof(bookmark->chapterTitle)) &&
+              readExpectedPod(file, bookmark->paragraphIndex) &&
+              readExpectedBytes(file, bookmark->snippet, sizeof(bookmark->snippet));
+  }
+  matches = matches && file.available() == 0;
+  const bool closed = file.close();
+  return matches && closed;
+}
+
+bool BookmarkStore::recoverPdfTransaction() const {
+  if (storeFilePath.empty()) return false;
+
+  const std::string temporaryPath = storeFilePath + PDF_TRANSACTION_TEMP_SUFFIX;
+  const std::string backupPath = storeFilePath + PDF_TRANSACTION_BACKUP_SUFFIX;
+  if (Storage.exists(storeFilePath.c_str())) {
+    bool recovered = true;
+    if (Storage.exists(temporaryPath.c_str()) && !Storage.remove(temporaryPath.c_str())) {
+      LOG_ERR("BKS", "Failed to clean stale PDF bookmark transaction: %s", temporaryPath.c_str());
+      recovered = false;
+    }
+    if (Storage.exists(backupPath.c_str()) && !Storage.remove(backupPath.c_str())) {
+      LOG_ERR("BKS", "Failed to clean stale PDF bookmark backup: %s", backupPath.c_str());
+      recovered = false;
+    }
+    return recovered;
+  }
+
+  if (Storage.exists(backupPath.c_str())) {
+    if (!Storage.rename(backupPath.c_str(), storeFilePath.c_str())) {
+      LOG_ERR("BKS", "Failed to restore PDF bookmark backup: %s", backupPath.c_str());
+      return false;
+    }
+    if (Storage.exists(temporaryPath.c_str()) && !Storage.remove(temporaryPath.c_str())) {
+      LOG_ERR("BKS", "Failed to clean rolled-back PDF bookmark transaction: %s", temporaryPath.c_str());
+      return false;
+    }
+    return true;
+  }
+
+  if (Storage.exists(temporaryPath.c_str()) && !Storage.remove(temporaryPath.c_str())) {
+    LOG_ERR("BKS", "Failed to discard incomplete PDF bookmark transaction: %s", temporaryPath.c_str());
+    return false;
+  }
+  return true;
+}
+
+bool BookmarkStore::deleteForFilePath(const std::string& filePath, const std::string& bookType) {
+  if (bookType == "pdf") {
+    std::string currentPath;
+    std::string legacyPath;
+    if (!pdfBookmarkStoreFilePathForBook(filePath, false, currentPath) ||
+        !pdfBookmarkStoreFilePathForBook(filePath, true, legacyPath)) {
+      return false;
+    }
+    const bool deleted = deletePdfBookmarkStorePaths(currentPath, legacyPath);
+    if (deleted) {
+      LOG_DBG("BKS", "Deleted PDF bookmark files for: %s", filePath.c_str());
+    }
+    return deleted;
+  }
+
   const std::string currentPath = currentStoreFilePathForBook(filePath, bookType);
   const std::string legacyPath = legacyStoreFilePathForBook(filePath, bookType);
   bool deletedAny = false;
+  bool success = true;
 
   if (Storage.exists(currentPath.c_str())) {
-    deletedAny = deleteBookmarkStorePath(currentPath, "canonical") || deletedAny;
+    const bool deleted = deleteBookmarkStorePath(currentPath, "canonical");
+    deletedAny = deleted || deletedAny;
+    success = success && deleted;
   }
   if (legacyPath != currentPath && Storage.exists(legacyPath.c_str())) {
-    deletedAny = deleteBookmarkStorePath(legacyPath, "legacy") || deletedAny;
+    const bool deleted = deleteBookmarkStorePath(legacyPath, "legacy");
+    deletedAny = deleted || deletedAny;
+    success = success && deleted;
   }
 
   if (deletedAny) {
     LOG_DBG("BKS", "Deleted bookmark file for: %s", filePath.c_str());
   }
+  return success;
 }
 
-bool BookmarkStore::migrateForFilePath(const std::string& oldFilePath, const std::string& newFilePath,
-                                       const std::string& title, const std::string& author,
-                                       const std::string& bookType) {
-  if (bookType != "epub" && bookType != "xtc" && bookType != "txt") {
-    LOG_ERR("BKS", "Unknown book type for bookmark migration: %s", bookType.c_str());
+bool BookmarkStore::migratePdfForFilePath(const std::string& oldFilePath, const std::string& newFilePath,
+                                          const std::string& title, const std::string& author) {
+  // A rename is a cold operation. Keep its Store/vector/path control objects in
+  // one fallible allocation instead of consuming most of the activity stack.
+  auto scratch = makeUniqueNoThrow<PdfBookmarkMigrationScratch>();
+  if (!scratch) {
+    LOG_ERR("BKS", "Out of memory allocating PDF bookmark migration scratch");
     return false;
   }
-  if (oldFilePath.empty() || newFilePath.empty() || oldFilePath == newFilePath) {
+
+  if (!pdfBookmarkStoreFilePathForBook(oldFilePath, false, scratch->sourceCurrentPath) ||
+      !pdfBookmarkStoreFilePathForBook(oldFilePath, true, scratch->sourceLegacyPath) ||
+      !pdfBookmarkStoreFilePathForBook(newFilePath, false, scratch->destinationCurrentPath) ||
+      !pdfBookmarkStoreFilePathForBook(newFilePath, true, scratch->destinationLegacyPath)) {
+    return false;
+  }
+
+  scratch->store.bookFilePath = oldFilePath;
+  scratch->store.storeFilePath = scratch->sourceCurrentPath;
+  if (!scratch->store.recoverPdfTransaction()) {
+    LOG_ERR("BKS", "Failed to recover source PDF bookmarks before migration: %s", scratch->sourceCurrentPath.c_str());
+    return false;
+  }
+  if (scratch->sourceLegacyPath != scratch->sourceCurrentPath) {
+    scratch->store.storeFilePath = scratch->sourceLegacyPath;
+    if (!scratch->store.recoverPdfTransaction()) {
+      LOG_ERR("BKS", "Failed to recover source legacy PDF bookmarks before migration: %s",
+              scratch->sourceLegacyPath.c_str());
+      return false;
+    }
+  }
+
+  const bool hasSourceCurrent = Storage.exists(scratch->sourceCurrentPath.c_str());
+  const bool hasSourceLegacy =
+      scratch->sourceLegacyPath != scratch->sourceCurrentPath && Storage.exists(scratch->sourceLegacyPath.c_str());
+  if (!hasSourceCurrent && !hasSourceLegacy) {
     return true;
   }
 
+  scratch->store.bookFilePath = newFilePath;
+  scratch->store.storeFilePath = scratch->destinationCurrentPath;
+  if (!scratch->store.recoverPdfTransaction()) {
+    LOG_ERR("BKS", "Failed to recover destination PDF bookmarks before migration: %s",
+            scratch->destinationCurrentPath.c_str());
+    return false;
+  }
+  if (scratch->destinationLegacyPath != scratch->destinationCurrentPath) {
+    scratch->store.storeFilePath = scratch->destinationLegacyPath;
+    if (!scratch->store.recoverPdfTransaction()) {
+      LOG_ERR("BKS", "Failed to recover destination legacy PDF bookmarks before migration: %s",
+              scratch->destinationLegacyPath.c_str());
+      return false;
+    }
+  }
+
+  scratch->store.bookFilePath = oldFilePath;
+  bool sourceNeedsRewrite = false;
+  if (hasSourceCurrent &&
+      !scratch->store.readFromFile(scratch->sourceCurrentPath, scratch->primary, sourceNeedsRewrite)) {
+    LOG_ERR("BKS", "Failed to load source PDF bookmarks during migration: %s", scratch->sourceCurrentPath.c_str());
+    return false;
+  }
+  if (hasSourceLegacy) {
+    bool legacyNeedsRewrite = false;
+    if (!scratch->store.readFromFile(scratch->sourceLegacyPath, scratch->secondary, legacyNeedsRewrite)) {
+      LOG_ERR("BKS", "Failed to load source legacy PDF bookmarks during migration: %s",
+              scratch->sourceLegacyPath.c_str());
+      return false;
+    }
+    mergeBookmarks(scratch->primary, scratch->secondary, true);
+    sourceNeedsRewrite = sourceNeedsRewrite || legacyNeedsRewrite;
+  }
+
+  scratch->store.bookFilePath = newFilePath;
+  if (scratch->sourceCurrentPath == scratch->destinationCurrentPath) {
+    if (scratch->destinationLegacyPath != scratch->destinationCurrentPath &&
+        Storage.exists(scratch->destinationLegacyPath.c_str())) {
+      bool destinationLegacyNeedsRewrite = false;
+      if (!scratch->store.readFromFile(scratch->destinationLegacyPath, scratch->secondary,
+                                       destinationLegacyNeedsRewrite)) {
+        LOG_ERR("BKS", "Failed to load destination legacy PDF bookmarks during collision retag: %s",
+                scratch->destinationLegacyPath.c_str());
+        return false;
+      }
+      mergeBookmarks(scratch->secondary, scratch->primary, true);
+      scratch->primary.swap(scratch->secondary);
+    }
+
+    scratch->store.bookTitle = title;
+    scratch->store.bookAuthor = author;
+    scratch->store.storeFilePath = scratch->destinationCurrentPath;
+    scratch->store.bookmarks = std::move(scratch->primary);
+    if (!scratch->store.writePdfTransaction(nullptr, std::numeric_limits<size_t>::max(), false)) {
+      LOG_ERR("BKS", "Failed to durably retag colliding PDF bookmarks: %s", scratch->destinationCurrentPath.c_str());
+      return false;
+    }
+    if (scratch->destinationLegacyPath != scratch->destinationCurrentPath &&
+        !deletePdfBookmarkStorePaths(scratch->destinationLegacyPath, scratch->destinationLegacyPath)) {
+      return false;
+    }
+    if (scratch->sourceLegacyPath != scratch->sourceCurrentPath &&
+        scratch->sourceLegacyPath != scratch->destinationLegacyPath &&
+        !deletePdfBookmarkStorePaths(scratch->sourceLegacyPath, scratch->sourceLegacyPath)) {
+      return false;
+    }
+    LOG_INF("BKS", "Retagged colliding PDF bookmark path: %s -> %s (%u bookmark(s))", oldFilePath.c_str(),
+            newFilePath.c_str(), static_cast<unsigned>(scratch->store.bookmarks.size()));
+    return true;
+  }
+
+  bool hasDestinationBookmarks = false;
+  if (Storage.exists(scratch->destinationCurrentPath.c_str())) {
+    bool destinationNeedsRewrite = false;
+    if (!scratch->store.readFromFile(scratch->destinationCurrentPath, scratch->secondary, destinationNeedsRewrite)) {
+      LOG_ERR("BKS", "Failed to load destination PDF bookmarks during migration: %s",
+              scratch->destinationCurrentPath.c_str());
+      return false;
+    }
+    mergeBookmarks(scratch->secondary, scratch->primary, true);
+    scratch->primary.swap(scratch->secondary);
+    hasDestinationBookmarks = true;
+  }
+  if (scratch->destinationLegacyPath != scratch->destinationCurrentPath &&
+      Storage.exists(scratch->destinationLegacyPath.c_str())) {
+    bool destinationLegacyNeedsRewrite = false;
+    if (!scratch->store.readFromFile(scratch->destinationLegacyPath, scratch->secondary,
+                                     destinationLegacyNeedsRewrite)) {
+      LOG_ERR("BKS", "Failed to load destination legacy PDF bookmarks during migration: %s",
+              scratch->destinationLegacyPath.c_str());
+      return false;
+    }
+    mergeBookmarks(scratch->secondary, scratch->primary, true);
+    scratch->primary.swap(scratch->secondary);
+    hasDestinationBookmarks = true;
+  }
+
+  scratch->store.bookTitle = title;
+  scratch->store.bookAuthor = author;
+  scratch->store.storeFilePath = scratch->destinationCurrentPath;
+  scratch->store.bookmarks = std::move(scratch->primary);
+  if (!scratch->store.writePdfTransaction(nullptr, std::numeric_limits<size_t>::max(), false)) {
+    LOG_ERR("BKS", "Failed to durably write migrated PDF bookmarks: %s", scratch->destinationCurrentPath.c_str());
+    return false;
+  }
+
+  if (scratch->destinationLegacyPath != scratch->destinationCurrentPath &&
+      !deletePdfBookmarkStorePaths(scratch->destinationLegacyPath, scratch->destinationLegacyPath)) {
+    return false;
+  }
+  if (scratch->sourceCurrentPath != scratch->destinationCurrentPath &&
+      !deletePdfBookmarkStorePaths(scratch->sourceCurrentPath, scratch->sourceLegacyPath)) {
+    return false;
+  }
+
+  LOG_INF("BKS", "Migrated PDF bookmark path: %s -> %s (%u bookmark(s)%s%s)", oldFilePath.c_str(), newFilePath.c_str(),
+          static_cast<unsigned>(scratch->store.bookmarks.size()),
+          hasDestinationBookmarks ? ", merged with destination" : "", sourceNeedsRewrite ? ", normalized format" : "");
+  return true;
+}
+
+bool BookmarkStore::migrateLegacyForFilePath(const std::string& oldFilePath, const std::string& newFilePath,
+                                             const std::string& title, const std::string& author,
+                                             const std::string& bookType) {
   const std::string srcCurrentPath = currentStoreFilePathForBook(oldFilePath, bookType);
   const std::string srcLegacyPath = legacyStoreFilePathForBook(oldFilePath, bookType);
   const std::string dstCurrentPath = currentStoreFilePathForBook(newFilePath, bookType);
@@ -618,7 +1252,7 @@ bool BookmarkStore::migrateForFilePath(const std::string& oldFilePath, const std
       LOG_ERR("BKS", "Failed to load source legacy bookmark file during path migration: %s", srcLegacyPath.c_str());
       return false;
     }
-    mergeBookmarks(migratedBookmarks, legacyBookmarks);
+    mergeBookmarks(migratedBookmarks, legacyBookmarks, bookType == "pdf");
     sourceNeedsRewrite = sourceNeedsRewrite || legacyNeedsRewrite;
     loadedSourceBookmarks = true;
   }
@@ -638,7 +1272,7 @@ bool BookmarkStore::migrateForFilePath(const std::string& oldFilePath, const std
       LOG_ERR("BKS", "Failed to load destination bookmark file during path migration: %s", dstCurrentPath.c_str());
       return false;
     }
-    mergeBookmarks(existingBookmarks, migratedBookmarks);
+    mergeBookmarks(existingBookmarks, migratedBookmarks, bookType == "pdf");
     migratedBookmarks = std::move(existingBookmarks);
     hasDestBookmarks = true;
   }
@@ -651,7 +1285,7 @@ bool BookmarkStore::migrateForFilePath(const std::string& oldFilePath, const std
               dstLegacyPath.c_str());
       return false;
     }
-    mergeBookmarks(existingLegacyBookmarks, migratedBookmarks);
+    mergeBookmarks(existingLegacyBookmarks, migratedBookmarks, bookType == "pdf");
     migratedBookmarks = std::move(existingLegacyBookmarks);
     hasDestBookmarks = true;
   }
@@ -688,9 +1322,28 @@ bool BookmarkStore::migrateForFilePath(const std::string& oldFilePath, const std
   return true;
 }
 
+bool BookmarkStore::migrateForFilePath(const std::string& oldFilePath, const std::string& newFilePath,
+                                       const std::string& title, const std::string& author,
+                                       const std::string& bookType) {
+  if (bookType != "epub" && bookType != "pdf" && bookType != "xtc" && bookType != "txt") {
+    LOG_ERR("BKS", "Unknown book type for bookmark migration: %s", bookType.c_str());
+    return false;
+  }
+  if (oldFilePath.empty() || newFilePath.empty() || oldFilePath == newFilePath) {
+    return true;
+  }
+  if (bookType == "pdf") {
+    return migratePdfForFilePath(oldFilePath, newFilePath, title, author);
+  }
+  return migrateLegacyForFilePath(oldFilePath, newFilePath, title, author, bookType);
+}
+
 bool BookmarkStore::hasAnyBookmarks() {
   if (!Storage.exists(BOOKMARKS_DIR)) return false;
-  return !Storage.listFiles(BOOKMARKS_DIR).empty();
+  for (const auto& name : Storage.listFiles(BOOKMARKS_DIR)) {
+    if (!isPdfTransactionArtifact(name.c_str())) return true;
+  }
+  return false;
 }
 
 bool BookmarkStore::getAllBookmarkedBooks(std::vector<BookmarkedBookEntry>& out) {
@@ -698,6 +1351,7 @@ bool BookmarkStore::getAllBookmarkedBooks(std::vector<BookmarkedBookEntry>& out)
 
   const auto files = Storage.listFiles(BOOKMARKS_DIR);
   for (const auto& name : files) {
+    if (isPdfTransactionArtifact(name.c_str())) continue;
     const std::string fullPath = std::string(BOOKMARKS_DIR) + "/" + name.c_str();
 
     FsFile f;
@@ -707,7 +1361,7 @@ bool BookmarkStore::getAllBookmarkedBooks(std::vector<BookmarkedBookEntry>& out)
       f.close();
       continue;
     }
-    uint8_t version;
+    uint8_t version = 0;
     serialization::readPod(f, version);
     if (version != LEGACY_VERSION && version != COUNT_U16_VERSION && version != PARAGRAPH_ANCHOR_VERSION &&
         version != VERSION) {

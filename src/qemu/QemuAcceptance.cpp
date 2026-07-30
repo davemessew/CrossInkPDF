@@ -12,9 +12,11 @@
 #include <PdfHalIo.h>
 #include <PdfHalReflowDocument.h>
 #include <PdfHiddenText.h>
+#include <PdfLayoutWordIndex.h>
 #include <PdfPageTree.h>
 #include <PdfPreparation.h>
 #include <PdfReadingOrder.h>
+#include <PdfReaderProgressState.h>
 #include <PdfRunStore.h>
 #include <PdfSemanticWriter.h>
 #include <QemuHalControl.h>
@@ -24,6 +26,7 @@
 
 #include <cstring>
 #include <memory>
+#include <optional>
 
 #include "CrossPointSettings.h"
 #include "Epub/Page.h"
@@ -806,8 +809,11 @@ bool checkPdfProductTracer(GfxRenderer& renderer) {
   sampleRuntime();
 
   bool rendered = false;
+  bool progressVerified = false;
+  bool progressSaved = false;
   uint16_t pageCount = 0;
   uint32_t renderedFrame = 0;
+  ReflowReadingPosition expectedPosition;
   {
     PdfStatus documentStatus{};
     auto loaded = loadPdfHalReflowDocumentNoThrow(PDF_FIXTURE_PATH, "/.crosspoint", &documentStatus);
@@ -852,15 +858,39 @@ bool checkPdfProductTracer(GfxRenderer& renderer) {
       page->renderText(renderer, fontId, marginLeft, marginTop);
       renderedFrame = QemuHalControl::frameCrc32();
     }
+    const auto semantic = built ? section.getSemanticRangeForPage(0) : std::optional<ReflowPageSemanticRange>{};
+    float wordProgress = 0.0F;
+    expectedPosition.sectionIndex = 0;
+    expectedPosition.pageNumber = 0;
+    expectedPosition.pageCount = pageCount;
+    expectedPosition.hasPageCount = pageCount > 0;
+    const bool populatedPosition = semantic && pdfPopulateReadingPositionFromRange(*semantic, &expectedPosition);
+    progressSaved =
+        populatedPosition && semantic->valid && semantic->firstGlobalWordOrdinal == 0 &&
+        semantic->lastGlobalWordOrdinal == 1 && semantic->wordCursor == 2 &&
+        pdfCalculateWordCursorProgress(semantic->wordCursor, document->getTotalWordCount(), &wordProgress) &&
+        wordProgress == 1.0F && document->saveReadingPosition(expectedPosition);
     rendered = built && !lowMemory && text == PDF_EXPECTED_TEXT && page != nullptr && pageCount > 0 &&
                renderedFrame != blankFrame;
   }
 
+  // Recreate the complete document and progress store before claiming
+  // persistence. A same-object read could accidentally pass from cached state.
+  if (progressSaved) {
+    PdfStatus reopenStatus{};
+    auto reopened = loadPdfHalReflowDocumentNoThrow(PDF_FIXTURE_PATH, "/.crosspoint", &reopenStatus);
+    ReflowReadingPosition persistedPosition;
+    progressVerified = reopened && reopenStatus.ok() && reopened->getTotalWordCount() == 2 &&
+                       reopened->loadReadingPosition(persistedPosition) &&
+                       pdfReadingPositionsEqualExact(expectedPosition, persistedPosition);
+  }
+
   const bool cleaned = Storage.exists(cacheRoot) && Storage.removeDir(cacheRoot);
-  if (!rendered || !cleaned) {
-    fail("PDF_TRACER", !rendered ? "shared_reader" : "cleanup");
+  if (!rendered || !progressVerified || !cleaned) {
+    fail("PDF_TRACER", !rendered ? "shared_reader" : (!progressVerified ? "progress" : "cleanup"));
     return false;
   }
+  esp_rom_printf("QEMU_PDF_PROGRESS_PASS words=2 reached=2 percent=100 persisted=1 cursor=2\n");
   esp_rom_printf("QEMU_PDF_TRACER text=Hello_PDF words=2 pages=%u frame=%08lX heap=%lu\n",
                  static_cast<unsigned>(pageCount), static_cast<unsigned long>(renderedFrame),
                  static_cast<unsigned long>(preparationPeak));
