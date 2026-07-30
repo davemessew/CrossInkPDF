@@ -104,6 +104,13 @@ struct PdfByteStore {
   constexpr bool valid() const { return reset != nullptr && size != nullptr && readAt != nullptr && write != nullptr; }
 };
 
+struct PdfRectangle {
+  int32_t xMin = 0;
+  int32_t yMin = 0;
+  int32_t xMax = 0;
+  int32_t yMax = 0;
+};
+
 enum class PdfTokenKind : uint8_t {
   End,
   Integer,

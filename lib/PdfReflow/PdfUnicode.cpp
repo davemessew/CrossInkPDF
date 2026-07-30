@@ -38,6 +38,51 @@ bool pdfIsUnicodeLetterOrDigit(const uint32_t scalar) {
 
 bool pdfIsCjkReadingUnit(const uint32_t scalar) { return inRanges(scalar, CJK_READING_RANGES); }
 
+PdfStatus pdfDecodeUtf8Scalar(const uint8_t* const source, const size_t sourceLength, size_t* const offset,
+                              uint32_t* const scalar) {
+  if (source == nullptr || offset == nullptr || scalar == nullptr || *offset >= sourceLength) {
+    return PdfStatus::failure(PdfError::InvalidArgument, offset == nullptr ? 0 : *offset);
+  }
+  const size_t start = *offset;
+  const uint8_t first = source[start];
+  size_t required = 1;
+  uint32_t value = first;
+  uint32_t minimum = 0;
+  if ((first & 0x80U) == 0) {
+    required = 1;
+  } else if ((first & 0xE0U) == 0xC0U) {
+    required = 2;
+    value = first & 0x1FU;
+    minimum = 0x80;
+  } else if ((first & 0xF0U) == 0xE0U) {
+    required = 3;
+    value = first & 0x0FU;
+    minimum = 0x800;
+  } else if ((first & 0xF8U) == 0xF0U) {
+    required = 4;
+    value = first & 0x07U;
+    minimum = 0x10000;
+  } else {
+    return PdfStatus::failure(PdfError::Malformed, start);
+  }
+  if (required > sourceLength - start) {
+    return PdfStatus::failure(PdfError::Malformed, start);
+  }
+  for (size_t index = 1; index < required; ++index) {
+    const uint8_t continuation = source[start + index];
+    if ((continuation & 0xC0U) != 0x80U) {
+      return PdfStatus::failure(PdfError::Malformed, start + index);
+    }
+    value = (value << 6U) | (continuation & 0x3FU);
+  }
+  if (value < minimum || !pdfIsUnicodeScalar(value)) {
+    return PdfStatus::failure(PdfError::Malformed, start);
+  }
+  *offset = start + required;
+  *scalar = value;
+  return PdfStatus::success();
+}
+
 PdfStatus pdfAppendUtf8Scalar(const uint32_t scalar, uint8_t* const destination, const size_t capacity,
                               size_t* const length) {
   if (destination == nullptr || length == nullptr || *length > capacity || !pdfIsUnicodeScalar(scalar)) {

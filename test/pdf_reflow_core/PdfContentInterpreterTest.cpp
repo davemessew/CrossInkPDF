@@ -9,6 +9,8 @@
 #include <vector>
 
 #include "PdfContentInterpreter.h"
+#include "PdfDocumentTextClassifier.h"
+#include "PdfHiddenText.h"
 #include "PdfPageTree.h"
 #include "PdfTestIo.h"
 
@@ -158,7 +160,16 @@ struct FixtureWorkspace {
 struct FixtureTextResult {
   PdfStatus status{};
   std::string text;
+  std::vector<uint8_t> pageText;
+  std::vector<PdfTextRun> runs;
+  std::vector<PdfImagePlacement> images;
 };
+
+FixtureTextResult fixtureFailure(const PdfStatus status) {
+  FixtureTextResult result;
+  result.status = status;
+  return result;
+}
 
 FixtureTextResult interpretFontFixture(const char* filename) {
   const std::filesystem::path path = std::filesystem::path(__FILE__).parent_path() / "fixtures" / filename;
@@ -172,21 +183,21 @@ FixtureTextResult interpretFontFixture(const char* filename) {
   xrefParser.begin();
   PdfStepResult result = runBudgetOne(xrefParser);
   if (!result.complete()) {
-    return {result.status, {}};
+    return fixtureFailure(result.status);
   }
   PdfObjectReference catalog;
   if (!workspace.xref.root(&catalog)) {
-    return {PdfStatus::failure(PdfError::Malformed), {}};
+    return fixtureFailure(PdfStatus::failure(PdfError::Malformed));
   }
   PdfObjectResolver resolver(source, workspace.xref, workspace.sourceBuffer.data(), workspace.sourceBuffer.size(),
                              workspace.arena);
   PdfStatus status = resolver.begin(catalog);
   if (!status.ok() || !(result = runBudgetOne(resolver)).complete()) {
-    return {status.ok() ? result.status : status, {}};
+    return fixtureFailure(status.ok() ? result.status : status);
   }
   uint16_t pagesIndex = PDF_INVALID_INDEX;
   if (!pdfDictionaryFind(workspace.arena, resolver.result().rootIndex, "Pages", &pagesIndex)) {
-    return {PdfStatus::failure(PdfError::Malformed), {}};
+    return fixtureFailure(PdfStatus::failure(PdfError::Malformed));
   }
   const PdfValue pages = workspace.arena.values[pagesIndex];
   PdfPageTreeWalker walker(resolver, workspace.arena, workspace.traversalStorage.store(), FixtureWorkspace::capturePage,
@@ -194,27 +205,37 @@ FixtureTextResult interpretFontFixture(const char* filename) {
   status = walker.begin({pages.objectNumber, pages.generation});
   if (!status.ok() || !(result = runBudgetOne(walker)).complete() || workspace.pageCount != 1 ||
       workspace.page.contentCount != 1) {
-    return {status.ok() ? result.status : status, {}};
+    return fixtureFailure(status.ok() ? result.status : status);
   }
   status = resolver.begin(workspace.page.contents[0]);
   if (!status.ok() || !(result = runBudgetOne(resolver)).complete() || !resolver.result().hasStream) {
-    return {status.ok() ? result.status : status, {}};
+    return fixtureFailure(status.ok() ? result.status : status);
   }
   PdfByteRange range;
   status = pdfInitializeByteRange(source, resolver.result().streamOffset, resolver.result().streamLength, &range);
   if (!status.ok()) {
-    return {status, {}};
+    return fixtureFailure(status);
   }
   const PdfByteSource content = pdfByteRangeSource(range);
   DefaultFont defaultFont;
   TestResourceTable resources;
   resources.font = &defaultFont.font;
+  resources.image.kind = PdfContentXObjectKind::Image;
+  resources.image.reference = {6, 0};
+  resources.image.pixelWidth = 4;
+  resources.image.pixelHeight = 4;
   InterpreterHarness harness;
   status = harness.interpreter.begin(&content, 1, resources.descriptor, harness.model);
   if (!status.ok() || !(result = runInterpreter(harness.interpreter)).complete()) {
-    return {status.ok() ? result.status : status, {}};
+    return fixtureFailure(status.ok() ? result.status : status);
   }
-  return {PdfStatus::success(), transcript(harness.model)};
+  return {
+      PdfStatus::success(),
+      transcript(harness.model),
+      {harness.model.text(), harness.model.text() + harness.model.textLength()},
+      {harness.model.runs(), harness.model.runs() + harness.model.runCount()},
+      {harness.model.images(), harness.model.images() + harness.model.imageCount()},
+  };
 }
 
 }  // namespace
@@ -408,4 +429,53 @@ TEST(PdfContentInterpreterTest, ExistingVectorFixtureRetainsItsCaption) {
   const FixtureTextResult fixture = interpretFontFixture("vector_caption.pdf");
   ASSERT_TRUE(fixture.status.ok()) << static_cast<int>(fixture.status.error);
   EXPECT_EQ(fixture.text, "Figure one: bounded vector caption.");
+}
+
+TEST(PdfContentInterpreterTest, GeneratedHiddenOcrFixturesQualifyAndDeduplicate) {
+  const PdfRectangle page{PdfFixed16::fromInteger(0).raw, PdfFixed16::fromInteger(0).raw,
+                          PdfFixed16::fromInteger(612).raw, PdfFixed16::fromInteger(792).raw};
+  const FixtureTextResult hidden = interpretFontFixture("hidden_ocr.pdf");
+  ASSERT_TRUE(hidden.status.ok()) << static_cast<int>(hidden.status.error);
+  ASSERT_EQ(hidden.runs.size(), 1u);
+  ASSERT_EQ(hidden.images.size(), 1u);
+  ASSERT_NE(hidden.runs[0].flags & PdfTextHidden, 0u);
+  const PdfHiddenTextContext hiddenContext{
+      page,
+      hidden.runs.data(),
+      static_cast<uint16_t>(hidden.runs.size()),
+      hidden.pageText.data(),
+      hidden.pageText.size(),
+      hidden.images.data(),
+      static_cast<uint16_t>(hidden.images.size()),
+  };
+  EXPECT_EQ(pdfClassifyHiddenText(hiddenContext, 0), PdfHiddenTextDecision::Qualified);
+
+  const FixtureTextResult duplicate = interpretFontFixture("hidden_ocr_visible_duplicate.pdf");
+  ASSERT_TRUE(duplicate.status.ok()) << static_cast<int>(duplicate.status.error);
+  ASSERT_EQ(duplicate.runs.size(), 2u);
+  ASSERT_EQ(duplicate.images.size(), 1u);
+  const uint16_t hiddenIndex = (duplicate.runs[0].flags & PdfTextHidden) != 0 ? 0 : 1;
+  const PdfHiddenTextContext duplicateContext{
+      page,
+      duplicate.runs.data(),
+      static_cast<uint16_t>(duplicate.runs.size()),
+      duplicate.pageText.data(),
+      duplicate.pageText.size(),
+      duplicate.images.data(),
+      static_cast<uint16_t>(duplicate.images.size()),
+  };
+  EXPECT_EQ(pdfClassifyHiddenText(duplicateContext, hiddenIndex), PdfHiddenTextDecision::DuplicateVisible);
+}
+
+TEST(PdfContentInterpreterTest, GeneratedScanOnlyFixtureWaitsForFullExtractionBeforeNoReadableText) {
+  const FixtureTextResult scan = interpretFontFixture("scan_only.pdf");
+  ASSERT_TRUE(scan.status.ok()) << static_cast<int>(scan.status.error);
+  ASSERT_TRUE(scan.runs.empty());
+  ASSERT_EQ(scan.images.size(), 1u);
+
+  PdfDocumentTextClassifier classifier;
+  ASSERT_TRUE(classifier.begin(1).ok());
+  ASSERT_TRUE(classifier.observePage(0, {0, 0, static_cast<uint16_t>(scan.images.size())}).ok());
+  EXPECT_EQ(classifier.sampledKind(), PdfDocumentTextKind::ImageOnlyCandidate);
+  EXPECT_EQ(classifier.finish(PdfStatus::success()).error, PdfError::NoReadableText);
 }

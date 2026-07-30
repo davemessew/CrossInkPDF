@@ -41,6 +41,7 @@ class PdfTestRecordStore {
 
   PdfFixedRecordStore store();
   void forbidReadsWhile(const bool* flag) { readForbiddenFlag_ = flag; }
+  void setReadFailureOrdinal(uint32_t ordinal) { readFailureOrdinal_ = ordinal; }
   uint32_t readCount() const { return readCount_; }
 
  private:
@@ -51,6 +52,7 @@ class PdfTestRecordStore {
   size_t recordSize_ = 0;
   uint32_t capacity_ = 0;
   const bool* readForbiddenFlag_ = nullptr;
+  uint32_t readFailureOrdinal_ = UINT32_MAX;
   uint32_t readCount_ = 0;
 };
 
@@ -62,6 +64,7 @@ class PdfTestByteStore {
   const std::vector<uint8_t>& bytes() const { return bytes_; }
   uint32_t resetCount() const { return resetCount_; }
   void forbidReadsWhile(const bool* flag) { readForbiddenFlag_ = flag; }
+  void setReadFailureOffset(uint64_t offset) { readFailureOffset_ = offset; }
 
  private:
   static PdfStatus reset(void* context);
@@ -73,4 +76,5 @@ class PdfTestByteStore {
   uint64_t capacity_ = 0;
   uint32_t resetCount_ = 0;
   const bool* readForbiddenFlag_ = nullptr;
+  uint64_t readFailureOffset_ = UINT64_MAX;
 };

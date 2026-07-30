@@ -40,9 +40,17 @@ void accountWrite(size_t count) {
       std::min<uint64_t>(VIRTUAL_INITIAL_FREE_BYTES, qemuVirtualBytesWritten + static_cast<uint64_t>(count));
 }
 
-const char* modeForFlags(oflag_t flags) {
-  const bool writable = (flags & O_WRONLY) != 0 || (flags & O_RDWR) != 0;
-  if (!writable) {
+const char* modeForFlags(const oflag_t flags, const bool exists) {
+  if ((flags & O_RDWR) != 0) {
+    if ((flags & (O_APPEND | O_AT_END)) != 0) {
+      return "a+";
+    }
+    if ((flags & O_TRUNC) != 0 || ((flags & O_CREAT) != 0 && !exists)) {
+      return "w+";
+    }
+    return "r+";
+  }
+  if ((flags & O_WRONLY) == 0) {
     return FILE_READ;
   }
   return (flags & (O_APPEND | O_AT_END)) != 0 ? FILE_APPEND : FILE_WRITE;
@@ -161,7 +169,7 @@ HalFile HalStorage::open(const char* path, const oflag_t oflag) {
   if (!initialized || path == nullptr) {
     return {};
   }
-  fs::File opened = LittleFS.open(path, modeForFlags(oflag), (oflag & O_CREAT) != 0);
+  fs::File opened = LittleFS.open(path, modeForFlags(oflag, LittleFS.exists(path)), (oflag & O_CREAT) != 0);
   if (opened && (oflag & O_AT_END) != 0) {
     opened.seek(static_cast<uint32_t>(opened.size()));
   }

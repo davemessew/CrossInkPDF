@@ -6,11 +6,15 @@ add_executable(PdfReflowCoreTest
   ${REPO_ROOT}/lib/PdfReflow/PdfContentInterpreter.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfEncoding.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfFontMap.cpp
+  ${REPO_ROOT}/lib/PdfReflow/PdfHiddenText.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfLexer.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfObjectParser.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfObjectResolver.cpp
+  ${REPO_ROOT}/lib/PdfReflow/PdfDocumentTextClassifier.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfPageModel.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfPageTree.cpp
+  ${REPO_ROOT}/lib/PdfReflow/PdfReadingOrder.cpp
+  ${REPO_ROOT}/lib/PdfReflow/PdfRunStore.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfStreamDecoder.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfUnicode.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfXref.cpp
@@ -21,7 +25,10 @@ add_executable(PdfReflowCoreTest
   PdfByteSourceTest.cpp
   PdfCMapFontMapTest.cpp
   PdfContentInterpreterTest.cpp
+  PdfDocumentTextClassifierTest.cpp
+  PdfHiddenTextTest.cpp
   PdfLexerObjectTest.cpp
+  PdfReadingOrderTest.cpp
   PdfXrefResolverTest.cpp
   PdfPageTreeTest.cpp
   PdfStreamDecoderTest.cpp

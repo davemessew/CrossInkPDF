@@ -10,9 +10,13 @@
 
 #include "PdfCMap.h"
 #include "PdfContentInterpreter.h"
+#include "PdfDocumentTextClassifier.h"
+#include "PdfHiddenText.h"
 #include "PdfIo.h"
 #include "PdfLexer.h"
 #include "PdfObjectParser.h"
+#include "PdfReadingOrder.h"
+#include "PdfRunStore.h"
 #include "PdfStreamDecoder.h"
 #include "PdfTestIo.h"
 #include "PdfXref.h"
@@ -65,6 +69,8 @@ struct AllocationResources {
     return *font == nullptr ? PdfStatus::failure(PdfError::UnsupportedEncoding) : PdfStatus::success();
   }
 };
+
+PdfStatus discardOrderItem(void*, const PdfReadingOrderItem&) { return PdfStatus::success(); }
 
 }  // namespace
 
@@ -304,4 +310,90 @@ TEST(PdfAllocationTest, CMapAndContentInterpreterAllocateNothingWhenInterceptorI
   EXPECT_TRUE(contentBegin.ok());
   EXPECT_TRUE(contentResult.complete());
   EXPECT_EQ(allocationCount, 0u);
+}
+
+TEST(PdfAllocationTest, HiddenTextOrderingRunStoreAndClassifierAllocateNothingWhenArmed) {
+  std::array<PdfTextRun, 4> memoryRuns{};
+  std::array<uint8_t, 256> memoryText{};
+  PdfTestRecordStore spillRuns(sizeof(PdfTextRun), 8);
+  PdfTestByteStore spillText(1024);
+  PdfRunStore runs({memoryRuns.data(), static_cast<uint16_t>(memoryRuns.size()), memoryText.data(), memoryText.size(),
+                    spillRuns.store(), spillText.store()});
+  std::array<PdfReadingOrderItem, 4> order{};
+  PdfReadingOrderReducer reducer({order.data(), static_cast<uint16_t>(order.size())});
+  const PdfRectangle page{PdfFixed16::fromInteger(0).raw, PdfFixed16::fromInteger(0).raw,
+                          PdfFixed16::fromInteger(612).raw, PdfFixed16::fromInteger(792).raw};
+  std::array<PdfImagePlacement, 1> images{};
+  images[0].pixelWidth = 4;
+  images[0].pixelHeight = 4;
+  images[0].xMin = PdfFixed16::fromInteger(60).raw;
+  images[0].yMin = PdfFixed16::fromInteger(560).raw;
+  images[0].xMax = PdfFixed16::fromInteger(240).raw;
+  images[0].yMax = PdfFixed16::fromInteger(720).raw;
+  const char hiddenText[] = "Readable OCR";
+  std::array<PdfTextRun, 1> hiddenRuns{};
+  hiddenRuns[0].textLength = sizeof(hiddenText) - 1;
+  hiddenRuns[0].xMin = PdfFixed16::fromInteger(72).raw;
+  hiddenRuns[0].xMax = PdfFixed16::fromInteger(170).raw;
+  hiddenRuns[0].yMin = PdfFixed16::fromInteger(620).raw;
+  hiddenRuns[0].yMax = PdfFixed16::fromInteger(632).raw;
+  hiddenRuns[0].baselineX = hiddenRuns[0].xMin;
+  hiddenRuns[0].baseline = hiddenRuns[0].yMin;
+  hiddenRuns[0].baselineDx = PdfFixed16::fromInteger(98).raw;
+  hiddenRuns[0].flags = PdfTextHidden;
+  const PdfHiddenTextContext hiddenContext{
+      page, hiddenRuns.data(), 1, reinterpret_cast<const uint8_t*>(hiddenText), sizeof(hiddenText) - 1, images.data(),
+      1};
+  PdfTextRun first = hiddenRuns[0];
+  first.flags = 0;
+  first.sourceOrder = 0;
+  PdfTextRun second = first;
+  second.sourceOrder = 1;
+  second.yMin = PdfFixed16::fromInteger(590).raw;
+  second.yMax = PdfFixed16::fromInteger(602).raw;
+  second.baseline = second.yMin;
+  PdfStatus storeStatus;
+  PdfStatus reduceStatus;
+  PdfStatus classifierStatus;
+  PdfHiddenTextDecision hiddenDecision = PdfHiddenTextDecision::Unmappable;
+  uint32_t emitted = 0;
+  size_t allocationCount = 0;
+  bool allocationFailed = false;
+
+  {
+    AllocationWatch watch;
+    try {
+      storeStatus = runs.reset();
+      if (storeStatus.ok()) {
+        storeStatus = runs.append(first, reinterpret_cast<const uint8_t*>("First line."), std::strlen("First line."));
+      }
+      if (storeStatus.ok()) {
+        storeStatus =
+            runs.append(second, reinterpret_cast<const uint8_t*>("Second line."), std::strlen("Second line."));
+      }
+      if (storeStatus.ok()) {
+        reduceStatus = reducer.reduce(runs, page, 0, nullptr, 0, {nullptr, discardOrderItem}, &emitted);
+      }
+      hiddenDecision = pdfClassifyHiddenText(hiddenContext, 0);
+      PdfDocumentTextClassifier classifier;
+      classifierStatus = classifier.begin(1);
+      if (classifierStatus.ok()) {
+        classifierStatus = classifier.observePage(0, {12, 0, 1});
+      }
+      if (classifierStatus.ok()) {
+        classifierStatus = classifier.finish(PdfStatus::success());
+      }
+    } catch (const std::bad_alloc&) {
+      allocationFailed = true;
+    }
+    allocationCount = watch.count();
+  }
+
+  EXPECT_FALSE(allocationFailed);
+  EXPECT_EQ(allocationCount, 0u);
+  EXPECT_TRUE(storeStatus.ok());
+  EXPECT_TRUE(reduceStatus.ok());
+  EXPECT_TRUE(classifierStatus.ok());
+  EXPECT_EQ(hiddenDecision, PdfHiddenTextDecision::Qualified);
+  EXPECT_EQ(emitted, 2u);
 }

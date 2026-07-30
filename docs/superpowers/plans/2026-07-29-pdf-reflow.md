@@ -1002,38 +1002,43 @@ smallest failing hypothesis; do not layer speculative production changes.
 - Test: `test/pdf_reflow_core/PdfReadingOrderTest.cpp`
 - Test: `test/pdf_reflow_core/PdfDocumentTextClassifierTest.cpp`
 
-- [ ] Add red hidden-text fixtures requiring render-mode-3 text to have a
+- [x] Add red hidden-text fixtures requiring render-mode-3 text to have a
   nonzero on-page transform and plausible image overlap. Reject off-page,
   zero-size, metadata-like, and unmappable hidden text.
-- [ ] Deduplicate qualified hidden OCR against visible normalized text using
+- [x] Deduplicate qualified hidden OCR against visible normalized text using
   content plus geometry. Fix all thresholds as named constants with positive
   and negative controls.
-- [ ] Add red geometry tests for single-column lines, two/three columns,
+- [x] Add red geometry tests for single-column lines, two/three columns,
   headings, paragraphs, row-major tables, repeated headers/footers, rotated
   noise, and ambiguous layouts.
-- [ ] Implement conservative whitespace-histogram columns, line clustering,
+- [x] Implement conservative whitespace-histogram columns, line clustering,
   table rows/cells, paragraph grouping, and document-scoped repeated-band
   suppression. A three-page fixture must remove a repeated header/footer while
   retaining a one-off heading.
   Ambiguity must degrade to a deterministic readable stream, never fixed-page
   rendering.
-- [ ] Define `PdfRunStore`, HAL fixed-record spill, and host fault-injection
+- [x] Define `PdfRunStore`, HAL fixed-record spill, and host fault-injection
   implementations. Store fixed geometry/order metadata with checked offset and
   length into a paired sequential variable-text file. Run a dense fixture that
   exceeds both 256 runs and the 8 KiB page-text workspace through a real disk
   spill, with no truncation. Required oracle: byte-identical semantic output
   versus the roomy in-memory path.
-- [ ] Add a single-reader fake that fails on any second source-PDF handle.
+- [x] Add a single-reader fake that fails on any second source-PDF handle.
   At a verified page boundary, close the source before opening/reading a spill
   reduction file; close the spill; then reopen the source once and seek to the
   checked continuation offset. Add a negative witness that intentionally reads
   spill while the source remains open and must fail.
-- [ ] Sample early pages only for UI classification, but return
+- [x] Sample early pages only for UI classification, but return
   `NoReadableText` only after full extraction confirms zero meaningful mapped
   text. `scan_only.pdf` must reach that result; unsupported encoding/filter and
   malformed input retain their distinct errors.
-- [ ] Run `ctest -R "^Pdf"`. Expected: PASS, including
+- [x] Run `ctest -R "^Pdf"`. Expected: PASS, including
   `PdfDocumentTextClassifier`.
+
+Task 16 verification (2026-07-29): 86/86 PDF tests and 207/207 complete host
+tests passed. Default firmware and ESP32-C3 QEMU builds passed; QEMU exercised
+HAL-backed text and fixed-record spill and emitted `QEMU_PDF_REFLOW_PASS`.
+Resource and no-flash gates passed.
 
 ### Task 17: Count words once and emit semantic XHTML blocks
 

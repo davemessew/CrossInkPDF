@@ -6,8 +6,12 @@
 #include <HalDisplay.h>
 #include <HalPowerManager.h>
 #include <HalStorage.h>
+#include <PdfDocumentTextClassifier.h>
 #include <PdfHalIo.h>
+#include <PdfHiddenText.h>
 #include <PdfPageTree.h>
+#include <PdfReadingOrder.h>
+#include <PdfRunStore.h>
 #include <QemuHalControl.h>
 #include <esp_rom_sys.h>
 #include <freertos/FreeRTOS.h>
@@ -22,6 +26,7 @@ namespace {
 constexpr char SENTINEL_PATH[] = "/qemu/sentinel.txt";
 constexpr char SENTINEL_CONTENT[] = "crossink-qemu-sentinel-v1\n";
 constexpr char PDF_FIXTURE_PATH[] = "/qemu/classic_text.pdf";
+constexpr char PDF_SPILL_PATH[] = "/qemu/pdf-run-spill.tmp";
 constexpr char PDF_EXPECTED_TEXT[] = "Hello PDF";
 constexpr uint32_t EXPECTED_FRAME_BYTES = 48000;
 constexpr uint32_t EXPECTED_FRAME_CRC32 = 0x0F7C8C45;
@@ -54,11 +59,21 @@ struct PdfCoreAcceptanceWorkspace {
   uint8_t objectText[2048]{};
   PdfXrefEntry xrefEntries[128]{};
   PdfPageTreeRecord traversalRecords[64]{};
+  PdfTextRun reductionRuns[4]{};
+  uint8_t reductionText[256]{};
+  PdfReadingOrderItem reductionOrder[4]{};
   PdfPageInfo firstPage{};
   char transcript[32]{};
   uint32_t pageCount = 0;
 };
 static_assert(sizeof(PdfCoreAcceptanceWorkspace) <= 32768);
+
+struct ReductionSinkContext {
+  PdfRunStore* runs = nullptr;
+  char* transcript = nullptr;
+  size_t capacity = 0;
+  size_t length = 0;
+};
 
 void fail(const char* component, const char* reason) {
   esp_rom_printf("QEMU_%s_FAIL reason=%s\n", component, reason);
@@ -143,6 +158,159 @@ PdfStatus captureFirstPdfPage(void* context, const PdfPageInfo& page) {
   }
   ++workspace.pageCount;
   return PdfStatus::success();
+}
+
+PdfStatus appendReductionRun(void* context, const PdfReadingOrderItem& item) {
+  if (context == nullptr) {
+    return PdfStatus::failure(PdfError::InvalidArgument);
+  }
+  auto& sink = *static_cast<ReductionSinkContext*>(context);
+  if (sink.runs == nullptr || sink.transcript == nullptr) {
+    return PdfStatus::failure(PdfError::InvalidArgument);
+  }
+  PdfTextRun run{};
+  PdfStatus status = sink.runs->readRun(item.runOrdinal, &run);
+  if (!status.ok()) {
+    return status;
+  }
+  const size_t separator = sink.length == 0 ? 0 : 1;
+  if (separator + run.textLength > sink.capacity - sink.length) {
+    return PdfStatus::failure(PdfError::LimitExceeded, sink.length);
+  }
+  if (separator != 0) {
+    sink.transcript[sink.length++] = ' ';
+  }
+  status = sink.runs->readTextExact(item.runOrdinal, 0, reinterpret_cast<uint8_t*>(sink.transcript + sink.length),
+                                    run.textLength);
+  if (status.ok()) {
+    sink.length += run.textLength;
+  }
+  return status;
+}
+
+bool checkPdfReduction(PdfCoreAcceptanceWorkspace& workspace) {
+  const PdfRectangle page{
+      PdfFixed16::fromInteger(0).raw,
+      PdfFixed16::fromInteger(0).raw,
+      PdfFixed16::fromInteger(612).raw,
+      PdfFixed16::fromInteger(792).raw,
+  };
+  PdfRunStore runs({
+      workspace.reductionRuns,
+      static_cast<uint16_t>(sizeof(workspace.reductionRuns) / sizeof(workspace.reductionRuns[0])),
+      workspace.reductionText,
+      sizeof(workspace.reductionText),
+      {},
+      {},
+  });
+  PdfStatus status = runs.reset();
+  PdfTextRun second{};
+  second.sourceOrder = 1;
+  second.xMin = PdfFixed16::fromInteger(72).raw;
+  second.xMax = PdfFixed16::fromInteger(140).raw;
+  second.yMin = PdfFixed16::fromInteger(650).raw;
+  second.yMax = PdfFixed16::fromInteger(662).raw;
+  second.baselineX = second.xMin;
+  second.baseline = second.yMin;
+  second.baselineDx = second.xMax - second.xMin;
+  PdfTextRun first = second;
+  first.sourceOrder = 0;
+  first.yMin = PdfFixed16::fromInteger(710).raw;
+  first.yMax = PdfFixed16::fromInteger(722).raw;
+  first.baseline = first.yMin;
+  static constexpr uint8_t SECOND_TEXT[] = "Second";
+  static constexpr uint8_t FIRST_TEXT[] = "First";
+  if (status.ok()) {
+    status = runs.append(second, SECOND_TEXT, sizeof(SECOND_TEXT) - 1);
+  }
+  if (status.ok()) {
+    status = runs.append(first, FIRST_TEXT, sizeof(FIRST_TEXT) - 1);
+  }
+
+  std::memset(workspace.transcript, 0, sizeof(workspace.transcript));
+  ReductionSinkContext sink{&runs, workspace.transcript, sizeof(workspace.transcript), 0};
+  PdfReadingOrderReducer reducer({
+      workspace.reductionOrder,
+      static_cast<uint16_t>(sizeof(workspace.reductionOrder) / sizeof(workspace.reductionOrder[0])),
+  });
+  uint32_t emitted = 0;
+  if (status.ok()) {
+    status = reducer.reduce(runs, page, 0, nullptr, 0, {&sink, appendReductionRun}, &emitted);
+  }
+
+  static constexpr uint8_t OCR_TEXT[] = "Readable OCR";
+  PdfTextRun hidden{};
+  hidden.textLength = sizeof(OCR_TEXT) - 1;
+  hidden.xMin = PdfFixed16::fromInteger(72).raw;
+  hidden.xMax = PdfFixed16::fromInteger(170).raw;
+  hidden.yMin = PdfFixed16::fromInteger(620).raw;
+  hidden.yMax = PdfFixed16::fromInteger(632).raw;
+  hidden.baselineX = hidden.xMin;
+  hidden.baseline = hidden.yMin;
+  hidden.baselineDx = hidden.xMax - hidden.xMin;
+  hidden.flags = PdfTextHidden;
+  PdfImagePlacement image{};
+  image.xMin = PdfFixed16::fromInteger(60).raw;
+  image.xMax = PdfFixed16::fromInteger(240).raw;
+  image.yMin = PdfFixed16::fromInteger(560).raw;
+  image.yMax = PdfFixed16::fromInteger(720).raw;
+  const PdfHiddenTextContext hiddenContext{
+      page, &hidden, 1, OCR_TEXT, sizeof(OCR_TEXT) - 1, &image, 1,
+  };
+  const PdfHiddenTextDecision hiddenDecision = pdfClassifyHiddenText(hiddenContext, 0);
+
+  PdfDocumentTextClassifier classifier;
+  PdfStatus classifierStatus = classifier.begin(1);
+  if (classifierStatus.ok()) {
+    classifierStatus = classifier.observePage(0, {11, 0, 1});
+  }
+  if (classifierStatus.ok()) {
+    classifierStatus = classifier.finish(PdfStatus::success());
+  }
+
+  static constexpr char EXPECTED[] = "First Second";
+  if (!status.ok() || !classifierStatus.ok() || hiddenDecision != PdfHiddenTextDecision::Qualified || emitted != 2 ||
+      sink.length != sizeof(EXPECTED) - 1 || std::memcmp(workspace.transcript, EXPECTED, sink.length) != 0) {
+    fail("PDF_REFLOW", "reduction");
+    return false;
+  }
+
+  HalFile spill = Storage.open(PDF_SPILL_PATH, static_cast<oflag_t>(O_RDWR | O_CREAT | O_TRUNC));
+  PdfHalByteStoreContext spillContext;
+  status = spill ? pdfInitializeHalByteStore(&spillContext, spill, 128) : PdfStatus::failure(PdfError::IoFailure);
+  static constexpr uint8_t SPILL_TEXT[] = "spill";
+  if (status.ok()) {
+    PdfByteStore byteStore = pdfHalByteStore(spillContext);
+    status = pdfWriteExact(pdfByteStoreSink(byteStore), SPILL_TEXT, sizeof(SPILL_TEXT) - 1);
+    uint8_t roundTrip[sizeof(SPILL_TEXT) - 1]{};
+    if (status.ok()) {
+      status = pdfReadExact(pdfByteStoreSource(byteStore), 0, roundTrip, sizeof(roundTrip));
+    }
+    if (status.ok() && std::memcmp(roundTrip, SPILL_TEXT, sizeof(roundTrip)) != 0) {
+      status = PdfStatus::failure(PdfError::Malformed);
+    }
+  }
+  if (status.ok()) {
+    const PdfFixedRecordStore recordStore = pdfHalFixedRecordStore(spill, sizeof(PdfTextRun), 1);
+    status = pdfWriteRecord(recordStore, 0, &first);
+    PdfTextRun roundTrip{};
+    if (status.ok()) {
+      status = pdfReadRecord(recordStore, 0, &roundTrip);
+    }
+    if (status.ok() && (roundTrip.sourceOrder != first.sourceOrder || roundTrip.xMin != first.xMin ||
+                        roundTrip.baseline != first.baseline)) {
+      status = PdfStatus::failure(PdfError::Malformed);
+    }
+  }
+  const bool spillClosed = spill.close();
+  const bool spillRemoved = Storage.remove(PDF_SPILL_PATH);
+  if (!status.ok() || !spillClosed || !spillRemoved) {
+    fail("PDF_REFLOW", "hal_spill");
+    return false;
+  }
+  esp_rom_printf("QEMU_PDF_REFLOW_PASS runs=%lu bytes=%lu\n", static_cast<unsigned long>(emitted),
+                 static_cast<unsigned long>(sink.length));
+  return true;
 }
 
 bool checkPdfCore() {
@@ -317,7 +485,7 @@ bool checkPdfCore() {
 
   esp_rom_printf("QEMU_PDF_CORE bytes=%lu\n", static_cast<unsigned long>(transcriptLength));
   esp_rom_printf("QEMU_PDF_CORE_PASS\n");
-  return true;
+  return checkPdfReduction(*workspace);
 }
 
 bool checkStorage() {

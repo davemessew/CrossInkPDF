@@ -48,7 +48,7 @@
     "partition_sha256": "98e02c50532c388d85cc3b7c96d004142dc713b23368d293c881ecdcb419e44e",
     "platform": "55.03.37",
     "qemu_config_sha256": "ba6b3cd7495c08aa94edc9815dbef573e87f828922fe92c8075b91cbcc6ce515",
-    "qemu_hal_sha256": "fd0d8bb2acaf782f7aa6d7737515344db6303e9bd9fe206d2c6bee74c1d68656",
+    "qemu_hal_sha256": "773e7eabffba36d9cf763cfb72333de170d524f7268714ccf9f1c659d4fa8fb6",
     "toolchain": "14.2.0+20251107"
   },
   "schema_version": 1

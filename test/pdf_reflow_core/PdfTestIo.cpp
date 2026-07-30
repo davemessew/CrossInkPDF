@@ -51,6 +51,9 @@ PdfStatus PdfTestRecordStore::read(void* context, const uint32_t ordinal, void* 
   if (store.readForbiddenFlag_ != nullptr && *store.readForbiddenFlag_) {
     return PdfStatus::failure(PdfError::IoFailure, ordinal);
   }
+  if (ordinal == store.readFailureOrdinal_) {
+    return PdfStatus::failure(PdfError::IoFailure, ordinal);
+  }
   if (record == nullptr || recordSize != store.recordSize_ || ordinal >= store.capacity_) {
     return PdfStatus::failure(PdfError::InvalidOffset, ordinal);
   }
@@ -92,6 +95,9 @@ PdfStatus PdfTestByteStore::readAt(void* context, const uint64_t offset, uint8_t
   }
   auto& store = *static_cast<PdfTestByteStore*>(context);
   if (store.readForbiddenFlag_ != nullptr && *store.readForbiddenFlag_) {
+    return PdfStatus::failure(PdfError::IoFailure, offset);
+  }
+  if (offset >= store.readFailureOffset_) {
     return PdfStatus::failure(PdfError::IoFailure, offset);
   }
   if (offset > store.bytes_.size()) {
