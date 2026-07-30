@@ -85,6 +85,7 @@ bool CrossPointState::loadFromBinaryFile() {
     return false;
   }
 
+  // Legacy binary compatibility: retain the persisted member and field order.
   serialization::readString(inputFile, openEpubPath);
   if (version >= 2) {
     uint8_t legacyLastSleep = UINT8_MAX;

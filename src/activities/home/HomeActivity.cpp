@@ -882,9 +882,9 @@ void HomeActivity::onEnter() {
       std::min(kMaxCachedBooks, std::max(metrics.homeRecentBooksCount, HOME_BOOK_SWAP_RECENT_COUNT));
   loadRecentBooks(recentBooksToLoad);
 
-  if (!APP_STATE.openEpubPath.empty()) {
+  if (!APP_STATE.openBookPath().empty()) {
     for (int i = 0; i < static_cast<int>(recentBooks.size()); ++i) {
-      if (recentBooks[i].path == APP_STATE.openEpubPath) {
+      if (recentBooks[i].path == APP_STATE.openBookPath()) {
         if (metrics.homeRecentBooksCount == 1 && i > 0) {
           std::rotate(recentBooks.begin(), recentBooks.begin() + i, recentBooks.end());
           selectorIndex = 0;

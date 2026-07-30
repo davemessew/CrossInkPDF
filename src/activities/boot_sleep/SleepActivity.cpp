@@ -626,7 +626,7 @@ void SleepActivity::renderCoverSleepScreen() const {
       break;
   }
 
-  const std::string& path = currentBookPath.empty() ? APP_STATE.openEpubPath : currentBookPath;
+  const std::string& path = currentBookPath.empty() ? APP_STATE.openBookPath() : currentBookPath;
   if (path.empty()) {
     return (this->*renderNoCoverSleepScreen)();
   }
@@ -658,7 +658,7 @@ void SleepActivity::renderReadingStatsSleepScreen() const {
   std::string bookTitle = tr(STR_READING_STATS);
   float progressPercent = -1.0f;
 
-  const std::string& path = currentBookPath.empty() ? APP_STATE.openEpubPath : currentBookPath;
+  const std::string& path = currentBookPath.empty() ? APP_STATE.openBookPath() : currentBookPath;
   if (!path.empty()) {
     const std::string recentTitle = recentTitleForPath(path);
     bookTitle = recentTitle.empty() ? filenameFromPath(path) : recentTitle;
@@ -684,7 +684,7 @@ void SleepActivity::renderReadingStatsSleepScreen() const {
 }
 
 void SleepActivity::renderMinimalSleepScreen() const {
-  const std::string& path = currentBookPath.empty() ? APP_STATE.openEpubPath : currentBookPath;
+  const std::string& path = currentBookPath.empty() ? APP_STATE.openBookPath() : currentBookPath;
   if (path.empty()) {
     return renderDefaultSleepScreen();
   }
@@ -703,7 +703,7 @@ void SleepActivity::renderMinimalSleepScreen() const {
 }
 
 void SleepActivity::renderMinimalStatsSleepScreen() const {
-  const std::string& path = currentBookPath.empty() ? APP_STATE.openEpubPath : currentBookPath;
+  const std::string& path = currentBookPath.empty() ? APP_STATE.openBookPath() : currentBookPath;
   if (path.empty()) {
     return renderDefaultSleepScreen();
   }
@@ -724,7 +724,7 @@ void SleepActivity::renderMinimalStatsSleepScreen() const {
 }
 
 void SleepActivity::renderDashboardSleepScreen() const {
-  const std::string& path = currentBookPath.empty() ? APP_STATE.openEpubPath : currentBookPath;
+  const std::string& path = currentBookPath.empty() ? APP_STATE.openBookPath() : currentBookPath;
   if (path.empty()) {
     return renderDefaultSleepScreen();
   }
@@ -772,7 +772,7 @@ void SleepActivity::renderOverlaySleepScreen() const {
   const auto pageHeight = renderer.getScreenHeight();
   const bool shouldUseReaderPageBackground = canSnapshotOverlayBackground;
   const std::string path = shouldUseReaderPageBackground
-                               ? (currentBookPath.empty() ? APP_STATE.openEpubPath : currentBookPath)
+                               ? (currentBookPath.empty() ? APP_STATE.openBookPath() : currentBookPath)
                                : std::string{};
 
   auto renderSavedReaderPage = [&]() -> bool {

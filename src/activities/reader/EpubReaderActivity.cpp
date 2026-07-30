@@ -2138,7 +2138,7 @@ void EpubReaderActivity::onEnter() {
   initializeCompletionPromptTrigger();
 
   // Save current document as last opened document and add to recent books
-  APP_STATE.openEpubPath = document->getPath();
+  APP_STATE.openBookPath() = document->getPath();
   APP_STATE.saveToFile();
   RECENT_BOOKS.addOrUpdateBook(document->getPath(), document->getTitle(), document->getAuthor(),
                                document->getThumbBmpPath());

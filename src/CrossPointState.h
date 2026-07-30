@@ -17,6 +17,8 @@ class CrossPointState {
   static constexpr uint8_t SLEEP_RECENT_COUNT = 16;
 
   std::string openEpubPath;
+  std::string& openBookPath() noexcept { return openEpubPath; }
+  const std::string& openBookPath() const noexcept { return openEpubPath; }
   std::string favoriteSleepImagePath;
   std::string preferredSleepFolderPath;
   uint16_t recentSleepImages[SLEEP_RECENT_COUNT] = {};  // circular buffer of recent wallpaper indices

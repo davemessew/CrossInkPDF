@@ -75,7 +75,7 @@ void XtcReaderActivity::onEnter() {
   hasSessionStartLocalDateTime = getCurrentLocalReadingStatsDateTime(sessionStartLocalDateTime);
 
   // Save current XTC as last opened book and add to recent books
-  APP_STATE.openEpubPath = xtc->getPath();
+  APP_STATE.openBookPath() = xtc->getPath();
   APP_STATE.saveToFile();
   RECENT_BOOKS.addOrUpdateBook(xtc->getPath(), xtc->getTitle(), xtc->getAuthor(), xtc->getThumbBmpPath());
   SleepCoverAssets::prepareXtc(*xtc);

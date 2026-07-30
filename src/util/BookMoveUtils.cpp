@@ -66,8 +66,8 @@ bool migrateMovedEpubState(const std::string& oldPath, const std::string& newPat
     RECENT_BOOKS.removeByPath(newPath);
   }
 
-  if (APP_STATE.openEpubPath == oldPath) {
-    APP_STATE.openEpubPath = newPath;
+  if (APP_STATE.openBookPath() == oldPath) {
+    APP_STATE.openBookPath() = newPath;
     APP_STATE.saveToFile();
   }
 

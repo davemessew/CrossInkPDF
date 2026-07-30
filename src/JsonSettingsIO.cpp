@@ -104,6 +104,7 @@ uint8_t migrateTiltDirectionValue(uint8_t direction) {
 
 bool JsonSettingsIO::saveState(const CrossPointState& s, const char* path) {
   JsonDocument doc;
+  // Persisted-state compatibility: retain the legacy member and JSON key.
   doc["openEpubPath"] = s.openEpubPath;
   doc["favoriteSleepImagePath"] = s.favoriteSleepImagePath;
   doc["preferredSleepFolderPath"] = s.preferredSleepFolderPath;
@@ -132,6 +133,7 @@ bool JsonSettingsIO::loadState(CrossPointState& s, const char* json) {
     return false;
   }
 
+  // Persisted-state compatibility: retain the legacy member and JSON key.
   s.openEpubPath = doc["openEpubPath"] | std::string("");
   s.favoriteSleepImagePath = doc["favoriteSleepImagePath"] | std::string("");
   s.preferredSleepFolderPath = doc["preferredSleepFolderPath"] | std::string("");
