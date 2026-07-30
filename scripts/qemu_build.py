@@ -24,6 +24,7 @@ EFUSE_REVISION_BYTE_OFFSET = 38
 EFUSE_REVISION_BYTE_VALUE = 0x0C
 ESP_IDF_EFUSE_SOURCE = "esp-idf-v5.5.2/tools/idf_py_actions/qemu_ext.py"
 PDF_FIXTURE_RELATIVE_PATH = Path("qemu") / "classic_text.pdf"
+PDF_NAVIGATION_FIXTURE_RELATIVE_PATH = Path("qemu") / "navigation_outline.pdf"
 
 
 def validate_flash_layout(
@@ -269,6 +270,7 @@ def _write_manifest(
     env: Any,
     fixture_bytes: int,
     pdf_fixture_sha256: str,
+    pdf_navigation_fixture_sha256: str,
 ) -> None:
     project_dir = Path(env.subst("$PROJECT_DIR")).resolve()
     fingerprint, tools = _resource_fingerprint(env, project_dir)
@@ -304,6 +306,7 @@ def _write_manifest(
             "fixture_bytes": fixture_bytes,
             "writable_headroom": MIN_WRITABLE_HEADROOM,
             "pdf_fixture_sha256": pdf_fixture_sha256,
+            "pdf_navigation_fixture_sha256": pdf_navigation_fixture_sha256,
         },
         "images": images,
         "resource_fingerprint": fingerprint,
@@ -327,10 +330,19 @@ def _build_qemu_images(target: Any, source: Any, env: Any) -> int:
             "$PROJECT_DIR/test/pdf_reflow_core/fixtures/classic_text.pdf"
         )
     ).resolve()
+    canonical_navigation_pdf = Path(
+        env.subst(
+            "$PROJECT_DIR/test/pdf_reflow_core/fixtures/navigation_outline.pdf"
+        )
+    ).resolve()
 
     try:
         pdf_fixture_sha256 = verify_pdf_fixture(
             canonical_pdf, fixtures / PDF_FIXTURE_RELATIVE_PATH
+        )
+        pdf_navigation_fixture_sha256 = verify_pdf_fixture(
+            canonical_navigation_pdf,
+            fixtures / PDF_NAVIGATION_FIXTURE_RELATIVE_PATH,
         )
         fixture_bytes = verify_fixture_headroom(fixtures)
         entries = _flash_entries_from_environment(
@@ -366,6 +378,7 @@ def _build_qemu_images(target: Any, source: Any, env: Any) -> int:
             env,
             fixture_bytes,
             pdf_fixture_sha256,
+            pdf_navigation_fixture_sha256,
         )
     except (OSError, RuntimeError, ValueError) as error:
         sys.stderr.write(f"QEMU image build failed: {error}\n")

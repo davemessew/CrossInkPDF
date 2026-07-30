@@ -70,6 +70,7 @@ class PdfSemanticWriter {
   PdfStatus endTableRow();
   PdfStatus endTable();
   PdfStatus writePublisherPageBreak(const uint8_t* label, size_t length);
+  PdfStatus writePublisherPageBreak(uint32_t sourcePageIndex, const uint8_t* label, size_t length);
 
   PdfStatus flush();
   PdfStatus finish();

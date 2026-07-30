@@ -16,6 +16,11 @@ constexpr uint16_t kArenaEntryCount = 128;
 constexpr uint16_t kArenaTextBytes = 1536;
 constexpr uint32_t kXrefRecordCount = 256;
 constexpr uint32_t kTraversalRecordCount = 64;
+constexpr uint16_t kPreparationPageLimit = 32;
+constexpr uint16_t kPreparationOutlineLimit = 32;
+constexpr uint8_t kPreparationNamedDestinationLimit = 16;
+constexpr uint8_t kPreparationPageLabelLimit = 16;
+constexpr uint16_t kPreparationLinkLimit = 32;
 
 struct ArenaWorkspace {
   PdfValue values[kArenaEntryCount]{};
@@ -32,6 +37,16 @@ struct RecordWorkspace {
 static_assert(sizeof(ArenaWorkspace) <= PdfLimits::PageTextBytes);
 static_assert(sizeof(RecordWorkspace) <= PdfLimits::PageRunBytes);
 
+struct PreparedOutlinePending {
+  PdfObjectReference reference{};
+  int16_t parentIndex = -1;
+};
+
+struct PreparedLink {
+  PdfRawDestination destination{};
+  uint16_t sourcePageIndex = 0;
+};
+
 bool copyPath(const char* source, char* destination, const size_t capacity) {
   if (source == nullptr || destination == nullptr || capacity == 0) {
     return false;
@@ -45,6 +60,38 @@ bool copyPath(const char* source, char* destination, const size_t capacity) {
   return true;
 }
 
+bool asciiEqualInsensitive(const char* const value, const char* const expected, const size_t length) {
+  for (size_t index = 0; index < length; ++index) {
+    char left = value[index];
+    char right = expected[index];
+    if (left >= 'A' && left <= 'Z') {
+      left = static_cast<char>(left - 'A' + 'a');
+    }
+    if (right >= 'A' && right <= 'Z') {
+      right = static_cast<char>(right - 'A' + 'a');
+    }
+    if (left != right) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void sourceFallbackTitle(const char* const path, const uint8_t** const title, size_t* const length) {
+  const char* start = path;
+  for (const char* cursor = path; *cursor != '\0'; ++cursor) {
+    if (*cursor == '/' || *cursor == '\\') {
+      start = cursor + 1;
+    }
+  }
+  size_t titleLength = std::strlen(start);
+  if (titleLength >= 4 && asciiEqualInsensitive(start + titleLength - 4, ".pdf", 4)) {
+    titleLength -= 4;
+  }
+  *title = reinterpret_cast<const uint8_t*>(start);
+  *length = titleLength;
+}
+
 uint32_t deterministicGeneration(const PdfSourceIdentity& identity) {
   uint32_t generation = static_cast<uint32_t>(identity.headFingerprint ^ (identity.headFingerprint >> 32U) ^
                                               identity.tailFingerprint ^ (identity.tailFingerprint >> 32U));
@@ -54,7 +101,62 @@ uint32_t deterministicGeneration(const PdfSourceIdentity& identity) {
   return generation;
 }
 
+bool parseTokenInt16(const PdfToken& token, int16_t* const value) {
+  if (value == nullptr || (token.kind != PdfTokenKind::Integer && token.kind != PdfTokenKind::Real) ||
+      token.length == 0) {
+    return false;
+  }
+  size_t index = 0;
+  bool negative = false;
+  if (token.bytes[index] == '-' || token.bytes[index] == '+') {
+    negative = token.bytes[index] == '-';
+    if (++index == token.length) {
+      return false;
+    }
+  }
+  int32_t parsed = 0;
+  bool digit = false;
+  while (index < token.length && token.bytes[index] != '.') {
+    if (token.bytes[index] < '0' || token.bytes[index] > '9') {
+      return false;
+    }
+    digit = true;
+    parsed = parsed * 10 + token.bytes[index] - '0';
+    if (parsed > INT16_MAX + (negative ? 1 : 0)) {
+      return false;
+    }
+    ++index;
+  }
+  if (!digit) {
+    return false;
+  }
+  *value = static_cast<int16_t>(negative ? -parsed : parsed);
+  return true;
+}
+
 }  // namespace
+
+struct PdfPreparation::ExtractedBlockRecord {
+  uint16_t textOffset = 0;
+  uint16_t textLength = 0;
+  int16_t sourceFontSize = 0;
+  uint16_t reserved = 0;
+};
+
+struct PdfPreparation::NavigationWorkspace {
+  PdfPageInfo pages[kPreparationPageLimit]{};
+  PdfOutlineEntry outlineEntries[kPreparationOutlineLimit]{};
+  PdfNamedDestinationRecord namedDestinations[kPreparationNamedDestinationLimit]{};
+  PdfPageLabelRange pageLabels[kPreparationPageLabelLimit]{};
+  PreparedLink links[kPreparationLinkLimit]{};
+  PreparedOutlinePending outlinePending[kPreparationOutlineLimit]{};
+  PdfObjectReference outlineSeen[kPreparationOutlineLimit]{};
+  PdfMetadataSection sections[kPreparationPageLimit]{};
+  PdfRequiredFileRecord sectionFiles[kPreparationPageLimit]{};
+  uint32_t pageFirstAnchors[kPreparationPageLimit]{};
+  uint16_t pageFirstSections[kPreparationPageLimit]{};
+  uint16_t linkCount = 0;
+};
 
 bool PdfPreparationPaintGate::shouldPaint(const uint8_t progressPercent, const uint32_t nowMs) {
   if (intermediatePaintCount_ >= 10 || progressPercent < lastPaintPercent_ ||
@@ -72,6 +174,12 @@ PdfPreparation::~PdfPreparation() {
   if (sectionWriter_.open) {
     pdfAbortTrackedCacheFile(&sectionWriter_);
   }
+  if (metadataWriter_.open) {
+    pdfAbortTrackedCacheFile(&metadataWriter_);
+  }
+  if (outlineWriter_.open) {
+    pdfAbortTrackedCacheFile(&outlineWriter_);
+  }
   (void)closeSource();
   releaseWorkspaces();
 }
@@ -80,6 +188,12 @@ PdfStatus PdfPreparation::begin(const PdfPreparationConfig& config) {
   destroyParsers();
   if (sectionWriter_.open) {
     pdfAbortTrackedCacheFile(&sectionWriter_);
+  }
+  if (metadataWriter_.open) {
+    pdfAbortTrackedCacheFile(&metadataWriter_);
+  }
+  if (outlineWriter_.open) {
+    pdfAbortTrackedCacheFile(&outlineWriter_);
   }
   (void)closeSource();
   releaseWorkspaces();
@@ -98,6 +212,14 @@ PdfStatus PdfPreparation::begin(const PdfPreparationConfig& config) {
     phase_ = PdfPreparationPhase::Failed;
     return status_;
   }
+  const uint8_t* fallbackTitle = nullptr;
+  size_t fallbackTitleLength = 0;
+  sourceFallbackTitle(sourcePath_, &fallbackTitle, &fallbackTitleLength);
+  status_ = metadataBuilder_.begin(fallbackTitle, fallbackTitleLength);
+  if (!status_) {
+    phase_ = PdfPreparationPhase::Failed;
+    return status_;
+  }
 
   resources_.emplace(config.resourceHooks);
   sourceHandle_ = {};
@@ -107,17 +229,54 @@ PdfStatus PdfPreparation::begin(const PdfPreparationConfig& config) {
   arena_ = {};
   xrefRecords_ = {};
   traversalRecords_ = {};
-  firstPage_ = {};
+  navigation_ = nullptr;
+  namedDestinations_.reset();
+  pageLabels_.reset();
+  outlineBuilder_.reset();
+  catalogNavigation_ = {};
+  infoReference_ = {};
+  activeNavigationReference_ = {};
   pageCount_ = 0;
+  currentPageIndex_ = 0;
+  currentContentIndex_ = 0;
+  extractedBlockCount_ = 0;
+  currentBlockIndex_ = 0;
+  sectionCount_ = 0;
+  explicitOutlineCount_ = 0;
+  outlinePendingCount_ = 0;
+  outlineSeenCount_ = 0;
+  currentOutlineParent_ = -1;
+  currentAnnotationPage_ = 0;
+  currentAnnotationIndex_ = 0;
+  navigationStage_ = 0;
+  navigationTask_ = NavigationTask::None;
+  hasInfoReference_ = false;
   contentRange_ = {};
   transcriptLength_ = 0;
+  currentFontSize_ = 0;
+  lastNumericValue_ = 0;
+  nextAnchorOrdinal_ = 0;
+  currentSectionFirstWord_ = 0;
+  currentSectionFirstAnchor_ = 0;
+  cumulativeSectionBytes_ = 0;
+  xmpStreamOffset_ = 0;
+  xmpStreamLength_ = 0;
+  coverCandidateSourceCount_ = 0;
+  for (auto& source : coverCandidateSources_) {
+    source = {};
+  }
   cacheStore_ = {};
   cacheCapacity_ = {};
   cacheBudget_ = {};
   checkpointSelection_ = PdfBuildCheckpointSelection{};
   sectionWriter_ = {};
+  metadataWriter_ = {};
+  outlineWriter_ = {};
   sectionRecord_ = {};
+  metadataRecord_ = {};
+  outlineRecord_ = {};
   semanticWriter_ = {};
+  metadata_ = {};
   generation_ = 0;
   sequence_ = 0;
   totalWords_ = 0;
@@ -149,6 +308,12 @@ PdfStepResult PdfPreparation::fail(const PdfStatus status) {
   if (sectionWriter_.open) {
     pdfAbortTrackedCacheFile(&sectionWriter_);
   }
+  if (metadataWriter_.open) {
+    pdfAbortTrackedCacheFile(&metadataWriter_);
+  }
+  if (outlineWriter_.open) {
+    pdfAbortTrackedCacheFile(&outlineWriter_);
+  }
   (void)closeSource();
   if (generation_ != 0 && sourceIdentity_.size != 0) {
     (void)commitCheckpoint(PdfBuildPhase::Failed);
@@ -162,6 +327,12 @@ PdfStepResult PdfPreparation::cancel() {
   destroyParsers();
   if (sectionWriter_.open) {
     pdfAbortTrackedCacheFile(&sectionWriter_);
+  }
+  if (metadataWriter_.open) {
+    pdfAbortTrackedCacheFile(&metadataWriter_);
+  }
+  if (outlineWriter_.open) {
+    pdfAbortTrackedCacheFile(&outlineWriter_);
   }
   (void)closeSource();
   if (generation_ != 0 && sourceIdentity_.size != 0) {
@@ -231,11 +402,40 @@ PdfStatus PdfPreparation::capturePage(void* context, const PdfPageInfo& page) {
     return PdfStatus::failure(PdfError::InvalidArgument);
   }
   auto& self = *static_cast<PdfPreparation*>(context);
-  if (self.pageCount_ == 0) {
-    self.firstPage_ = page;
+  if (self.navigation_ == nullptr || self.pageCount_ >= kPreparationPageLimit) {
+    return PdfStatus::failure(PdfError::LimitExceeded, page.pageIndex);
+  }
+  self.navigation_->pages[self.pageCount_] = page;
+  if (page.pageIndex < PdfLimits::MaxCoverScanPages && page.hasResources &&
+      self.coverCandidateSourceCount_ < PdfLimits::MaxCoverCandidateSources) {
+    const PdfObjectReference reference = page.resourcesIndirect ? page.resourceReference : page.resourceOwner;
+    if (reference.objectNumber != 0) {
+      bool alreadyRecorded = false;
+      for (uint8_t index = 0; index < self.coverCandidateSourceCount_; ++index) {
+        if (self.coverCandidateSources_[index].reference == reference) {
+          alreadyRecorded = true;
+          break;
+        }
+      }
+      if (!alreadyRecorded) {
+        self.coverCandidateSources_[self.coverCandidateSourceCount_++] = {
+            reference,
+            static_cast<uint16_t>(page.pageIndex),
+            page.resourcesIndirect,
+        };
+      }
+    }
   }
   ++self.pageCount_;
-  return self.pageCount_ <= 1 ? PdfStatus::success() : PdfStatus::failure(PdfError::Unsupported, page.pageIndex);
+  return PdfStatus::success();
+}
+
+bool PdfPreparation::coverCandidateSource(const uint8_t index, PdfCoverCandidateSource* const output) const {
+  if (output == nullptr || index >= coverCandidateSourceCount_) {
+    return false;
+  }
+  *output = coverCandidateSources_[index];
+  return true;
 }
 
 PdfStatus PdfPreparation::writeSection(void* context, const uint8_t* source, const size_t requested,
@@ -249,13 +449,71 @@ PdfStatus PdfPreparation::writeSection(void* context, const uint8_t* source, con
   return status;
 }
 
+PdfStatus PdfPreparation::writeMetadata(void* context, const uint8_t* source, const size_t requested,
+                                        size_t* bytesWritten) {
+  if (context == nullptr || bytesWritten == nullptr) {
+    return PdfStatus::failure(PdfError::InvalidArgument);
+  }
+  auto& self = *static_cast<PdfPreparation*>(context);
+  const uint64_t before = self.metadataWriter_.record.size;
+  const PdfStatus status = pdfWriteTrackedCacheFile(&self.metadataWriter_, source, requested);
+  *bytesWritten = static_cast<size_t>(self.metadataWriter_.record.size - before);
+  return status;
+}
+
+PdfStatus PdfPreparation::writeOutline(void* context, const uint8_t* source, const size_t requested,
+                                       size_t* bytesWritten) {
+  if (context == nullptr || bytesWritten == nullptr) {
+    return PdfStatus::failure(PdfError::InvalidArgument);
+  }
+  auto& self = *static_cast<PdfPreparation*>(context);
+  const uint64_t before = self.outlineWriter_.record.size;
+  const PdfStatus status = pdfWriteTrackedCacheFile(&self.outlineWriter_, source, requested);
+  *bytesWritten = static_cast<size_t>(self.outlineWriter_.record.size - before);
+  return status;
+}
+
 PdfStatus PdfPreparation::emitBlock(void*, const PdfSemanticBlockRecord&) { return PdfStatus::success(); }
 
-PdfStatus PdfPreparation::readRequiredFile(void* context, const uint32_t index, PdfRequiredFileRecord* record) {
-  if (context == nullptr || record == nullptr || index != 0) {
+PdfStatus PdfPreparation::readMetadataSection(void* context, const uint16_t index, PdfMetadataSection* record) {
+  if (context == nullptr || record == nullptr) {
     return PdfStatus::failure(PdfError::InvalidArgument, index);
   }
-  *record = static_cast<PdfPreparation*>(context)->sectionRecord_;
+  auto& self = *static_cast<PdfPreparation*>(context);
+  if (self.navigation_ == nullptr || index >= self.sectionCount_) {
+    return PdfStatus::failure(PdfError::InvalidOffset, index);
+  }
+  *record = self.navigation_->sections[index];
+  return PdfStatus::success();
+}
+
+PdfStatus PdfPreparation::readOutlineEntry(void* context, const uint16_t index, PdfOutlineEntry* record) {
+  if (context == nullptr || record == nullptr) {
+    return PdfStatus::failure(PdfError::InvalidArgument, index);
+  }
+  auto& self = *static_cast<PdfPreparation*>(context);
+  if (self.navigation_ == nullptr || !self.outlineBuilder_.has_value() || index >= self.outlineBuilder_->count()) {
+    return PdfStatus::failure(PdfError::InvalidOffset, index);
+  }
+  *record = self.navigation_->outlineEntries[index];
+  return PdfStatus::success();
+}
+
+PdfStatus PdfPreparation::readRequiredFile(void* context, const uint32_t index, PdfRequiredFileRecord* record) {
+  if (context == nullptr || record == nullptr) {
+    return PdfStatus::failure(PdfError::InvalidArgument, index);
+  }
+  auto& self = *static_cast<PdfPreparation*>(context);
+  if (self.navigation_ == nullptr || index >= static_cast<uint32_t>(self.sectionCount_) + 2U) {
+    return PdfStatus::failure(PdfError::InvalidOffset, index);
+  }
+  if (index < self.sectionCount_) {
+    *record = self.navigation_->sectionFiles[index];
+  } else if (index == self.sectionCount_) {
+    *record = self.metadataRecord_;
+  } else {
+    *record = self.outlineRecord_;
+  }
   return PdfStatus::success();
 }
 
@@ -265,6 +523,9 @@ void PdfPreparation::destroyParsers() {
   resolver_.reset();
   xrefParser_.reset();
   xref_.reset();
+  outlineBuilder_.reset();
+  pageLabels_.reset();
+  namedDestinations_.reset();
 }
 
 PdfStatus PdfPreparation::closeSource() {
@@ -279,6 +540,7 @@ PdfStatus PdfPreparation::closeSource() {
 }
 
 void PdfPreparation::releaseWorkspaces() {
+  navigation_ = nullptr;
   if (!resources_.has_value()) {
     dictionary_.reset();
     sourceWindow_.reset();
@@ -394,8 +656,15 @@ bool PdfPreparation::allocateNextWorkspace() {
 }
 
 PdfStatus PdfPreparation::initializeParserStorage() {
-  if (!pageText_ || !runRecords_) {
+  static_assert(sizeof(NavigationWorkspace) <= PdfLimits::UzlibDictionaryBytes);
+  static_assert(sizeof(ExtractedBlockRecord) <= 8);
+  if (!dictionary_ || !pageText_ || !runRecords_ || !decoderOutput_) {
     return PdfStatus::failure(PdfError::InsufficientMemory);
+  }
+  navigation_ = new (dictionary_.get()) NavigationWorkspace{};
+  for (uint32_t index = 0; index < kPreparationPageLimit; ++index) {
+    navigation_->pageFirstAnchors[index] = UINT32_MAX;
+    navigation_->pageFirstSections[index] = UINT16_MAX;
   }
   auto* arenaWorkspace = new (pageText_.get()) ArenaWorkspace{};
   auto* recordWorkspace = new (runRecords_.get()) RecordWorkspace{};
@@ -450,6 +719,16 @@ PdfStatus PdfPreparation::setupCache() {
   if (!status) {
     return status;
   }
+  char sectionDirectory[PDF_CACHE_PATH_CAPACITY]{};
+  const int sectionDirectoryLength = std::snprintf(sectionDirectory, sizeof(sectionDirectory), "%s/gen_%lu/sections",
+                                                   cacheRoot_, static_cast<unsigned long>(generation_));
+  if (sectionDirectoryLength < 0 || static_cast<size_t>(sectionDirectoryLength) >= sizeof(sectionDirectory)) {
+    return PdfStatus::failure(PdfError::LimitExceeded);
+  }
+  status = config_.io.mkdir(config_.io.context, sectionDirectory);
+  if (!status) {
+    return status;
+  }
   status = config_.io.capacity(config_.io.context, &cacheCapacity_);
   if (!status) {
     return status;
@@ -459,11 +738,25 @@ PdfStatus PdfPreparation::setupCache() {
     return status ? PdfStatus::failure(PdfError::InsufficientStorage) : status;
   }
 
-  const int relativeLength = std::snprintf(sectionRelativePath_, sizeof(sectionRelativePath_), "gen_%lu/section.xhtml",
-                                           static_cast<unsigned long>(generation_));
+  const int relativeLength = std::snprintf(sectionRelativePath_, sizeof(sectionRelativePath_),
+                                           "gen_%lu/sections/000000.xhtml", static_cast<unsigned long>(generation_));
   const int fullLength = std::snprintf(sectionPath_, sizeof(sectionPath_), "%s/%s", cacheRoot_, sectionRelativePath_);
   if (relativeLength < 0 || static_cast<size_t>(relativeLength) >= sizeof(sectionRelativePath_) || fullLength < 0 ||
       static_cast<size_t>(fullLength) >= sizeof(sectionPath_)) {
+    return PdfStatus::failure(PdfError::LimitExceeded);
+  }
+  const int metadataRelativeLength = std::snprintf(metadataRelativePath_, sizeof(metadataRelativePath_),
+                                                   "gen_%lu/metadata.bin", static_cast<unsigned long>(generation_));
+  const int metadataFullLength =
+      std::snprintf(metadataPath_, sizeof(metadataPath_), "%s/%s", cacheRoot_, metadataRelativePath_);
+  const int outlineRelativeLength = std::snprintf(outlineRelativePath_, sizeof(outlineRelativePath_),
+                                                  "gen_%lu/outline.bin", static_cast<unsigned long>(generation_));
+  const int outlineFullLength =
+      std::snprintf(outlinePath_, sizeof(outlinePath_), "%s/%s", cacheRoot_, outlineRelativePath_);
+  if (metadataRelativeLength < 0 || static_cast<size_t>(metadataRelativeLength) >= sizeof(metadataRelativePath_) ||
+      metadataFullLength < 0 || static_cast<size_t>(metadataFullLength) >= sizeof(metadataPath_) ||
+      outlineRelativeLength < 0 || static_cast<size_t>(outlineRelativeLength) >= sizeof(outlineRelativePath_) ||
+      outlineFullLength < 0 || static_cast<size_t>(outlineFullLength) >= sizeof(outlinePath_)) {
     return PdfStatus::failure(PdfError::LimitExceeded);
   }
   return PdfStatus::success();
@@ -489,30 +782,315 @@ PdfStatus PdfPreparation::finishXref() {
 }
 
 PdfStatus PdfPreparation::finishCatalog() {
-  if (!resolver_.has_value()) {
+  if (!resolver_.has_value() || navigation_ == nullptr) {
     return PdfStatus::failure(PdfError::InvalidArgument);
   }
-  uint16_t pagesIndex = PDF_INVALID_INDEX;
-  if (!pdfDictionaryFind(arena_, resolver_->result().rootIndex, "Pages", &pagesIndex) ||
-      pagesIndex >= arena_.valueCount || arena_.values[pagesIndex].kind != PdfValueKind::Reference) {
-    return PdfStatus::failure(PdfError::Malformed);
+  PdfStatus status = pdfReadCatalogNavigation(arena_, resolver_->result().rootIndex, &catalogNavigation_);
+  if (!status) {
+    return status;
   }
-  const PdfValue& pages = arena_.values[pagesIndex];
+  status = pdfApplyCatalogMetadata(catalogNavigation_, &metadataBuilder_);
+  if (!status) {
+    return status;
+  }
+  hasInfoReference_ = xref_.has_value() && xref_->info(&infoReference_);
   pageCount_ = 0;
-  firstPage_ = {};
   pageWalker_.emplace(*resolver_, arena_, recordStore(traversalRecords_), capturePage, this);
-  return pageWalker_->begin({pages.objectNumber, pages.generation});
+  return pageWalker_->begin(catalogNavigation_.pages);
 }
 
 PdfStatus PdfPreparation::finishPageTree() {
   pageWalker_.reset();
-  if (!resolver_.has_value() || pageCount_ == 0) {
+  if (!resolver_.has_value() || navigation_ == nullptr || pageCount_ == 0) {
     return PdfStatus::failure(PdfError::NoReadableText);
   }
-  if (pageCount_ != 1 || firstPage_.contentCount != 1) {
-    return PdfStatus::failure(PdfError::Unsupported);
+  return beginNavigationDiscovery();
+}
+
+PdfStatus PdfPreparation::beginNavigationDiscovery() {
+  if (navigation_ == nullptr || !resolver_.has_value()) {
+    return PdfStatus::failure(PdfError::InvalidArgument);
   }
-  return resolver_->begin(firstPage_.contents[0]);
+  namedDestinations_.emplace(PdfNamedDestinationWorkspace{
+      navigation_->namedDestinations,
+      static_cast<uint8_t>(std::size(navigation_->namedDestinations)),
+  });
+  pageLabels_.emplace(PdfPageLabelWorkspace{
+      navigation_->pageLabels,
+      static_cast<uint8_t>(std::size(navigation_->pageLabels)),
+  });
+  outlineBuilder_.emplace(
+      PdfOutlineWorkspace{navigation_->outlineEntries, static_cast<uint16_t>(std::size(navigation_->outlineEntries))});
+  PdfStatus status = namedDestinations_->begin();
+  if (status) {
+    status = pageLabels_->begin();
+  }
+  if (status) {
+    status = outlineBuilder_->begin();
+  }
+  if (!status) {
+    return status;
+  }
+  navigationStage_ = 0;
+  navigationTask_ = NavigationTask::None;
+  outlinePendingCount_ = 0;
+  outlineSeenCount_ = 0;
+  explicitOutlineCount_ = 0;
+  currentAnnotationPage_ = 0;
+  currentAnnotationIndex_ = 0;
+  navigation_->linkCount = 0;
+  return startNextNavigationObject();
+}
+
+PdfStatus PdfPreparation::startNextNavigationObject() {
+  if (!resolver_.has_value() || navigation_ == nullptr) {
+    return PdfStatus::failure(PdfError::InvalidArgument);
+  }
+  while (true) {
+    switch (navigationStage_) {
+      case 0:
+        ++navigationStage_;
+        if (hasInfoReference_) {
+          navigationTask_ = NavigationTask::Info;
+          activeNavigationReference_ = infoReference_;
+          return resolver_->begin(activeNavigationReference_);
+        }
+        break;
+      case 1:
+        ++navigationStage_;
+        if (catalogNavigation_.hasMetadata) {
+          navigationTask_ = NavigationTask::Xmp;
+          activeNavigationReference_ = catalogNavigation_.metadata;
+          return resolver_->begin(activeNavigationReference_);
+        }
+        break;
+      case 2:
+        ++navigationStage_;
+        if (catalogNavigation_.hasNamedDestinations) {
+          navigationTask_ = NavigationTask::NamedDestinations;
+          activeNavigationReference_ = catalogNavigation_.namedDestinations;
+          return resolver_->begin(activeNavigationReference_);
+        }
+        break;
+      case 3:
+        ++navigationStage_;
+        if (catalogNavigation_.hasPageLabels) {
+          navigationTask_ = NavigationTask::PageLabels;
+          activeNavigationReference_ = catalogNavigation_.pageLabels;
+          return resolver_->begin(activeNavigationReference_);
+        }
+        break;
+      case 4:
+        ++navigationStage_;
+        if (catalogNavigation_.hasOutlines) {
+          navigationTask_ = NavigationTask::OutlineRoot;
+          activeNavigationReference_ = catalogNavigation_.outlines;
+          return resolver_->begin(activeNavigationReference_);
+        }
+        break;
+      case 5:
+        if (outlinePendingCount_ != 0) {
+          const PreparedOutlinePending pending = navigation_->outlinePending[--outlinePendingCount_];
+          navigationTask_ = NavigationTask::OutlineNode;
+          activeNavigationReference_ = pending.reference;
+          currentOutlineParent_ = pending.parentIndex;
+          return resolver_->begin(activeNavigationReference_);
+        }
+        ++navigationStage_;
+        break;
+      case 6:
+        while (currentAnnotationPage_ < pageCount_) {
+          const PdfPageInfo& page = navigation_->pages[currentAnnotationPage_];
+          if (currentAnnotationIndex_ < page.annotationCount) {
+            navigationTask_ = NavigationTask::Annotation;
+            activeNavigationReference_ = page.annotations[currentAnnotationIndex_++];
+            return resolver_->begin(activeNavigationReference_);
+          }
+          ++currentAnnotationPage_;
+          currentAnnotationIndex_ = 0;
+        }
+        ++navigationStage_;
+        break;
+      default:
+        navigationTask_ = NavigationTask::Complete;
+        return PdfStatus::success();
+    }
+  }
+}
+
+PdfStatus PdfPreparation::resolveDestination(const PdfRawDestination& raw,
+                                             PdfResolvedDestination* const destination) const {
+  if (destination == nullptr || navigation_ == nullptr) {
+    return PdfStatus::failure(PdfError::InvalidArgument);
+  }
+  *destination = {};
+  PdfRawDestination explicitDestination = raw;
+  if (raw.kind == PdfRawDestinationKind::Named) {
+    if (!namedDestinations_.has_value()) {
+      return PdfStatus::failure(PdfError::InvalidOffset);
+    }
+    const PdfStatus status =
+        namedDestinations_->resolve(reinterpret_cast<const uint8_t*>(raw.name), raw.nameLength, &explicitDestination);
+    if (!status) {
+      return status;
+    }
+  }
+  if (explicitDestination.kind != PdfRawDestinationKind::Explicit) {
+    return PdfStatus::failure(PdfError::InvalidOffset);
+  }
+  for (uint16_t page = 0; page < pageCount_; ++page) {
+    if (navigation_->pages[page].pageReference == explicitDestination.pageReference) {
+      destination->sectionIndex =
+          navigation_->pageFirstSections[page] == UINT16_MAX ? page : navigation_->pageFirstSections[page];
+      destination->sourcePageIndex = page;
+      destination->anchorOrdinal =
+          navigation_->pageFirstAnchors[page] == UINT32_MAX ? 0 : navigation_->pageFirstAnchors[page];
+      destination->resolved = true;
+      return PdfStatus::success();
+    }
+  }
+  return PdfStatus::failure(PdfError::InvalidOffset, explicitDestination.pageReference.objectNumber);
+}
+
+PdfStatus PdfPreparation::finishNavigationObject() {
+  if (!resolver_.has_value() || navigation_ == nullptr || !outlineBuilder_.has_value()) {
+    return PdfStatus::failure(PdfError::InvalidArgument);
+  }
+  const PdfResolvedObject resolved = resolver_->result();
+  PdfStatus status = PdfStatus::success();
+  switch (navigationTask_) {
+    case NavigationTask::Info:
+      status = pdfApplyInfoMetadata(arena_, resolved.rootIndex, &metadataBuilder_);
+      break;
+    case NavigationTask::Xmp:
+      if (!resolved.hasStream || resolved.streamLength > PdfLimits::DecoderOutputBytes) {
+        return PdfStatus::failure(PdfError::LimitExceeded, resolved.streamLength);
+      }
+      xmpStreamOffset_ = resolved.streamOffset;
+      xmpStreamLength_ = resolved.streamLength;
+      return PdfStatus::success();
+    case NavigationTask::NamedDestinations:
+      status = pdfReadNamedDestinations(arena_, resolved.rootIndex, &*namedDestinations_);
+      break;
+    case NavigationTask::PageLabels:
+      status = pdfReadPageLabels(arena_, resolved.rootIndex, &*pageLabels_);
+      break;
+    case NavigationTask::OutlineRoot: {
+      PdfObjectReference first{};
+      status = pdfReadOutlineRoot(arena_, resolved.rootIndex, &first);
+      if (status) {
+        navigation_->outlinePending[outlinePendingCount_++] = {first, -1};
+      }
+      break;
+    }
+    case NavigationTask::OutlineNode: {
+      for (uint16_t index = 0; index < outlineSeenCount_; ++index) {
+        if (navigation_->outlineSeen[index] == activeNavigationReference_) {
+          return PdfStatus::failure(PdfError::Malformed, activeNavigationReference_.objectNumber);
+        }
+      }
+      if (outlineSeenCount_ >= kPreparationOutlineLimit) {
+        return PdfStatus::failure(PdfError::LimitExceeded, activeNavigationReference_.objectNumber);
+      }
+      navigation_->outlineSeen[outlineSeenCount_++] = activeNavigationReference_;
+      PdfRawOutlineNode node{};
+      status = pdfReadOutlineNode(arena_, resolved.rootIndex, &node);
+      if (!status) {
+        break;
+      }
+      PdfResolvedDestination destination{};
+      const PdfStatus destinationStatus = resolveDestination(node.destination, &destination);
+      int16_t childParent = currentOutlineParent_;
+      if (destinationStatus) {
+        const PdfOutlineCandidate candidate{
+            activeNavigationReference_,
+            currentOutlineParent_,
+            destination,
+            reinterpret_cast<const uint8_t*>(node.title),
+            node.titleLength,
+        };
+        status = outlineBuilder_->append(candidate);
+        if (!status) {
+          break;
+        }
+        childParent = static_cast<int16_t>(outlineBuilder_->count() - 1);
+        explicitOutlineCount_ = outlineBuilder_->count();
+      }
+      const uint16_t needed = static_cast<uint16_t>((node.hasNext ? 1 : 0) + (node.hasFirstChild ? 1 : 0));
+      if (outlinePendingCount_ > kPreparationOutlineLimit - needed) {
+        return PdfStatus::failure(PdfError::LimitExceeded, activeNavigationReference_.objectNumber);
+      }
+      if (node.hasNext) {
+        navigation_->outlinePending[outlinePendingCount_++] = {node.next, currentOutlineParent_};
+      }
+      if (node.hasFirstChild) {
+        navigation_->outlinePending[outlinePendingCount_++] = {node.firstChild, childParent};
+      }
+      break;
+    }
+    case NavigationTask::Annotation: {
+      PdfRawLinkAnnotation annotation{};
+      status = pdfReadLinkAnnotation(arena_, resolved.rootIndex, &annotation);
+      if (!status && status.error == PdfError::Unsupported) {
+        status = PdfStatus::success();
+      } else if (status && annotation.action == PdfActionKind::GoTo &&
+                 annotation.destination.kind != PdfRawDestinationKind::None) {
+        if (navigation_->linkCount >= kPreparationLinkLimit) {
+          return PdfStatus::failure(PdfError::LimitExceeded, activeNavigationReference_.objectNumber);
+        }
+        navigation_->links[navigation_->linkCount++] = {annotation.destination, currentAnnotationPage_};
+      }
+      break;
+    }
+    case NavigationTask::None:
+    case NavigationTask::Complete:
+    default:
+      return PdfStatus::failure(PdfError::InvalidArgument);
+  }
+  if (!status) {
+    return status;
+  }
+  navigationTask_ = NavigationTask::None;
+  return startNextNavigationObject();
+}
+
+PdfStatus PdfPreparation::readXmpMetadata() {
+  if (!decoderOutput_ || xmpStreamLength_ > PdfLimits::DecoderOutputBytes) {
+    return PdfStatus::failure(PdfError::LimitExceeded, xmpStreamLength_);
+  }
+  size_t bytesRead = 0;
+  PdfStatus status = source().readAt(source().context, xmpStreamOffset_, decoderOutput_.get(),
+                                     static_cast<size_t>(xmpStreamLength_), &bytesRead);
+  if (!status) {
+    return status;
+  }
+  if (bytesRead != xmpStreamLength_) {
+    return PdfStatus::failure(PdfError::UnexpectedEof, xmpStreamOffset_ + bytesRead);
+  }
+  status = pdfApplyXmpMetadata(decoderOutput_.get(), bytesRead, &metadataBuilder_);
+  if (!status) {
+    return status;
+  }
+  navigationTask_ = NavigationTask::None;
+  return startNextNavigationObject();
+}
+
+PdfStatus PdfPreparation::beginCurrentPageContent() {
+  if (!resolver_.has_value() || navigation_ == nullptr || currentPageIndex_ >= pageCount_) {
+    return PdfStatus::failure(PdfError::InvalidArgument, currentPageIndex_);
+  }
+  const PdfPageInfo& page = navigation_->pages[currentPageIndex_];
+  if (page.contentCount != 1) {
+    return PdfStatus::failure(page.contentCount == 0 ? PdfError::NoReadableText : PdfError::Unsupported,
+                              currentPageIndex_);
+  }
+  currentContentIndex_ = 0;
+  transcriptLength_ = 0;
+  extractedBlockCount_ = 0;
+  currentBlockIndex_ = 0;
+  currentFontSize_ = 0;
+  lastNumericValue_ = 0;
+  return resolver_->begin(page.contents[0]);
 }
 
 PdfStatus PdfPreparation::finishContentObject() {
@@ -524,65 +1102,210 @@ PdfStatus PdfPreparation::finishContentObject() {
   if (!status) {
     return status;
   }
-  resolver_.reset();
-  xref_.reset();
-  arena_ = {};
-  transcriptLength_ = 0;
   contentLexer_.emplace(pdfByteRangeSource(contentRange_), sourceWindow_.get(), PdfLimits::SourceBufferBytes);
   return PdfStatus::success();
 }
 
+PdfStatus PdfPreparation::finishExtractedPage() {
+  contentLexer_.reset();
+  if (transcriptLength_ == 0 || extractedBlockCount_ == 0) {
+    return PdfStatus::failure(PdfError::NoReadableText, currentPageIndex_);
+  }
+  return PdfStatus::success();
+}
+
 PdfStatus PdfPreparation::appendContentToken(const PdfToken& token) {
+  if (token.kind == PdfTokenKind::Integer || token.kind == PdfTokenKind::Real) {
+    int16_t value = 0;
+    if (parseTokenInt16(token, &value)) {
+      lastNumericValue_ = value;
+    }
+    return PdfStatus::success();
+  }
+  if (token.kind == PdfTokenKind::Keyword) {
+    if (token.length == 2 && token.bytes[0] == 'T' && token.bytes[1] == 'f') {
+      currentFontSize_ = lastNumericValue_;
+    }
+    return PdfStatus::success();
+  }
   if (token.kind != PdfTokenKind::String && token.kind != PdfTokenKind::HexString) {
     return PdfStatus::success();
   }
-  const size_t separator = transcriptLength_ == 0 ? 0 : 1;
-  if (!pageText_ || token.length > PdfLimits::PageTextBytes ||
-      transcriptLength_ > PdfLimits::PageTextBytes - separator - token.length) {
+  const size_t blockCapacity = PdfLimits::DecoderOutputBytes / sizeof(ExtractedBlockRecord);
+  if (!pageText_ || !decoderOutput_ || token.length == 0 || token.length > UINT16_MAX ||
+      extractedBlockCount_ >= blockCapacity || token.length > PdfLimits::PageTextBytes ||
+      transcriptLength_ > PdfLimits::PageTextBytes - token.length) {
     return PdfStatus::failure(PdfError::LimitExceeded);
   }
-  if (separator != 0) {
-    pageText_[transcriptLength_++] = ' ';
-  }
+  auto* const blocks = reinterpret_cast<ExtractedBlockRecord*>(decoderOutput_.get());
+  blocks[extractedBlockCount_++] = {
+      static_cast<uint16_t>(transcriptLength_),
+      static_cast<uint16_t>(token.length),
+      currentFontSize_,
+      0,
+  };
   std::memcpy(pageText_.get() + transcriptLength_, token.bytes, token.length);
   transcriptLength_ += token.length;
   return PdfStatus::success();
 }
 
+PdfStatus PdfPreparation::formatCurrentSectionPath() {
+  const int relativeLength =
+      std::snprintf(sectionRelativePath_, sizeof(sectionRelativePath_), "gen_%lu/sections/%06u.xhtml",
+                    static_cast<unsigned long>(generation_), sectionCount_);
+  const int fullLength = std::snprintf(sectionPath_, sizeof(sectionPath_), "%s/%s", cacheRoot_, sectionRelativePath_);
+  if (relativeLength < 0 || static_cast<size_t>(relativeLength) >= sizeof(sectionRelativePath_) || fullLength < 0 ||
+      static_cast<size_t>(fullLength) >= sizeof(sectionPath_)) {
+    return PdfStatus::failure(PdfError::LimitExceeded, sectionCount_);
+  }
+  return PdfStatus::success();
+}
+
 PdfStatus PdfPreparation::openSection() {
-  if (transcriptLength_ == 0) {
+  if (transcriptLength_ == 0 || extractedBlockCount_ == 0 || navigation_ == nullptr ||
+      sectionCount_ >= kPreparationPageLimit) {
     return PdfStatus::failure(PdfError::NoReadableText);
   }
-  const uint64_t byteLimit = std::min<uint64_t>(cacheBudget_.limit, kSectionByteLimit);
+  PdfStatus status = formatCurrentSectionPath();
+  if (!status) {
+    return status;
+  }
+  const uint64_t used = cacheBudget_.requiredBytes + cacheBudget_.optionalBytes;
+  const uint64_t byteLimit =
+      used >= cacheBudget_.limit ? 0 : std::min<uint64_t>(cacheBudget_.limit - used, kSectionByteLimit);
   if (byteLimit == 0) {
     return PdfStatus::failure(PdfError::InsufficientStorage);
   }
-  PdfStatus status = pdfOpenTrackedCacheWriter(config_.io, sectionPath_, sectionRelativePath_,
-                                               PdfCacheFileKind::Required, byteLimit, &sectionWriter_);
+  status = pdfOpenTrackedCacheWriter(config_.io, sectionPath_, sectionRelativePath_, PdfCacheFileKind::Required,
+                                     byteLimit, &sectionWriter_);
   if (!status) {
     return status;
   }
   status = semanticWriter_.begin({this, writeSection}, {this, emitBlock},
-                                 {operandScratch_.get(), PdfLimits::OperandOrderHistogramBytes});
+                                 {operandScratch_.get(), PdfLimits::OperandOrderHistogramBytes}, totalWords_);
   if (!status) {
     pdfAbortTrackedCacheFile(&sectionWriter_);
+  } else {
+    if (navigation_->pageFirstSections[currentPageIndex_] == UINT16_MAX) {
+      navigation_->pageFirstSections[currentPageIndex_] = sectionCount_;
+    }
+    currentSectionFirstWord_ = totalWords_;
+    currentSectionFirstAnchor_ = nextAnchorOrdinal_;
   }
   return status;
 }
 
-PdfStatus PdfPreparation::emitSection() {
-  PdfStatus status = semanticWriter_.beginBlock({PdfSemanticBlockKind::Paragraph, 0, 0});
-  if (status) {
-    status = semanticWriter_.writeText(pageText_.get(), transcriptLength_);
+PdfStatus PdfPreparation::formatInternalLink(const uint16_t sourcePageIndex, const uint8_t* const text,
+                                             const size_t textLength, char* const href, const size_t capacity,
+                                             size_t* const hrefLength) const {
+  if (navigation_ == nullptr || text == nullptr || textLength == 0 || href == nullptr || capacity == 0 ||
+      hrefLength == nullptr) {
+    return PdfStatus::failure(PdfError::InvalidArgument);
   }
-  if (status) {
-    status = semanticWriter_.endBlock();
+  href[0] = '\0';
+  *hrefLength = 0;
+  for (uint16_t linkIndex = 0; linkIndex < navigation_->linkCount; ++linkIndex) {
+    const PreparedLink& link = navigation_->links[linkIndex];
+    if (link.sourcePageIndex != sourcePageIndex) {
+      continue;
+    }
+    PdfResolvedDestination destination{};
+    if (!resolveDestination(link.destination, &destination)) {
+      continue;
+    }
+    bool titleMatches = false;
+    for (uint16_t outlineIndex = 0; outlineIndex < explicitOutlineCount_; ++outlineIndex) {
+      const PdfOutlineEntry& entry = navigation_->outlineEntries[outlineIndex];
+      if (entry.sourcePageIndex == destination.sourcePageIndex && entry.titleLength == textLength &&
+          std::memcmp(entry.title, text, textLength) == 0) {
+        titleMatches = true;
+        break;
+      }
+    }
+    if (!titleMatches) {
+      continue;
+    }
+    if (navigation_->pageFirstAnchors[destination.sourcePageIndex] == UINT32_MAX) {
+      return PdfStatus::failure(PdfError::InvalidOffset, destination.sourcePageIndex);
+    }
+    destination.anchorOrdinal = navigation_->pageFirstAnchors[destination.sourcePageIndex];
+    return pdfResolveInternalAction(PdfActionKind::GoTo, destination, href, capacity, hrefLength);
+  }
+  return PdfStatus::failure(PdfError::InvalidOffset);
+}
+
+PdfStatus PdfPreparation::emitSection() {
+  if (navigation_ == nullptr || !pageLabels_.has_value() || currentPageIndex_ >= pageCount_) {
+    return PdfStatus::failure(PdfError::InvalidArgument, currentPageIndex_);
+  }
+  char pageLabel[PdfSemanticWriterLimits::PublisherLabelBytes]{};
+  size_t pageLabelLength = 0;
+  PdfStatus status = pageLabels_->format(currentPageIndex_, pageLabel, sizeof(pageLabel), &pageLabelLength);
+  if (!status) {
+    const int length =
+        std::snprintf(pageLabel, sizeof(pageLabel), "%lu", static_cast<unsigned long>(currentPageIndex_ + 1U));
+    if (length <= 0 || static_cast<size_t>(length) >= sizeof(pageLabel)) {
+      return PdfStatus::failure(PdfError::LimitExceeded, currentPageIndex_);
+    }
+    pageLabelLength = static_cast<size_t>(length);
+    status = PdfStatus::success();
+  }
+  if (currentBlockIndex_ == 0) {
+    navigation_->pageFirstAnchors[currentPageIndex_] = nextAnchorOrdinal_;
+    if (currentPageIndex_ + 1U < pageCount_ && navigation_->pageFirstAnchors[currentPageIndex_ + 1U] == UINT32_MAX) {
+      navigation_->pageFirstAnchors[currentPageIndex_ + 1U] = nextAnchorOrdinal_ + extractedBlockCount_;
+    }
+    status = semanticWriter_.writePublisherPageBreak(currentPageIndex_, reinterpret_cast<const uint8_t*>(pageLabel),
+                                                     pageLabelLength);
+  }
+  auto* const blocks = reinterpret_cast<const ExtractedBlockRecord*>(decoderOutput_.get());
+  uint16_t endBlock = extractedBlockCount_;
+  if (explicitOutlineCount_ == 0) {
+    for (uint16_t index = static_cast<uint16_t>(currentBlockIndex_ + 1U); index < extractedBlockCount_; ++index) {
+      if (blocks[index].sourceFontSize >= 18) {
+        endBlock = index;
+        break;
+      }
+    }
+  }
+  for (uint16_t index = currentBlockIndex_; status && index < endBlock; ++index) {
+    const ExtractedBlockRecord& record = blocks[index];
+    const uint8_t* const text = pageText_.get() + record.textOffset;
+    const bool heading = record.sourceFontSize >= 18;
+    if (heading && explicitOutlineCount_ == 0) {
+      status = outlineBuilder_->appendHeading(text, record.textLength, sectionCount_, nextAnchorOrdinal_, 1);
+    }
+    if (status) {
+      status = semanticWriter_.beginBlock({heading ? PdfSemanticBlockKind::Heading : PdfSemanticBlockKind::Paragraph,
+                                           nextAnchorOrdinal_, static_cast<uint8_t>(heading ? 1 : 0)});
+    }
+    char href[PdfOutlineLimits::HrefBytes]{};
+    size_t hrefLength = 0;
+    bool linked = false;
+    if (status && formatInternalLink(static_cast<uint16_t>(currentPageIndex_), text, record.textLength, href,
+                                     sizeof(href), &hrefLength)) {
+      status = semanticWriter_.beginInternalLink(reinterpret_cast<const uint8_t*>(href), hrefLength);
+      linked = status.ok();
+    }
+    if (status) {
+      status = semanticWriter_.writeText(text, record.textLength);
+    }
+    if (status && linked) {
+      status = semanticWriter_.endInternalLink();
+    }
+    if (status) {
+      status = semanticWriter_.endBlock();
+    }
+    if (status) {
+      ++nextAnchorOrdinal_;
+    }
   }
   if (status) {
     status = semanticWriter_.finish();
   }
   if (status) {
     totalWords_ = semanticWriter_.totalWords();
+    currentBlockIndex_ = endBlock;
   }
   return status;
 }
@@ -592,24 +1315,135 @@ PdfStatus PdfPreparation::closeSection() {
   if (status) {
     status = pdfReserveCacheBytes(&cacheBudget_, sectionRecord_.size, PdfCacheFileKind::Required);
   }
+  if (status) {
+    if (sectionRecord_.size == 0 || sectionRecord_.size > UINT32_MAX ||
+        cumulativeSectionBytes_ > UINT32_MAX - sectionRecord_.size) {
+      return PdfStatus::failure(PdfError::LimitExceeded, sectionCount_);
+    }
+    cumulativeSectionBytes_ += sectionRecord_.size;
+    navigation_->sectionFiles[sectionCount_] = sectionRecord_;
+    navigation_->sections[sectionCount_] = {
+        static_cast<uint32_t>(sectionRecord_.size),
+        static_cast<uint32_t>(cumulativeSectionBytes_),
+        currentSectionFirstWord_,
+        totalWords_ - currentSectionFirstWord_,
+        currentSectionFirstAnchor_,
+        -1,
+        0,
+    };
+    ++sectionCount_;
+  }
+  return status;
+}
+
+PdfStatus PdfPreparation::prepareNavigationRecords() {
+  if (navigation_ == nullptr || !outlineBuilder_.has_value() || sectionCount_ == 0) {
+    return PdfStatus::failure(PdfError::InvalidArgument);
+  }
+  for (uint16_t index = 0; index < explicitOutlineCount_; ++index) {
+    PdfOutlineEntry& entry = navigation_->outlineEntries[index];
+    if (entry.sourcePageIndex >= pageCount_ || navigation_->pageFirstAnchors[entry.sourcePageIndex] == UINT32_MAX) {
+      return PdfStatus::failure(PdfError::InvalidOffset, entry.sourcePageIndex);
+    }
+    entry.sectionIndex = navigation_->pageFirstSections[entry.sourcePageIndex];
+    entry.anchorOrdinal = navigation_->pageFirstAnchors[entry.sourcePageIndex];
+    PdfStatus status = pdfFormatSemanticAnchor(entry.anchorOrdinal, entry.anchor);
+    if (!status) {
+      return status;
+    }
+  }
+  metadata_ = metadataBuilder_.metadata();
+  PdfStatus status = outlineBuilder_->finish(reinterpret_cast<const uint8_t*>(metadata_.title), metadata_.titleLength);
+  if (!status) {
+    return status;
+  }
+  metadata_.sectionCount = sectionCount_;
+  metadata_.outlineCount = outlineBuilder_->count();
+  metadata_.totalWords = totalWords_;
+  for (uint16_t outlineIndex = 0; outlineIndex < outlineBuilder_->count(); ++outlineIndex) {
+    const PdfOutlineEntry& entry = navigation_->outlineEntries[outlineIndex];
+    if (entry.sectionIndex < sectionCount_ && navigation_->sections[entry.sectionIndex].tocIndex < 0) {
+      navigation_->sections[entry.sectionIndex].tocIndex = static_cast<int16_t>(outlineIndex);
+    }
+  }
+  return PdfStatus::success();
+}
+
+PdfStatus PdfPreparation::openMetadata() {
+  const uint64_t used = cacheBudget_.requiredBytes + cacheBudget_.optionalBytes;
+  const uint64_t byteLimit =
+      used >= cacheBudget_.limit ? 0 : std::min<uint64_t>(cacheBudget_.limit - used, 16ULL * 1024ULL);
+  if (byteLimit == 0) {
+    return PdfStatus::failure(PdfError::InsufficientStorage);
+  }
+  return pdfOpenTrackedCacheWriter(config_.io, metadataPath_, metadataRelativePath_, PdfCacheFileKind::Required,
+                                   byteLimit, &metadataWriter_);
+}
+
+PdfStatus PdfPreparation::writeMetadata() {
+  return pdfEncodeMetadata(metadata_, {this, sectionCount_, readMetadataSection}, {this, writeMetadata});
+}
+
+PdfStatus PdfPreparation::closeMetadata() {
+  PdfStatus status = pdfCloseTrackedCacheFile(&metadataWriter_, &metadataRecord_);
+  if (status) {
+    status = pdfReserveCacheBytes(&cacheBudget_, metadataRecord_.size, PdfCacheFileKind::Required);
+  }
+  return status;
+}
+
+PdfStatus PdfPreparation::openOutline() {
+  const uint64_t used = cacheBudget_.requiredBytes + cacheBudget_.optionalBytes;
+  const uint64_t byteLimit =
+      used >= cacheBudget_.limit ? 0 : std::min<uint64_t>(cacheBudget_.limit - used, 64ULL * 1024ULL);
+  if (byteLimit == 0) {
+    return PdfStatus::failure(PdfError::InsufficientStorage);
+  }
+  return pdfOpenTrackedCacheWriter(config_.io, outlinePath_, outlineRelativePath_, PdfCacheFileKind::Required,
+                                   byteLimit, &outlineWriter_);
+}
+
+PdfStatus PdfPreparation::writeOutline() {
+  return pdfEncodeOutline({this, outlineBuilder_->count(), readOutlineEntry}, {this, writeOutline});
+}
+
+PdfStatus PdfPreparation::closeOutline() {
+  PdfStatus status = pdfCloseTrackedCacheFile(&outlineWriter_, &outlineRecord_);
+  if (status) {
+    status = pdfReserveCacheBytes(&cacheBudget_, outlineRecord_.size, PdfCacheFileKind::Required);
+  }
   return status;
 }
 
 PdfStatus PdfPreparation::commitManifest() {
+  if (navigation_ == nullptr) {
+    return PdfStatus::failure(PdfError::InvalidArgument);
+  }
+  const uint32_t requiredCount = static_cast<uint32_t>(sectionCount_) + 2U;
   PdfCacheManifest manifest{};
   manifest.sequence = sequence_;
   manifest.completed = true;
   manifest.source = sourceIdentity_;
   manifest.generation = generation_;
   manifest.totalWords = totalWords_;
-  manifest.requiredFileCount = 1;
-  manifest.requiredFileBytes = sectionRecord_.size;
-  manifest.requiredFileLedger = pdfUpdateRequiredFileLedger(PDF_CACHE_FNV64_OFFSET, sectionRecord_);
-  const PdfRequiredFileTableSource files{this, 1, readRequiredFile};
+  manifest.requiredFileCount = requiredCount;
+  manifest.requiredFileBytes = metadataRecord_.size + outlineRecord_.size;
+  manifest.requiredFileLedger = PDF_CACHE_FNV64_OFFSET;
+  for (uint16_t index = 0; index < sectionCount_; ++index) {
+    if (manifest.requiredFileBytes > UINT64_MAX - navigation_->sectionFiles[index].size) {
+      return PdfStatus::failure(PdfError::LimitExceeded, index);
+    }
+    manifest.requiredFileBytes += navigation_->sectionFiles[index].size;
+    manifest.requiredFileLedger =
+        pdfUpdateRequiredFileLedger(manifest.requiredFileLedger, navigation_->sectionFiles[index]);
+  }
+  manifest.requiredFileLedger = pdfUpdateRequiredFileLedger(manifest.requiredFileLedger, metadataRecord_);
+  manifest.requiredFileLedger = pdfUpdateRequiredFileLedger(manifest.requiredFileLedger, outlineRecord_);
+  const PdfRequiredFileTableSource files{this, requiredCount, readRequiredFile};
   const PdfCacheCommitEvidence evidence{
       true,
-      1,
-      sectionRecord_.size,
+      requiredCount,
+      manifest.requiredFileBytes,
       manifest.requiredFileLedger,
   };
   const PdfCacheManifestSelection prior{};
@@ -623,9 +1457,9 @@ PdfStatus PdfPreparation::commitCheckpoint(const PdfBuildPhase phase) {
   checkpoint.generation = generation_;
   checkpoint.phase = phase;
   checkpoint.lastVerifiedPage = pageCount_;
-  checkpoint.emittedSections = sectionRecord_.size == 0 ? 0 : 1;
+  checkpoint.emittedSections = sectionCount_;
   checkpoint.cumulativeWords = totalWords_;
-  checkpoint.outputBytes = sectionRecord_.size;
+  checkpoint.outputBytes = cumulativeSectionBytes_ + metadataRecord_.size + outlineRecord_.size;
   return cacheStore_.commitCheckpoint(checkpoint);
 }
 
@@ -784,9 +1618,48 @@ PdfStepResult PdfPreparation::step() {
       if (!operation) {
         return fail(operation);
       }
-      setPhase(PdfPreparationPhase::ResolveContent, 55);
+      setPhase(PdfPreparationPhase::ResolveNavigation, 55);
       return pause();
     }
+
+    case PdfPreparationPhase::ResolveNavigation: {
+      if (navigationTask_ == NavigationTask::Complete) {
+        currentPageIndex_ = 0;
+        operation = beginCurrentPageContent();
+        if (!operation) {
+          return fail(operation);
+        }
+        setPhase(PdfPreparationPhase::ResolveContent, 64);
+        return pause();
+      }
+      const NavigationTask completedTask = navigationTask_;
+      const PdfStepResult result = resolver_->step(budget);
+      if (cancelRequested_) {
+        return cancel();
+      }
+      if (result.failed()) {
+        return fail(result.status);
+      }
+      if (result.yielded()) {
+        return pause();
+      }
+      operation = finishNavigationObject();
+      if (!operation) {
+        return fail(operation);
+      }
+      if (completedTask == NavigationTask::Xmp) {
+        setPhase(PdfPreparationPhase::ReadXmpMetadata, 60);
+      }
+      return pause();
+    }
+
+    case PdfPreparationPhase::ReadXmpMetadata:
+      operation = readXmpMetadata();
+      if (!operation) {
+        return fail(operation);
+      }
+      setPhase(PdfPreparationPhase::ResolveNavigation, 62);
+      return pause();
 
     case PdfPreparationPhase::ResolveContent: {
       const PdfStepResult result = resolver_->step(budget);
@@ -803,7 +1676,7 @@ PdfStepResult PdfPreparation::step() {
       if (!operation) {
         return fail(operation);
       }
-      setPhase(PdfPreparationPhase::ExtractText, 65);
+      setPhase(PdfPreparationPhase::ExtractText, 70);
       return pause();
     }
 
@@ -821,8 +1694,11 @@ PdfStepResult PdfPreparation::step() {
           return pause();
         }
         if (token.kind == PdfTokenKind::End) {
-          contentLexer_.reset();
-          setPhase(PdfPreparationPhase::CloseSource, 78);
+          operation = finishExtractedPage();
+          if (!operation) {
+            return fail(operation);
+          }
+          setPhase(PdfPreparationPhase::OpenSection, 78);
           return pause();
         }
         operation = appendContentToken(token);
@@ -837,7 +1713,11 @@ PdfStepResult PdfPreparation::step() {
       if (!operation) {
         return fail(operation);
       }
-      setPhase(PdfPreparationPhase::OpenSection, 82);
+      operation = prepareNavigationRecords();
+      if (!operation) {
+        return fail(operation);
+      }
+      setPhase(PdfPreparationPhase::OpenMetadata, 91);
       return pause();
 
     case PdfPreparationPhase::OpenSection:
@@ -861,7 +1741,65 @@ PdfStepResult PdfPreparation::step() {
       if (!operation) {
         return fail(operation);
       }
-      setPhase(PdfPreparationPhase::CommitManifest, 94);
+      if (currentBlockIndex_ < extractedBlockCount_) {
+        setPhase(PdfPreparationPhase::OpenSection, 78);
+      } else if (++currentPageIndex_ < pageCount_) {
+        operation = beginCurrentPageContent();
+        if (!operation) {
+          return fail(operation);
+        }
+        setPhase(PdfPreparationPhase::ResolveContent, 70);
+      } else {
+        setPhase(PdfPreparationPhase::CloseSource, 90);
+      }
+      return pause();
+
+    case PdfPreparationPhase::OpenMetadata:
+      operation = openMetadata();
+      if (!operation) {
+        return fail(operation);
+      }
+      setPhase(PdfPreparationPhase::WriteMetadata, 92);
+      return pause();
+
+    case PdfPreparationPhase::WriteMetadata:
+      operation = writeMetadata();
+      if (!operation) {
+        return fail(operation);
+      }
+      setPhase(PdfPreparationPhase::CloseMetadata, 93);
+      return pause();
+
+    case PdfPreparationPhase::CloseMetadata:
+      operation = closeMetadata();
+      if (!operation) {
+        return fail(operation);
+      }
+      setPhase(PdfPreparationPhase::OpenOutline, 94);
+      return pause();
+
+    case PdfPreparationPhase::OpenOutline:
+      operation = openOutline();
+      if (!operation) {
+        return fail(operation);
+      }
+      setPhase(PdfPreparationPhase::WriteOutline, 95);
+      return pause();
+
+    case PdfPreparationPhase::WriteOutline:
+      operation = writeOutline();
+      if (!operation) {
+        return fail(operation);
+      }
+      setPhase(PdfPreparationPhase::CloseOutline, 96);
+      return pause();
+
+    case PdfPreparationPhase::CloseOutline:
+      operation = closeOutline();
+      if (!operation) {
+        return fail(operation);
+      }
+      setPhase(PdfPreparationPhase::CommitManifest, 97);
       return pause();
 
     case PdfPreparationPhase::CommitManifest:
@@ -869,7 +1807,7 @@ PdfStepResult PdfPreparation::step() {
       if (!operation) {
         return fail(operation);
       }
-      setPhase(PdfPreparationPhase::CommitCheckpoint, 97);
+      setPhase(PdfPreparationPhase::CommitCheckpoint, 98);
       return pause();
 
     case PdfPreparationPhase::CommitCheckpoint:

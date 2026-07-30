@@ -21,8 +21,10 @@ struct PdfPageInfo {
   PdfObjectReference resourceOwner{};
   PdfObjectReference resourceReference{};
   PdfObjectReference contents[PdfLimits::MaxContentStreamsPerPage]{};
+  PdfObjectReference annotations[PdfLimits::MaxLinkAnnotationsPerPage]{};
   uint32_t pageIndex = 0;
   uint8_t contentCount = 0;
+  uint8_t annotationCount = 0;
   bool hasResources = false;
   bool resourcesIndirect = false;
 };

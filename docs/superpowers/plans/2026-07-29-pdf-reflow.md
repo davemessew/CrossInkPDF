@@ -1287,38 +1287,58 @@ largest block, zero sampled allocation bytes, and 13,220 bytes of stack margin.
 - Modify: `test/CMakeLists.txt`
 - Test: `test/pdf_navigation/PdfNavigationTest.cpp`
 
-- [ ] Add fixtures for PDF `/Info`, XMP/catalog language, hierarchical
+- [x] Add fixtures for PDF `/Info`, XMP/catalog language, hierarchical
   outlines, named destinations, explicit
   destinations, same/cross-section links, contents/index text, nonnumeric page
   labels, no-outline headings, no-outline/no-heading fallback, malformed
   cycles, and unresolved external/actions.
-- [ ] Populate metadata deterministically: title from XMP then `/Info` then
+- [x] Populate metadata deterministically: title from XMP then `/Info` then
   filename; author from XMP then `/Info`; language from Catalog `/Lang` then
   XMP. Store bounded UTF-8 values in `metadata.bin`.
-- [ ] Parse outline hierarchy with hard depth/count/cycle limits. Preserve
+- [x] Parse outline hierarchy with hard depth/count/cycle limits. Preserve
   title, level, and destination; map destinations to stable semantic anchors.
-- [ ] Make navigation discovery an explicit preparation phase before final
+- [x] Make navigation discovery an explicit preparation phase before final
   section emission. Outline destinations define semantic section boundaries
   but never force an original-PDF page break. If there is no usable outline,
   derive conservative entries from heading blocks; if there are no headings,
   emit one root entry from title/filename.
-- [ ] Resolve named and explicit internal destinations. Ignore URI, launch,
+- [x] Resolve named and explicit internal destinations. Ignore URI, launch,
   JavaScript, attachment, and external-file actions without executing/fetching.
-- [ ] Preserve resolvable link annotations as internal XHTML anchors. Do not
+- [x] Preserve resolvable link annotations as internal XHTML anchors. Do not
   synthesize links from arbitrary printed numbers.
-- [ ] Parse `/PageLabels` number trees with bounded recursion/ranges and emit
+- [x] Parse `/PageLabels` number trees with bounded recursion/ranges and emit
   publisher-page markers without forcing reader page breaks. Keep
   contents and index text in the semantic stream even when some printed
   references cannot resolve.
-- [ ] Record bounded early-content cover candidate references in build state,
+- [x] Record bounded early-content cover candidate references in build state,
   but do not mutate `metadata.bin` or an active generation after manifest
   commit. Task 22 performs final image classification and cover creation inside
   the inactive generation before its file table/CRC is finalized.
-- [ ] Run chapter selector/link/page-label host tests, then QEMU scripted
+- [x] Run chapter selector/link/page-label host tests, then QEMU scripted
   navigation. Expected: correct hierarchical titles and anchor landings before
   `QEMU_PDF_NAV_PASS`.
-- [ ] Run `python scripts/generate_pdf_reflow_fixtures.py --check`; all new
+- [x] Run `python scripts/generate_pdf_reflow_fixtures.py --check`; all new
   navigation expectations and hashes must be deterministic.
+
+Task 20 completion evidence (2026-07-29): the generated navigation corpus is
+deterministic at 62 artifacts, and the full host suite passes 266/266. Metadata,
+hierarchical outlines, named/explicit destinations, internal link annotations,
+publisher page labels, heading/root fallback, unsafe-action rejection, and
+cycle failure are cached into fixed, CRC-checked records. The existing chapter
+selector already consumes the format-neutral `ReflowDocument` TOC API, so the
+PDF document supplies the preserved levels and stable anchor destinations
+without a PDF-specific UI path. Cover discovery retains at most eight
+deduplicated early resource sources as 96 bytes of inline build state; it
+allocates no image buffer and cannot mutate committed metadata.
+
+The default ESP32-C3 firmware and containerized SDL2 simulator compile, strict
+cppcheck reports no defects, and the final QEMU replay reports
+`QEMU_PDF_NAV_PASS chapters=3 sections=2 words=10 labels=2` before the standard
+tracer pass. The navigation replay uses the fixed 63,488-byte preparation
+workspace and reports 68,228 bytes minimum free heap, 63,476 bytes minimum
+largest allocation, and 10,708 bytes stack margin. The pinned resource verifier
+reports `QEMU_RESOURCE_PASS`, and every physical upload/debug target still
+fails before device discovery with `QEMU_NO_FLASH_PASS`.
 
 ### Task 21: Add word-ordinal progress, relayout resume, bookmarks, and clippings
 

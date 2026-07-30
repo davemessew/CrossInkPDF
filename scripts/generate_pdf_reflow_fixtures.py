@@ -19,6 +19,9 @@ from typing import Callable
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT = REPO_ROOT / "test" / "pdf_reflow_core" / "fixtures"
 QEMU_CLASSIC_OUTPUT = REPO_ROOT / "test" / "qemu" / "data" / "qemu" / "classic_text.pdf"
+QEMU_NAVIGATION_OUTPUT = (
+    REPO_ROOT / "test" / "qemu" / "data" / "qemu" / "navigation_outline.pdf"
+)
 PDF_HEADER = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n"
 
 
@@ -149,6 +152,203 @@ def make_classic_text() -> Fixture:
     text = "Hello PDF"
     content = b"BT /F1 12 Tf 72 720 Td (Hello PDF) Tj ET"
     return Fixture(one_page_pdf(content), text, (text,))
+
+
+def make_navigation_outline() -> Fixture:
+    pdf = ClassicPdf()
+    pdf.add(
+        1,
+        b"<< /Type /Catalog /Pages 2 0 R /Outlines 10 0 R "
+        b"/Names << /Dests 20 0 R >> /PageLabels 25 0 R "
+        b"/Lang (de-CH) /Metadata 31 0 R >>",
+    )
+    pdf.add(2, b"<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 2 >>")
+    pdf.add(
+        3,
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R "
+        b"/Annots [40 0 R 41 0 R 42 0 R 43 0 R] >>",
+    )
+    page_one = (
+        b"BT /F1 24 Tf 72 720 Td (Contents) Tj "
+        b"/F1 12 Tf 0 -36 Td (Chapter One) Tj "
+        b"0 -24 Td (Chapter Two) Tj ET"
+    )
+    pdf.add(4, stream(page_one))
+    pdf.add(5, font_object())
+    pdf.add(
+        6,
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /Font << /F1 5 0 R >> >> /Contents 7 0 R >>",
+    )
+    page_two = (
+        b"BT /F1 24 Tf 72 720 Td (Chapter Two) Tj "
+        b"/F1 12 Tf 0 -36 Td (Index) Tj "
+        b"0 -24 Td (Chapter One) Tj ET"
+    )
+    pdf.add(7, stream(page_two))
+    pdf.add(10, b"<< /Type /Outlines /First 11 0 R /Last 11 0 R /Count 3 >>")
+    pdf.add(
+        11,
+        b"<< /Title (Part One) /Parent 10 0 R /First 12 0 R /Last 13 0 R "
+        b"/Count 2 /Dest /part-one >>",
+    )
+    pdf.add(
+        12,
+        b"<< /Title (Chapter One) /Parent 11 0 R /Next 13 0 R "
+        b"/Dest [3 0 R /XYZ null 720 null] >>",
+    )
+    pdf.add(
+        13,
+        b"<< /Title (Chapter Two) /Parent 11 0 R /Prev 12 0 R "
+        b"/Dest (chapter-two) >>",
+    )
+    pdf.add(
+        20,
+        b"<< /Names [(chapter-two) [6 0 R /Fit] "
+        b"(part-one) [3 0 R /Fit]] >>",
+    )
+    pdf.add(
+        25,
+        b"<< /Nums [0 << /S /r >> 1 << /S /D /P (A-) /St 1 >>] >>",
+    )
+    pdf.add(30, b"<< /Title (Info title) /Author (Info author) >>")
+    xmp = (
+        b"<?xpacket begin=\"\"?>"
+        b"<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">"
+        b"<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">"
+        b"<rdf:Description xmlns:dc=\"http://purl.org/dc/elements/1.1/\">"
+        b"<dc:title><rdf:Alt><rdf:li xml:lang=\"x-default\">XMP Navigation</rdf:li>"
+        b"</rdf:Alt></dc:title>"
+        b"<dc:creator><rdf:Seq><rdf:li>XMP Author</rdf:li></rdf:Seq></dc:creator>"
+        b"<dc:language><rdf:Bag><rdf:li>fr</rdf:li></rdf:Bag></dc:language>"
+        b"</rdf:Description></rdf:RDF></x:xmpmeta><?xpacket end=\"w\"?>"
+    )
+    pdf.add(31, stream(xmp, b"/Type /Metadata /Subtype /XML"))
+    pdf.add(
+        40,
+        b"<< /Type /Annot /Subtype /Link /Rect [70 645 180 675] "
+        b"/Dest (chapter-two) >>",
+    )
+    pdf.add(
+        41,
+        b"<< /Type /Annot /Subtype /Link /Rect [70 670 180 700] "
+        b"/Dest [3 0 R /XYZ null 720 null] >>",
+    )
+    pdf.add(
+        42,
+        b"<< /Type /Annot /Subtype /Link /Rect [200 645 300 675] "
+        b"/A << /S /URI /URI (https://example.invalid/) >> >>",
+    )
+    pdf.add(
+        43,
+        b"<< /Type /Annot /Subtype /Link /Rect [200 670 300 700] "
+        b"/A << /S /JavaScript /JS (app.alert\\(1\\)) >> >>",
+    )
+    rendered = pdf.render(trailer_entries=b"/Root 1 0 R /Info 30 0 R")[0]
+    transcript = "Contents Chapter One Chapter Two Chapter Two Index Chapter One"
+    outline = (
+        {
+            "title": "Part One",
+            "level": 1,
+            "section": 0,
+            "anchor": "b00000000",
+            "destination": "named:part-one",
+        },
+        {
+            "title": "Chapter One",
+            "level": 2,
+            "section": 0,
+            "anchor": "b00000000",
+            "destination": "explicit:page-0",
+        },
+        {
+            "title": "Chapter Two",
+            "level": 2,
+            "section": 1,
+            "anchor": "b00000003",
+            "destination": "named:chapter-two",
+        },
+    )
+    links = (
+        {
+            "text": "Chapter One",
+            "href": "sections/000000.xhtml#b00000000",
+            "kind": "same-section",
+        },
+        {
+            "text": "Chapter Two",
+            "href": "sections/000001.xhtml#b00000003",
+            "kind": "cross-section",
+        },
+        {"source_page": 0, "page_label": "i"},
+        {"source_page": 1, "page_label": "A-1"},
+        {"ignored_action": "URI"},
+        {"ignored_action": "JavaScript"},
+    )
+    return Fixture(rendered, transcript, (), outline, links)
+
+
+def make_navigation_heading_fallback() -> Fixture:
+    content = (
+        b"BT /F1 24 Tf 72 720 Td (First Heading) Tj "
+        b"/F1 12 Tf 0 -36 Td (Body text.) Tj "
+        b"/F1 24 Tf 0 -48 Td (Second Heading) Tj "
+        b"/F1 12 Tf 0 -36 Td (More body.) Tj ET"
+    )
+    transcript = "First Heading Body text. Second Heading More body."
+    outline = (
+        {
+            "title": "First Heading",
+            "level": 1,
+            "section": 0,
+            "anchor": "b00000000",
+            "destination": "heading",
+        },
+        {
+            "title": "Second Heading",
+            "level": 1,
+            "section": 1,
+            "anchor": "b00000002",
+            "destination": "heading",
+        },
+    )
+    return Fixture(one_page_pdf(content), transcript, (), outline)
+
+
+def make_navigation_root_fallback() -> Fixture:
+    text = "Plain document without a reliable heading."
+    content = b"BT /F1 12 Tf 72 720 Td (Plain document without a reliable heading.) Tj ET"
+    outline = (
+        {
+            "title": "navigation_root_fallback",
+            "level": 1,
+            "section": 0,
+            "anchor": "b00000000",
+            "destination": "fallback",
+        },
+    )
+    return Fixture(one_page_pdf(content), text, (), outline)
+
+
+def make_navigation_outline_cycle() -> Fixture:
+    pdf = ClassicPdf()
+    pdf.add(1, b"<< /Type /Catalog /Pages 2 0 R /Outlines 10 0 R >>")
+    pdf.add(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
+    pdf.add(
+        3,
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+    )
+    pdf.add(4, stream(b"BT /F1 12 Tf 72 720 Td (Cycle body.) Tj ET"))
+    pdf.add(5, font_object())
+    pdf.add(10, b"<< /Type /Outlines /First 11 0 R /Last 11 0 R /Count 1 >>")
+    pdf.add(
+        11,
+        b"<< /Title (Loop) /Parent 10 0 R /Next 11 0 R "
+        b"/Dest [3 0 R /Fit] >>",
+    )
+    return Fixture(pdf.render()[0], "Cycle body.", error="OutlineCycle")
 
 
 def make_incremental_update() -> Fixture:
@@ -671,6 +871,10 @@ def make_page_tree_count_overflow() -> Fixture:
 def build_fixtures() -> dict[str, Fixture]:
     fixtures = {
         "classic_text": make_classic_text(),
+        "navigation_heading_fallback": make_navigation_heading_fallback(),
+        "navigation_outline": make_navigation_outline(),
+        "navigation_outline_cycle": make_navigation_outline_cycle(),
+        "navigation_root_fallback": make_navigation_root_fallback(),
         "incremental_update": make_incremental_update(),
         "incremental_xref_stream": make_incremental_xref_stream(),
         "xref_stream_objstm": make_xref_stream_objstm(),
@@ -732,6 +936,7 @@ def check_files(
     output_directory: Path,
     files: dict[str, bytes],
     staged_classic: Path | None = None,
+    staged_navigation: Path | None = None,
 ) -> int:
     with tempfile.TemporaryDirectory(prefix="crossink-pdf-fixtures-") as temporary:
         regenerated = Path(temporary)
@@ -751,6 +956,11 @@ def check_files(
             or staged_classic.read_bytes() != files["classic_text.pdf"]
         ):
             differences.append("qemu/classic_text.pdf")
+        if staged_navigation is not None and (
+            not staged_navigation.is_file()
+            or staged_navigation.read_bytes() != files["navigation_outline.pdf"]
+        ):
+            differences.append("qemu/navigation_outline.pdf")
         if differences:
             print("PDF fixture corpus differs:")
             for name in sorted(set(differences)):
@@ -773,11 +983,14 @@ def main() -> int:
             arguments.output,
             files,
             QEMU_CLASSIC_OUTPUT if stage_qemu else None,
+            QEMU_NAVIGATION_OUTPUT if stage_qemu else None,
         )
     write_files(arguments.output, files)
     if stage_qemu:
         QEMU_CLASSIC_OUTPUT.parent.mkdir(parents=True, exist_ok=True)
         QEMU_CLASSIC_OUTPUT.write_bytes(files["classic_text.pdf"])
+        QEMU_NAVIGATION_OUTPUT.parent.mkdir(parents=True, exist_ok=True)
+        QEMU_NAVIGATION_OUTPUT.write_bytes(files["navigation_outline.pdf"])
     print(f"Wrote {len(files) - 1} PDF fixture artifacts to {arguments.output}")
     return 0
 

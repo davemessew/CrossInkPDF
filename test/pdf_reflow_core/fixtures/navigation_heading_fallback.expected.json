@@ -1,0 +1,28 @@
+{
+  "error": null,
+  "fixture": "navigation_heading_fallback",
+  "geometry_order": [],
+  "image_hashes": {},
+  "outline_link_map": {
+    "links": [],
+    "outline": [
+      {
+        "anchor": "b00000000",
+        "destination": "heading",
+        "level": 1,
+        "section": 0,
+        "title": "First Heading"
+      },
+      {
+        "anchor": "b00000002",
+        "destination": "heading",
+        "level": 1,
+        "section": 1,
+        "title": "Second Heading"
+      }
+    ]
+  },
+  "transcript": "First Heading Body text. Second Heading More body.",
+  "warning": null,
+  "word_count": 8
+}

@@ -1,0 +1,21 @@
+{
+  "error": null,
+  "fixture": "navigation_root_fallback",
+  "geometry_order": [],
+  "image_hashes": {},
+  "outline_link_map": {
+    "links": [],
+    "outline": [
+      {
+        "anchor": "b00000000",
+        "destination": "fallback",
+        "level": 1,
+        "section": 0,
+        "title": "navigation_root_fallback"
+      }
+    ]
+  },
+  "transcript": "Plain document without a reliable heading.",
+  "warning": null,
+  "word_count": 6
+}

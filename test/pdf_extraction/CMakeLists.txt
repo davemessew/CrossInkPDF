@@ -4,6 +4,8 @@ add_executable(PdfExtractionTest
   ${REPO_ROOT}/lib/PdfReflow/PdfObjectParser.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfObjectResolver.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfPageTree.cpp
+  ${REPO_ROOT}/lib/PdfReflow/PdfMetadataStore.cpp
+  ${REPO_ROOT}/lib/PdfReflow/PdfOutline.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfSemanticWriter.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfStreamDecoder.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfUnicode.cpp
@@ -19,6 +21,7 @@ add_executable(PdfExtractionTest
   ${REPO_ROOT}/lib/uzlib/src/tinflate.c
   ${REPO_ROOT}/lib/uzlib/src/uzlib_checksums.c
   ${REPO_ROOT}/test/pdf_cache_recovery/PdfTestCacheIo.cpp
+  ${REPO_ROOT}/test/pdf_reflow_core/PdfTestIo.cpp
   PdfPreparationTest.cpp
   PdfResourceTrackerTest.cpp
 )
@@ -29,6 +32,7 @@ target_include_directories(PdfExtractionTest PRIVATE
   ${REPO_ROOT}/lib/PdfReflow
   ${REPO_ROOT}/lib/uzlib/src
   ${REPO_ROOT}/test/pdf_cache_recovery
+  ${REPO_ROOT}/test/pdf_reflow_core
 )
 
 target_link_libraries(PdfExtractionTest PRIVATE

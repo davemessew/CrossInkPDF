@@ -8,8 +8,11 @@
 #include <vector>
 
 #include "PdfCacheStore.h"
+#include "PdfMetadataStore.h"
+#include "PdfOutline.h"
 #include "PdfReflowDocument.h"
 #include "PdfTestCacheIo.h"
+#include "PdfTestIo.h"
 
 namespace {
 
@@ -20,18 +23,46 @@ constexpr char kSection[] =
     "<html xmlns=\"http://www.w3.org/1999/xhtml\"><head><meta charset=\"UTF-8\"/></head>"
     "<body><p id=\"b00000000\">Hello PDF</p></body></html>";
 
-struct SingleRecord {
-  PdfRequiredFileRecord value{};
+struct RequiredRecords {
+  std::vector<PdfRequiredFileRecord> values;
 
   static PdfStatus read(void* context, const uint32_t index, PdfRequiredFileRecord* output) {
-    if (context == nullptr || output == nullptr || index != 0) {
+    if (context == nullptr || output == nullptr) {
       return PdfStatus::failure(PdfError::InvalidArgument);
     }
-    *output = static_cast<SingleRecord*>(context)->value;
+    const auto& self = *static_cast<RequiredRecords*>(context);
+    if (index >= self.values.size()) {
+      return PdfStatus::failure(PdfError::InvalidOffset, index);
+    }
+    *output = self.values[index];
     return PdfStatus::success();
   }
 
-  PdfRequiredFileTableSource source() { return {this, 1, read}; }
+  PdfRequiredFileTableSource source() { return {this, static_cast<uint32_t>(values.size()), read}; }
+};
+
+struct OneMetadataSection {
+  PdfMetadataSection value{};
+
+  static PdfStatus read(void* context, const uint16_t index, PdfMetadataSection* output) {
+    if (context == nullptr || output == nullptr || index != 0) {
+      return PdfStatus::failure(PdfError::InvalidArgument);
+    }
+    *output = static_cast<OneMetadataSection*>(context)->value;
+    return PdfStatus::success();
+  }
+};
+
+struct OneOutlineEntry {
+  PdfOutlineEntry value{};
+
+  static PdfStatus read(void* context, const uint16_t index, PdfOutlineEntry* output) {
+    if (context == nullptr || output == nullptr || index != 0) {
+      return PdfStatus::failure(PdfError::InvalidArgument);
+    }
+    *output = static_cast<OneOutlineEntry*>(context)->value;
+    return PdfStatus::success();
+  }
 };
 
 struct CacheFixture {
@@ -50,19 +81,65 @@ struct CacheFixture {
     std::array<char, PDF_CACHE_PATH_CAPACITY> root{};
     ASSERT_TRUE(pdfFormatCacheRoot(kCacheDirectory, kSourcePath, root.data(), root.size()).ok());
     cacheRoot = root.data();
-    sectionPath = cacheRoot + "/gen_7/section.xhtml";
+    sectionPath = cacheRoot + "/gen_7/sections/000000.xhtml";
 
     PdfCacheStore cache;
     ASSERT_TRUE(cache.initialize(storage.io(), cacheRoot.c_str()).ok());
     ASSERT_TRUE(cache.ensureGeneration(7).ok());
     PdfCacheTrackedWriter writer;
-    ASSERT_TRUE(pdfOpenTrackedCacheWriter(storage.io(), sectionPath.c_str(), "gen_7/section.xhtml",
+    ASSERT_TRUE(pdfOpenTrackedCacheWriter(storage.io(), sectionPath.c_str(), "gen_7/sections/000000.xhtml",
                                           PdfCacheFileKind::Required, sizeof(kSection), &writer)
                     .ok());
     ASSERT_TRUE(
         pdfWriteTrackedCacheFile(&writer, reinterpret_cast<const uint8_t*>(kSection), sizeof(kSection) - 1).ok());
-    SingleRecord record;
-    ASSERT_TRUE(pdfCloseTrackedCacheFile(&writer, &record.value).ok());
+    RequiredRecords records;
+    PdfRequiredFileRecord sectionRecord{};
+    ASSERT_TRUE(pdfCloseTrackedCacheFile(&writer, &sectionRecord).ok());
+    records.values.push_back(sectionRecord);
+
+    PdfMetadataBuilder metadataBuilder;
+    ASSERT_TRUE(metadataBuilder.begin(reinterpret_cast<const uint8_t*>("minimal"), 7).ok());
+    PdfMetadata metadata = metadataBuilder.metadata();
+    metadata.sectionCount = 1;
+    metadata.outlineCount = 1;
+    metadata.totalWords = 2;
+    OneMetadataSection metadataSection{{
+        .byteSize = static_cast<uint32_t>(sectionRecord.size),
+        .cumulativeSize = static_cast<uint32_t>(sectionRecord.size),
+        .firstWordOrdinal = 0,
+        .wordCount = 2,
+        .firstAnchorOrdinal = 0,
+        .tocIndex = 0,
+    }};
+    PdfTestByteSink metadataBytes;
+    ASSERT_TRUE(
+        pdfEncodeMetadata(metadata, {&metadataSection, 1, OneMetadataSection::read}, metadataBytes.sink()).ok());
+    const std::string metadataRelative = "gen_7/metadata.bin";
+    const std::string metadataPath = cacheRoot + "/" + metadataRelative;
+    storage.addFile(metadataPath, metadataBytes.bytes());
+    PdfRequiredFileRecord metadataRecord{};
+    std::memcpy(metadataRecord.path, metadataRelative.data(), metadataRelative.size());
+    metadataRecord.pathLength = static_cast<uint8_t>(metadataRelative.size());
+    metadataRecord.size = metadataBytes.bytes().size();
+    metadataRecord.crc32 = pdfCacheCrc32(metadataBytes.bytes().data(), metadataBytes.bytes().size());
+    records.values.push_back(metadataRecord);
+
+    std::array<PdfOutlineEntry, 1> outlineWorkspace{};
+    PdfOutlineBuilder outlineBuilder({outlineWorkspace.data(), 1});
+    ASSERT_TRUE(outlineBuilder.begin().ok());
+    ASSERT_TRUE(outlineBuilder.finish(reinterpret_cast<const uint8_t*>("minimal"), 7).ok());
+    OneOutlineEntry outlineEntry{outlineWorkspace[0]};
+    PdfTestByteSink outlineBytes;
+    ASSERT_TRUE(pdfEncodeOutline({&outlineEntry, 1, OneOutlineEntry::read}, outlineBytes.sink()).ok());
+    const std::string outlineRelative = "gen_7/outline.bin";
+    const std::string outlinePath = cacheRoot + "/" + outlineRelative;
+    storage.addFile(outlinePath, outlineBytes.bytes());
+    PdfRequiredFileRecord outlineRecord{};
+    std::memcpy(outlineRecord.path, outlineRelative.data(), outlineRelative.size());
+    outlineRecord.pathLength = static_cast<uint8_t>(outlineRelative.size());
+    outlineRecord.size = outlineBytes.bytes().size();
+    outlineRecord.crc32 = pdfCacheCrc32(outlineBytes.bytes().data(), outlineBytes.bytes().size());
+    records.values.push_back(outlineRecord);
 
     PdfCacheManifest manifest;
     manifest.sequence = 3;
@@ -70,18 +147,21 @@ struct CacheFixture {
     manifest.source = identity;
     manifest.generation = 7;
     manifest.totalWords = 2;
-    manifest.requiredFileCount = 1;
-    manifest.requiredFileBytes = record.value.size;
-    manifest.requiredFileLedger = pdfUpdateRequiredFileLedger(PDF_CACHE_FNV64_OFFSET, record.value);
+    manifest.requiredFileCount = static_cast<uint32_t>(records.values.size());
+    manifest.requiredFileLedger = PDF_CACHE_FNV64_OFFSET;
+    for (const auto& record : records.values) {
+      manifest.requiredFileBytes += record.size;
+      manifest.requiredFileLedger = pdfUpdateRequiredFileLedger(manifest.requiredFileLedger, record);
+    }
     const PdfCacheCommitEvidence evidence{
         true,
-        1,
-        record.value.size,
+        manifest.requiredFileCount,
+        manifest.requiredFileBytes,
         manifest.requiredFileLedger,
     };
     PdfCacheManifestSelection committed;
     const PdfCacheManifestSelection prior{};
-    ASSERT_TRUE(cache.commitManifest(manifest, record.source(), evidence, prior, &committed).ok());
+    ASSERT_TRUE(cache.commitManifest(manifest, records.source(), evidence, prior, &committed).ok());
     ASSERT_TRUE(committed.selected);
     storage.clearEvents();
   }

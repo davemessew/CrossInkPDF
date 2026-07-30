@@ -1,6 +1,7 @@
 #include "PdfSemanticWriter.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 
@@ -413,6 +414,11 @@ PdfStatus PdfSemanticWriter::endTable() {
 }
 
 PdfStatus PdfSemanticWriter::writePublisherPageBreak(const uint8_t* const label, const size_t length) {
+  return writePublisherPageBreak(UINT32_MAX, label, length);
+}
+
+PdfStatus PdfSemanticWriter::writePublisherPageBreak(const uint32_t sourcePageIndex, const uint8_t* const label,
+                                                     const size_t length) {
   if (!status_.ok()) {
     return status_;
   }
@@ -426,7 +432,25 @@ PdfStatus PdfSemanticWriter::writePublisherPageBreak(const uint8_t* const label,
   if (!status.ok()) {
     return fail(status);
   }
-  status = appendLiteral("<span role=\"doc-pagebreak\" aria-label=\"");
+  status = appendLiteral("<span");
+  if (status.ok() && sourcePageIndex != UINT32_MAX) {
+    char pageAnchor[11]{};
+    const int written =
+        std::snprintf(pageAnchor, sizeof(pageAnchor), "p%08lx", static_cast<unsigned long>(sourcePageIndex));
+    if (written != 9) {
+      return fail(PdfStatus::failure(PdfError::LimitExceeded, sourcePageIndex));
+    }
+    status = appendLiteral(" id=\"");
+    if (status.ok()) {
+      status = appendLiteral(pageAnchor);
+    }
+    if (status.ok()) {
+      status = appendLiteral("\"");
+    }
+  }
+  if (status.ok()) {
+    status = appendLiteral(" role=\"doc-pagebreak\" aria-label=\"");
+  }
   if (status.ok()) {
     status = appendEscaped(reinterpret_cast<const uint8_t*>(truncated), truncatedLength, true);
   }

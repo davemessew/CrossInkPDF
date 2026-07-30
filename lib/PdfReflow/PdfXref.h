@@ -40,12 +40,19 @@ class PdfXrefTable {
     hasRoot_ = true;
   }
   bool root(PdfObjectReference* root) const;
+  void setInfo(PdfObjectReference info) {
+    info_ = info;
+    hasInfo_ = true;
+  }
+  bool info(PdfObjectReference* info) const;
 
  private:
   PdfFixedRecordStore records_{};
   uint32_t entryCount_ = 0;
   PdfObjectReference root_{};
+  PdfObjectReference info_{};
   bool hasRoot_ = false;
+  bool hasInfo_ = false;
   bool finalized_ = false;
 };
 

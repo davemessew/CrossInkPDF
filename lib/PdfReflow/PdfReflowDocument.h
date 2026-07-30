@@ -2,12 +2,15 @@
 
 #include <ReflowDocument.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
 
 #include "PdfCacheStore.h"
+#include "PdfMetadataStore.h"
+#include "PdfOutline.h"
 
 class PdfReflowDocument : public ReflowDocument {
  public:
@@ -80,8 +83,15 @@ class PdfReflowDocument : public ReflowDocument {
   };
 
   static PdfStatus validateRequiredFile(void* context, const PdfRequiredFileRecord& record);
+  static PdfStatus captureMetadataSection(void* context, uint16_t index, const PdfMetadataSection& record);
+  static PdfStatus validateOutlineEntry(void* context, uint16_t index, const PdfOutlineEntry& record);
   PdfStatus validateFile(const PdfRequiredFileRecord& record);
-  bool streamCachedFile(const std::string& path, Print& out, size_t chunkSize) const;
+  PdfStatus loadMetadataCache();
+  PdfStatus loadOutlineCache();
+  bool readOutlineEntry(int tocIndex, PdfOutlineEntry* entry) const;
+  bool formatSectionHref(int sectionIndex, char* output, size_t capacity) const;
+  bool formatSectionPath(int sectionIndex, char* output, size_t capacity) const;
+  bool streamCachedFile(const std::string& path, uint64_t fileSize, Print& out, size_t chunkSize) const;
   void resetLoadedState();
   void deriveFallbackTitle();
 
@@ -91,13 +101,24 @@ class PdfReflowDocument : public ReflowDocument {
   std::string title_;
   std::string author_;
   std::string language_;
-  std::string sectionPath_;
+  std::string metadataPath_;
+  std::string outlinePath_;
   PdfSourceIdentity sourceIdentity_{};
   PdfCacheManifest manifest_{};
-  PdfRequiredFileRecord sectionRecord_{};
+  PdfMetadata metadata_{};
+  PdfRequiredFileRecord metadataRecord_{};
+  PdfRequiredFileRecord outlineRecord_{};
+  std::unique_ptr<PdfMetadataSection[]> sections_;
   std::unique_ptr<uint8_t[]> ioWorkspace_;
+  std::array<uint32_t, PdfMetadataLimits::MaxSections> manifestSectionSizes_{};
+  std::array<uint8_t, (PdfMetadataLimits::MaxSections + 7) / 8> manifestSectionSeen_{};
+  mutable PdfOutlineEntry cachedOutlineEntry_{};
+  mutable int cachedOutlineIndex_ = -1;
+  uint32_t validationGeneration_ = 0;
   uint32_t requiredFilesSeen_ = 0;
   uint32_t xhtmlFilesSeen_ = 0;
+  uint16_t metadataFilesSeen_ = 0;
+  uint16_t outlineFilesSeen_ = 0;
   bool loaded_ = false;
   PdfStatus status_{};
 };

@@ -227,6 +227,23 @@ PdfStatus PdfPageTreeWalker::processResolvedNode() {
     }
   }
 
+  if (pdfDictionaryFind(arena_, resolved.rootIndex, "Annots", &valueIndex)) {
+    if (valueIndex >= arena_.valueCount || arena_.values[valueIndex].kind != PdfValueKind::Array ||
+        arena_.values[valueIndex].count > PdfLimits::MaxLinkAnnotationsPerPage) {
+      return PdfStatus::failure(PdfError::LimitExceeded, current_.reference.objectNumber);
+    }
+    for (uint16_t ordinal = 0; ordinal < arena_.values[valueIndex].count; ++ordinal) {
+      uint16_t annotationIndex = PDF_INVALID_INDEX;
+      if (!pdfArrayAt(arena_, valueIndex, ordinal, &annotationIndex) || annotationIndex >= arena_.valueCount) {
+        return PdfStatus::failure(PdfError::Malformed, current_.reference.objectNumber);
+      }
+      const PdfValue& annotation = arena_.values[annotationIndex];
+      if (annotation.kind == PdfValueKind::Reference) {
+        page.annotations[page.annotationCount++] = {annotation.objectNumber, annotation.generation};
+      }
+    }
+  }
+
   const PdfStatus callbackStatus = pageFn_(pageContext_, page);
   if (!callbackStatus.ok()) {
     return callbackStatus;

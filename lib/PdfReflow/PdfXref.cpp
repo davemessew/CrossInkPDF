@@ -85,7 +85,9 @@ void stableSortXrefRun(PdfXrefEntry* entries, const uint32_t count) {
 void PdfXrefTable::reset() {
   entryCount_ = 0;
   root_ = {};
+  info_ = {};
   hasRoot_ = false;
+  hasInfo_ = false;
   finalized_ = false;
 }
 
@@ -266,6 +268,14 @@ bool PdfXrefTable::root(PdfObjectReference* root) const {
     return false;
   }
   *root = root_;
+  return true;
+}
+
+bool PdfXrefTable::info(PdfObjectReference* info) const {
+  if (!hasInfo_ || info == nullptr) {
+    return false;
+  }
+  *info = info_;
   return true;
 }
 
@@ -624,6 +634,14 @@ PdfStatus PdfXrefParser::consumeCommonDictionary(const uint16_t rootIndex) {
       return PdfStatus::failure(PdfError::Malformed, lexer_.tokenOffset());
     }
     table_.setRoot({root.objectNumber, root.generation});
+  }
+  PdfObjectReference existingInfo;
+  if (!table_.info(&existingInfo) && pdfDictionaryFind(trailerArena_, rootIndex, "Info", &valueIndex)) {
+    const PdfValue& info = trailerArena_.values[valueIndex];
+    if (info.kind != PdfValueKind::Reference) {
+      return PdfStatus::failure(PdfError::Malformed, lexer_.tokenOffset());
+    }
+    table_.setInfo({info.objectNumber, info.generation});
   }
 
   if (pdfDictionaryFind(trailerArena_, rootIndex, "Prev", &valueIndex)) {

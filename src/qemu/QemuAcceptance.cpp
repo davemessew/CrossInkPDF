@@ -36,6 +36,7 @@ namespace {
 constexpr char SENTINEL_PATH[] = "/qemu/sentinel.txt";
 constexpr char SENTINEL_CONTENT[] = "crossink-qemu-sentinel-v1\n";
 constexpr char PDF_FIXTURE_PATH[] = "/qemu/classic_text.pdf";
+constexpr char PDF_NAVIGATION_FIXTURE_PATH[] = "/qemu/navigation_outline.pdf";
 constexpr char PDF_SPILL_PATH[] = "/qemu/pdf-run-spill.tmp";
 constexpr char PDF_CACHE_ROOT[] = "/qemu/pdf_cache_accept";
 constexpr char PDF_CACHE_GENERATION_ONE[] = "/qemu/pdf_cache_accept/gen_1";
@@ -60,6 +61,49 @@ struct AcceptanceState {
 };
 
 AcceptanceState state;
+
+class PatternPrint final : public Print {
+ public:
+  PatternPrint(const char* first, const char* second) : first_(first), second_(second) {}
+
+  size_t write(const uint8_t byte) override { return write(&byte, 1); }
+
+  size_t write(const uint8_t* source, const size_t length) override {
+    if (source == nullptr) {
+      return 0;
+    }
+    for (size_t index = 0; index < length; ++index) {
+      advance(first_, source[index], &firstOffset_, &firstFound_);
+      advance(second_, source[index], &secondOffset_, &secondFound_);
+    }
+    return length;
+  }
+
+  bool matched() const { return firstFound_ && secondFound_; }
+
+ private:
+  static void advance(const char* pattern, const uint8_t byte, size_t* offset, bool* found) {
+    if (*found || pattern == nullptr || pattern[0] == '\0') {
+      *found = true;
+      return;
+    }
+    if (byte == static_cast<uint8_t>(pattern[*offset])) {
+      ++*offset;
+      if (pattern[*offset] == '\0') {
+        *found = true;
+      }
+    } else {
+      *offset = byte == static_cast<uint8_t>(pattern[0]) ? 1U : 0U;
+    }
+  }
+
+  const char* first_ = nullptr;
+  const char* second_ = nullptr;
+  size_t firstOffset_ = 0;
+  size_t secondOffset_ = 0;
+  bool firstFound_ = false;
+  bool secondFound_ = false;
+};
 
 struct MemoryRecordContext {
   uint8_t* bytes = nullptr;
@@ -824,6 +868,77 @@ bool checkPdfProductTracer(GfxRenderer& renderer) {
   return true;
 }
 
+bool checkPdfNavigation() {
+  char cacheRoot[PDF_CACHE_PATH_CAPACITY]{};
+  PdfStatus status = pdfFormatCacheRoot("/.crosspoint", PDF_NAVIGATION_FIXTURE_PATH, cacheRoot, sizeof(cacheRoot));
+  if (!status.ok()) {
+    fail("PDF_NAV", "cache_path");
+    return false;
+  }
+  if (Storage.exists(cacheRoot) && !Storage.removeDir(cacheRoot)) {
+    fail("PDF_NAV", "preclean");
+    return false;
+  }
+
+  PdfHalCacheIoContext preparationIoContext;
+  auto preparation = makeUniqueNoThrow<PdfPreparation>();
+  if (!preparation) {
+    fail("PDF_NAV", "preparation_oom");
+    return false;
+  }
+  const PdfPreparationConfig config{
+      pdfHalCacheIo(preparationIoContext),
+      PDF_NAVIGATION_FIXTURE_PATH,
+      "/.crosspoint",
+      nullptr,
+      qemuNowMs,
+      {nullptr, qemuPdfResources, ignorePdfResourceEvent},
+  };
+  status = preparation->begin(config);
+  PdfStepResult result = PdfStepResult::paused();
+  for (uint32_t slice = 0; status.ok() && result.yielded() && slice < 100000; ++slice) {
+    result = preparation->step();
+    sampleRuntime();
+  }
+  if (!status.ok() || !result.complete() || preparation->totalWords() != 10 ||
+      preparation->resourcePeakBytes() != PdfLimits::TotalWorkspaceBytes) {
+    fail("PDF_NAV", !status.ok() ? "begin" : "prepare");
+    return false;
+  }
+  preparation.reset();
+
+  PdfStatus documentStatus{};
+  auto loaded = loadPdfHalReflowDocumentNoThrow(PDF_NAVIGATION_FIXTURE_PATH, "/.crosspoint", &documentStatus);
+  if (!loaded || !documentStatus.ok() || loaded->getSectionCount() != 2 || loaded->getTocEntryCount() != 3 ||
+      loaded->getTotalWordCount() != 10 || loaded->getTitle() != "XMP Navigation" ||
+      loaded->getAuthor() != "XMP Author" || loaded->getLanguage() != "de-CH") {
+    fail("PDF_NAV", "document");
+    return false;
+  }
+
+  const ReflowTocEntry part = loaded->getTocEntry(0);
+  const ReflowTocEntry chapterOne = loaded->getTocEntry(1);
+  const ReflowTocEntry chapterTwo = loaded->getTocEntry(2);
+  PatternPrint firstSection("aria-label=\"i\"", "sections/000001.xhtml#b00000003");
+  PatternPrint secondSection("aria-label=\"A-1\"", ">Index</p>");
+  const bool streamed = loaded->streamSection(0, firstSection, 256) && loaded->streamSection(1, secondSection, 256);
+  const bool navigationMatches =
+      part.title == "Part One" && part.level == 1 && part.sectionIndex == 0 && chapterOne.title == "Chapter One" &&
+      chapterOne.level == 2 && chapterOne.parentIndex == 0 && chapterTwo.title == "Chapter Two" &&
+      chapterTwo.level == 2 && chapterTwo.sectionIndex == 1 && chapterTwo.anchor == "b00000003" &&
+      loaded->resolveHrefToSectionIndex(chapterTwo.href) == 1 && loaded->getTocIndexForSectionIndex(0) == 0 &&
+      loaded->getTocIndexForSectionIndex(1) == 2 && streamed && firstSection.matched() && secondSection.matched();
+  loaded.reset();
+
+  const bool cleaned = Storage.exists(cacheRoot) && Storage.removeDir(cacheRoot);
+  if (!navigationMatches || !cleaned) {
+    fail("PDF_NAV", !navigationMatches ? "content" : "cleanup");
+    return false;
+  }
+  esp_rom_printf("QEMU_PDF_NAV_PASS chapters=3 sections=2 words=10 labels=2\n");
+  return true;
+}
+
 bool checkStorage() {
   const uint32_t opensBefore = QemuHalControl::storageOpenCount();
   const uint32_t closesBefore = QemuHalControl::storageCloseCount();
@@ -898,8 +1013,8 @@ void qemuAcceptanceBegin(MappedInputManager& input, GfxRenderer& renderer) {
   state.minStackMargin = stackMarginBytes();
   sampleRuntime();
 
-  if (!checkStorage() || !checkPdfCore() || !checkPdfCache() || !checkPdfProductTracer(renderer) || !checkFrame() ||
-      !checkInput(input)) {
+  if (!checkStorage() || !checkPdfCore() || !checkPdfCache() || !checkPdfProductTracer(renderer) ||
+      !checkPdfNavigation() || !checkFrame() || !checkInput(input)) {
     return;
   }
 
