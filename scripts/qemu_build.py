@@ -23,6 +23,7 @@ EFUSE_SIZE = 1024
 EFUSE_REVISION_BYTE_OFFSET = 38
 EFUSE_REVISION_BYTE_VALUE = 0x0C
 ESP_IDF_EFUSE_SOURCE = "esp-idf-v5.5.2/tools/idf_py_actions/qemu_ext.py"
+PDF_FIXTURE_RELATIVE_PATH = Path("qemu") / "classic_text.pdf"
 
 
 def validate_flash_layout(
@@ -62,6 +63,18 @@ def verify_fixture_headroom(fixtures: Path) -> int:
             "QEMU fixtures leave less than the required writable headroom"
         )
     return total
+
+
+def verify_pdf_fixture(canonical: Path, staged: Path) -> str:
+    if not canonical.is_file():
+        raise ValueError(f"canonical PDF fixture does not exist: {canonical}")
+    if not staged.is_file():
+        raise ValueError(f"staged QEMU PDF fixture does not exist: {staged}")
+    canonical_hash = _sha256_file(canonical)
+    staged_hash = _sha256_file(staged)
+    if staged_hash != canonical_hash:
+        raise ValueError("staged QEMU PDF fixture differs from the generated corpus")
+    return canonical_hash
 
 
 def generate_esp32c3_efuse(output: Path) -> None:
@@ -255,6 +268,7 @@ def _write_manifest(
     efuse_image: Path,
     env: Any,
     fixture_bytes: int,
+    pdf_fixture_sha256: str,
 ) -> None:
     project_dir = Path(env.subst("$PROJECT_DIR")).resolve()
     fingerprint, tools = _resource_fingerprint(env, project_dir)
@@ -289,6 +303,7 @@ def _write_manifest(
             "block_size": 4096,
             "fixture_bytes": fixture_bytes,
             "writable_headroom": MIN_WRITABLE_HEADROOM,
+            "pdf_fixture_sha256": pdf_fixture_sha256,
         },
         "images": images,
         "resource_fingerprint": fingerprint,
@@ -307,8 +322,16 @@ def _build_qemu_images(target: Any, source: Any, env: Any) -> int:
     firmware = Path(str(source[0])).resolve()
     filesystem = Path(str(source[1])).resolve()
     fixtures = Path(env.subst("$PROJECT_DIR/test/qemu/data")).resolve()
+    canonical_pdf = Path(
+        env.subst(
+            "$PROJECT_DIR/test/pdf_reflow_core/fixtures/classic_text.pdf"
+        )
+    ).resolve()
 
     try:
+        pdf_fixture_sha256 = verify_pdf_fixture(
+            canonical_pdf, fixtures / PDF_FIXTURE_RELATIVE_PATH
+        )
         fixture_bytes = verify_fixture_headroom(fixtures)
         entries = _flash_entries_from_environment(
             env, firmware, filesystem
@@ -342,6 +365,7 @@ def _build_qemu_images(target: Any, source: Any, env: Any) -> int:
             efuse_image,
             env,
             fixture_bytes,
+            pdf_fixture_sha256,
         )
     except (OSError, RuntimeError, ValueError) as error:
         sys.stderr.write(f"QEMU image build failed: {error}\n")

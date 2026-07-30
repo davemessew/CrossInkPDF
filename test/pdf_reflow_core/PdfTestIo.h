@@ -15,8 +15,7 @@ class PdfTestByteSource {
   void setFailureOffset(uint64_t failureOffset) { failureOffset_ = failureOffset; }
 
  private:
-  static PdfStatus readAt(void* context, uint64_t offset, uint8_t* destination, size_t requested,
-                          size_t* bytesRead);
+  static PdfStatus readAt(void* context, uint64_t offset, uint8_t* destination, size_t requested, size_t* bytesRead);
 
   std::vector<uint8_t> bytes_;
   size_t maximumRead_ = static_cast<size_t>(-1);
@@ -34,4 +33,19 @@ class PdfTestByteSink {
 
   std::vector<uint8_t> bytes_;
   size_t maximumWrite_ = static_cast<size_t>(-1);
+};
+
+class PdfTestRecordStore {
+ public:
+  PdfTestRecordStore(size_t recordSize, uint32_t capacity);
+
+  PdfFixedRecordStore store();
+
+ private:
+  static PdfStatus read(void* context, uint32_t ordinal, void* record, size_t recordSize);
+  static PdfStatus write(void* context, uint32_t ordinal, const void* record, size_t recordSize);
+
+  std::vector<uint8_t> bytes_;
+  size_t recordSize_ = 0;
+  uint32_t capacity_ = 0;
 };

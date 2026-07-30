@@ -242,6 +242,23 @@ class QemuBuildContractTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "headroom"):
                 module.verify_fixture_headroom(fixtures)
 
+    def test_pdf_fixture_must_match_generated_corpus(self) -> None:
+        module = self._load_build_module()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            canonical = directory / "classic_text.pdf"
+            staged = directory / "qemu" / "classic_text.pdf"
+            staged.parent.mkdir()
+            canonical.write_bytes(b"%PDF-fixture")
+            staged.write_bytes(canonical.read_bytes())
+            self.assertEqual(
+                module.verify_pdf_fixture(canonical, staged),
+                hashlib.sha256(canonical.read_bytes()).hexdigest(),
+            )
+            staged.write_bytes(b"different")
+            with self.assertRaisesRegex(ValueError, "differs"):
+                module.verify_pdf_fixture(canonical, staged)
+
     def test_qemu_config_fingerprint_ignores_unrelated_environments(self) -> None:
         module = self._load_build_module()
         with tempfile.TemporaryDirectory() as temporary_directory:

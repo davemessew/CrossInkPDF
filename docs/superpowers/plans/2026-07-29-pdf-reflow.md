@@ -853,34 +853,34 @@ smallest failing hypothesis; do not layer speculative production changes.
 - Test: `test/pdf_reflow_core/PdfPageTreeTest.cpp`
 - Test: `test/pdf_reflow_core/PdfFixtureIntegrationTest.cpp`
 
-- [ ] Add red tests for every 4 KiB split, short read, checked-add overflow,
+- [x] Add red tests for every 4 KiB split, short read, checked-add overflow,
   EOF, names with `#xx`, comments, nested literal strings, hex padding,
   references, malformed nesting, token limits, and one-operation work budgets.
-- [ ] Implement resumable lexing/object parsing with caller-owned token storage.
+- [x] Implement resumable lexing/object parsing with caller-owned token storage.
   Every long method returns `StepResult`. The pure core decrements operation and
   4 KiB byte budgets and calls the supplied stop callback only at bounded
   boundaries; `PdfPreparation` later supplies the 8 ms deadline and
   cancellation callback. Assert byte-identical output with operation budget 1
   and the normal budget 32.
-- [ ] Add red end-to-end test: resolve catalog → page tree → content in
+- [x] Add red end-to-end test: resolve catalog → page tree → content in
   `classic_text.pdf` and emit exactly `Hello PDF`.
-- [ ] Implement `startxref`, classic xref, trailers, newest incremental revision
+- [x] Implement `startxref`, classic xref, trailers, newest incremental revision
   precedence, and `/Prev` cap/cycle detection. Reject `/Encrypt`, including an
   empty-password dictionary, before content extraction. Treat a linearization
   dictionary as an ordinary indirect object and ignore its hints.
-- [ ] Add `PdfPageTree.h/.cpp` and `PdfPageTreeTest.cpp` for inherited
+- [x] Add `PdfPageTree.h/.cpp` and `PdfPageTreeTest.cpp` for inherited
   resources, single/array `/Contents`, cycles, depth, checked page count, and
   the 5,000-page production cap. Keep page traversal separate from object
   resolution.
-- [ ] Reject bad offsets before seeking. Test every truncation of the tiny
+- [x] Reject bad offsets before seeking. Test every truncation of the tiny
   classic fixture and `/Prev` cycles.
-- [ ] Run `ctest -R "^Pdf"`. Expected: PASS, including `PdfPageTree`, with
+- [x] Run `ctest -R "^Pdf"`. Expected: PASS, including `PdfPageTree`, with
   stable error classes and no crash/allocation.
-- [ ] Stage `classic_text.pdf` into the generated QEMU fixture filesystem and
+- [x] Stage `classic_text.pdf` into the generated QEMU fixture filesystem and
   extend `src/qemu/QemuAcceptance.cpp` with a target-core tracer. It must read
   the file through QEMU `HalStorage`, run the same parser code, compare exactly
   `Hello PDF`, and emit `QEMU_PDF_CORE_PASS`.
-- [ ] Run the QEMU core tracer before expanding the parser:
+- [x] Run the QEMU core tracer before expanding the parser:
 
   ```powershell
   Remove-Item -LiteralPath .pio\build\qemu-esp32c3\qemu-pdf-core.log -ErrorAction SilentlyContinue

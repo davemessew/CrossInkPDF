@@ -38,8 +38,7 @@ TEST(PdfByteSourceTest, RejectsCheckedAdditionOverflow) {
   const PdfByteSource source = memory.source(std::numeric_limits<uint64_t>::max());
   uint8_t output = 0;
 
-  const PdfStatus status =
-      pdfReadExact(source, std::numeric_limits<uint64_t>::max(), &output, static_cast<size_t>(2));
+  const PdfStatus status = pdfReadExact(source, std::numeric_limits<uint64_t>::max(), &output, static_cast<size_t>(2));
 
   EXPECT_EQ(status.error, PdfError::InvalidOffset);
   EXPECT_EQ(status.offset, std::numeric_limits<uint64_t>::max());
@@ -72,6 +71,19 @@ TEST(PdfByteSourceTest, BudgetOneProducesSameOutputAsUnboundedRead) {
   EXPECT_TRUE(result.complete());
   EXPECT_EQ(result.status.error, PdfError::None);
   EXPECT_EQ(output, expected);
+}
+
+TEST(PdfByteSourceTest, BoundedRangeTranslatesOffsetsWithoutEscapingParent) {
+  PdfTestByteSource memory({0, 1, 2, 3, 4, 5});
+  const PdfByteSource parent = memory.source();
+  PdfByteRange range;
+  ASSERT_TRUE(pdfInitializeByteRange(parent, 2, 3, &range).ok());
+  const PdfByteSource source = pdfByteRangeSource(range);
+  std::array<uint8_t, 3> output{};
+  EXPECT_TRUE(pdfReadExact(source, 0, output.data(), output.size()).ok());
+  EXPECT_EQ(output, (std::array<uint8_t, 3>{2, 3, 4}));
+  uint8_t byte = 0;
+  EXPECT_EQ(pdfReadExact(source, 3, &byte, 1).error, PdfError::InvalidOffset);
 }
 
 TEST(PdfCheckedMathTest, RejectsOverflowAndTransformsFixedPoint) {

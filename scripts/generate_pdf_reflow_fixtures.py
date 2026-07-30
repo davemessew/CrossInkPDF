@@ -18,6 +18,7 @@ from typing import Callable
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT = REPO_ROOT / "test" / "pdf_reflow_core" / "fixtures"
+QEMU_CLASSIC_OUTPUT = REPO_ROOT / "test" / "qemu" / "data" / "qemu" / "classic_text.pdf"
 PDF_HEADER = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n"
 
 
@@ -145,46 +146,9 @@ def one_page_pdf(
 
 
 def make_classic_text() -> Fixture:
-    pdf = ClassicPdf()
-    pdf.add(1, b"<< /Type /Catalog /Pages 2 0 R /Outlines 9 0 R /PageMode /UseOutlines >>")
-    pdf.add(2, b"<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 2 >>")
-    pdf.add(
-        3,
-        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
-        b"/Resources << /Font << /F1 8 0 R >> >> /Contents 4 0 R /Annots [5 0 R] >>",
-    )
-    pdf.add(4, stream(b"BT /F1 12 Tf 72 720 Td (Chapter One body. See Chapter Two.) Tj ET"))
-    pdf.add(
-        5,
-        b"<< /Type /Annot /Subtype /Link /Rect [205 714 310 730] /Border [0 0 0] "
-        b"/Dest [6 0 R /Fit] >>",
-    )
-    pdf.add(
-        6,
-        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
-        b"/Resources << /Font << /F1 8 0 R >> >> /Contents 7 0 R >>",
-    )
-    pdf.add(7, stream(b"BT /F1 12 Tf 72 720 Td (Chapter Two body and index entry 1.) Tj ET"))
-    pdf.add(8, font_object())
-    pdf.add(9, b"<< /Type /Outlines /First 10 0 R /Last 11 0 R /Count 2 >>")
-    pdf.add(
-        10,
-        b"<< /Title (Chapter One) /Parent 9 0 R /Dest [3 0 R /Fit] /Next 11 0 R >>",
-    )
-    pdf.add(
-        11,
-        b"<< /Title (Chapter Two) /Parent 9 0 R /Dest [6 0 R /Fit] /Prev 10 0 R >>",
-    )
-    return Fixture(
-        pdf.render()[0],
-        "Chapter One body. See Chapter Two. Chapter Two body and index entry 1.",
-        ("Chapter One body. See Chapter Two.", "Chapter Two body and index entry 1."),
-        (
-            {"title": "Chapter One", "level": 0, "page": 0, "anchor": "page-1"},
-            {"title": "Chapter Two", "level": 0, "page": 1, "anchor": "page-2"},
-        ),
-        ({"page": 0, "text": "Chapter Two", "target": "page-2"},),
-    )
+    text = "Hello PDF"
+    content = b"BT /F1 12 Tf 72 720 Td (Hello PDF) Tj ET"
+    return Fixture(one_page_pdf(content), text, (text,))
 
 
 def make_incremental_update() -> Fixture:
@@ -585,6 +549,65 @@ def make_encrypted() -> Fixture:
     )
 
 
+def make_page_tree_inherited() -> Fixture:
+    pdf = ClassicPdf()
+    pdf.add(1, b"<< /Type /Catalog /Pages 2 0 R >>")
+    pdf.add(2, b"<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 2 /Resources 10 0 R >>")
+    pdf.add(
+        3,
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Contents [4 0 R 5 0 R] >>",
+    )
+    pdf.add(4, stream(b"BT /F1 12 Tf 72 720 Td (First A) Tj ET"))
+    pdf.add(5, stream(b"BT /F1 12 Tf 0 -24 Td (First B) Tj ET"))
+    pdf.add(
+        6,
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 7 0 R >>",
+    )
+    pdf.add(7, stream(b"BT /F1 12 Tf 72 720 Td (Second) Tj ET"))
+    pdf.add(8, font_object())
+    pdf.add(10, b"<< /Font << /F1 8 0 R >> >>")
+    return Fixture(
+        pdf.render()[0],
+        "First A First B Second",
+        ("First A", "First B", "Second"),
+    )
+
+
+def make_page_tree_cycle() -> Fixture:
+    pdf = ClassicPdf()
+    pdf.add(1, b"<< /Type /Catalog /Pages 2 0 R >>")
+    pdf.add(2, b"<< /Type /Pages /Kids [2 0 R] /Count 1 >>")
+    return Fixture(pdf.render()[0], "", error="PageTreeCycle")
+
+
+def make_page_tree_deep() -> Fixture:
+    pdf = ClassicPdf()
+    pdf.add(1, b"<< /Type /Catalog /Pages 2 0 R >>")
+    first_page_object = 68
+    for number in range(2, first_page_object):
+        child = number + 1
+        pdf.add(
+            number,
+            f"<< /Type /Pages /Kids [{child} 0 R] /Count 1 >>".encode("ascii"),
+        )
+    pdf.add(
+        first_page_object,
+        b"<< /Type /Page /Parent 67 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /Font << /F1 70 0 R >> >> /Contents 69 0 R >>",
+    )
+    pdf.add(69, stream(b"BT /F1 12 Tf 72 720 Td (Too deep.) Tj ET"))
+    pdf.add(70, font_object())
+    return Fixture(pdf.render()[0], "", error="PageTreeDepth")
+
+
+def make_page_tree_count_overflow() -> Fixture:
+    pdf = ClassicPdf()
+    pdf.add(1, b"<< /Type /Catalog /Pages 2 0 R >>")
+    pdf.add(2, b"<< /Type /Pages /Kids [] /Count 5001 >>")
+    return Fixture(pdf.render()[0], "", error="PageCountLimit")
+
+
 def build_fixtures() -> dict[str, Fixture]:
     fixtures = {
         "classic_text": make_classic_text(),
@@ -613,6 +636,10 @@ def build_fixtures() -> dict[str, Fixture]:
         "oversized_length": make_oversized_length(),
         "flate_bomb": make_flate_bomb(),
         "encrypted": make_encrypted(),
+        "page_tree_inherited": make_page_tree_inherited(),
+        "page_tree_cycle": make_page_tree_cycle(),
+        "page_tree_deep": make_page_tree_deep(),
+        "page_tree_count_overflow": make_page_tree_count_overflow(),
     }
     return dict(sorted(fixtures.items()))
 
@@ -640,7 +667,11 @@ def write_files(output_directory: Path, files: dict[str, bytes]) -> None:
         (output_directory / name).write_bytes(data)
 
 
-def check_files(output_directory: Path, files: dict[str, bytes]) -> int:
+def check_files(
+    output_directory: Path,
+    files: dict[str, bytes],
+    staged_classic: Path | None = None,
+) -> int:
     with tempfile.TemporaryDirectory(prefix="crossink-pdf-fixtures-") as temporary:
         regenerated = Path(temporary)
         write_files(regenerated, files)
@@ -654,6 +685,11 @@ def check_files(output_directory: Path, files: dict[str, bytes]) -> int:
         for name in sorted(expected_names & actual_names):
             if (regenerated / name).read_bytes() != (output_directory / name).read_bytes():
                 differences.append(name)
+        if staged_classic is not None and (
+            not staged_classic.is_file()
+            or staged_classic.read_bytes() != files["classic_text.pdf"]
+        ):
+            differences.append("qemu/classic_text.pdf")
         if differences:
             print("PDF fixture corpus differs:")
             for name in sorted(set(differences)):
@@ -670,9 +706,17 @@ def main() -> int:
     arguments = parser.parse_args()
 
     files = generated_files()
+    stage_qemu = arguments.output.resolve() == DEFAULT_OUTPUT.resolve()
     if arguments.check:
-        return check_files(arguments.output, files)
+        return check_files(
+            arguments.output,
+            files,
+            QEMU_CLASSIC_OUTPUT if stage_qemu else None,
+        )
     write_files(arguments.output, files)
+    if stage_qemu:
+        QEMU_CLASSIC_OUTPUT.parent.mkdir(parents=True, exist_ok=True)
+        QEMU_CLASSIC_OUTPUT.write_bytes(files["classic_text.pdf"])
     print(f"Wrote {len(files) - 1} PDF fixture artifacts to {arguments.output}")
     return 0
 

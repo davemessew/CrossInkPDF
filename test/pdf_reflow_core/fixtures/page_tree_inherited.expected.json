@@ -1,15 +1,17 @@
 {
   "error": null,
-  "fixture": "classic_text",
+  "fixture": "page_tree_inherited",
   "geometry_order": [
-    "Hello PDF"
+    "First A",
+    "First B",
+    "Second"
   ],
   "image_hashes": {},
   "outline_link_map": {
     "links": [],
     "outline": []
   },
-  "transcript": "Hello PDF",
+  "transcript": "First A First B Second",
   "warning": null,
-  "word_count": 2
+  "word_count": 5
 }

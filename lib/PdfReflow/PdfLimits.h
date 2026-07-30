@@ -18,6 +18,7 @@ inline constexpr uint8_t MaxContainerNesting = 32;
 inline constexpr uint8_t MaxObjectRecursion = 32;
 inline constexpr uint8_t MaxTrailerDepth = 32;
 inline constexpr uint8_t MaxPageTreeDepth = 64;
+inline constexpr uint8_t MaxContentStreamsPerPage = 16;
 inline constexpr uint8_t MaxXrefSections = 64;
 inline constexpr uint32_t MaxCMapRanges = 8192;
 inline constexpr uint16_t MaxPaletteEntries = 256;
@@ -32,9 +33,8 @@ inline constexpr size_t PageTextBytes = 8192;
 inline constexpr size_t PageRunCount = 256;
 inline constexpr size_t PageRunBytes = PageRunCount * 48;
 inline constexpr size_t OperandOrderHistogramBytes = 2048;
-inline constexpr size_t TotalWorkspaceBytes =
-    UzlibDictionaryBytes + SourceBufferBytes + DecoderOutputBytes + PageTextBytes + PageRunBytes +
-    OperandOrderHistogramBytes;
+inline constexpr size_t TotalWorkspaceBytes = UzlibDictionaryBytes + SourceBufferBytes + DecoderOutputBytes +
+                                              PageTextBytes + PageRunBytes + OperandOrderHistogramBytes;
 inline constexpr size_t MaxIndividualWorkspaceBytes = UzlibDictionaryBytes;
 
 static_assert(PageRunBytes <= 12288);

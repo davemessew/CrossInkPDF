@@ -13,6 +13,15 @@ struct PdfReadExactState {
   size_t completed = 0;
 };
 
+struct PdfByteRange {
+  PdfByteSource parent{};
+  uint64_t offset = 0;
+  uint64_t length = 0;
+};
+
+PdfStatus pdfInitializeByteRange(const PdfByteSource& parent, uint64_t offset, uint64_t length, PdfByteRange* range);
+PdfByteSource pdfByteRangeSource(PdfByteRange& range);
+
 PdfStepResult pdfStepReadExact(const PdfByteSource& source, PdfReadExactState& state, PdfWorkBudget& budget);
 PdfStatus pdfReadExact(const PdfByteSource& source, uint64_t offset, uint8_t* destination, size_t length);
 

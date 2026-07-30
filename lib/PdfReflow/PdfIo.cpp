@@ -5,6 +5,40 @@
 
 #include "PdfCheckedMath.h"
 
+namespace {
+
+PdfStatus readByteRange(void* context, const uint64_t offset, uint8_t* destination, const size_t requested,
+                        size_t* bytesRead) {
+  if (context == nullptr) {
+    return PdfStatus::failure(PdfError::InvalidArgument, offset);
+  }
+  auto& range = *static_cast<PdfByteRange*>(context);
+  if (!pdfCheckedRange(offset, requested, range.length)) {
+    return PdfStatus::failure(PdfError::InvalidOffset, offset);
+  }
+  uint64_t parentOffset = 0;
+  if (!pdfCheckedAdd(range.offset, offset, &parentOffset)) {
+    return PdfStatus::failure(PdfError::InvalidOffset, offset);
+  }
+  return range.parent.readAt(range.parent.context, parentOffset, destination, requested, bytesRead);
+}
+
+}  // namespace
+
+PdfStatus pdfInitializeByteRange(const PdfByteSource& parent, const uint64_t offset, const uint64_t length,
+                                 PdfByteRange* range) {
+  if (range == nullptr || !parent.valid()) {
+    return PdfStatus::failure(PdfError::InvalidArgument, offset);
+  }
+  if (!pdfCheckedRange(offset, length, parent.size)) {
+    return PdfStatus::failure(PdfError::InvalidOffset, offset);
+  }
+  *range = {parent, offset, length};
+  return PdfStatus::success();
+}
+
+PdfByteSource pdfByteRangeSource(PdfByteRange& range) { return {&range, range.length, readByteRange}; }
+
 PdfStepResult pdfStepReadExact(const PdfByteSource& source, PdfReadExactState& state, PdfWorkBudget& budget) {
   if (!source.valid() || (state.destination == nullptr && state.length != 0) || state.completed > state.length) {
     return PdfStepResult::failure(PdfStatus::failure(PdfError::InvalidArgument, state.sourceOffset));
@@ -18,8 +52,7 @@ PdfStepResult pdfStepReadExact(const PdfByteSource& source, PdfReadExactState& s
 
   while (state.completed < state.length) {
     if (budget.stopRequested()) {
-      return PdfStepResult::failure(
-          PdfStatus::failure(PdfError::Cancelled, state.sourceOffset + state.completed));
+      return PdfStepResult::failure(PdfStatus::failure(PdfError::Cancelled, state.sourceOffset + state.completed));
     }
     if (!budget.consumeOperation()) {
       return PdfStepResult::paused();
@@ -54,8 +87,7 @@ PdfStepResult pdfStepReadExact(const PdfByteSource& source, PdfReadExactState& s
   return PdfStepResult::completed();
 }
 
-PdfStatus pdfReadExact(const PdfByteSource& source, const uint64_t offset, uint8_t* destination,
-                       const size_t length) {
+PdfStatus pdfReadExact(const PdfByteSource& source, const uint64_t offset, uint8_t* destination, const size_t length) {
   PdfReadExactState state{offset, destination, length, 0};
   while (true) {
     PdfWorkBudget budget{std::numeric_limits<uint32_t>::max(), std::numeric_limits<size_t>::max()};
