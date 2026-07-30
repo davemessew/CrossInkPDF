@@ -133,7 +133,10 @@ struct PdfTextRun {
   int32_t yMin = 0;
   int32_t xMax = 0;
   int32_t yMax = 0;
+  int32_t baselineX = 0;
   int32_t baseline = 0;
+  int32_t baselineDx = 0;
+  int32_t baselineDy = 0;
   uint16_t fontId = 0;
   uint16_t flags = 0;
 };

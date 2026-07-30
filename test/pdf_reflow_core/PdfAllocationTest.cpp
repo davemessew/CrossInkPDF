@@ -8,6 +8,8 @@
 #include <string>
 #include <vector>
 
+#include "PdfCMap.h"
+#include "PdfContentInterpreter.h"
 #include "PdfIo.h"
 #include "PdfLexer.h"
 #include "PdfObjectParser.h"
@@ -50,6 +52,18 @@ struct FixedSink {
   }
 
   PdfByteSink sink() { return {this, write}; }
+};
+
+struct AllocationResources {
+  PdfFontMap* font = nullptr;
+
+  static PdfStatus resolveFont(void* context, const uint8_t* name, const size_t length, PdfFontMap** font) {
+    if (context == nullptr || name == nullptr || font == nullptr || length != 2 || name[0] != 'F' || name[1] != '1') {
+      return PdfStatus::failure(PdfError::UnsupportedEncoding);
+    }
+    *font = static_cast<AllocationResources*>(context)->font;
+    return *font == nullptr ? PdfStatus::failure(PdfError::UnsupportedEncoding) : PdfStatus::success();
+  }
 };
 
 }  // namespace
@@ -208,5 +222,86 @@ TEST(PdfAllocationTest, XrefExternalMergeAllocatesNothingWhenFailureInterceptorI
   EXPECT_FALSE(allocationFailed);
   EXPECT_TRUE(status.ok());
   EXPECT_TRUE(table.finalized());
+  EXPECT_EQ(allocationCount, 0u);
+}
+
+TEST(PdfAllocationTest, CMapAndContentInterpreterAllocateNothingWhenInterceptorIsArmed) {
+  const std::vector<uint8_t> cmapBytes{
+      '1', ' ', 'b', 'e', 'g', 'i', 'n', 'c', 'o', 'd', 'e', 's', 'p', 'a', 'c', 'e', 'r', 'a', 'n', 'g', 'e', ' ',
+      '<', '0', '0', '>', ' ', '<', 'F', 'F', '>', ' ', 'e', 'n', 'd', 'c', 'o', 'd', 'e', 's', 'p', 'a', 'c', 'e',
+      'r', 'a', 'n', 'g', 'e', ' ', '1', ' ', 'b', 'e', 'g', 'i', 'n', 'b', 'f', 'c', 'h', 'a', 'r', ' ', '<', '4',
+      '1', '>', ' ', '<', '0', '0', '4', '1', '>', ' ', 'e', 'n', 'd', 'b', 'f', 'c', 'h', 'a', 'r'};
+  const std::vector<uint8_t> contentBytes{'B', 'T', ' ', '/', 'F', '1', ' ', '1', '2', ' ', 'T',
+                                          'f', ' ', '(', 'A', ')', ' ', 'T', 'j', ' ', 'E', 'T'};
+  PdfTestByteSource cmapInput(cmapBytes);
+  PdfTestByteSource contentInput(contentBytes);
+  std::array<uint8_t, 128> cmapSourceBuffer{};
+  std::array<PdfCMapRecord, 2> cmapRecords{};
+  PdfCMap cmap(cmapSourceBuffer.data(), cmapSourceBuffer.size(),
+               {cmapRecords.data(), static_cast<uint16_t>(cmapRecords.size())});
+  std::array<PdfEncodingDifference, 1> differences{};
+  PdfSimpleEncoding encoding({differences.data(), static_cast<uint16_t>(differences.size())});
+  std::array<PdfFontWidthRecord, 1> widths{};
+  PdfFontMap font({widths.data(), static_cast<uint16_t>(widths.size())});
+  ASSERT_TRUE(encoding.begin(PdfBaseEncoding::Standard).ok());
+  ASSERT_TRUE(font.begin(1, false, &cmap, &encoding).ok());
+  ASSERT_TRUE(font.addWidth(0, 255, 500).ok());
+  AllocationResources resourceContext{&font};
+  PdfContentResources resources{&resourceContext, AllocationResources::resolveFont, nullptr};
+  std::array<uint8_t, 128> contentSourceBuffer{};
+  std::array<PdfContentOperand, 8> operands{};
+  std::array<PdfContentArrayItem, 8> arrayItems{};
+  std::array<uint8_t, 128> scratchText{};
+  std::array<uint8_t, 64> markedText{};
+  std::array<uint8_t, 64> pageText{};
+  std::array<PdfTextRun, 4> runs{};
+  std::array<PdfImagePlacement, 1> images{};
+  PdfPageModel model({pageText.data(), pageText.size(), runs.data(), runs.size(), images.data(), images.size()});
+  PdfContentInterpreter interpreter({contentSourceBuffer.data(), contentSourceBuffer.size(), operands.data(),
+                                     operands.size(), arrayItems.data(), arrayItems.size(), scratchText.data(),
+                                     scratchText.size(), markedText.data(), markedText.size(), nullptr});
+  const PdfByteSource contentSource = contentInput.source();
+  PdfStepResult cmapResult;
+  PdfStepResult contentResult;
+  PdfStatus cmapBegin;
+  PdfStatus contentBegin;
+  PdfStatus lookupStatus;
+  bool allocationFailed = false;
+  size_t allocationCount = 0;
+
+  {
+    AllocationWatch watch;
+    try {
+      cmapBegin = cmap.begin(cmapInput.source());
+      if (cmapBegin.ok()) {
+        do {
+          PdfWorkBudget budget{4, 32};
+          cmapResult = cmap.step(budget);
+        } while (cmapResult.yielded());
+      }
+      const uint8_t encoded = 0x41;
+      PdfCMapLookup lookup;
+      if (cmapResult.complete()) {
+        lookupStatus = cmap.lookup(&encoded, 1, &lookup);
+      }
+      contentBegin = interpreter.begin(&contentSource, 1, resources, model);
+      if (contentBegin.ok()) {
+        do {
+          PdfWorkBudget budget{4, 32};
+          contentResult = interpreter.step(budget);
+        } while (contentResult.yielded());
+      }
+    } catch (const std::bad_alloc&) {
+      allocationFailed = true;
+    }
+    allocationCount = watch.count();
+  }
+
+  EXPECT_FALSE(allocationFailed);
+  EXPECT_TRUE(cmapBegin.ok());
+  EXPECT_TRUE(cmapResult.complete());
+  EXPECT_TRUE(lookupStatus.ok());
+  EXPECT_TRUE(contentBegin.ok());
+  EXPECT_TRUE(contentResult.complete());
   EXPECT_EQ(allocationCount, 0u);
 }

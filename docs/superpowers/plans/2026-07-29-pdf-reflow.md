@@ -959,32 +959,32 @@ smallest failing hypothesis; do not layer speculative production changes.
 - Test: `test/pdf_reflow_core/PdfCMapFontMapTest.cpp`
 - Test: `test/pdf_reflow_core/PdfContentInterpreterTest.cpp`
 
-- [ ] Add red CMap tests for 1–4 byte codespaces, `bfchar`, scalar/array
+- [x] Add red CMap tests for 1–4 byte codespaces, `bfchar`, scalar/array
   `bfrange`, UTF-16BE, surrogate pairs, `/Differences`, and mapping priority:
   `/ActualText` → `/ToUnicode` → simple encoding → conservative common Latin.
-- [ ] Keep Standard, WinAnsi, MacRoman, PDFDoc, and Unicode classification
+- [x] Keep Standard, WinAnsi, MacRoman, PDFDoc, and Unicode classification
   tables in flash. Spill over-cap mappings to fixed records. Close the source
   before reading CMap/font-map spills, close them before reopening the source,
   and exercise both spill types with the single-reader fake.
-- [ ] Return `UnsupportedEncoding` when an unmapped CID font supplies the
+- [x] Return `UnsupportedEncoding` when an unmapped CID font supplies the
   document's meaningful text; do not guess broadly.
-- [ ] Add red operator tests for:
+- [x] Add red operator tests for:
   `BT ET Tf Tm Td TD T* Tc Tw Tz TL Ts Tr Tj TJ ' " cm q Q`,
   marked content/`ActualText`, single/array page content, `Do` image/form
   XObjects, resource lookup, `BI/ID/EI` inline-image token boundaries, simple
   `/Widths`/`FirstChar`, CID `/W`/`DW`, and bounded graphics/form stacks.
-- [ ] Add a vector/path-painting fixture. Consume and bounded-skip ordinary
+- [x] Add a vector/path-painting fixture. Consume and bounded-skip ordinary
   path/paint/clipping/color operands (`m l c v y h re S s f F f* B B* b b*
   n W W*` and related color operators) without rasterizing vector art, leaking
   operand state, or losing captions/text before or after it.
-- [ ] Implement 16.16 text/graphics matrices and extraction-only glyph geometry.
+- [x] Implement 16.16 text/graphics matrices and extraction-only glyph geometry.
   Never carry PDF font family or point size into semantic XHTML styles.
-- [ ] Record bounded image placements and references in `PdfPageModel`; defer
+- [x] Record bounded image placements and references in `PdfPageModel`; defer
   decoding/caching to Task 22. Form recursion and inline image data must share
   the same work/decompression limits and never obscure following text tokens.
-- [ ] Prove `font_size_6.pdf` and `font_size_72.pdf` produce byte-identical
+- [x] Prove `font_size_6.pdf` and `font_size_72.pdf` produce byte-identical
   semantic text and word inputs.
-- [ ] Run `ctest -R "^Pdf(CMap|Content)"`. Expected: PASS.
+- [x] Run `ctest -R "^Pdf(CMap|Content)"`. Expected: PASS.
 
 ### Task 16: Add hidden OCR qualification and reading-order reduction
 

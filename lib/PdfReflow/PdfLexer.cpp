@@ -93,6 +93,9 @@ void PdfLexer::reset(const uint64_t offset) {
   hasHexNibble_ = false;
   operationCharged_ = false;
   hasUnreadToken_ = false;
+  inlineSkipActive_ = false;
+  inlineSkipState_ = InlineSkipState::NeedSeparator;
+  inlineBytesScanned_ = 0;
 }
 
 PdfStepResult PdfLexer::next(PdfToken& token, PdfWorkBudget& budget) {
@@ -426,6 +429,84 @@ PdfStepResult PdfLexer::next(PdfToken& token, PdfWorkBudget& budget) {
       continue;
     }
   }
+}
+
+PdfStepResult PdfLexer::skipInlineImageData(PdfWorkBudget& budget) {
+  if (!source_.valid() || sourceBuffer_ == nullptr || sourceBufferSize_ == 0 ||
+      sourceBufferSize_ > PdfLimits::SourceBufferBytes || mode_ != Mode::Idle || hasUnreadToken_) {
+    return PdfStepResult::failure(PdfStatus::failure(PdfError::InvalidArgument, position_));
+  }
+  if (!inlineSkipActive_) {
+    inlineSkipActive_ = true;
+    inlineSkipState_ = InlineSkipState::NeedSeparator;
+    inlineBytesScanned_ = 0;
+  }
+  if (!budget.consumeOperation()) {
+    return PdfStepResult::paused();
+  }
+
+  uint16_t scannedThisStep = 0;
+  while (scannedThisStep < 256) {
+    uint8_t byte = 0;
+    PdfStatus status;
+    const ByteResult result = peek(byte, budget, status);
+    if (result == ByteResult::Yielded) {
+      return PdfStepResult::paused();
+    }
+    if (result == ByteResult::Failed) {
+      inlineSkipActive_ = false;
+      return PdfStepResult::failure(status);
+    }
+    if (result == ByteResult::End) {
+      inlineSkipActive_ = false;
+      return PdfStepResult::failure(PdfStatus::failure(PdfError::Malformed, position_));
+    }
+    consume();
+    ++scannedThisStep;
+    ++inlineBytesScanned_;
+    if (inlineBytesScanned_ > PdfLimits::MaxExpandedRequiredStreamBytes) {
+      inlineSkipActive_ = false;
+      return PdfStepResult::failure(PdfStatus::failure(PdfError::ExpansionLimit, position_));
+    }
+
+    switch (inlineSkipState_) {
+      case InlineSkipState::NeedSeparator:
+        if (!isWhitespace(byte)) {
+          inlineSkipActive_ = false;
+          return PdfStepResult::failure(PdfStatus::failure(PdfError::Malformed, position_ - 1));
+        }
+        inlineSkipState_ = InlineSkipState::Data;
+        break;
+      case InlineSkipState::Data:
+        if (isWhitespace(byte)) {
+          inlineSkipState_ = InlineSkipState::Whitespace;
+        }
+        break;
+      case InlineSkipState::Whitespace:
+        if (byte == 'E') {
+          inlineSkipState_ = InlineSkipState::WhitespaceE;
+        } else if (!isWhitespace(byte)) {
+          inlineSkipState_ = InlineSkipState::Data;
+        }
+        break;
+      case InlineSkipState::WhitespaceE:
+        if (byte == 'I') {
+          inlineSkipState_ = InlineSkipState::WhitespaceEI;
+        } else {
+          inlineSkipState_ = isWhitespace(byte) ? InlineSkipState::Whitespace : InlineSkipState::Data;
+        }
+        break;
+      case InlineSkipState::WhitespaceEI:
+        if (isWhitespace(byte)) {
+          inlineSkipActive_ = false;
+          inlineSkipState_ = InlineSkipState::NeedSeparator;
+          return PdfStepResult::completed();
+        }
+        inlineSkipState_ = InlineSkipState::Data;
+        break;
+    }
+  }
+  return PdfStepResult::paused();
 }
 
 bool PdfLexer::unread(const PdfToken& token) {

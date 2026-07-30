@@ -13,6 +13,7 @@ class PdfLexer {
   void setSource(const PdfByteSource& source, uint64_t offset = 0);
   void reset(uint64_t offset = 0);
   PdfStepResult next(PdfToken& token, PdfWorkBudget& budget);
+  PdfStepResult skipInlineImageData(PdfWorkBudget& budget);
   bool unread(const PdfToken& token);
 
   uint64_t position() const { return position_; }
@@ -41,6 +42,14 @@ class PdfLexer {
     Failed,
   };
 
+  enum class InlineSkipState : uint8_t {
+    NeedSeparator,
+    Data,
+    Whitespace,
+    WhitespaceE,
+    WhitespaceEI,
+  };
+
   ByteResult peek(uint8_t& byte, PdfWorkBudget& budget, PdfStatus& status);
   void consume();
   bool append(uint8_t byte, PdfStatus& status);
@@ -66,4 +75,7 @@ class PdfLexer {
   bool hasHexNibble_ = false;
   bool operationCharged_ = false;
   bool hasUnreadToken_ = false;
+  bool inlineSkipActive_ = false;
+  InlineSkipState inlineSkipState_ = InlineSkipState::NeedSeparator;
+  uint64_t inlineBytesScanned_ = 0;
 };

@@ -1,0 +1,81 @@
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+
+#include "PdfCheckedMath.h"
+#include "PdfObjectParser.h"
+#include "PdfTypes.h"
+
+enum class PdfPageWarning : uint16_t {
+  None = 0,
+  VectorArtOmitted = 1U << 0,
+  OptionalImageOmitted = 1U << 1,
+};
+
+constexpr PdfPageWarning operator|(const PdfPageWarning left, const PdfPageWarning right) {
+  return static_cast<PdfPageWarning>(static_cast<uint16_t>(left) | static_cast<uint16_t>(right));
+}
+
+struct PdfImagePlacement {
+  PdfObjectReference reference{};
+  uint32_t sourceOrder = 0;
+  uint32_t pixelWidth = 0;
+  uint32_t pixelHeight = 0;
+  int32_t xMin = 0;
+  int32_t yMin = 0;
+  int32_t xMax = 0;
+  int32_t yMax = 0;
+  uint16_t flags = 0;
+  uint16_t reserved = 0;
+};
+
+enum PdfImagePlacementFlag : uint16_t {
+  PdfImageInline = 1U << 0,
+};
+
+enum PdfTextRunFlag : uint16_t {
+  PdfTextHidden = 1U << 0,
+  PdfTextActualText = 1U << 1,
+};
+
+struct PdfPageModelWorkspace {
+  uint8_t* text = nullptr;
+  size_t textCapacity = 0;
+  PdfTextRun* runs = nullptr;
+  uint16_t runCapacity = 0;
+  PdfImagePlacement* images = nullptr;
+  uint16_t imageCapacity = 0;
+};
+
+class PdfPageModel {
+ public:
+  explicit PdfPageModel(PdfPageModelWorkspace workspace) : workspace_(workspace) {}
+
+  PdfStatus reset();
+  PdfStatus beginTextRun(const PdfTextRun& run);
+  PdfStatus appendText(const uint8_t* text, size_t length);
+  PdfStatus expandTextRunBounds(uint16_t runIndex, int32_t x, int32_t y);
+  PdfStatus setTextRunBaselineEnd(uint16_t runIndex, int32_t x, int32_t y);
+  PdfStatus finishTextRun();
+  void abortTextRun();
+  PdfStatus appendImage(const PdfImagePlacement& image);
+  void addWarning(PdfPageWarning warning) { warnings_ = warnings_ | warning; }
+
+  const uint8_t* text() const { return workspace_.text; }
+  size_t textLength() const { return textLength_; }
+  const PdfTextRun* runs() const { return workspace_.runs; }
+  uint16_t runCount() const { return runCount_; }
+  const PdfImagePlacement* images() const { return workspace_.images; }
+  uint16_t imageCount() const { return imageCount_; }
+  PdfPageWarning warnings() const { return warnings_; }
+
+ private:
+  PdfPageModelWorkspace workspace_{};
+  size_t textLength_ = 0;
+  size_t pendingTextStart_ = 0;
+  uint16_t runCount_ = 0;
+  uint16_t imageCount_ = 0;
+  PdfPageWarning warnings_ = PdfPageWarning::None;
+  bool runPending_ = false;
+};

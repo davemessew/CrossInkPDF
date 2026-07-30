@@ -54,6 +54,7 @@ PdfStatus PdfTestRecordStore::read(void* context, const uint32_t ordinal, void* 
   if (record == nullptr || recordSize != store.recordSize_ || ordinal >= store.capacity_) {
     return PdfStatus::failure(PdfError::InvalidOffset, ordinal);
   }
+  ++store.readCount_;
   std::memcpy(record, store.bytes_.data() + ordinal * recordSize, recordSize);
   return PdfStatus::success();
 }

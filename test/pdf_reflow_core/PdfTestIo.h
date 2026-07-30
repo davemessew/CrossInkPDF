@@ -41,6 +41,7 @@ class PdfTestRecordStore {
 
   PdfFixedRecordStore store();
   void forbidReadsWhile(const bool* flag) { readForbiddenFlag_ = flag; }
+  uint32_t readCount() const { return readCount_; }
 
  private:
   static PdfStatus read(void* context, uint32_t ordinal, void* record, size_t recordSize);
@@ -50,6 +51,7 @@ class PdfTestRecordStore {
   size_t recordSize_ = 0;
   uint32_t capacity_ = 0;
   const bool* readForbiddenFlag_ = nullptr;
+  uint32_t readCount_ = 0;
 };
 
 class PdfTestByteStore {
