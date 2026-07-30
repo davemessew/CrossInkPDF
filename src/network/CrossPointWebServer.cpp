@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cctype>
 #include <iterator>
+#include <limits>
 
 #include "AppVersion.h"
 #include "CrossPointSettings.h"
@@ -33,10 +34,14 @@
 #include "html/SettingsPageHtml.generated.h"
 #include "html/StyleCss.generated.h"
 #include "html/js/jszip_minJs.generated.h"
+#include "mbedtls/sha256.h"
 #include "util/BookCacheUtils.h"
 #include "util/StringUtils.h"
 
 namespace {
+static_assert(sizeof(mbedtls_sha256_context) <= BookUpload::kAtomicUploadSha256ContextCapacity,
+              "mbedTLS SHA-256 context exceeded the fixed upload workspace");
+
 // Folders/files to hide from the web interface file browser.
 // Dot-prefixed items are hidden unless showHiddenFiles is enabled.
 constexpr const char* HIDDEN_ITEMS[] = {"System Volume Information", "XTCache"};
@@ -68,8 +73,8 @@ uint8_t enumRawValueForDisplayIndex(const SettingInfo& setting, uint8_t displayI
   return setting.enumRawValues[displayIndex];
 }
 
-// WebSocket upload state
-HalFile wsUploadFile;
+// WebSocket upload metadata. The file handle and atomic transaction live in
+// CrossPointWebServer::upload so HTTP and WS cannot write concurrently.
 String wsUploadFileName;
 String wsUploadPath;
 size_t wsUploadSize = 0;
@@ -81,6 +86,157 @@ size_t wsLastProgressSent = 0;
 String wsLastCompleteName;
 size_t wsLastCompleteSize = 0;
 unsigned long wsLastCompleteAt = 0;
+
+bool atomicUploadExists(void*, const char* const path) { return Storage.exists(path); }
+
+bool atomicUploadOpenWrite(void* const context, const char* const path) {
+  return context != nullptr && Storage.openFileForWrite("WEB", path, *static_cast<HalFile*>(context));
+}
+
+size_t atomicUploadWrite(void* const context, const uint8_t* const data, const size_t length) {
+  if (context == nullptr) return 0;
+  esp_task_wdt_reset();
+  const size_t written = static_cast<HalFile*>(context)->write(data, length);
+  esp_task_wdt_reset();
+  return written;
+}
+
+bool atomicUploadFlush(void* const context) {
+  if (context == nullptr) return false;
+  // HalFile::flush() has no status result. The following sync() and close()
+  // remain the production durability/error gates; the pure fake can still
+  // witness a reported flush failure.
+  static_cast<HalFile*>(context)->flush();
+  return true;
+}
+
+bool atomicUploadSync(void* const context) {
+  if (context == nullptr) return false;
+  esp_task_wdt_reset();
+  const bool synced = static_cast<HalFile*>(context)->sync();
+  esp_task_wdt_reset();
+  return synced;
+}
+
+bool atomicUploadClose(void* const context) { return context != nullptr && static_cast<HalFile*>(context)->close(); }
+
+bool atomicUploadOpenRead(void* const context, const char* const path) {
+  return context != nullptr && Storage.openFileForRead("WEB", path, *static_cast<HalFile*>(context));
+}
+
+int atomicUploadRead(void* const context, uint8_t* const destination, const size_t capacity) {
+  if (context == nullptr) return -1;
+  esp_task_wdt_reset();
+  const int read = static_cast<HalFile*>(context)->read(destination, capacity);
+  esp_task_wdt_reset();
+  return read;
+}
+
+bool atomicUploadRemove(void*, const char* const path) { return Storage.remove(path); }
+
+bool atomicUploadRename(void*, const char* const source, const char* const destination) {
+  return Storage.rename(source, destination);
+}
+
+bool atomicUploadSha256Start(void* const context) {
+  if (context == nullptr) return false;
+  auto* const sha256 = static_cast<mbedtls_sha256_context*>(context);
+  mbedtls_sha256_init(sha256);
+  if (mbedtls_sha256_starts(sha256, 0) == 0) return true;
+  mbedtls_sha256_free(sha256);
+  return false;
+}
+
+bool atomicUploadSha256Update(void* const context, const uint8_t* const data, const size_t length) {
+  return context != nullptr && mbedtls_sha256_update(static_cast<mbedtls_sha256_context*>(context), data, length) == 0;
+}
+
+bool atomicUploadSha256Finish(void* const context, uint8_t digest[BookUpload::kAtomicUploadSha256Size]) {
+  if (context == nullptr || digest == nullptr) return false;
+  auto* const sha256 = static_cast<mbedtls_sha256_context*>(context);
+  const bool finished = mbedtls_sha256_finish(sha256, digest) == 0;
+  mbedtls_sha256_free(sha256);
+  return finished;
+}
+
+void atomicUploadSha256Abort(void* const context) {
+  if (context != nullptr) mbedtls_sha256_free(static_cast<mbedtls_sha256_context*>(context));
+}
+
+BookUpload::AtomicUploadIo atomicUploadIo(HalFile& file) {
+  BookUpload::AtomicUploadIo io{};
+  io.context = &file;
+  io.exists = &atomicUploadExists;
+  io.openWrite = &atomicUploadOpenWrite;
+  io.write = &atomicUploadWrite;
+  io.flush = &atomicUploadFlush;
+  io.sync = &atomicUploadSync;
+  io.close = &atomicUploadClose;
+  io.openRead = &atomicUploadOpenRead;
+  io.read = &atomicUploadRead;
+  io.remove = &atomicUploadRemove;
+  io.rename = &atomicUploadRename;
+  io.sha256.contextSize = sizeof(mbedtls_sha256_context);
+  io.sha256.start = &atomicUploadSha256Start;
+  io.sha256.update = &atomicUploadSha256Update;
+  io.sha256.finish = &atomicUploadSha256Finish;
+  io.sha256.abort = &atomicUploadSha256Abort;
+  return io;
+}
+
+bool invalidateUploadedBookCache(void*, const char* const targetPath) {
+  return clearBookCachePreservingUserState(targetPath);
+}
+
+BookUpload::AtomicUploadCommitHook uploadCommitHook() { return {nullptr, &invalidateUploadedBookCache}; }
+
+const char* atomicUploadStatusMessage(const BookUpload::AtomicUploadStatus status) {
+  switch (status) {
+    case BookUpload::AtomicUploadStatus::Ok:
+      return "";
+    case BookUpload::AtomicUploadStatus::Busy:
+      return "Upload already in progress";
+    case BookUpload::AtomicUploadStatus::PathTooLong:
+      return "Upload path is too long";
+    case BookUpload::AtomicUploadStatus::RecoveryFailed:
+      return "Failed to recover an interrupted upload";
+    case BookUpload::AtomicUploadStatus::OpenWriteFailed:
+      return "Failed to create temporary file on SD card";
+    case BookUpload::AtomicUploadStatus::SizeMismatch:
+      return "Upload size mismatch";
+    case BookUpload::AtomicUploadStatus::WriteFailed:
+      return "Failed to write to SD card - disk may be full";
+    case BookUpload::AtomicUploadStatus::FlushFailed:
+      return "Failed to flush uploaded data";
+    case BookUpload::AtomicUploadStatus::SyncFailed:
+      return "Failed to sync uploaded data";
+    case BookUpload::AtomicUploadStatus::CloseFailed:
+      return "Failed to close uploaded file";
+    case BookUpload::AtomicUploadStatus::OpenReadFailed:
+      return "Failed to verify uploaded file";
+    case BookUpload::AtomicUploadStatus::ReadFailed:
+      return "Failed while verifying uploaded file";
+    case BookUpload::AtomicUploadStatus::DigestFailed:
+      return "Failed to calculate uploaded file checksum";
+    case BookUpload::AtomicUploadStatus::VerificationFailed:
+      return "Uploaded file verification failed";
+    case BookUpload::AtomicUploadStatus::BackupFailed:
+      return "Failed to preserve existing file";
+    case BookUpload::AtomicUploadStatus::MarkerFailed:
+      return "Failed to persist upload commit marker";
+    case BookUpload::AtomicUploadStatus::PromotionFailed:
+      return "Failed to activate uploaded file";
+    case BookUpload::AtomicUploadStatus::CommitHookFailed:
+      return "Failed to invalidate derived book cache";
+    case BookUpload::AtomicUploadStatus::CleanupFailed:
+      return "Upload cleanup failed; retry is safe";
+    case BookUpload::AtomicUploadStatus::NotActive:
+      return "No upload in progress";
+    case BookUpload::AtomicUploadStatus::InvalidArgument:
+    default:
+      return "Invalid upload state";
+  }
+}
 
 String normalizeWebPath(const String& inputPath) {
   if (inputPath.isEmpty() || inputPath == "/") {
@@ -98,6 +254,25 @@ String normalizeWebPath(const String& inputPath) {
     result = result.substring(0, result.length() - 1);
   }
   return result;
+}
+
+bool parseUploadSizeToken(const String& token, size_t& size) {
+  if (token.isEmpty()) return false;
+  size_t index = 0;
+  if (token[0] == '+') {
+    if (token.length() == 1) return false;
+    index = 1;
+  }
+  size_t value = 0;
+  for (; index < token.length(); ++index) {
+    const char ch = token[index];
+    if (ch < '0' || ch > '9') return false;
+    const size_t digit = static_cast<size_t>(ch - '0');
+    if (value > (std::numeric_limits<size_t>::max() - digit) / 10) return false;
+    value = value * 10 + digit;
+  }
+  size = value;
+  return true;
 }
 
 bool isProtectedPath(const String& path) {
@@ -258,16 +433,12 @@ void CrossPointWebServer::begin() {
 }
 
 void CrossPointWebServer::abortWsUpload(const char* tag) {
-  // Explicit close() required: file-scope global persists beyond function scope
-  wsUploadFile.close();
-  String filePath = wsUploadPath;
-  if (!filePath.endsWith("/")) filePath += "/";
-  filePath += wsUploadFileName;
-  if (Storage.remove(filePath.c_str())) {
-    LOG_DBG(tag, "Deleted incomplete upload: %s", filePath.c_str());
-  } else {
-    LOG_DBG(tag, "Failed to delete incomplete upload: %s", filePath.c_str());
+  const BookUpload::AtomicUploadIo io = atomicUploadIo(upload.file);
+  const BookUpload::AtomicUploadStatus status = BookUpload::abort(upload.transaction, io);
+  if (status != BookUpload::AtomicUploadStatus::Ok) {
+    LOG_ERR(tag, "Failed to clean interrupted WS upload: %s", atomicUploadStatusMessage(status));
   }
+  upload.owner = UploadState::Owner::None;
   wsUploadInProgress = false;
   wsUploadClientNum = 255;
   wsLastProgressSent = 0;
@@ -284,9 +455,17 @@ void CrossPointWebServer::stop() {
 
   LOG_DBG("WEB", "[MEM] Free heap before stop: %d bytes", ESP.getFreeHeap());
 
-  // Close any in-progress WebSocket upload and remove partial file
-  if (wsUploadInProgress && wsUploadFile) {
-    abortWsUpload("WEB");
+  // Close any in-progress upload. The atomic helper removes only its hidden
+  // sibling temp and leaves the canonical book untouched.
+  if (BookUpload::isActive(upload.transaction)) {
+    const BookUpload::AtomicUploadIo io = atomicUploadIo(upload.file);
+    const BookUpload::AtomicUploadStatus status = BookUpload::abort(upload.transaction, io);
+    if (status != BookUpload::AtomicUploadStatus::Ok) {
+      LOG_ERR("WEB", "Failed to clean interrupted upload during stop: %s", atomicUploadStatusMessage(status));
+    }
+    upload.owner = UploadState::Owner::None;
+    wsUploadInProgress = false;
+    wsUploadClientNum = 255;
   }
 
   // Stop WebSocket server
@@ -647,23 +826,16 @@ static unsigned long uploadStartTime = 0;
 static unsigned long totalWriteTime = 0;
 static size_t writeCount = 0;
 
-static bool flushUploadBuffer(CrossPointWebServer::UploadState& state) {
-  if (state.bufferPos > 0 && state.file) {
-    esp_task_wdt_reset();  // Reset watchdog before potentially slow SD write
-    const unsigned long writeStart = millis();
-    const size_t written = state.file.write(state.buffer.data(), state.bufferPos);
-    totalWriteTime += millis() - writeStart;
-    writeCount++;
-    esp_task_wdt_reset();  // Reset watchdog after SD write
-
-    if (written != state.bufferPos) {
-      LOG_DBG("WEB", "[UPLOAD] Buffer flush failed: expected %d, wrote %d", state.bufferPos, written);
-      state.bufferPos = 0;
-      return false;
-    }
-    state.bufferPos = 0;
-  }
-  return true;
+static BookUpload::AtomicUploadStatus flushUploadBuffer(CrossPointWebServer::UploadState& state) {
+  if (state.bufferPos == 0) return BookUpload::AtomicUploadStatus::Ok;
+  const unsigned long writeStart = millis();
+  const BookUpload::AtomicUploadIo io = atomicUploadIo(state.file);
+  const BookUpload::AtomicUploadStatus status =
+      BookUpload::write(state.transaction, io, state.buffer.data(), state.bufferPos);
+  totalWriteTime += millis() - writeStart;
+  writeCount++;
+  state.bufferPos = 0;
+  return status;
 }
 
 void CrossPointWebServer::handleUpload(UploadState& state) const {
@@ -681,13 +853,23 @@ void CrossPointWebServer::handleUpload(UploadState& state) const {
   const HTTPUpload& upload = server->upload();
 
   if (upload.status == UPLOAD_FILE_START) {
+    BookUpload::UploadTransportResponse response{state.success, !state.error.isEmpty()};
+    const BookUpload::AtomicUploadStatus admission =
+        BookUpload::admitTransportStart(BookUpload::isActive(state.transaction), response);
+    state.success = response.success;
+    state.fileName = "";
+    state.error = "";
+    if (admission != BookUpload::AtomicUploadStatus::Ok) {
+      state.error = atomicUploadStatusMessage(admission);
+      LOG_DBG("WEB", "[UPLOAD] START rejected: transaction already active");
+      return;
+    }
+
     // Reset watchdog - this is the critical 1% crash point
     esp_task_wdt_reset();
 
     state.fileName = StringUtils::sanitizeFilename(upload.filename.c_str()).c_str();
     state.size = 0;
-    state.success = false;
-    state.error = "";
     uploadStartTime = millis();
     lastLoggedSize = 0;
     state.bufferPos = 0;
@@ -717,26 +899,19 @@ void CrossPointWebServer::handleUpload(UploadState& state) const {
       return;
     }
 
-    // Check if file already exists - SD operations can be slow
-    esp_task_wdt_reset();
-    if (Storage.exists(filePath.c_str())) {
-      LOG_DBG("WEB", "[UPLOAD] Overwriting existing file: %s", filePath.c_str());
-      esp_task_wdt_reset();
-      Storage.remove(filePath.c_str());
-    }
-
-    // Open file for writing - this can be slow due to FAT cluster allocation
-    esp_task_wdt_reset();
-    if (!Storage.openFileForWrite("WEB", filePath, state.file)) {
-      state.error = "Failed to create file on SD card";
-      LOG_DBG("WEB", "[UPLOAD] FAILED to create file: %s", filePath.c_str());
+    const BookUpload::AtomicUploadIo io = atomicUploadIo(state.file);
+    const BookUpload::AtomicUploadStatus status =
+        BookUpload::begin(state.transaction, io, filePath.c_str(), BookUpload::kUnknownUploadSize);
+    if (status != BookUpload::AtomicUploadStatus::Ok) {
+      state.error = atomicUploadStatusMessage(status);
+      LOG_ERR("WEB", "[UPLOAD] START failed for %s: %s", filePath.c_str(), state.error.c_str());
       return;
     }
-    esp_task_wdt_reset();
 
-    LOG_DBG("WEB", "[UPLOAD] File created successfully: %s", filePath.c_str());
+    state.owner = UploadState::Owner::Http;
+    LOG_DBG("WEB", "[UPLOAD] Hidden sibling temp opened for: %s", filePath.c_str());
   } else if (upload.status == UPLOAD_FILE_WRITE) {
-    if (state.file && state.error.isEmpty()) {
+    if (state.owner == UploadState::Owner::Http && BookUpload::isActive(state.transaction) && state.error.isEmpty()) {
       // Buffer incoming data and flush when buffer is full
       // This reduces SD card write operations and improves throughput
       const uint8_t* data = upload.buf;
@@ -753,14 +928,22 @@ void CrossPointWebServer::handleUpload(UploadState& state) const {
 
         // Flush buffer when full
         if (state.bufferPos >= UploadState::UPLOAD_BUFFER_SIZE) {
-          if (!flushUploadBuffer(state)) {
-            state.error = "Failed to write to SD card - disk may be full";
-            state.file.close();
+          const BookUpload::AtomicUploadStatus status = flushUploadBuffer(state);
+          if (status != BookUpload::AtomicUploadStatus::Ok) {
+            state.error = atomicUploadStatusMessage(status);
             return;
           }
         }
       }
 
+      if (upload.currentSize > std::numeric_limits<size_t>::max() - state.size) {
+        const BookUpload::AtomicUploadIo io = atomicUploadIo(state.file);
+        BookUpload::abort(state.transaction, io);
+        state.owner = UploadState::Owner::None;
+        state.error = "Upload size overflow";
+        state.bufferPos = 0;
+        return;
+      }
       state.size += upload.currentSize;
 
       // Log progress every 100KB
@@ -773,15 +956,31 @@ void CrossPointWebServer::handleUpload(UploadState& state) const {
       }
     }
   } else if (upload.status == UPLOAD_FILE_END) {
-    if (state.file) {
+    if (state.owner == UploadState::Owner::Http) {
       // Flush any remaining buffered data
-      if (!flushUploadBuffer(state)) {
-        state.error = "Failed to write final data to SD card";
+      if (state.error.isEmpty()) {
+        const BookUpload::AtomicUploadStatus writeStatus = flushUploadBuffer(state);
+        if (writeStatus != BookUpload::AtomicUploadStatus::Ok) {
+          state.error = atomicUploadStatusMessage(writeStatus);
+        }
       }
-      state.file.close();
 
       if (state.error.isEmpty()) {
-        state.success = true;
+        const BookUpload::AtomicUploadIo io = atomicUploadIo(state.file);
+        const BookUpload::AtomicUploadStatus finishStatus = BookUpload::finish(
+            state.transaction, io, state.size, state.buffer.data(), state.buffer.size(), uploadCommitHook());
+        if (finishStatus == BookUpload::AtomicUploadStatus::Ok) {
+          state.success = true;
+        } else {
+          state.error = atomicUploadStatusMessage(finishStatus);
+        }
+      } else {
+        const BookUpload::AtomicUploadIo io = atomicUploadIo(state.file);
+        BookUpload::abort(state.transaction, io);
+      }
+      state.owner = UploadState::Owner::None;
+
+      if (state.success) {
         const unsigned long elapsed = millis() - uploadStartTime;
         const float avgKbps = (elapsed > 0) ? (state.size / 1024.0) / (elapsed / 1000.0) : 0;
         const float writePercent = (elapsed > 0) ? (totalWriteTime * 100.0 / elapsed) : 0;
@@ -789,23 +988,17 @@ void CrossPointWebServer::handleUpload(UploadState& state) const {
                 elapsed, avgKbps);
         LOG_DBG("WEB", "[UPLOAD] Diagnostics: %d writes, total write time: %lu ms (%.1f%%)", writeCount, totalWriteTime,
                 writePercent);
-
-        // Clear epub cache to prevent stale metadata issues when overwriting files
-        String filePath = state.path;
-        if (!filePath.endsWith("/")) filePath += "/";
-        filePath += state.fileName;
-        clearBookCachePreservingUserState(filePath.c_str());
       }
     }
   } else if (upload.status == UPLOAD_FILE_ABORTED) {
     state.bufferPos = 0;  // Discard buffered data
-    if (state.file) {
-      state.file.close();
-      // Try to delete the incomplete file
-      String filePath = state.path;
-      if (!filePath.endsWith("/")) filePath += "/";
-      filePath += state.fileName;
-      Storage.remove(filePath.c_str());
+    if (state.owner == UploadState::Owner::Http) {
+      const BookUpload::AtomicUploadIo io = atomicUploadIo(state.file);
+      const BookUpload::AtomicUploadStatus status = BookUpload::abort(state.transaction, io);
+      if (status != BookUpload::AtomicUploadStatus::Ok) {
+        LOG_ERR("WEB", "[UPLOAD] Abort cleanup failed: %s", atomicUploadStatusMessage(status));
+      }
+      state.owner = UploadState::Owner::None;
     }
     state.error = "Upload aborted";
     LOG_DBG("WEB", "Upload aborted");
@@ -813,7 +1006,8 @@ void CrossPointWebServer::handleUpload(UploadState& state) const {
 }
 
 void CrossPointWebServer::handleUploadPost(UploadState& state) const {
-  if (state.success) {
+  const BookUpload::UploadTransportResponse response{state.success, !state.error.isEmpty()};
+  if (BookUpload::httpResponseStatus(response) == 200) {
     server->send(200, "text/plain", "File uploaded successfully: " + state.fileName);
   } else {
     const String error = state.error.isEmpty() ? "Unknown error during upload" : state.error;
@@ -1600,7 +1794,8 @@ void CrossPointWebServer::onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* 
       // Only clean up if this is the client that owns the active upload.
       // A new client may have already started a fresh upload before this
       // DISCONNECTED event fires (race condition on quick cancel + retry).
-      if (num == wsUploadClientNum && wsUploadInProgress && wsUploadFile) {
+      if (num == wsUploadClientNum && wsUploadInProgress && upload.owner == UploadState::Owner::WebSocket &&
+          BookUpload::isActive(upload.transaction)) {
         abortWsUpload("WS");
       }
       break;
@@ -1616,9 +1811,9 @@ void CrossPointWebServer::onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* 
       LOG_DBG("WS", "Text from client %u: %s", num, msg.c_str());
 
       if (msg.startsWith("START:")) {
-        // Reject any START while an upload is already active to prevent
-        // leaking the open wsUploadFile handle (owning client re-START included)
-        if (wsUploadInProgress) {
+        // Reject any START while an upload is already active so both transports
+        // keep exactly one transaction/file handle (owning re-START included).
+        if (BookUpload::isActive(upload.transaction)) {
           wsServer->sendTXT(num, "ERROR:Upload already in progress");
           break;
         }
@@ -1630,18 +1825,11 @@ void CrossPointWebServer::onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* 
         if (firstColon > 0 && secondColon > 0) {
           wsUploadFileName = StringUtils::sanitizeFilename(msg.substring(6, firstColon).c_str()).c_str();
           String sizeToken = msg.substring(firstColon + 1, secondColon);
-          bool sizeValid = sizeToken.length() > 0;
-          int digitStart = (sizeValid && sizeToken[0] == '+') ? 1 : 0;
-          if (digitStart > 0 && sizeToken.length() < 2) sizeValid = false;
-          for (int i = digitStart; i < (int)sizeToken.length() && sizeValid; i++) {
-            if (!isdigit((unsigned char)sizeToken[i])) sizeValid = false;
-          }
-          if (!sizeValid) {
+          if (!parseUploadSizeToken(sizeToken, wsUploadSize)) {
             LOG_DBG("WS", "START rejected: invalid size token '%s'", sizeToken.c_str());
             wsServer->sendTXT(num, "ERROR:Invalid START format");
             return;
           }
-          wsUploadSize = sizeToken.toInt();
           wsUploadPath = normalizeWebPath(msg.substring(secondColon + 1));
           wsUploadReceived = 0;
           wsLastProgressSent = 0;
@@ -1662,31 +1850,31 @@ void CrossPointWebServer::onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* 
           LOG_DBG("WS", "Starting upload: %s (%d bytes) to %s", wsUploadFileName.c_str(), wsUploadSize,
                   filePath.c_str());
 
-          // Check if file exists and remove it
-          esp_task_wdt_reset();
-          if (Storage.exists(filePath.c_str())) {
-            Storage.remove(filePath.c_str());
-          }
-
-          // Open file for writing
-          esp_task_wdt_reset();
-          if (!Storage.openFileForWrite("WS", filePath, wsUploadFile)) {
-            wsServer->sendTXT(num, "ERROR:Failed to create file");
+          const BookUpload::AtomicUploadIo io = atomicUploadIo(upload.file);
+          const BookUpload::AtomicUploadStatus beginStatus =
+              BookUpload::begin(upload.transaction, io, filePath.c_str(), wsUploadSize);
+          if (beginStatus != BookUpload::AtomicUploadStatus::Ok) {
+            wsServer->sendTXT(num, String("ERROR:") + atomicUploadStatusMessage(beginStatus));
             wsUploadInProgress = false;
             wsUploadClientNum = 255;
             return;
           }
-          esp_task_wdt_reset();
+          upload.owner = UploadState::Owner::WebSocket;
 
           // Zero-byte upload: complete immediately without waiting for BIN frames
           if (wsUploadSize == 0) {
-            // Explicit close() required: file-scope global persists beyond function scope
-            wsUploadFile.close();
+            const BookUpload::AtomicUploadStatus finishStatus = BookUpload::finish(
+                upload.transaction, io, 0, upload.buffer.data(), upload.buffer.size(), uploadCommitHook());
+            upload.owner = UploadState::Owner::None;
+            if (finishStatus != BookUpload::AtomicUploadStatus::Ok) {
+              wsServer->sendTXT(num, String("ERROR:") + atomicUploadStatusMessage(finishStatus));
+              wsLastProgressSent = 0;
+              return;
+            }
             wsLastCompleteName = wsUploadFileName;
             wsLastCompleteSize = 0;
             wsLastCompleteAt = millis();
             LOG_DBG("WS", "Zero-byte upload complete: %s", filePath.c_str());
-            clearBookCachePreservingUserState(filePath.c_str());
             wsServer->sendTXT(num, "DONE");
             wsLastProgressSent = 0;
             break;
@@ -1703,7 +1891,8 @@ void CrossPointWebServer::onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* 
     }
 
     case WStype_BIN: {
-      if (!wsUploadInProgress || !wsUploadFile || num != wsUploadClientNum) {
+      if (!wsUploadInProgress || upload.owner != UploadState::Owner::WebSocket ||
+          !BookUpload::isActive(upload.transaction) || num != wsUploadClientNum) {
         wsServer->sendTXT(num, "ERROR:No upload in progress");
         return;
       }
@@ -1715,17 +1904,15 @@ void CrossPointWebServer::onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* 
         wsServer->sendTXT(num, "ERROR:Upload overflow");
         return;
       }
-      esp_task_wdt_reset();
-      size_t written = wsUploadFile.write(payload, length);
-      esp_task_wdt_reset();
-
-      if (written != length) {
+      const BookUpload::AtomicUploadIo io = atomicUploadIo(upload.file);
+      const BookUpload::AtomicUploadStatus writeStatus = BookUpload::write(upload.transaction, io, payload, length);
+      if (writeStatus != BookUpload::AtomicUploadStatus::Ok) {
         abortWsUpload("WS");
-        wsServer->sendTXT(num, "ERROR:Write failed - disk full?");
+        wsServer->sendTXT(num, String("ERROR:") + atomicUploadStatusMessage(writeStatus));
         return;
       }
 
-      wsUploadReceived += written;
+      wsUploadReceived += length;
 
       // Send progress update (every 64KB or at end)
       if (wsUploadReceived - wsLastProgressSent >= 65536 || wsUploadReceived >= wsUploadSize) {
@@ -1736,10 +1923,16 @@ void CrossPointWebServer::onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* 
 
       // Check if upload complete
       if (wsUploadReceived >= wsUploadSize) {
-        // Explicit close() required: file-scope global persists beyond function scope
-        wsUploadFile.close();
+        const BookUpload::AtomicUploadStatus finishStatus = BookUpload::finish(
+            upload.transaction, io, wsUploadSize, upload.buffer.data(), upload.buffer.size(), uploadCommitHook());
+        upload.owner = UploadState::Owner::None;
         wsUploadInProgress = false;
         wsUploadClientNum = 255;
+        if (finishStatus != BookUpload::AtomicUploadStatus::Ok) {
+          wsServer->sendTXT(num, String("ERROR:") + atomicUploadStatusMessage(finishStatus));
+          wsLastProgressSent = 0;
+          return;
+        }
 
         wsLastCompleteName = wsUploadFileName;
         wsLastCompleteSize = wsUploadSize;
@@ -1750,12 +1943,6 @@ void CrossPointWebServer::onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* 
 
         LOG_DBG("WS", "Upload complete: %s (%d bytes in %lu ms, %.1f KB/s)", wsUploadFileName.c_str(), wsUploadSize,
                 elapsed, kbps);
-
-        // Clear epub cache to prevent stale metadata issues when overwriting files
-        String filePath = wsUploadPath;
-        if (!filePath.endsWith("/")) filePath += "/";
-        filePath += wsUploadFileName;
-        clearBookCachePreservingUserState(filePath.c_str());
 
         wsServer->sendTXT(num, "DONE");
         wsLastProgressSent = 0;

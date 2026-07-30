@@ -5,9 +5,12 @@
 #include <WebServer.h>
 #include <WebSocketsServer.h>
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
+
+#include "../../lib/BookUpload/AtomicBookUpload.h"
 
 // Structure to hold file information
 struct FileInfo {
@@ -31,7 +34,15 @@ class CrossPointWebServer {
 
   // Used by POST upload handler
   struct UploadState {
+    enum class Owner : uint8_t {
+      None,
+      Http,
+      WebSocket,
+    };
+
     HalFile file;
+    BookUpload::AtomicUploadState transaction;
+    Owner owner = Owner::None;
     String fileName;
     String path = "/";
     size_t size = 0;
