@@ -278,6 +278,23 @@ bool HalStorage::openFileForWrite(const char* moduleName, const String& path, Ha
 
 bool HalStorage::removeDir(const char* path) { HAL_STORAGE_WRAPPED_CALL(removeDir, path); }
 
+HalStorageCapacityInfo HalStorage::capacityInfo() {
+  StorageLock lock;
+  HalStorageCapacityInfo result;
+  const uint64_t total = SDCard.sdTotalBytes();
+  if (total == 0) {
+    return result;
+  }
+  result.total = {true, total};
+  const uint64_t used = SDCard.sdUsedBytes();
+  // SDCardManager currently returns zero both for an empty filesystem and for
+  // a failed FAT free-cluster query, so zero cannot safely prove free space.
+  if (used != 0 && used <= total) {
+    result.free = {true, total - used};
+  }
+  return result;
+}
+
 // HalFile implementation
 // Allow doing file operations while ensuring thread safety via HalStorage's mutex.
 // Please keep the list below in sync with the HalFile.h header
@@ -334,4 +351,17 @@ HalFile HalFile::openNextFile() {
   return HalFile(std::move(childImpl));
 }
 bool HalFile::isOpen() const { return impl != nullptr && impl->file.isOpen(); }  // already thread-safe, no need to wrap
+bool HalFile::modificationTime(uint64_t* const packedFatDateTime) {
+  if (impl == nullptr || packedFatDateTime == nullptr) {
+    return false;
+  }
+  uint16_t date = 0;
+  uint16_t time = 0;
+  HalStorage::StorageLock lock;
+  if (!impl->file.getModifyDateTime(&date, &time)) {
+    return false;
+  }
+  *packedFatDateTime = static_cast<uint64_t>(date) << 16U | time;
+  return true;
+}
 HalFile::operator bool() const { return isOpen(); }

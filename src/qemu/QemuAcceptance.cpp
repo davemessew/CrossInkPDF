@@ -6,7 +6,9 @@
 #include <HalDisplay.h>
 #include <HalPowerManager.h>
 #include <HalStorage.h>
+#include <PdfCacheStore.h>
 #include <PdfDocumentTextClassifier.h>
+#include <PdfHalCacheIo.h>
 #include <PdfHalIo.h>
 #include <PdfHiddenText.h>
 #include <PdfPageTree.h>
@@ -28,6 +30,11 @@ constexpr char SENTINEL_PATH[] = "/qemu/sentinel.txt";
 constexpr char SENTINEL_CONTENT[] = "crossink-qemu-sentinel-v1\n";
 constexpr char PDF_FIXTURE_PATH[] = "/qemu/classic_text.pdf";
 constexpr char PDF_SPILL_PATH[] = "/qemu/pdf-run-spill.tmp";
+constexpr char PDF_CACHE_ROOT[] = "/qemu/pdf_cache_accept";
+constexpr char PDF_CACHE_GENERATION_ONE[] = "/qemu/pdf_cache_accept/gen_1";
+constexpr char PDF_CACHE_GENERATION_TWO[] = "/qemu/pdf_cache_accept/gen_2";
+constexpr char PDF_CACHE_METADATA_PATH[] = "/qemu/pdf_cache_accept/gen_1/metadata.bin";
+constexpr char PDF_CACHE_PARTIAL_PATH[] = "/qemu/pdf_cache_accept/gen_2/partial.bin";
 constexpr char PDF_EXPECTED_TEXT[] = "Hello PDF";
 constexpr uint32_t EXPECTED_FRAME_BYTES = 48000;
 constexpr uint32_t EXPECTED_FRAME_CRC32 = 0x0F7C8C45;
@@ -83,6 +90,20 @@ struct SemanticSinkContext {
   PdfCoreAcceptanceWorkspace* workspace = nullptr;
   size_t length = 0;
   uint32_t records = 0;
+};
+
+struct SingleCacheRecordSource {
+  PdfRequiredFileRecord record{};
+
+  static PdfStatus read(void* context, const uint32_t index, PdfRequiredFileRecord* output) {
+    if (context == nullptr || output == nullptr || index != 0) {
+      return PdfStatus::failure(PdfError::InvalidArgument, index);
+    }
+    *output = static_cast<SingleCacheRecordSource*>(context)->record;
+    return PdfStatus::success();
+  }
+
+  PdfRequiredFileTableSource source() { return {this, 1, read}; }
 };
 
 void fail(const char* component, const char* reason) {
@@ -561,6 +582,129 @@ bool checkPdfCore() {
   return checkPdfReduction(*workspace) && checkPdfSemantic(*workspace);
 }
 
+bool checkPdfCache() {
+  if (Storage.exists(PDF_CACHE_ROOT) && !Storage.removeDir(PDF_CACHE_ROOT)) {
+    fail("PDF_CACHE", "preclean");
+    return false;
+  }
+  const uint32_t opensBefore = QemuHalControl::storageOpenCount();
+  const uint32_t closesBefore = QemuHalControl::storageCloseCount();
+  auto fingerprintWorkspace = makeUniqueNoThrow<uint8_t[]>(PDF_SOURCE_FINGERPRINT_BYTES);
+  if (!fingerprintWorkspace) {
+    fail("PDF_CACHE", "workspace_oom");
+    return false;
+  }
+
+  PdfHalCacheIoContext halContext;
+  const PdfCacheIo io = pdfHalCacheIo(halContext);
+  PdfCacheCapacity capacity{};
+  PdfSourceIdentity sourceIdentity{};
+  PdfStatus status = io.capacity(io.context, &capacity);
+  if (status.ok()) {
+    status = pdfComputeSourceIdentity(io, PDF_FIXTURE_PATH, fingerprintWorkspace.get(), PDF_SOURCE_FINGERPRINT_BYTES,
+                                      &sourceIdentity);
+  }
+  PdfCacheStore store;
+  if (status.ok()) {
+    status = store.initialize(io, PDF_CACHE_ROOT);
+  }
+  if (status.ok()) {
+    status = store.ensureGeneration(1);
+  }
+
+  static constexpr uint8_t METADATA[] = {'m', 'e', 't', 'a'};
+  PdfCacheTrackedWriter writer{};
+  if (status.ok()) {
+    status = pdfOpenTrackedCacheWriter(io, PDF_CACHE_METADATA_PATH, "metadata.bin", PdfCacheFileKind::Required,
+                                       sizeof(METADATA), &writer);
+  }
+  if (status.ok()) {
+    status = pdfWriteTrackedCacheFile(&writer, METADATA, sizeof(METADATA));
+  }
+  SingleCacheRecordSource table;
+  if (status.ok()) {
+    status = pdfCloseTrackedCacheFile(&writer, &table.record);
+  } else if (writer.open) {
+    pdfAbortTrackedCacheFile(&writer);
+  }
+
+  PdfCacheManifest committedManifest{};
+  committedManifest.sequence = 1;
+  committedManifest.completed = true;
+  committedManifest.source = sourceIdentity;
+  committedManifest.generation = 1;
+  committedManifest.totalWords = 2;
+  committedManifest.requiredFileCount = 1;
+  committedManifest.requiredFileBytes = table.record.size;
+  committedManifest.requiredFileLedger = pdfUpdateRequiredFileLedger(PDF_CACHE_FNV64_OFFSET, table.record);
+  PdfCacheManifestSelection prior{};
+  PdfCacheManifestSelection committed{};
+  if (status.ok()) {
+    status = store.loadManifestSlots(sourceIdentity, &prior);
+  }
+  if (status.ok()) {
+    status = store.commitManifest(committedManifest, table.source(),
+                                  {true, committedManifest.requiredFileCount, committedManifest.requiredFileBytes,
+                                   committedManifest.requiredFileLedger},
+                                  prior, &committed);
+  }
+
+  PdfBuildCheckpoint checkpoint{};
+  checkpoint.sequence = 1;
+  checkpoint.source = sourceIdentity;
+  checkpoint.generation = 1;
+  checkpoint.phase = PdfBuildPhase::Complete;
+  checkpoint.lastVerifiedPage = 1;
+  checkpoint.emittedSections = 1;
+  checkpoint.cumulativeWords = 2;
+  checkpoint.outputBytes = sizeof(METADATA);
+  if (status.ok()) {
+    status = store.commitCheckpoint(checkpoint);
+  }
+  PdfBuildCheckpointSelection recoveredCheckpoint{};
+  if (status.ok()) {
+    status = store.loadCheckpointSlots(sourceIdentity, &recoveredCheckpoint);
+  }
+
+  if (status.ok()) {
+    status = store.ensureGeneration(2);
+  }
+  PdfCacheTrackedWriter partialWriter{};
+  if (status.ok()) {
+    status = pdfOpenTrackedCacheWriter(io, PDF_CACHE_PARTIAL_PATH, "partial.bin", PdfCacheFileKind::Optional,
+                                       sizeof(METADATA), &partialWriter);
+  }
+  PdfRequiredFileRecord ignoredRecord{};
+  if (status.ok()) {
+    status = pdfWriteTrackedCacheFile(&partialWriter, METADATA, sizeof(METADATA));
+  }
+  if (status.ok()) {
+    status = pdfCloseTrackedCacheFile(&partialWriter, &ignoredRecord);
+  } else if (partialWriter.open) {
+    pdfAbortTrackedCacheFile(&partialWriter);
+  }
+  if (status.ok()) {
+    status = store.cleanupUnreferencedGenerations();
+  }
+
+  fingerprintWorkspace.reset();
+  const bool resultMatches = status.ok() && capacity.total.known && capacity.free.known && committed.selected &&
+                             committed.manifest.sequence == 1 && recoveredCheckpoint.selected &&
+                             recoveredCheckpoint.checkpoint.sequence == 1 && Storage.exists(PDF_CACHE_GENERATION_ONE) &&
+                             !Storage.exists(PDF_CACHE_GENERATION_TWO);
+  const bool cleaned = Storage.exists(PDF_CACHE_ROOT) && Storage.removeDir(PDF_CACHE_ROOT);
+  const bool countersBalanced =
+      QemuHalControl::storageOpenCount() - opensBefore == QemuHalControl::storageCloseCount() - closesBefore;
+  if (!resultMatches || !cleaned || !countersBalanced) {
+    fail("PDF_CACHE", !status.ok() ? "transaction" : (!cleaned ? "cleanup" : "result"));
+    return false;
+  }
+  esp_rom_printf("QEMU_PDF_CACHE_PASS files=1 words=2 capacity=%llu free=%llu\n",
+                 static_cast<unsigned long long>(capacity.total.value),
+                 static_cast<unsigned long long>(capacity.free.value));
+  return true;
+}
+
 bool checkStorage() {
   const uint32_t opensBefore = QemuHalControl::storageOpenCount();
   const uint32_t closesBefore = QemuHalControl::storageCloseCount();
@@ -630,7 +774,7 @@ void qemuAcceptanceBegin(MappedInputManager& input) {
   state = {};
   esp_rom_printf("QEMU_BOOT seq=0\n");
 
-  if (!checkStorage() || !checkPdfCore() || !checkFrame() || !checkInput(input)) {
+  if (!checkStorage() || !checkPdfCore() || !checkPdfCache() || !checkFrame() || !checkInput(input)) {
     return;
   }
 

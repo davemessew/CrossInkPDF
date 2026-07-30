@@ -8,6 +8,18 @@
 #include <string>
 #include <vector>
 
+#define HAL_STORAGE_HAS_CACHE_METADATA 1
+
+struct HalStorageOptionalUInt64 {
+  bool known = false;
+  uint64_t value = 0;
+};
+
+struct HalStorageCapacityInfo {
+  HalStorageOptionalUInt64 total{};
+  HalStorageOptionalUInt64 free{};
+};
+
 class HalFile;
 
 class HalStorage {
@@ -46,6 +58,7 @@ class HalStorage {
   bool openFileForWrite(const char* moduleName, const std::string& path, HalFile& file);
   bool openFileForWrite(const char* moduleName, const String& path, HalFile& file);
   bool removeDir(const char* path);
+  HalStorageCapacityInfo capacityInfo();
 
   static HalStorage& getInstance() { return instance; }
 
@@ -96,6 +109,7 @@ class HalFile : public Print {
   bool close();
   HalFile openNextFile();
   bool isOpen() const;
+  bool modificationTime(uint64_t* packedFatDateTime);
   operator bool() const;
 };
 

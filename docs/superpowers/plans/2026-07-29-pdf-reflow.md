@@ -1111,50 +1111,50 @@ largest block, zero sampled allocation bytes, and 13,220 bytes of stack margin.
 - Test: `test/pdf_cache_recovery/PdfCacheFaultInjectionTest.cpp`
 - Modify: `test/CMakeLists.txt`
 
-- [ ] Add red explicit-codec tests for magic/version/length/sequence/CRC,
+- [x] Add red explicit-codec tests for magic/version/length/sequence/CRC,
   highest-valid slot, identity mismatch, sequence wrap, corrupt/truncated slots,
   and every torn-write prefix. Never serialize raw POD.
-- [ ] Define a host-testable `PdfCacheIo` seam for
+- [x] Define a host-testable `PdfCacheIo` seam for
   open/read/write/flush/sync/close/remove/mkdir/list/capacity/file metadata.
   Implement HAL and fault-injection test adapters; do not hide storage calls
   behind host filesystem APIs in recovery tests.
-- [ ] Use stable FNV64 path hashing matching `Epub::cachePathForFilePath`; never
+- [x] Use stable FNV64 path hashing matching `Epub::cachePathForFilePath`; never
   use `std::hash`.
-- [ ] Lock source fingerprints to domain-separated FNV-1a 64-bit over at most
+- [x] Lock source fingerprints to domain-separated FNV-1a 64-bit over at most
   the first and last 4,096 bytes plus their absolute offsets/lengths and source
   size. Use one source handle and at most two reads; a file ≤4,096 bytes is read
   once and feeds both domains. Test 0-byte, 1-byte, 4,096-byte, overlapping
   4,097–8,191-byte, and larger files.
-- [ ] Add optional HAL results for FAT modification time and total/free
+- [x] Add optional HAL results for FAT modification time and total/free
   capacity. Encode `known=false` when the production or emulated filesystem
   cannot supply a value; never invent one. Cache byte ceilings remain mandatory
   even when capacity is unknown.
-- [ ] Encode manifest fields for format/capability version, sequence, completed
+- [x] Encode manifest fields for format/capability version, sequence, completed
   state, warning flags, source identity, active generation, total words, and a
   bounded/streamed required-file table of relative path, size, and accumulated
   CRC.
-- [ ] Encode checkpoint fields for sequence, verified source identity,
+- [x] Encode checkpoint fields for sequence, verified source identity,
   generation, phase, last verified page/object boundary, emitted
   section/image state, cumulative words, output bytes, warning flags, and CRC.
-- [ ] Implement inactive `gen_<sequence>` builds plus alternating
+- [x] Implement inactive `gen_<sequence>` builds plus alternating
   `manifest.a/b` and `build.a/b`. Manifest is the only commit marker; never
   assume directory rename is power-loss atomic.
-- [ ] Accumulate file sizes/CRCs while streaming. Finalization validates the
+- [x] Accumulate file sizes/CRCs while streaming. Finalization validates the
   recorded writer state and closed handles without rereading complete cache
   files; reopen only the new manifest slot to prove its commit record.
-- [ ] Checkpoint only after at least eight completed PDF pages or 512 KiB of new
+- [x] Checkpoint only after at least eight completed PDF pages or 512 KiB of new
   output and at least five seconds, except forced cancellation/terminal state.
-- [ ] Add fault injection at open, write, short write, flush, sync, close,
+- [x] Add fault injection at open, write, short write, flush, sync, close,
   validation, manifest commit, reopen, and cleanup. The older valid slot must
   survive every inactive-slot tear.
-- [ ] Validate cleanup targets as local `gen_<digits>` entries unreferenced by
+- [x] Validate cleanup targets as local `gen_<digits>` entries unreferenced by
   either valid manifest. Reject traversal, symlink-like, root, and foreign
   paths.
-- [ ] Enforce checked cache cap
+- [x] Enforce checked cache cap
   `min(max(4 MiB, 2 * sourceSize + 1 MiB), 64 MiB)`. When capacity is exposed,
   also preserve `max(16 MiB, 5% total)`. Omit optional images before required
   text/metadata.
-- [ ] Run:
+- [x] Run:
 
   ```powershell
   cmake --build build/test
@@ -1163,6 +1163,16 @@ largest block, zero sampled allocation bytes, and 13,220 bytes of stack margin.
 
   Expected: all recovery/fault tests PASS; no partial generation becomes
   committed.
+
+  **2026-07-29 completion:** explicit little-endian manifest/checkpoint codecs,
+  alternating durable slots, streamed CRC/size evidence, source identity,
+  bounded capacity policy, safe stale-generation cleanup, and debounced
+  checkpoints are implemented behind fixed-function-pointer I/O adapters.
+  Cache-specific host tests pass 22/22 and the full host suite passes 241/241.
+  The hardware and native simulator environments build successfully; the
+  ESP32-C3 QEMU run completes a real cache write, commit, recovery, and cleanup
+  transaction before `QEMU_PDF_CACHE_PASS`, and the resource, static-analysis,
+  and no-flash gates pass.
 
 ### Task 19: Add the foreground preparation state machine and minimal PDF route
 

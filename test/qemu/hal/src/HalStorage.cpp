@@ -18,6 +18,8 @@ constexpr uint64_t VIRTUAL_CAPACITY_BYTES = 64ULL * 1024ULL * 1024ULL;
 constexpr uint64_t VIRTUAL_INITIAL_FREE_BYTES = 32ULL * 1024ULL * 1024ULL;
 constexpr uint64_t LITTLEFS_CAPACITY_BYTES = 0x360000ULL;
 constexpr int MAX_LISTED_FILES = 200;
+constexpr uint8_t MAX_REMOVE_DIRECTORY_DEPTH = 8;
+constexpr size_t MAX_STORAGE_PATH_BYTES = 192;
 
 uint32_t qemuStorageOpenCount = 0;
 uint32_t qemuStorageCloseCount = 0;
@@ -54,6 +56,36 @@ const char* modeForFlags(const oflag_t flags, const bool exists) {
     return FILE_READ;
   }
   return (flags & (O_APPEND | O_AT_END)) != 0 ? FILE_APPEND : FILE_WRITE;
+}
+
+bool removeDirectoryTree(const char* path, const uint8_t depth) {
+  if (path == nullptr || depth > MAX_REMOVE_DIRECTORY_DEPTH) {
+    return false;
+  }
+  fs::File directory = LittleFS.open(path, FILE_READ);
+  if (!directory || !directory.isDirectory()) {
+    directory.close();
+    return false;
+  }
+  bool success = true;
+  fs::File entry = directory.openNextFile();
+  while (entry && success) {
+    char childPath[MAX_STORAGE_PATH_BYTES];
+    const char* const entryPath = entry.path();
+    const int written = std::snprintf(childPath, sizeof(childPath), "%s", entryPath == nullptr ? "" : entryPath);
+    const bool directoryEntry = entry.isDirectory();
+    entry.close();
+    if (written <= 0 || static_cast<size_t>(written) >= sizeof(childPath)) {
+      success = false;
+      break;
+    }
+    success =
+        directoryEntry ? removeDirectoryTree(childPath, static_cast<uint8_t>(depth + 1)) : LittleFS.remove(childPath);
+    entry = directory.openNextFile();
+  }
+  entry.close();
+  directory.close();
+  return success && LittleFS.rmdir(path);
 }
 }  // namespace
 
@@ -219,7 +251,11 @@ bool HalStorage::openFileForWrite(const char* moduleName, const String& path, Ha
   return openFileForWrite(moduleName, path.c_str(), file);
 }
 
-bool HalStorage::removeDir(const char* path) { return rmdir(path); }
+bool HalStorage::removeDir(const char* path) { return initialized && path != nullptr && removeDirectoryTree(path, 0); }
+
+HalStorageCapacityInfo HalStorage::capacityInfo() {
+  return {{true, QemuHalControl::storageCapacity()}, {true, QemuHalControl::storageFree()}};
+}
 
 HalFile::HalFile() = default;
 
@@ -356,6 +392,18 @@ HalFile HalFile::openNextFile() {
 }
 
 bool HalFile::isOpen() const { return static_cast<bool>(file); }
+
+bool HalFile::modificationTime(uint64_t* const packedFatDateTime) {
+  if (!file || packedFatDateTime == nullptr) {
+    return false;
+  }
+  const time_t modified = file.getLastWrite();
+  if (modified <= 0) {
+    return false;
+  }
+  *packedFatDateTime = static_cast<uint64_t>(modified);
+  return true;
+}
 
 HalFile::operator bool() const { return isOpen(); }
 
