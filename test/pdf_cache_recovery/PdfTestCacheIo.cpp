@@ -114,6 +114,16 @@ uint32_t PdfTestCacheIo::openCalls() const { return openCalls_; }
 uint32_t PdfTestCacheIo::readCalls() const { return readCalls_; }
 uint32_t PdfTestCacheIo::writeCalls() const { return writeCalls_; }
 uint32_t PdfTestCacheIo::closeCalls() const { return closeCalls_; }
+uint64_t PdfTestCacheIo::bytesReadTotal() const { return bytesReadTotal_; }
+uint64_t PdfTestCacheIo::bytesWrittenTotal() const { return bytesWrittenTotal_; }
+size_t PdfTestCacheIo::maximumReadRequest() const { return maximumReadRequest_; }
+size_t PdfTestCacheIo::maximumWriteRequest() const { return maximumWriteRequest_; }
+uint32_t PdfTestCacheIo::openCallsForPath(const std::string& path) const {
+  const auto found = pathOpenCalls_.find(path);
+  return found == pathOpenCalls_.end() ? 0 : found->second;
+}
+const std::vector<std::string>& PdfTestCacheIo::events() const { return events_; }
+void PdfTestCacheIo::clearEvents() { events_.clear(); }
 
 uint32_t PdfTestCacheIo::openHandleCount() const {
   uint32_t count = 0;
@@ -191,6 +201,8 @@ PdfStatus PdfTestCacheIo::open(const char* path, const PdfCacheOpenMode mode, Pd
     return PdfStatus::failure(PdfError::IoFailure);
   }
   const std::string key(path);
+  ++pathOpenCalls_[key];
+  events_.push_back("open:" + key);
   auto found = nodes_.find(key);
   if (mode == PdfCacheOpenMode::Read) {
     if (found == nodes_.end() || found->second.directory) {
@@ -215,6 +227,7 @@ PdfStatus PdfTestCacheIo::open(const char* path, const PdfCacheOpenMode mode, Pd
 PdfStatus PdfTestCacheIo::read(const PdfCacheHandle handle, const uint64_t offset, uint8_t* destination,
                                const size_t requested, size_t* bytesRead) {
   ++readCalls_;
+  maximumReadRequest_ = std::max(maximumReadRequest_, requested);
   if (!handle.valid() || handle.value >= 8 || !handles_[handle.value].open || destination == nullptr ||
       bytesRead == nullptr) {
     return PdfStatus::failure(PdfError::InvalidArgument, offset);
@@ -232,12 +245,14 @@ PdfStatus PdfTestCacheIo::read(const PdfCacheHandle handle, const uint64_t offse
   if (*bytesRead != 0) {
     std::memcpy(destination, found->second.bytes.data() + static_cast<size_t>(offset), *bytesRead);
   }
+  bytesReadTotal_ += *bytesRead;
   return PdfStatus::success();
 }
 
 PdfStatus PdfTestCacheIo::write(const PdfCacheHandle handle, const uint8_t* source, const size_t requested,
                                 size_t* bytesWritten) {
   ++writeCalls_;
+  maximumWriteRequest_ = std::max(maximumWriteRequest_, requested);
   if (!handle.valid() || handle.value >= 8 || !handles_[handle.value].open || !handles_[handle.value].writable ||
       source == nullptr || bytesWritten == nullptr) {
     return PdfStatus::failure(PdfError::InvalidArgument);
@@ -261,6 +276,7 @@ PdfStatus PdfTestCacheIo::write(const PdfCacheHandle handle, const uint8_t* sour
   openHandle.position += allowed;
   writeAllowance_ -= allowed;
   *bytesWritten = allowed;
+  bytesWrittenTotal_ += allowed;
   return PdfStatus::success();
 }
 
@@ -284,6 +300,7 @@ PdfStatus PdfTestCacheIo::close(PdfCacheHandle* handle) {
     return PdfStatus::failure(PdfError::InvalidArgument);
   }
   const bool failClose = shouldFail(PdfTestFaultPoint::Close);
+  events_.push_back("close:" + handles_[handle->value].path);
   handles_[handle->value] = {};
   handle->value = kInvalidHandle;
   return failClose ? PdfStatus::failure(PdfError::IoFailure) : PdfStatus::success();

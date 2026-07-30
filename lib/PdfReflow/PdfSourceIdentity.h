@@ -15,8 +15,15 @@ struct PdfSourceIdentity {
   uint64_t tailFingerprint = 0;
 };
 
+enum class PdfSourceFingerprintWindow : uint8_t {
+  Head,
+  Tail,
+};
+
 bool pdfSourceIdentityEqual(const PdfSourceIdentity& left, const PdfSourceIdentity& right);
 uint64_t pdfPathHash64(const char* path, size_t length);
+uint64_t pdfFingerprintSourceWindow(PdfSourceFingerprintWindow window, uint64_t sourceSize, uint64_t offset,
+                                    const uint8_t* bytes, size_t length);
 PdfStatus pdfFormatCacheRoot(const char* cacheDirectory, const char* sourcePath, char* destination,
                              size_t destinationCapacity);
 PdfStatus pdfComputeSourceIdentity(const PdfCacheIo& io, const char* sourcePath, uint8_t* workspace,

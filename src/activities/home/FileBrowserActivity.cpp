@@ -81,14 +81,24 @@ bool hasHeapForFileEntryAppend(const std::vector<std::string>& files, size_t ent
 }
 
 bool hasFileMetadata(const std::string& path) {
-  return FsHelpers::hasEpubExtension(path) || FsHelpers::hasXtcExtension(path) || FsHelpers::hasTxtExtension(path) ||
-         FsHelpers::hasMarkdownExtension(path);
+  const bool existingFormat = FsHelpers::hasEpubExtension(path) || FsHelpers::hasXtcExtension(path) ||
+                              FsHelpers::hasTxtExtension(path) || FsHelpers::hasMarkdownExtension(path);
+#if defined(CROSSINK_ENABLE_PDF) && CROSSINK_ENABLE_PDF
+  return existingFormat || FsHelpers::hasPdfExtension(path);
+#else
+  return existingFormat;
+#endif
 }
 
 bool isSupportedBrowserFile(std::string_view filename) {
-  return FsHelpers::hasEpubExtension(filename) || FsHelpers::hasXtcExtension(filename) ||
-         FsHelpers::hasTxtExtension(filename) || FsHelpers::hasMarkdownExtension(filename) ||
-         FsHelpers::hasBmpExtension(filename) || FsHelpers::hasPngExtension(filename);
+  const bool existingFormat = FsHelpers::hasEpubExtension(filename) || FsHelpers::hasXtcExtension(filename) ||
+                              FsHelpers::hasTxtExtension(filename) || FsHelpers::hasMarkdownExtension(filename) ||
+                              FsHelpers::hasBmpExtension(filename) || FsHelpers::hasPngExtension(filename);
+#if defined(CROSSINK_ENABLE_PDF) && CROSSINK_ENABLE_PDF
+  return existingFormat || FsHelpers::hasPdfExtension(filename);
+#else
+  return existingFormat;
+#endif
 }
 
 bool acceptCommon(const char* name, bool isDir) {

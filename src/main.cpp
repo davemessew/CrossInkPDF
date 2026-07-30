@@ -898,7 +898,7 @@ void setup() {
   waitForPowerRelease();
   allowSleepAt = millis() + 2000;
 #ifdef CROSSINK_QEMU
-  qemuAcceptanceBegin(mappedInputManager);
+  qemuAcceptanceBegin(mappedInputManager, renderer);
 #endif
 }
 

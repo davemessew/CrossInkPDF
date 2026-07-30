@@ -51,6 +51,13 @@ class PdfTestCacheIo {
   uint32_t writeCalls() const;
   uint32_t closeCalls() const;
   uint32_t openHandleCount() const;
+  uint64_t bytesReadTotal() const;
+  uint64_t bytesWrittenTotal() const;
+  size_t maximumReadRequest() const;
+  size_t maximumWriteRequest() const;
+  uint32_t openCallsForPath(const std::string& path) const;
+  const std::vector<std::string>& events() const;
+  void clearEvents();
 
  private:
   struct Node {
@@ -106,4 +113,10 @@ class PdfTestCacheIo {
   uint32_t readCalls_ = 0;
   uint32_t writeCalls_ = 0;
   uint32_t closeCalls_ = 0;
+  uint64_t bytesReadTotal_ = 0;
+  uint64_t bytesWrittenTotal_ = 0;
+  size_t maximumReadRequest_ = 0;
+  size_t maximumWriteRequest_ = 0;
+  std::map<std::string, uint32_t> pathOpenCalls_;
+  std::vector<std::string> events_;
 };

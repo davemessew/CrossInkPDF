@@ -60,6 +60,16 @@ uint64_t pdfPathHash64(const char* const path, const size_t length) {
   return path == nullptr && length != 0 ? 0 : pdfCacheFnv64(path, length);
 }
 
+uint64_t pdfFingerprintSourceWindow(const PdfSourceFingerprintWindow window, const uint64_t sourceSize,
+                                    const uint64_t offset, const uint8_t* const bytes, const size_t length) {
+  if (bytes == nullptr && length != 0) {
+    return 0;
+  }
+  const uint8_t* const domain = window == PdfSourceFingerprintWindow::Head ? kHeadDomain : kTailDomain;
+  const size_t domainLength = window == PdfSourceFingerprintWindow::Head ? sizeof(kHeadDomain) : sizeof(kTailDomain);
+  return fingerprint(domain, domainLength, sourceSize, offset, length, bytes);
+}
+
 PdfStatus pdfFormatCacheRoot(const char* const cacheDirectory, const char* const sourcePath, char* const destination,
                              const size_t destinationCapacity) {
   if (cacheDirectory == nullptr || sourcePath == nullptr || destination == nullptr || destinationCapacity == 0) {
@@ -106,7 +116,8 @@ PdfStatus pdfComputeSourceIdentity(const PdfCacheIo& io, const char* const sourc
       return closePreservingFailure(io, &handle, status);
     }
   }
-  identity->headFingerprint = fingerprint(kHeadDomain, sizeof(kHeadDomain), metadata.size, 0, headLength, workspace);
+  identity->headFingerprint =
+      pdfFingerprintSourceWindow(PdfSourceFingerprintWindow::Head, metadata.size, 0, workspace, headLength);
 
   const uint64_t tailOffset =
       metadata.size > PDF_SOURCE_FINGERPRINT_BYTES ? metadata.size - PDF_SOURCE_FINGERPRINT_BYTES : 0;
@@ -118,6 +129,6 @@ PdfStatus pdfComputeSourceIdentity(const PdfCacheIo& io, const char* const sourc
     }
   }
   identity->tailFingerprint =
-      fingerprint(kTailDomain, sizeof(kTailDomain), metadata.size, tailOffset, tailLength, workspace);
+      pdfFingerprintSourceWindow(PdfSourceFingerprintWindow::Tail, metadata.size, tailOffset, workspace, tailLength);
   return closePreservingFailure(io, &handle, PdfStatus::success());
 }

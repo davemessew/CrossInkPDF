@@ -54,6 +54,12 @@ inline bool hasEpubExtension(const String& fileName) {
   return hasEpubExtension(std::string_view{fileName.c_str(), fileName.length()});
 }
 
+// Check for .pdf extension (case-insensitive)
+bool hasPdfExtension(std::string_view fileName);
+inline bool hasPdfExtension(const String& fileName) {
+  return hasPdfExtension(std::string_view{fileName.c_str(), fileName.length()});
+}
+
 // Check for either .xtc or .xtch extension (case-insensitive)
 bool hasXtcExtension(std::string_view fileName);
 

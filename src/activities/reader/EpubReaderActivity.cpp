@@ -4181,7 +4181,8 @@ void EpubReaderActivity::render(RenderLock&& lock) {
     LOG_DBG("ERS", "Rendered page in %dms", millis() - start);
   }
   if (!activeFootnotePreview) {
-    if (!saveProgress(currentSpineIndex, section->currentPage, section->pageCount)) {
+    if (!saveProgress(currentSpineIndex, section->currentPage, section->pageCount) &&
+        document->getFormat() != ReflowDocumentFormat::Pdf) {
       pendingSyncSaveError = true;
     }
     queueCompletionPromptIfNeeded();

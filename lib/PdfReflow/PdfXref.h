@@ -24,7 +24,7 @@ struct PdfXrefEntry {
 
 class PdfXrefTable {
  public:
-  explicit PdfXrefTable(PdfFixedRecordStore records) : records_(records) {}
+  explicit PdfXrefTable(const PdfFixedRecordStore& records) : records_(records) {}
 
   void reset();
   PdfStatus appendNewest(const PdfXrefEntry& entry);

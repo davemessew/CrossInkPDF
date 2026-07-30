@@ -1201,45 +1201,45 @@ largest block, zero sampled allocation bytes, and 13,220 bytes of stack margin.
 - Test: `test/pdf_product_integration/PdfRoutingTest.cpp`
 - Test: `test/pdf_extraction/PdfPreparationTest.cpp`
 
-- [ ] Extract a pure `ReaderRoute` selector and add red tests for `.pdf`,
+- [x] Extract a pure `ReaderRoute` selector and add red tests for `.pdf`,
   `.PDF`, and mixed case. A route spy must prove PDFs never call `loadEpub()`.
-- [ ] Add case-insensitive `hasPdfExtension` and browser visibility.
-- [ ] Under a temporary compile-time `CROSSINK_ENABLE_PDF` gate, route a valid
+- [x] Add case-insensitive `hasPdfExtension` and browser visibility.
+- [x] Under a temporary compile-time `CROSSINK_ENABLE_PDF` gate, route a valid
   completed cache to `PdfReflowDocument` and missing/stale cache to
   `PdfPrepareActivity`; keep other routes unchanged. Enable the gate only for
   QEMU/simulator acceptance until Task 23 makes all product actions
   format-aware, then enable it for normal firmware and remove the temporary
   limitation.
-- [ ] `PdfPreparation::step()` owns the one source `HalFile`, fixed workspaces,
+- [x] `PdfPreparation::step()` owns the one source `HalFile`, fixed workspaces,
   parser components, short-lived writers, resource tracker, and cancellation.
   End each `loop()` slice at 8 ms, 32 operations, or one 4 KiB I/O/decode chunk.
-- [ ] Before parsing, gate both total free heap and largest contiguous block.
+- [x] Before parsing, gate both total free heap and largest contiguous block.
   Allocate the six Task 12 workspaces once with `makeUniqueNoThrow`, log/account
   each allocation in `PdfResourceTracker`, reuse them without per-step
   allocation, and release them in reverse order. Never fall back to
   `InflateReader::init(true)`.
-- [ ] Use race-to-idle at normal CPU frequency only while work is queued. Create
+- [x] Use race-to-idle at normal CPU frequency only while work is queued. Create
   no task, timer poller, or background worker.
-- [ ] Repaint the static preparation UI only after both 10 percentage points
+- [x] Repaint the static preparation UI only after both 10 percentage points
   and 15 seconds, at most ten intermediate paints.
-- [ ] `PdfReflowDocument::loadCompletedCache()` performs one bounded identity
+- [x] `PdfReflowDocument::loadCompletedCache()` performs one bounded identity
   transaction, closes the source immediately, then opens/validates the selected
   manifest and required cache files before exposing loose sections/resources.
   Page turns must not parse or reopen the PDF. The single-reader fake covers
   this source-to-cache handoff.
-- [ ] Until Task 21 supplies `PdfProgressStore`, the QEMU-only minimal document
+- [x] Until Task 21 supplies `PdfProgressStore`, the QEMU-only minimal document
   returns `false` from position load/save without surfacing a save-error toast;
   the minimal tracer does not exercise persistence. Normal firmware routing
   remains disabled until real semantic progress exists.
-- [ ] Add translated outcomes for preparing, cancel/resume, no readable text,
+- [x] Add translated outcomes for preparing, cancel/resume, no readable text,
   encrypted, unsupported encoding/filter, damaged/unsafe, insufficient memory
   or storage, and optional content skipped.
-- [ ] Run `python scripts/gen_i18n.py` in this task so every new `tr(STR_*)`
+- [x] Run `python scripts/gen_i18n.py` in this task so every new `tr(STR_*)`
   identifier exists before compiling the activity.
-- [ ] Run the minimal born-digital fixture through preparation into one XHTML
+- [x] Run the minimal born-digital fixture through preparation into one XHTML
   section, then through the shared reader in QEMU. Add a temporary terminal
   `QEMU_PDF_TRACER_PASS` only after rendered text is `Hello PDF`.
-- [ ] Verify target size and runtime resources against the Task 5 baseline
+- [x] Verify target size and runtime resources against the Task 5 baseline
   immediately after this tracer; stop if any final hard envelope is already
   exceeded. Remove any prior log, run the tracer with
   `--log .pio/build/qemu-esp32c3/qemu-pdf-tracer.log`, and pass that exact log
@@ -1257,7 +1257,18 @@ largest block, zero sampled allocation bytes, and 13,220 bytes of stack margin.
     --elf .pio/build/qemu-esp32c3/firmware.elf `
     --runtime-log .pio/build/qemu-esp32c3/qemu-pdf-tracer.log
   ```
-- [ ] Stop expansion until the QEMU minimal tracer is green.
+- [x] Stop expansion until the QEMU minimal tracer is green.
+
+  **2026-07-29 completion:** case-insensitive PDF discovery and pure routing,
+  bounded foreground preparation, one-handle source parsing, atomic cache
+  handoff, and shared EPUB-style pagination are implemented behind the
+  temporary QEMU/simulator gate. The minimal born-digital fixture renders
+  `Hello PDF` through the shared reader before `QEMU_PDF_TRACER_PASS`. The full
+  host suite passes 253/253; strict static analysis, default firmware, SDL2
+  simulator, QEMU resource verification, standard QEMU acceptance, and the
+  explicit no-flash guard pass. The QEMU PDF run held the owned preparation
+  workspace to 63,488 bytes and reported 77,532 bytes minimum free heap, 65,524
+  bytes minimum largest allocation, and 10,708 bytes stack margin.
 
 ### Task 20: Preserve outline chapters, contents/index links, and page labels
 

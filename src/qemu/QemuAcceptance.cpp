@@ -10,8 +10,10 @@
 #include <PdfDocumentTextClassifier.h>
 #include <PdfHalCacheIo.h>
 #include <PdfHalIo.h>
+#include <PdfHalReflowDocument.h>
 #include <PdfHiddenText.h>
 #include <PdfPageTree.h>
+#include <PdfPreparation.h>
 #include <PdfReadingOrder.h>
 #include <PdfRunStore.h>
 #include <PdfSemanticWriter.h>
@@ -21,7 +23,12 @@
 #include <freertos/task.h>
 
 #include <cstring>
+#include <memory>
 
+#include "CrossPointSettings.h"
+#include "Epub/Page.h"
+#include "Epub/Section.h"
+#include "GfxRenderer.h"
 #include "MappedInputManager.h"
 #include "Memory.h"
 
@@ -49,6 +56,7 @@ struct AcceptanceState {
   uint32_t minFreeHeap = 0;
   uint32_t minMaxAllocation = 0;
   uint32_t minStackMargin = 0;
+  bool pdfTracerReady = false;
 };
 
 AcceptanceState state;
@@ -112,7 +120,8 @@ void fail(const char* component, const char* reason) {
 }
 
 uint32_t stackMarginBytes() {
-  return static_cast<uint32_t>(uxTaskGetStackHighWaterMark(nullptr)) * static_cast<uint32_t>(sizeof(StackType_t));
+  // ESP-IDF reports this high-water mark in bytes (unlike upstream FreeRTOS).
+  return static_cast<uint32_t>(uxTaskGetStackHighWaterMark(nullptr));
 }
 
 void sampleRuntime() {
@@ -134,6 +143,12 @@ void sampleRuntime() {
     state.minStackMargin = stackMargin;
   }
 }
+
+uint32_t qemuNowMs(void*) { return millis(); }
+
+PdfResourceSnapshot qemuPdfResources(void*) { return {ESP.getFreeHeap(), ESP.getMaxAllocHeap(), stackMarginBytes()}; }
+
+void ignorePdfResourceEvent(void*, const PdfResourceEvent&) {}
 
 PdfStatus readMemoryRecord(void* context, const uint32_t ordinal, void* record, const size_t recordSize) {
   if (context == nullptr || record == nullptr) {
@@ -705,6 +720,110 @@ bool checkPdfCache() {
   return true;
 }
 
+bool checkPdfProductTracer(GfxRenderer& renderer) {
+  char cacheRoot[PDF_CACHE_PATH_CAPACITY]{};
+  PdfStatus status = pdfFormatCacheRoot("/.crosspoint", PDF_FIXTURE_PATH, cacheRoot, sizeof(cacheRoot));
+  if (!status.ok()) {
+    fail("PDF_TRACER", "cache_path");
+    return false;
+  }
+  if (Storage.exists(cacheRoot) && !Storage.removeDir(cacheRoot)) {
+    fail("PDF_TRACER", "preclean");
+    return false;
+  }
+
+  PdfHalCacheIoContext preparationIoContext;
+  auto preparation = makeUniqueNoThrow<PdfPreparation>();
+  if (!preparation) {
+    fail("PDF_TRACER", "preparation_oom");
+    return false;
+  }
+  const PdfPreparationConfig config{
+      pdfHalCacheIo(preparationIoContext),
+      PDF_FIXTURE_PATH,
+      "/.crosspoint",
+      nullptr,
+      qemuNowMs,
+      {nullptr, qemuPdfResources, ignorePdfResourceEvent},
+  };
+  status = preparation->begin(config);
+  PdfStepResult result = PdfStepResult::paused();
+  for (uint32_t slice = 0; status.ok() && result.yielded() && slice < 100000; ++slice) {
+    result = preparation->step();
+    sampleRuntime();
+  }
+  if (!status.ok() || !result.complete() || preparation->totalWords() != 2 ||
+      preparation->resourcePeakBytes() != PdfLimits::TotalWorkspaceBytes) {
+    fail("PDF_TRACER", !status.ok() ? "begin" : "prepare");
+    return false;
+  }
+  const size_t preparationPeak = preparation->resourcePeakBytes();
+  preparation.reset();
+  sampleRuntime();
+
+  bool rendered = false;
+  uint16_t pageCount = 0;
+  uint32_t renderedFrame = 0;
+  {
+    PdfStatus documentStatus{};
+    auto loaded = loadPdfHalReflowDocumentNoThrow(PDF_FIXTURE_PATH, "/.crosspoint", &documentStatus);
+    if (!loaded || !documentStatus.ok() || loaded->getTotalWordCount() != 2) {
+      fail("PDF_TRACER", "document");
+      return false;
+    }
+    std::shared_ptr<ReflowDocument> document(std::move(loaded));
+
+    int marginTop = 0;
+    int marginRight = 0;
+    int marginBottom = 0;
+    int marginLeft = 0;
+    renderer.getOrientedViewableTRBL(&marginTop, &marginRight, &marginBottom, &marginLeft);
+    marginTop += SETTINGS.screenMargin;
+    marginRight += SETTINGS.screenMargin;
+    marginBottom += SETTINGS.screenMargin;
+    marginLeft += SETTINGS.screenMargin;
+    const int availableWidth = renderer.getScreenWidth() - marginLeft - marginRight;
+    const int availableHeight = renderer.getScreenHeight() - marginTop - marginBottom;
+    if (availableWidth <= 0 || availableHeight <= 0 || availableWidth > UINT16_MAX || availableHeight > UINT16_MAX) {
+      fail("PDF_TRACER", "viewport");
+      return false;
+    }
+
+    Section section(document, 0, renderer, "_qemu_pdf");
+    bool imagesSuppressed = false;
+    bool lowMemory = false;
+    const int fontId = SETTINGS.getReaderFontId();
+    const bool built = section.createSectionFile(
+        fontId, SETTINGS.getReaderLineCompression(), SETTINGS.extraParagraphSpacing, SETTINGS.forceParagraphIndents,
+        SETTINGS.paragraphAlignment, static_cast<uint16_t>(availableWidth), static_cast<uint16_t>(availableHeight),
+        SETTINGS.hyphenationEnabled, false, SETTINGS.imageRendering, SETTINGS.bionicReadingEnabled,
+        SETTINGS.guideReadingEnabled, nullptr, &imagesSuppressed, &lowMemory, EpubRenderMode::Light);
+    const std::string text = built ? section.getTextFromSectionFile() : std::string{};
+    section.currentPage = 0;
+    auto page = built ? section.loadPageFromSectionFile() : nullptr;
+    pageCount = section.pageCount;
+    display.clearScreen(0xFF);
+    const uint32_t blankFrame = QemuHalControl::frameCrc32();
+    if (page) {
+      page->renderText(renderer, fontId, marginLeft, marginTop);
+      renderedFrame = QemuHalControl::frameCrc32();
+    }
+    rendered = built && !lowMemory && text == PDF_EXPECTED_TEXT && page != nullptr && pageCount > 0 &&
+               renderedFrame != blankFrame;
+  }
+
+  const bool cleaned = Storage.exists(cacheRoot) && Storage.removeDir(cacheRoot);
+  if (!rendered || !cleaned) {
+    fail("PDF_TRACER", !rendered ? "shared_reader" : "cleanup");
+    return false;
+  }
+  esp_rom_printf("QEMU_PDF_TRACER text=Hello_PDF words=2 pages=%u frame=%08lX heap=%lu\n",
+                 static_cast<unsigned>(pageCount), static_cast<unsigned long>(renderedFrame),
+                 static_cast<unsigned long>(preparationPeak));
+  state.pdfTracerReady = true;
+  return true;
+}
+
 bool checkStorage() {
   const uint32_t opensBefore = QemuHalControl::storageOpenCount();
   const uint32_t closesBefore = QemuHalControl::storageCloseCount();
@@ -770,18 +889,20 @@ bool checkInput(MappedInputManager& input) {
 }
 }  // namespace
 
-void qemuAcceptanceBegin(MappedInputManager& input) {
+void qemuAcceptanceBegin(MappedInputManager& input, GfxRenderer& renderer) {
   state = {};
   esp_rom_printf("QEMU_BOOT seq=0\n");
-
-  if (!checkStorage() || !checkPdfCore() || !checkPdfCache() || !checkFrame() || !checkInput(input)) {
-    return;
-  }
-
   state.heapStart = ESP.getFreeHeap();
   state.minFreeHeap = state.heapStart;
   state.minMaxAllocation = ESP.getMaxAllocHeap();
   state.minStackMargin = stackMarginBytes();
+  sampleRuntime();
+
+  if (!checkStorage() || !checkPdfCore() || !checkPdfCache() || !checkPdfProductTracer(renderer) || !checkFrame() ||
+      !checkInput(input)) {
+    return;
+  }
+
   state.idleStartedAt = millis();
   state.phase = AcceptancePhase::WaitingForPowerSaving;
   sampleRuntime();
@@ -803,6 +924,9 @@ void qemuAcceptanceTick() {
                  static_cast<unsigned long>(state.heapStart), static_cast<unsigned long>(state.minFreeHeap),
                  static_cast<unsigned long>(state.minMaxAllocation), static_cast<unsigned long>(NO_ALLOCATION_SAMPLE),
                  static_cast<unsigned long>(state.minStackMargin));
+  if (state.pdfTracerReady) {
+    esp_rom_printf("QEMU_PDF_TRACER_PASS\n");
+  }
   esp_rom_printf("QEMU_TRACER_PASS\n");
   state.phase = AcceptancePhase::Finished;
 }
