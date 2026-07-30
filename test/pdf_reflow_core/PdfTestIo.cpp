@@ -36,6 +36,7 @@ PdfStatus PdfTestByteSink::write(void* context, const uint8_t* source, const siz
   if (source == nullptr || bytesWritten == nullptr) {
     return PdfStatus::failure(PdfError::InvalidArgument);
   }
+  ++sink.writeCount_;
   *bytesWritten = std::min(requested, sink.maximumWrite_);
   sink.bytes_.insert(sink.bytes_.end(), source, source + *bytesWritten);
   return PdfStatus::success();

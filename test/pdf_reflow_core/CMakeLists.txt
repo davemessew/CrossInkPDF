@@ -15,8 +15,10 @@ add_executable(PdfReflowCoreTest
   ${REPO_ROOT}/lib/PdfReflow/PdfPageTree.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfReadingOrder.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfRunStore.cpp
+  ${REPO_ROOT}/lib/PdfReflow/PdfSemanticWriter.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfStreamDecoder.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfUnicode.cpp
+  ${REPO_ROOT}/lib/PdfReflow/PdfWordCounter.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfXref.cpp
   ${REPO_ROOT}/lib/InflateReader/InflateReader.cpp
   ${REPO_ROOT}/lib/uzlib/src/tinflate.c
@@ -29,6 +31,8 @@ add_executable(PdfReflowCoreTest
   PdfHiddenTextTest.cpp
   PdfLexerObjectTest.cpp
   PdfReadingOrderTest.cpp
+  PdfSemanticWriterTest.cpp
+  PdfWordCounterTest.cpp
   PdfXrefResolverTest.cpp
   PdfPageTreeTest.cpp
   PdfStreamDecoderTest.cpp

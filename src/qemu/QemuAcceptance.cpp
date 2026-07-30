@@ -12,6 +12,7 @@
 #include <PdfPageTree.h>
 #include <PdfReadingOrder.h>
 #include <PdfRunStore.h>
+#include <PdfSemanticWriter.h>
 #include <QemuHalControl.h>
 #include <esp_rom_sys.h>
 #include <freertos/FreeRTOS.h>
@@ -64,6 +65,9 @@ struct PdfCoreAcceptanceWorkspace {
   PdfReadingOrderItem reductionOrder[4]{};
   PdfPageInfo firstPage{};
   char transcript[32]{};
+  uint8_t semanticOutput[384]{};
+  uint8_t semanticBuffer[PdfSemanticWriterLimits::MinimumOutputBufferBytes]{};
+  PdfSemanticBlockRecord semanticRecord{};
   uint32_t pageCount = 0;
 };
 static_assert(sizeof(PdfCoreAcceptanceWorkspace) <= 32768);
@@ -73,6 +77,12 @@ struct ReductionSinkContext {
   char* transcript = nullptr;
   size_t capacity = 0;
   size_t length = 0;
+};
+
+struct SemanticSinkContext {
+  PdfCoreAcceptanceWorkspace* workspace = nullptr;
+  size_t length = 0;
+  uint32_t records = 0;
 };
 
 void fail(const char* component, const char* reason) {
@@ -186,6 +196,69 @@ PdfStatus appendReductionRun(void* context, const PdfReadingOrderItem& item) {
     sink.length += run.textLength;
   }
   return status;
+}
+
+PdfStatus writeSemanticBytes(void* context, const uint8_t* source, const size_t requested, size_t* bytesWritten) {
+  if (context == nullptr || source == nullptr || bytesWritten == nullptr) {
+    return PdfStatus::failure(PdfError::InvalidArgument);
+  }
+  auto& sink = *static_cast<SemanticSinkContext*>(context);
+  if (sink.workspace == nullptr || requested > sizeof(sink.workspace->semanticOutput) - sink.length) {
+    return PdfStatus::failure(PdfError::InsufficientStorage, sink.length);
+  }
+  std::memcpy(sink.workspace->semanticOutput + sink.length, source, requested);
+  sink.length += requested;
+  *bytesWritten = requested;
+  return PdfStatus::success();
+}
+
+PdfStatus captureSemanticRecord(void* context, const PdfSemanticBlockRecord& record) {
+  if (context == nullptr) {
+    return PdfStatus::failure(PdfError::InvalidArgument);
+  }
+  auto& sink = *static_cast<SemanticSinkContext*>(context);
+  if (sink.workspace == nullptr || sink.records != 0) {
+    return PdfStatus::failure(PdfError::LimitExceeded, sink.records);
+  }
+  sink.workspace->semanticRecord = record;
+  ++sink.records;
+  return PdfStatus::success();
+}
+
+bool checkPdfSemantic(PdfCoreAcceptanceWorkspace& workspace) {
+  static constexpr char EXPECTED[] =
+      "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+      "<html xmlns=\"http://www.w3.org/1999/xhtml\"><head><meta charset=\"UTF-8\"/></head><body>"
+      "<p id=\"b00000000\">First Second</p></body></html>";
+  std::memset(workspace.semanticOutput, 0, sizeof(workspace.semanticOutput));
+  workspace.semanticRecord = {};
+  SemanticSinkContext sink{&workspace};
+  PdfSemanticWriter writer;
+  PdfStatus status = writer.begin({&sink, writeSemanticBytes}, {&sink, captureSemanticRecord},
+                                  {workspace.semanticBuffer, sizeof(workspace.semanticBuffer)});
+  if (status.ok()) {
+    status = writer.beginBlock({PdfSemanticBlockKind::Paragraph, 0, 0});
+  }
+  if (status.ok()) {
+    status =
+        writer.writeText(reinterpret_cast<const uint8_t*>(workspace.transcript), std::strlen(workspace.transcript));
+  }
+  if (status.ok()) {
+    status = writer.endBlock();
+  }
+  if (status.ok()) {
+    status = writer.finish();
+  }
+  if (!status.ok() || sink.records != 1 || writer.totalWords() != 2 || sink.length != sizeof(EXPECTED) - 1 ||
+      workspace.semanticRecord.cumulativeWordStart != 0 || workspace.semanticRecord.wordCount != 2 ||
+      std::strcmp(workspace.semanticRecord.anchor, "b00000000") != 0 ||
+      std::memcmp(workspace.semanticOutput, EXPECTED, sizeof(EXPECTED) - 1) != 0) {
+    fail("PDF_SEMANTIC", "result");
+    return false;
+  }
+  esp_rom_printf("QEMU_PDF_SEMANTIC_PASS words=%lu bytes=%lu\n", static_cast<unsigned long>(writer.totalWords()),
+                 static_cast<unsigned long>(sink.length));
+  return true;
 }
 
 bool checkPdfReduction(PdfCoreAcceptanceWorkspace& workspace) {
@@ -485,7 +558,7 @@ bool checkPdfCore() {
 
   esp_rom_printf("QEMU_PDF_CORE bytes=%lu\n", static_cast<unsigned long>(transcriptLength));
   esp_rom_printf("QEMU_PDF_CORE_PASS\n");
-  return checkPdfReduction(*workspace);
+  return checkPdfReduction(*workspace) && checkPdfSemantic(*workspace);
 }
 
 bool checkStorage() {

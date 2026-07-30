@@ -12,6 +12,7 @@
 #include "PdfDocumentTextClassifier.h"
 #include "PdfHiddenText.h"
 #include "PdfPageTree.h"
+#include "PdfSemanticWriter.h"
 #include "PdfTestIo.h"
 
 namespace {
@@ -165,9 +166,47 @@ struct FixtureTextResult {
   std::vector<PdfImagePlacement> images;
 };
 
+struct FixtureSemanticResult {
+  PdfStatus status{};
+  std::string xhtml;
+  std::vector<PdfSemanticBlockRecord> blocks;
+  uint32_t totalWords = 0;
+
+  static PdfStatus emit(void* context, const PdfSemanticBlockRecord& record) {
+    if (context == nullptr) {
+      return PdfStatus::failure(PdfError::InvalidArgument);
+    }
+    static_cast<FixtureSemanticResult*>(context)->blocks.push_back(record);
+    return PdfStatus::success();
+  }
+};
+
 FixtureTextResult fixtureFailure(const PdfStatus status) {
   FixtureTextResult result;
   result.status = status;
+  return result;
+}
+
+FixtureSemanticResult writeFixtureSemantic(const FixtureTextResult& fixture) {
+  FixtureSemanticResult result;
+  PdfTestByteSink output;
+  std::array<uint8_t, PdfSemanticWriterLimits::MinimumOutputBufferBytes> buffer{};
+  PdfSemanticWriter writer;
+  result.status = writer.begin(output.sink(), {&result, FixtureSemanticResult::emit}, {buffer.data(), buffer.size()});
+  if (result.status.ok()) {
+    result.status = writer.beginBlock({PdfSemanticBlockKind::Paragraph, 0, 0});
+  }
+  if (result.status.ok()) {
+    result.status = writer.writeText(reinterpret_cast<const uint8_t*>(fixture.text.data()), fixture.text.size());
+  }
+  if (result.status.ok()) {
+    result.status = writer.endBlock();
+  }
+  if (result.status.ok()) {
+    result.status = writer.finish();
+  }
+  result.totalWords = writer.totalWords();
+  result.xhtml.assign(output.bytes().begin(), output.bytes().end());
   return result;
 }
 
@@ -423,6 +462,23 @@ TEST(PdfContentInterpreterTest, PdfFontSizesSixAndSeventyTwoProduceIdenticalSema
   ASSERT_TRUE(large.status.ok()) << static_cast<int>(large.status.error);
   EXPECT_EQ(small.text, "Typography uses device defaults.");
   EXPECT_EQ(large.text, small.text);
+
+  const FixtureSemanticResult smallSemantic = writeFixtureSemantic(small);
+  const FixtureSemanticResult largeSemantic = writeFixtureSemantic(large);
+  ASSERT_TRUE(smallSemantic.status.ok()) << static_cast<int>(smallSemantic.status.error);
+  ASSERT_TRUE(largeSemantic.status.ok()) << static_cast<int>(largeSemantic.status.error);
+  EXPECT_EQ(largeSemantic.xhtml, smallSemantic.xhtml);
+  EXPECT_EQ(smallSemantic.xhtml.find("font-size"), std::string::npos);
+  EXPECT_EQ(smallSemantic.xhtml.find("font-family"), std::string::npos);
+  ASSERT_EQ(smallSemantic.blocks.size(), 1u);
+  ASSERT_EQ(largeSemantic.blocks.size(), 1u);
+  EXPECT_STREQ(smallSemantic.blocks[0].anchor, "b00000000");
+  EXPECT_STREQ(largeSemantic.blocks[0].anchor, smallSemantic.blocks[0].anchor);
+  EXPECT_EQ(largeSemantic.blocks[0].anchorOrdinal, smallSemantic.blocks[0].anchorOrdinal);
+  EXPECT_EQ(largeSemantic.blocks[0].cumulativeWordStart, smallSemantic.blocks[0].cumulativeWordStart);
+  EXPECT_EQ(largeSemantic.blocks[0].wordCount, smallSemantic.blocks[0].wordCount);
+  EXPECT_EQ(smallSemantic.totalWords, 4u);
+  EXPECT_EQ(largeSemantic.totalWords, smallSemantic.totalWords);
 }
 
 TEST(PdfContentInterpreterTest, ExistingVectorFixtureRetainsItsCaption) {

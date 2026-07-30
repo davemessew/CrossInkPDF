@@ -27,12 +27,14 @@ class PdfTestByteSink {
   PdfByteSink sink();
   const std::vector<uint8_t>& bytes() const { return bytes_; }
   void setMaximumWrite(size_t maximumWrite) { maximumWrite_ = maximumWrite; }
+  uint32_t writeCount() const { return writeCount_; }
 
  private:
   static PdfStatus write(void* context, const uint8_t* source, size_t requested, size_t* bytesWritten);
 
   std::vector<uint8_t> bytes_;
   size_t maximumWrite_ = static_cast<size_t>(-1);
+  uint32_t writeCount_ = 0;
 };
 
 class PdfTestRecordStore {

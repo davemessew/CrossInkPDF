@@ -541,6 +541,29 @@ bool verifyLooseLocalSource(const char* passName, GfxRenderer& renderer, const O
     return false;
   }
 
+  const uint16_t mediumPageCount = section.pageCount;
+  {
+    RenderLock renderLock;
+    SETTINGS.fontSize = CrossPointSettings::FONT_SIZE::LARGE;
+    UITheme::getInstance().reload();
+  }
+  Section largeFontSection(document, 0, renderer, "_font_large");
+  const bool largeFontCreated = largeFontSection.createSectionFile(
+      SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(), SETTINGS.extraParagraphSpacing,
+      SETTINGS.forceParagraphIndents, SETTINGS.paragraphAlignment, layout.width, layout.height,
+      SETTINGS.hyphenationEnabled, false, SETTINGS.imageRendering, SETTINGS.bionicReadingEnabled,
+      SETTINGS.guideReadingEnabled, nullptr, nullptr, nullptr, EpubRenderMode::CrossInkDefault);
+  const uint16_t largePageCount = largeFontSection.pageCount;
+  {
+    RenderLock renderLock;
+    SETTINGS.fontSize = CrossPointSettings::FONT_SIZE::MEDIUM;
+    UITheme::getInstance().reload();
+  }
+  if (!largeFontCreated || largePageCount == 0 || largePageCount == mediumPageCount) {
+    error = "device font-size positive control did not alter loose-source pagination";
+    return false;
+  }
+
   Section previewSection(document, 0, renderer, "_preview");
   const SectionBuildOptions previewOptions = {
       .previewAnchor = "preview",

@@ -17,8 +17,10 @@
 #include "PdfObjectParser.h"
 #include "PdfReadingOrder.h"
 #include "PdfRunStore.h"
+#include "PdfSemanticWriter.h"
 #include "PdfStreamDecoder.h"
 #include "PdfTestIo.h"
+#include "PdfWordCounter.h"
 #include "PdfXref.h"
 
 namespace {
@@ -56,6 +58,47 @@ struct FixedSink {
   }
 
   PdfByteSink sink() { return {this, write}; }
+};
+
+struct FixedSemanticSink {
+  std::array<uint8_t, 384> bytes{};
+  size_t length = 0;
+
+  static PdfStatus write(void* context, const uint8_t* source, const size_t requested, size_t* bytesWritten) {
+    if (context == nullptr || source == nullptr || bytesWritten == nullptr) {
+      return PdfStatus::failure(PdfError::InvalidArgument);
+    }
+    auto& sink = *static_cast<FixedSemanticSink*>(context);
+    if (requested > sink.bytes.size() - sink.length) {
+      return PdfStatus::failure(PdfError::InsufficientStorage, sink.length);
+    }
+    std::memcpy(sink.bytes.data() + sink.length, source, requested);
+    sink.length += requested;
+    *bytesWritten = requested;
+    return PdfStatus::success();
+  }
+
+  PdfByteSink sink() { return {this, write}; }
+};
+
+struct FixedSemanticRecordSink {
+  PdfSemanticBlockRecord record{};
+  uint32_t count = 0;
+
+  static PdfStatus emit(void* context, const PdfSemanticBlockRecord& record) {
+    if (context == nullptr) {
+      return PdfStatus::failure(PdfError::InvalidArgument);
+    }
+    auto& sink = *static_cast<FixedSemanticRecordSink*>(context);
+    if (sink.count != 0) {
+      return PdfStatus::failure(PdfError::LimitExceeded, sink.count);
+    }
+    sink.record = record;
+    ++sink.count;
+    return PdfStatus::success();
+  }
+
+  PdfSemanticBlockSink sink() { return {this, emit}; }
 };
 
 struct AllocationResources {
@@ -396,4 +439,64 @@ TEST(PdfAllocationTest, HiddenTextOrderingRunStoreAndClassifierAllocateNothingWh
   EXPECT_TRUE(classifierStatus.ok());
   EXPECT_EQ(hiddenDecision, PdfHiddenTextDecision::Qualified);
   EXPECT_EQ(emitted, 2u);
+}
+
+TEST(PdfAllocationTest, WordCountingAndSemanticWritingAllocateNothingWhenArmed) {
+  static constexpr uint8_t TEXT[] = "Energy-efficient PDF";
+  static constexpr char EXPECTED[] =
+      "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+      "<html xmlns=\"http://www.w3.org/1999/xhtml\"><head><meta charset=\"UTF-8\"/></head><body>"
+      "<p id=\"b00000000\">Energy-efficient PDF</p></body></html>";
+  PdfWordCounter counter;
+  PdfSemanticWriter writer;
+  FixedSemanticSink output;
+  FixedSemanticRecordSink records;
+  std::array<uint8_t, PdfSemanticWriterLimits::MinimumOutputBufferBytes> outputBuffer{};
+  PdfStatus countStatus;
+  PdfStatus writerStatus;
+  bool allocationFailed = false;
+  size_t allocationCount = 0;
+
+  {
+    AllocationWatch watch;
+    try {
+      countStatus = counter.reset();
+      if (countStatus.ok()) {
+        countStatus = counter.consume(TEXT, sizeof(TEXT) - 1);
+      }
+      if (countStatus.ok()) {
+        countStatus = counter.finish();
+      }
+
+      writerStatus = writer.begin(output.sink(), records.sink(), {outputBuffer.data(), outputBuffer.size()});
+      if (writerStatus.ok()) {
+        writerStatus = writer.beginBlock({PdfSemanticBlockKind::Paragraph, 0, 0});
+      }
+      if (writerStatus.ok()) {
+        writerStatus = writer.writeText(TEXT, sizeof(TEXT) - 1);
+      }
+      if (writerStatus.ok()) {
+        writerStatus = writer.endBlock();
+      }
+      if (writerStatus.ok()) {
+        writerStatus = writer.finish();
+      }
+    } catch (const std::bad_alloc&) {
+      allocationFailed = true;
+    }
+    allocationCount = watch.count();
+  }
+
+  EXPECT_FALSE(allocationFailed);
+  EXPECT_EQ(allocationCount, 0u);
+  EXPECT_TRUE(countStatus.ok());
+  EXPECT_TRUE(writerStatus.ok());
+  EXPECT_EQ(counter.words(), 2u);
+  EXPECT_EQ(writer.totalWords(), 2u);
+  ASSERT_EQ(records.count, 1u);
+  EXPECT_STREQ(records.record.anchor, "b00000000");
+  EXPECT_EQ(records.record.cumulativeWordStart, 0u);
+  EXPECT_EQ(records.record.wordCount, 2u);
+  ASSERT_EQ(output.length, sizeof(EXPECTED) - 1);
+  EXPECT_EQ(std::memcmp(output.bytes.data(), EXPECTED, sizeof(EXPECTED) - 1), 0);
 }

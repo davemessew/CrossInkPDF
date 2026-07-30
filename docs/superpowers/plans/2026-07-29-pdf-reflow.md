@@ -1051,22 +1051,36 @@ Resource and no-flash gates passed.
 - Test: `test/pdf_reflow_core/PdfWordCounterTest.cpp`
 - Test: `test/pdf_reflow_core/PdfSemanticWriterTest.cpp`
 
-- [ ] Add red streaming tests for Latin/digits, internal apostrophes/hyphens,
+- [x] Add red streaming tests for Latin/digits, internal apostrophes/hyphens,
   CJK character units, punctuation-only runs, malformed UTF-8, and every
   multibyte split.
-- [ ] Count each extraction token once. At block completion emit checked stable
+- [x] Count each extraction token once. At block completion emit checked stable
   32-bit `b%08lx` anchor, cumulative word start, and count. Test maximum value,
   rollover rejection, and collision detection.
-- [ ] Emit minimal well-formed XHTML using semantic headings, paragraphs,
+- [x] Emit minimal well-formed XHTML using semantic headings, paragraphs,
   row-major table fragments, internal `<a href>`, and
   `<span role="doc-pagebreak" aria-label="…">`; do not emit PDF font sizes,
   families, absolute coordinates, or page-sized containers.
-- [ ] Escape all source text/attributes and validate deterministic publisher
+- [x] Escape all source text/attributes and validate deterministic publisher
   label truncation against `Page`'s fixed 16-byte field.
-- [ ] Assert the 6 pt and 72 pt fixtures have identical transcript, XHTML,
+- [x] Assert the 6 pt and 72 pt fixtures have identical transcript, XHTML,
   anchors, and total words. Add a separate positive control showing a device
   font-size change later alters paginator output.
-- [ ] Run `ctest -R "^Pdf(Word|Semantic)"`. Expected: PASS.
+- [x] Run `ctest -R "^Pdf(Word|Semantic)"`. Expected: PASS.
+
+**2026-07-30 completion:** all 219 host tests and 54 deterministic fixture
+artifacts pass. The 6 pt and 72 pt fixtures produce identical text, XHTML,
+anchor, and four-word total; the simulator's borrowed PDF-format source changes
+page count when only the device font changes while both locked EPUB oracle
+passes remain identical. Word counting and semantic emission allocate nothing
+under the host allocation interceptor, batch sequential writes through a
+caller-owned 128-byte buffer, and contain no production heap/string containers.
+The default firmware link and cppcheck pass. ESP32-C3 QEMU emits
+`QEMU_PDF_SEMANTIC_PASS words=2 bytes=171`, `QEMU_TRACER_PASS`,
+`QEMU_RESOURCE_PASS`, and `QEMU_NO_FLASH_PASS`; current PDF work remains within
+the original baseline gates at 5,429,926 code/rodata bytes, 95,896 static DRAM
+bytes, 66,240 peak heap bytes, 98,644 minimum free heap bytes, 114,676-byte
+largest block, zero sampled allocation bytes, and 13,220 bytes of stack margin.
 
 ## Phase IV — Durable Cache, Navigation, Progress, and Images
 
