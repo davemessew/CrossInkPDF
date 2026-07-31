@@ -1,0 +1,15 @@
+{
+  "error": null,
+  "fixture": "explicit_mask_caption",
+  "geometry_order": [
+    "Explicit mask caption."
+  ],
+  "image_hashes": {},
+  "outline_link_map": {
+    "links": [],
+    "outline": []
+  },
+  "transcript": "Explicit mask caption.",
+  "warning": null,
+  "word_count": 3
+}

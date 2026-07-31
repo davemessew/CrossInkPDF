@@ -240,7 +240,7 @@ FixtureTextResult interpretFontFixture(const char* filename) {
   }
   const PdfValue pages = workspace.arena.values[pagesIndex];
   PdfPageTreeWalker walker(resolver, workspace.arena, workspace.traversalStorage.store(), FixtureWorkspace::capturePage,
-                           &workspace);
+                           &workspace, &workspace.page);
   status = walker.begin({pages.objectNumber, pages.generation});
   if (!status.ok() || !(result = runBudgetOne(walker)).complete() || workspace.pageCount != 1 ||
       workspace.page.contentCount != 1) {

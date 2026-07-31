@@ -162,7 +162,7 @@ PdfStepResult PdfStreamDecoder::step(PdfWorkBudget& budget) {
   if (phase_ == Phase::Idle || phase_ == Phase::Failed) {
     return PdfStepResult::failure(PdfStatus::failure(PdfError::Malformed, sourceOffset_));
   }
-  if (budget.stopRequested()) {
+  if (budget.cancelRequested()) {
     return fail(PdfStatus::failure(PdfError::Cancelled, sourceOffset_));
   }
   activeBudget_ = &budget;
@@ -370,7 +370,7 @@ PdfStreamDecoder::PullResult PdfStreamDecoder::pullRaw(uint8_t* byte) {
   if (activeBudget_ == nullptr) {
     return {PullState::Failed, PdfStatus::failure(PdfError::InvalidArgument, sourceOffset_)};
   }
-  if (activeBudget_->stopRequested()) {
+  if (activeBudget_->cancelRequested()) {
     return {PullState::Failed, PdfStatus::failure(PdfError::Cancelled, sourceOffset_)};
   }
   if (!activeBudget_->consumeOperation()) {
@@ -547,7 +547,7 @@ PdfStreamDecoder::PullResult PdfStreamDecoder::pullAscii85(const uint8_t stage, 
 PdfStreamDecoder::PullResult PdfStreamDecoder::flushPending(PdfWorkBudget& budget) {
   const uint8_t* source = workspace_.outputBuffer + (hasFlate_ ? finalOutputOffset_ : 0);
   while (pendingOutputWritten_ < pendingOutputLength_) {
-    if (budget.stopRequested()) {
+    if (budget.cancelRequested()) {
       return {PullState::Failed, PdfStatus::failure(PdfError::Cancelled, outputBytes_)};
     }
     if (!budget.consumeOperation()) {

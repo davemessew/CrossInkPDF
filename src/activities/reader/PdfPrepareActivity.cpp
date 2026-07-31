@@ -104,6 +104,9 @@ void PdfPrepareActivity::onEnter() {
       this,
       nowMs,
       {this, measureResources, resourceEvent},
+      pdfHalCacheRename,
+      static_cast<uint16_t>(renderer.getScreenWidth()),
+      static_cast<uint16_t>(renderer.getScreenHeight()),
   };
   const PdfStatus status = preparation_->begin(config);
   if (!status) {

@@ -1,0 +1,15 @@
+{
+  "error": null,
+  "fixture": "malformed_flate_caption",
+  "geometry_order": [
+    "Malformed raster caption survives."
+  ],
+  "image_hashes": {},
+  "outline_link_map": {
+    "links": [],
+    "outline": []
+  },
+  "transcript": "Malformed raster caption survives.",
+  "warning": "OptionalImageOmitted",
+  "word_count": 4
+}

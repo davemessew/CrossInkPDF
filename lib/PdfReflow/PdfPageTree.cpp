@@ -1,6 +1,9 @@
 #include "PdfPageTree.h"
 
+#include <algorithm>
 #include <cstring>
+#include <limits>
+#include <new>
 
 namespace {
 
@@ -8,22 +11,132 @@ bool valueIsName(const PdfObjectArena& arena, const PdfValue& value, const char*
   return value.kind == PdfValueKind::Name && pdfTextEquals(arena, value, expected);
 }
 
+bool numericFixed(const PdfValue& value, int32_t* const result) {
+  if (result == nullptr) {
+    return false;
+  }
+  if (value.kind == PdfValueKind::Real) {
+    *result = value.fixedValue;
+    return true;
+  }
+  constexpr int64_t kFixedOne = INT64_C(65536);
+  if (value.kind != PdfValueKind::Integer ||
+      value.integerValue <
+          std::numeric_limits<int32_t>::min() / kFixedOne ||
+      value.integerValue >
+          std::numeric_limits<int32_t>::max() / kFixedOne) {
+    return false;
+  }
+  *result = static_cast<int32_t>(value.integerValue * kFixedOne);
+  return true;
+}
+
+PdfStatus parsePageBox(const PdfObjectArena& arena, const uint16_t valueIndex,
+                       PdfRectangle* const result) {
+  if (result == nullptr || valueIndex >= arena.valueCount ||
+      arena.values[valueIndex].kind != PdfValueKind::Array ||
+      arena.values[valueIndex].count != 4) {
+    return PdfStatus::failure(PdfError::Malformed, valueIndex);
+  }
+  int32_t coordinates[4]{};
+  for (uint16_t ordinal = 0; ordinal < 4; ++ordinal) {
+    uint16_t coordinateIndex = PDF_INVALID_INDEX;
+    if (!pdfArrayAt(arena, valueIndex, ordinal, &coordinateIndex) ||
+        coordinateIndex >= arena.valueCount ||
+        !numericFixed(arena.values[coordinateIndex], &coordinates[ordinal])) {
+      return PdfStatus::failure(PdfError::Malformed, coordinateIndex);
+    }
+  }
+  const PdfRectangle box{
+      std::min(coordinates[0], coordinates[2]),
+      std::min(coordinates[1], coordinates[3]),
+      std::max(coordinates[0], coordinates[2]),
+      std::max(coordinates[1], coordinates[3]),
+  };
+  if (box.xMin >= box.xMax || box.yMin >= box.yMax) {
+    return PdfStatus::failure(PdfError::Malformed, valueIndex);
+  }
+  *result = box;
+  return PdfStatus::success();
+}
+
+PdfStatus parsePageRotation(const PdfObjectArena& arena,
+                            const uint16_t valueIndex,
+                            uint16_t* const result) {
+  if (result == nullptr || valueIndex >= arena.valueCount ||
+      arena.values[valueIndex].kind != PdfValueKind::Integer ||
+      arena.values[valueIndex].integerValue % 90 != 0) {
+    return PdfStatus::failure(PdfError::Malformed, valueIndex);
+  }
+  int64_t normalized = arena.values[valueIndex].integerValue % 360;
+  if (normalized < 0) {
+    normalized += 360;
+  }
+  *result = static_cast<uint16_t>(normalized);
+  return PdfStatus::success();
+}
+
+PdfRectangle effectivePageBox(const PdfPageTreeRecord& inherited) {
+  if (!inherited.hasCropBox) {
+    return inherited.mediaBox;
+  }
+  const PdfRectangle intersection{
+      std::max(inherited.mediaBox.xMin, inherited.cropBox.xMin),
+      std::max(inherited.mediaBox.yMin, inherited.cropBox.yMin),
+      std::min(inherited.mediaBox.xMax, inherited.cropBox.xMax),
+      std::min(inherited.mediaBox.yMax, inherited.cropBox.yMax),
+  };
+  return intersection.xMin < intersection.xMax &&
+                 intersection.yMin < intersection.yMax
+             ? intersection
+             : inherited.mediaBox;
+}
+
+PdfStatus orientedPageExtent(const PdfPageTreeRecord& inherited,
+                             uint16_t* const width,
+                             uint16_t* const height) {
+  if (!inherited.hasMediaBox || width == nullptr || height == nullptr) {
+    return PdfStatus::failure(PdfError::Malformed);
+  }
+  const PdfRectangle box = effectivePageBox(inherited);
+  const uint64_t fixedWidth =
+      static_cast<uint64_t>(static_cast<int64_t>(box.xMax) - box.xMin);
+  const uint64_t fixedHeight =
+      static_cast<uint64_t>(static_cast<int64_t>(box.yMax) - box.yMin);
+  const uint64_t roundedWidth = (fixedWidth + 65535U) >> 16U;
+  const uint64_t roundedHeight = (fixedHeight + 65535U) >> 16U;
+  if (roundedWidth == 0 || roundedHeight == 0 ||
+      roundedWidth > UINT16_MAX || roundedHeight > UINT16_MAX) {
+    return PdfStatus::failure(PdfError::LimitExceeded);
+  }
+  uint16_t resolvedWidth = static_cast<uint16_t>(roundedWidth);
+  uint16_t resolvedHeight = static_cast<uint16_t>(roundedHeight);
+  if (inherited.rotation == 90 || inherited.rotation == 270) {
+    std::swap(resolvedWidth, resolvedHeight);
+  }
+  *width = resolvedWidth;
+  *height = resolvedHeight;
+  return PdfStatus::success();
+}
+
 }  // namespace
 
 PdfPageTreeWalker::PdfPageTreeWalker(PdfObjectResolver& resolver, PdfObjectArena& arena,
                                      const PdfFixedRecordStore traversalStore, const PageFn pageFn, void* pageContext,
+                                     PdfPageInfo* const pageWorkspace,
                                      const uint32_t maxPages)
     : resolver_(resolver),
       arena_(arena),
       traversalStore_(traversalStore),
       pageFn_(pageFn),
       pageContext_(pageContext),
+      pageWorkspace_(pageWorkspace),
       maxPages_(maxPages) {}
 
 PdfStatus PdfPageTreeWalker::begin(const PdfObjectReference rootPages) {
   if (!traversalStore_.valid() || traversalStore_.recordSize != sizeof(PdfPageTreeRecord) ||
       traversalStore_.capacity == 0 || pageFn_ == nullptr || maxPages_ == 0 || maxPages_ > PdfLimits::MaxPages ||
-      rootPages.objectNumber == 0) {
+      rootPages.objectNumber == 0 || pageWorkspace_ == nullptr) {
     phase_ = Phase::Failed;
     return PdfStatus::failure(PdfError::InvalidArgument, rootPages.objectNumber);
   }
@@ -115,6 +228,32 @@ PdfStatus PdfPageTreeWalker::processResolvedNode() {
   const PdfValue& type = arena_.values[valueIndex];
 
   PdfPageTreeRecord inherited = current_;
+  if (pdfDictionaryFind(arena_, resolved.rootIndex, "MediaBox",
+                        &valueIndex)) {
+    const PdfStatus status =
+        parsePageBox(arena_, valueIndex, &inherited.mediaBox);
+    if (!status.ok()) {
+      return status;
+    }
+    inherited.hasMediaBox = true;
+  }
+  if (pdfDictionaryFind(arena_, resolved.rootIndex, "CropBox",
+                        &valueIndex)) {
+    const PdfStatus status =
+        parsePageBox(arena_, valueIndex, &inherited.cropBox);
+    if (!status.ok()) {
+      return status;
+    }
+    inherited.hasCropBox = true;
+  }
+  if (pdfDictionaryFind(arena_, resolved.rootIndex, "Rotate",
+                        &valueIndex)) {
+    const PdfStatus status =
+        parsePageRotation(arena_, valueIndex, &inherited.rotation);
+    if (!status.ok()) {
+      return status;
+    }
+  }
   if (pdfDictionaryFind(arena_, resolved.rootIndex, "Resources", &valueIndex)) {
     if (valueIndex >= arena_.valueCount) {
       return PdfStatus::failure(PdfError::Malformed, current_.reference.objectNumber);
@@ -191,13 +330,24 @@ PdfStatus PdfPageTreeWalker::processResolvedNode() {
     return PdfStatus::failure(PdfError::LimitExceeded, pageCount_);
   }
 
-  PdfPageInfo page;
+  PdfPageInfo& page = *pageWorkspace_;
+  page.~PdfPageInfo();
+  new (&page) PdfPageInfo();
   page.pageReference = current_.reference;
   page.pageIndex = pageCount_;
   page.hasResources = inherited.hasResources;
   page.resourcesIndirect = inherited.resourcesIndirect;
   page.resourceOwner = inherited.resourceOwner;
   page.resourceReference = inherited.resourceReference;
+  page.rotation = inherited.rotation;
+  const PdfRectangle viewBox = effectivePageBox(inherited);
+  page.viewXMin = viewBox.xMin;
+  page.viewYMin = viewBox.yMin;
+  PdfStatus geometryStatus =
+      orientedPageExtent(inherited, &page.pageWidth, &page.pageHeight);
+  if (!geometryStatus.ok()) {
+    return geometryStatus;
+  }
 
   if (pdfDictionaryFind(arena_, resolved.rootIndex, "Contents", &valueIndex)) {
     if (valueIndex >= arena_.valueCount) {
@@ -273,10 +423,15 @@ PdfStatus PdfPageTreeWalker::appendChild(const PdfObjectReference reference, con
   child.reference = reference;
   child.resourceOwner = parent.resourceOwner;
   child.resourceReference = parent.resourceReference;
+  child.mediaBox = parent.mediaBox;
+  child.cropBox = parent.cropBox;
   child.parentOrdinal = parentOrdinal;
   child.depth = static_cast<uint16_t>(parent.depth + 1);
+  child.rotation = parent.rotation;
   child.hasResources = parent.hasResources;
   child.resourcesIndirect = parent.resourcesIndirect;
+  child.hasMediaBox = parent.hasMediaBox;
+  child.hasCropBox = parent.hasCropBox;
   status = pdfWriteRecord(traversalStore_, childOrdinal, &child);
   if (!status.ok()) {
     return status;

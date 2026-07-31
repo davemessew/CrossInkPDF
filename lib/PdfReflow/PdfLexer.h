@@ -18,6 +18,7 @@ class PdfLexer {
 
   uint64_t position() const { return position_; }
   uint64_t tokenOffset() const { return lastTokenOffset_; }
+  bool bufferedRange(uint64_t sourceOffset, size_t* bufferOffset, size_t* length) const;
 
  private:
   enum class Mode : uint8_t {

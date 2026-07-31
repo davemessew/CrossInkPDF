@@ -32,6 +32,7 @@ struct PageTreeHarness {
   PdfTestRecordStore xrefStorage{sizeof(PdfXrefEntry), 256};
   PdfXrefTable xref{xrefStorage.store()};
   PdfTestRecordStore traversalStorage{sizeof(PdfPageTreeRecord), 256};
+  PdfPageInfo pageScratch{};
   std::vector<PdfPageInfo> pages;
 };
 
@@ -94,7 +95,9 @@ PdfStepResult walkFixture(const char* fixture, PageTreeHarness& harness,
     return PdfStepResult::failure(PdfStatus::failure(PdfError::Malformed));
   }
 
-  PdfPageTreeWalker walker(resolver, harness.arena, harness.traversalStorage.store(), capturePage, &harness, maxPages);
+  PdfPageTreeWalker walker(resolver, harness.arena,
+                           harness.traversalStorage.store(), capturePage,
+                           &harness, &harness.pageScratch, maxPages);
   status = walker.begin({pages.objectNumber, pages.generation});
   if (!status.ok()) {
     return PdfStepResult::failure(status);
@@ -125,9 +128,54 @@ TEST(PdfPageTreeTest, PreservesOrderInheritedResourcesAndSingleOrArrayContents) 
   EXPECT_TRUE(harness.pages[0].resourcesIndirect);
   EXPECT_EQ(harness.pages[0].resourceOwner, (PdfObjectReference{2, 0}));
   EXPECT_EQ(harness.pages[0].resourceReference, (PdfObjectReference{10, 0}));
+  EXPECT_EQ(harness.pages[0].pageWidth, 740U);
+  EXPECT_EQ(harness.pages[0].pageHeight, 600U);
+  EXPECT_EQ(harness.pages[0].rotation, 270U);
+  EXPECT_EQ(harness.pages[0].viewXMin, 10 << 16);
+  EXPECT_EQ(harness.pages[0].viewYMin, 40 << 16);
   EXPECT_EQ(harness.pages[1].pageReference, (PdfObjectReference{6, 0}));
   EXPECT_EQ(harness.pages[1].contentCount, 1u);
   EXPECT_EQ(harness.pages[1].contents[0], (PdfObjectReference{7, 0}));
+  EXPECT_EQ(harness.pages[1].pageWidth, 400U);
+  EXPECT_EQ(harness.pages[1].pageHeight, 250U);
+  EXPECT_EQ(harness.pages[1].rotation, 90U);
+  EXPECT_EQ(harness.pages[1].viewXMin, 50 << 16);
+  EXPECT_EQ(harness.pages[1].viewYMin, 0);
+  EXPECT_TRUE(harness.pages[1].hasResources);
+  EXPECT_EQ(harness.pages[1].resourceReference, (PdfObjectReference{10, 0}));
+}
+
+TEST(PdfPageTreeTest,
+     NormalizesAllQuarterTurnsAndIntersectsOrFallsBackFromCropBox) {
+  PageTreeHarness harness;
+
+  const PdfStepResult result = walkFixture("page_tree_geometry.pdf", harness);
+
+  ASSERT_TRUE(result.complete());
+  ASSERT_EQ(harness.pages.size(), 4U);
+  EXPECT_EQ(harness.pages[0].pageWidth, 200U);
+  EXPECT_EQ(harness.pages[0].pageHeight, 100U);
+  EXPECT_EQ(harness.pages[0].rotation, 0U);
+  EXPECT_EQ(harness.pages[1].pageWidth, 100U);
+  EXPECT_EQ(harness.pages[1].pageHeight, 200U);
+  EXPECT_EQ(harness.pages[1].rotation, 90U);
+  EXPECT_EQ(harness.pages[2].pageWidth, 150U);
+  EXPECT_EQ(harness.pages[2].pageHeight, 80U);
+  EXPECT_EQ(harness.pages[2].rotation, 180U);
+  EXPECT_EQ(harness.pages[3].pageWidth, 100U);
+  EXPECT_EQ(harness.pages[3].pageHeight, 200U);
+  EXPECT_EQ(harness.pages[3].rotation, 270U);
+}
+
+TEST(PdfPageTreeTest, RejectsMalformedInheritedPageGeometry) {
+  for (const char* fixture :
+       {"page_tree_bad_media_box.pdf", "page_tree_bad_crop_box.pdf",
+        "page_tree_bad_rotate.pdf"}) {
+    PageTreeHarness harness;
+    const PdfStepResult result = walkFixture(fixture, harness);
+    EXPECT_TRUE(result.failed()) << fixture;
+    EXPECT_EQ(result.status.error, PdfError::Malformed) << fixture;
+  }
 }
 
 TEST(PdfPageTreeTest, RejectsCycleDepthAndProductionPageCount) {

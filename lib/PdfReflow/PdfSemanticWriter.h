@@ -61,6 +61,7 @@ class PdfSemanticWriter {
                   uint32_t initialWords = 0);
   PdfStatus beginBlock(const PdfSemanticBlock& block);
   PdfStatus writeText(const uint8_t* text, size_t length);
+  PdfStatus writeRetainedImage(const uint8_t* resource, size_t length, uint16_t width, uint16_t height);
   PdfStatus beginInternalLink(const uint8_t* href, size_t length);
   PdfStatus endInternalLink();
   PdfStatus endBlock();

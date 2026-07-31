@@ -1,0 +1,15 @@
+{
+  "error": null,
+  "fixture": "repeated_logo_caption",
+  "geometry_order": [
+    "Repeated logo caption."
+  ],
+  "image_hashes": {},
+  "outline_link_map": {
+    "links": [],
+    "outline": []
+  },
+  "transcript": "Repeated logo caption.",
+  "warning": null,
+  "word_count": 3
+}

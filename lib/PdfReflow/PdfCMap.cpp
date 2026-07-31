@@ -132,8 +132,9 @@ PdfStepResult PdfCMap::step(PdfWorkBudget& budget) {
       return fail(status);
     }
   }
-  return budget.stopRequested() ? fail(PdfStatus::failure(PdfError::Cancelled, lexer_.position()))
-                                : PdfStepResult::paused();
+  return budget.cancelRequested()
+             ? fail(PdfStatus::failure(PdfError::Cancelled, lexer_.position()))
+             : PdfStepResult::paused();
 }
 
 PdfStatus PdfCMap::handleToken(const PdfToken& token) {

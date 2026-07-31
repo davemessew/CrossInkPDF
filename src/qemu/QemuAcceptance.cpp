@@ -125,6 +125,7 @@ struct PdfCoreAcceptanceWorkspace {
   PdfTextRun reductionRuns[4]{};
   uint8_t reductionText[256]{};
   PdfReadingOrderItem reductionOrder[4]{};
+  PdfPageInfo pageScratch{};
   PdfPageInfo firstPage{};
   char transcript[32]{};
   uint8_t semanticOutput[384]{};
@@ -553,7 +554,7 @@ bool checkPdfCore() {
   };
 
   auto walker = makeUniqueNoThrow<PdfPageTreeWalker>(*resolver, arena, memoryRecordStore(traversalRecords),
-                                                     captureFirstPdfPage, workspace.get());
+                                                     captureFirstPdfPage, workspace.get(), &workspace->pageScratch);
   if (!walker) {
     file.close();
     fail("PDF_CORE", "page_tree_oom");
@@ -792,6 +793,9 @@ bool checkPdfProductTracer(GfxRenderer& renderer) {
       nullptr,
       qemuNowMs,
       {nullptr, qemuPdfResources, ignorePdfResourceEvent},
+      pdfHalCacheRename,
+      static_cast<uint16_t>(renderer.getScreenWidth()),
+      static_cast<uint16_t>(renderer.getScreenHeight()),
   };
   status = preparation->begin(config);
   PdfStepResult result = PdfStepResult::paused();
@@ -898,7 +902,7 @@ bool checkPdfProductTracer(GfxRenderer& renderer) {
   return true;
 }
 
-bool checkPdfNavigation() {
+bool checkPdfNavigation(GfxRenderer& renderer) {
   char cacheRoot[PDF_CACHE_PATH_CAPACITY]{};
   PdfStatus status = pdfFormatCacheRoot("/.crosspoint", PDF_NAVIGATION_FIXTURE_PATH, cacheRoot, sizeof(cacheRoot));
   if (!status.ok()) {
@@ -923,6 +927,9 @@ bool checkPdfNavigation() {
       nullptr,
       qemuNowMs,
       {nullptr, qemuPdfResources, ignorePdfResourceEvent},
+      pdfHalCacheRename,
+      static_cast<uint16_t>(renderer.getScreenWidth()),
+      static_cast<uint16_t>(renderer.getScreenHeight()),
   };
   status = preparation->begin(config);
   PdfStepResult result = PdfStepResult::paused();
@@ -1044,7 +1051,7 @@ void qemuAcceptanceBegin(MappedInputManager& input, GfxRenderer& renderer) {
   sampleRuntime();
 
   if (!checkStorage() || !checkPdfCore() || !checkPdfCache() || !checkPdfProductTracer(renderer) ||
-      !checkPdfNavigation() || !checkFrame() || !checkInput(input)) {
+      !checkPdfNavigation(renderer) || !checkFrame() || !checkInput(input)) {
     return;
   }
 

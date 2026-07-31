@@ -95,6 +95,54 @@ bool fixedFromProductRatio(const PdfFixed16 value, const int32_t multiplier, con
   return true;
 }
 
+constexpr int32_t kPdfColorOne = 65536L;
+
+int32_t clampColor(const int32_t raw) {
+  if (raw <= 0) {
+    return 0;
+  }
+  return raw >= kPdfColorOne ? kPdfColorOne : raw;
+}
+
+uint8_t colorByte(const int32_t raw) {
+  const int32_t bounded = clampColor(raw);
+  return static_cast<uint8_t>((static_cast<int64_t>(bounded) * 255 + kPdfColorOne / 2) / kPdfColorOne);
+}
+
+uint8_t rgbLuminance(const uint8_t red, const uint8_t green, const uint8_t blue) {
+  return static_cast<uint8_t>((77U * red + 150U * green + 29U * blue + 128U) >> 8U);
+}
+
+bool colorLuminance(const PdfContentOperand* const operands, const uint8_t count, uint8_t* const luminance) {
+  if (operands == nullptr || luminance == nullptr || (count != 1U && count != 3U && count != 4U)) {
+    return false;
+  }
+  for (uint8_t index = 0; index < count; ++index) {
+    if (operands[index].kind != PdfContentOperandKind::Number) {
+      return false;
+    }
+  }
+  if (count == 1U) {
+    *luminance = colorByte(operands[0].number);
+    return true;
+  }
+  if (count == 3U) {
+    *luminance =
+        rgbLuminance(colorByte(operands[0].number), colorByte(operands[1].number), colorByte(operands[2].number));
+    return true;
+  }
+
+  const int32_t cyan = clampColor(operands[0].number);
+  const int32_t magenta = clampColor(operands[1].number);
+  const int32_t yellow = clampColor(operands[2].number);
+  const int32_t black = clampColor(operands[3].number);
+  const uint8_t red = colorByte(kPdfColorOne - clampColor(cyan + black));
+  const uint8_t green = colorByte(kPdfColorOne - clampColor(magenta + black));
+  const uint8_t blue = colorByte(kPdfColorOne - clampColor(yellow + black));
+  *luminance = rgbLuminance(red, green, blue);
+  return true;
+}
+
 bool concatenate(const PdfMatrix& current, const PdfMatrix& next, PdfMatrix* result) {
   if (result == nullptr) {
     return false;
@@ -276,8 +324,9 @@ PdfStepResult PdfContentInterpreter::step(PdfWorkBudget& budget) {
       return fail(status);
     }
   }
-  return budget.stopRequested() ? fail(PdfStatus::failure(PdfError::Cancelled, lexer_.position()))
-                                : PdfStepResult::paused();
+  return budget.cancelRequested()
+             ? fail(PdfStatus::failure(PdfError::Cancelled, lexer_.position()))
+             : PdfStepResult::paused();
 }
 
 PdfStatus PdfContentInterpreter::copyScratch(const uint8_t* const source, const size_t length, uint16_t* const offset) {
@@ -522,7 +571,9 @@ PdfStatus PdfContentInterpreter::processOperator(const PdfToken& token) {
       tokenEquals(token, "\"")) {
     return processTextOperator(token);
   }
-  if (tokenEquals(token, "q") || tokenEquals(token, "Q") || tokenEquals(token, "cm")) {
+  if (tokenEquals(token, "q") || tokenEquals(token, "Q") || tokenEquals(token, "cm") ||
+      tokenEquals(token, "g") || tokenEquals(token, "rg") || tokenEquals(token, "k") ||
+      tokenEquals(token, "sc") || tokenEquals(token, "scn")) {
     return processGraphicsOperator(token);
   }
   if (tokenEquals(token, "BDC") || tokenEquals(token, "BMC") || tokenEquals(token, "EMC") || tokenEquals(token, "MP") ||
@@ -712,6 +763,27 @@ PdfStatus PdfContentInterpreter::processGraphicsOperator(const PdfToken& token) 
     --graphicsDepth_;
     graphics_ = graphicsStack_[graphicsDepth_];
     text_ = textStack_[graphicsDepth_];
+    return PdfStatus::success();
+  }
+  if (tokenEquals(token, "g") || tokenEquals(token, "rg") || tokenEquals(token, "k")) {
+    const uint8_t expectedCount = tokenEquals(token, "g") ? 1U : (tokenEquals(token, "rg") ? 3U : 4U);
+    uint8_t luminance = 0;
+    if (operandCount_ != expectedCount || !colorLuminance(workspace_.operands, expectedCount, &luminance)) {
+      return failStatus(PdfError::Malformed);
+    }
+    graphics_.nonstrokingLuminance = luminance;
+    return PdfStatus::success();
+  }
+  if (tokenEquals(token, "sc") || tokenEquals(token, "scn")) {
+    uint8_t componentCount = operandCount_;
+    if (tokenEquals(token, "scn") && componentCount != 0 &&
+        workspace_.operands[componentCount - 1U].kind == PdfContentOperandKind::Name) {
+      --componentCount;
+    }
+    uint8_t luminance = 0;
+    if (colorLuminance(workspace_.operands, componentCount, &luminance)) {
+      graphics_.nonstrokingLuminance = luminance;
+    }
     return PdfStatus::success();
   }
   if (operandCount_ != 6) {
@@ -1181,6 +1253,7 @@ PdfStatus PdfContentInterpreter::appendImage(const PdfContentXObject& image, con
     placement.yMax = std::max(placement.yMax, y.raw);
   }
   placement.flags = inlineImage ? PdfImageInline : 0;
+  placement.imageMaskPaintLuminance = graphics_.nonstrokingLuminance;
   return pageModel_->appendImage(placement);
 }
 

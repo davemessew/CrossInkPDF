@@ -81,7 +81,10 @@ TEST(PdfFixtureIntegrationTest, ResolvesCatalogPageTreeAndEmitsExactlyHelloPdf) 
   const PdfValue pages = workspace.arena.values[pagesIndex];
   ASSERT_EQ(pages.kind, PdfValueKind::Reference);
 
-  PdfPageTreeWalker walker(resolver, workspace.arena, workspace.traversalStorage.store(), captureFirstPage, &workspace);
+  PdfPageTreeWalker walker(resolver, workspace.arena,
+                           workspace.traversalStorage.store(),
+                           captureFirstPage, &workspace,
+                           &workspace.firstPage);
   ASSERT_TRUE(walker.begin({pages.objectNumber, pages.generation}).ok());
   ASSERT_TRUE(runBudgetOne(walker).complete());
   ASSERT_EQ(workspace.pageCount, 1u);

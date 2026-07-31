@@ -449,6 +449,22 @@ PdfStepResult PdfObjectParser::step(PdfWorkBudget& budget) {
         }
         continue;
       }
+      if (token.kind == PdfTokenKind::Integer) {
+        int64_t nextInteger = 0;
+        if (!parseInteger(token, &nextInteger)) {
+          failed_ = true;
+          return PdfStepResult::failure(PdfStatus::failure(PdfError::Malformed, lexer_.tokenOffset()));
+        }
+        status = emitInteger(firstInteger_);
+        if (!status.ok() || complete_) {
+          failed_ = true;
+          return PdfStepResult::failure(status.ok() ? PdfStatus::failure(PdfError::Malformed, lexer_.tokenOffset())
+                                                    : status);
+        }
+        firstInteger_ = secondInteger_;
+        secondInteger_ = nextInteger;
+        continue;
+      }
       status = emitInteger(firstInteger_);
       if (status.ok()) {
         status = emitInteger(secondInteger_);

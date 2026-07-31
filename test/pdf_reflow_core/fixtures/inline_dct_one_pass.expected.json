@@ -1,0 +1,15 @@
+{
+  "error": null,
+  "fixture": "inline_dct_one_pass",
+  "geometry_order": [
+    "Inline DCT one pass."
+  ],
+  "image_hashes": {},
+  "outline_link_map": {
+    "links": [],
+    "outline": []
+  },
+  "transcript": "Inline DCT one pass.",
+  "warning": null,
+  "word_count": 4
+}

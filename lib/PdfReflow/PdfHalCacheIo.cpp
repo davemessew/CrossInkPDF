@@ -132,6 +132,23 @@ PdfStatus removePath(void* rawContext, const char* const path, const bool recurs
   return removed ? PdfStatus::success() : PdfStatus::failure(PdfError::IoFailure);
 }
 
+PdfStatus renamePath(void* rawContext, const char* const sourcePath,
+                     const char* const destinationPath) {
+  if (rawContext == nullptr || sourcePath == nullptr ||
+      destinationPath == nullptr) {
+    return PdfStatus::failure(PdfError::InvalidArgument);
+  }
+  if (!Storage.exists(sourcePath)) {
+    return PdfStatus::failure(PdfError::InvalidOffset);
+  }
+  if (Storage.exists(destinationPath)) {
+    return PdfStatus::failure(PdfError::IoFailure);
+  }
+  return Storage.rename(sourcePath, destinationPath)
+             ? PdfStatus::success()
+             : PdfStatus::failure(PdfError::IoFailure);
+}
+
 PdfStatus makeDirectory(void* rawContext, const char* const path) {
   if (rawContext == nullptr || path == nullptr) {
     return PdfStatus::failure(PdfError::InvalidArgument);
@@ -213,6 +230,11 @@ PdfStatus fileMetadata(void* rawContext, const PdfCacheHandle handle, PdfCacheFi
 }
 
 }  // namespace
+
+PdfStatus pdfHalCacheRename(void* context, const char* sourcePath,
+                            const char* destinationPath) {
+  return renamePath(context, sourcePath, destinationPath);
+}
 
 PdfCacheIo pdfHalCacheIo(PdfHalCacheIoContext& context) {
   return {&context,  openFile,   readFile,      writeFile,     flushFile,       syncFile,

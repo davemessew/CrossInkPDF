@@ -68,7 +68,7 @@ PdfStepResult pdfStepReadExact(const PdfByteSource& source, PdfReadExactState& s
   }
 
   while (state.completed < state.length) {
-    if (budget.stopRequested()) {
+    if (budget.cancelRequested()) {
       return PdfStepResult::failure(PdfStatus::failure(PdfError::Cancelled, state.sourceOffset + state.completed));
     }
     if (!budget.consumeOperation()) {

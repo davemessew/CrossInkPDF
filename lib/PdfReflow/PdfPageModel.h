@@ -27,7 +27,8 @@ struct PdfImagePlacement {
   int32_t xMax = 0;
   int32_t yMax = 0;
   uint16_t flags = 0;
-  uint16_t reserved = 0;
+  uint8_t imageMaskPaintLuminance = 0;
+  uint8_t reserved = 0;
 };
 
 enum PdfImagePlacementFlag : uint16_t {

@@ -1,0 +1,19 @@
+{
+  "error": null,
+  "fixture": "same_bytes_different_raster_contract",
+  "geometry_order": [
+    "Normal contract figure.",
+    "Inverted contract figure."
+  ],
+  "image_hashes": {
+    "image-6-normal-gray8": "03b722a15d4658be01f1eb9def5e8be124710cc0e88842f78107abfda3e23ea8",
+    "image-7-inverted-gray8": "03b722a15d4658be01f1eb9def5e8be124710cc0e88842f78107abfda3e23ea8"
+  },
+  "outline_link_map": {
+    "links": [],
+    "outline": []
+  },
+  "transcript": "Normal contract figure. Inverted contract figure.",
+  "warning": null,
+  "word_count": 6
+}

@@ -1,0 +1,17 @@
+{
+  "error": null,
+  "fixture": "sof1_jpeg_cover_caption",
+  "geometry_order": [
+    "SOF1 JPEG cover caption."
+  ],
+  "image_hashes": {
+    "image-6-sof1-cover-jpeg": "b9a812e00d2763ee33eadc8d54922b9068ebc9791fee66047cc1f0dea8eafdfc"
+  },
+  "outline_link_map": {
+    "links": [],
+    "outline": []
+  },
+  "transcript": "SOF1 JPEG cover caption.",
+  "warning": null,
+  "word_count": 4
+}

@@ -967,53 +967,143 @@ PdfStatus PdfPageLabelMap::format(const uint32_t pageIndex, char* const output, 
                                                                        : appendNumber(output, capacity, length, number);
 }
 
-PdfStatus pdfEncodeOutline(const PdfOutlineEntrySource& entries, const PdfByteSink& destination) {
-  if (!entries.valid() || !destination.valid() || entries.count == 0 || entries.count > PdfOutlineLimits::MaxEntries) {
-    return PdfStatus::failure(PdfError::InvalidArgument);
+PdfStepResult pdfStepEncodeOutline(
+    const PdfOutlineEntrySource& entries,
+    const PdfByteSink& destination,
+    PdfOutlineEncodeRuntime& runtime,
+    PdfOutlineEncodeWorkspace& workspace,
+    PdfWorkBudget& budget) {
+  if (!entries.valid() || !destination.valid() || entries.count == 0 ||
+      entries.count > PdfOutlineLimits::MaxEntries) {
+    return PdfStepResult::failure(
+        PdfStatus::failure(PdfError::InvalidArgument));
   }
-  uint8_t header[kHeaderBytes]{};
-  std::memcpy(header, kMagic, sizeof(kMagic));
-  putU16(header + 4, PdfOutlineLimits::CodecVersion);
-  putU16(header + 6, PdfOutlineLimits::EncodedRecordBytes);
-  putU16(header + 8, entries.count);
-  putU16(header + 10, 0);
-  putU32(header + 12, static_cast<uint32_t>(entries.count) * PdfOutlineLimits::EncodedRecordBytes);
-  uint32_t crc = pdfCacheCrc32(header, sizeof(header));
-  PdfStatus status = pdfWriteExact(destination, header, sizeof(header));
+  if (runtime.stage == PdfOutlineEncodeStage::Idle) {
+    runtime.crc32 = 0;
+    runtime.recordIndex = 0;
+    runtime.stage = PdfOutlineEncodeStage::Header;
+    return PdfStepResult::paused();
+  }
 
-  for (uint16_t index = 0; status && index < entries.count; ++index) {
-    PdfOutlineEntry entry{};
-    status = entries.read(entries.context, index, &entry);
+  if (runtime.stage == PdfOutlineEncodeStage::Header) {
+    if (budget.bytesRemaining < kHeaderBytes ||
+        !budget.consumeOperation()) {
+      return PdfStepResult::paused();
+    }
+    (void)budget.takeBytes(kHeaderBytes);
+    std::memset(workspace.encoded, 0, kHeaderBytes);
+    std::memcpy(workspace.encoded, kMagic, sizeof(kMagic));
+    putU16(workspace.encoded + 4, PdfOutlineLimits::CodecVersion);
+    putU16(workspace.encoded + 6,
+           PdfOutlineLimits::EncodedRecordBytes);
+    putU16(workspace.encoded + 8, entries.count);
+    putU16(workspace.encoded + 10, 0);
+    putU32(
+        workspace.encoded + 12,
+        static_cast<uint32_t>(entries.count) *
+            PdfOutlineLimits::EncodedRecordBytes);
+    const uint32_t crc =
+        pdfCacheCrc32(workspace.encoded, kHeaderBytes);
+    const PdfStatus status =
+        pdfWriteExact(destination, workspace.encoded, kHeaderBytes);
     if (!status) {
-      break;
+      return PdfStepResult::failure(status);
+    }
+    runtime.crc32 = crc;
+    runtime.stage = PdfOutlineEncodeStage::Records;
+    return PdfStepResult::paused();
+  }
+
+  if (runtime.stage == PdfOutlineEncodeStage::Records) {
+    if (runtime.recordIndex >= entries.count) {
+      runtime.stage = PdfOutlineEncodeStage::Crc;
+      return PdfStepResult::paused();
+    }
+    workspace.entry = {};
+    PdfStatus status = entries.read(
+        entries.context, runtime.recordIndex, &workspace.entry);
+    if (!status) {
+      return PdfStepResult::failure(status);
     }
     uint8_t parentLevel = 0;
-    if (entry.parentIndex >= 0) {
-      PdfOutlineEntry parent{};
-      status = entries.read(entries.context, static_cast<uint16_t>(entry.parentIndex), &parent);
+    if (workspace.entry.parentIndex >= 0) {
+      workspace.parent = {};
+      status = entries.read(
+          entries.context,
+          static_cast<uint16_t>(workspace.entry.parentIndex),
+          &workspace.parent);
       if (!status) {
-        return status;
+        return PdfStepResult::failure(status);
       }
-      parentLevel = parent.level;
+      parentLevel = workspace.parent.level;
     }
-    if (!validEntry(entry, index, parentLevel)) {
-      return PdfStatus::failure(PdfError::Malformed, index);
+    if (!validEntry(workspace.entry, runtime.recordIndex,
+                    parentLevel)) {
+      return PdfStepResult::failure(PdfStatus::failure(
+          PdfError::Malformed, runtime.recordIndex));
     }
-    status = validateUtf8Title(entry);
+    status = validateUtf8Title(workspace.entry);
     if (!status) {
-      return status;
+      return PdfStepResult::failure(status);
     }
-    uint8_t encoded[PdfOutlineLimits::EncodedRecordBytes]{};
-    encodeEntry(entry, encoded);
-    crc = pdfCacheCrc32(encoded, sizeof(encoded), crc);
-    status = pdfWriteExact(destination, encoded, sizeof(encoded));
+    if (budget.bytesRemaining <
+            PdfOutlineLimits::EncodedRecordBytes ||
+        !budget.consumeOperation()) {
+      return PdfStepResult::paused();
+    }
+    (void)budget.takeBytes(PdfOutlineLimits::EncodedRecordBytes);
+    encodeEntry(workspace.entry, workspace.encoded);
+    const uint32_t crc = pdfCacheCrc32(
+        workspace.encoded, PdfOutlineLimits::EncodedRecordBytes,
+        runtime.crc32);
+    status = pdfWriteExact(
+        destination, workspace.encoded,
+        PdfOutlineLimits::EncodedRecordBytes);
+    if (!status) {
+      return PdfStepResult::failure(status);
+    }
+    runtime.crc32 = crc;
+    ++runtime.recordIndex;
+    return PdfStepResult::paused();
   }
-  if (!status) {
-    return status;
+
+  if (runtime.stage == PdfOutlineEncodeStage::Crc) {
+    if (budget.bytesRemaining < kCrcBytes ||
+        !budget.consumeOperation()) {
+      return PdfStepResult::paused();
+    }
+    (void)budget.takeBytes(kCrcBytes);
+    putU32(workspace.encoded, runtime.crc32);
+    const PdfStatus status =
+        pdfWriteExact(destination, workspace.encoded, kCrcBytes);
+    if (!status) {
+      return PdfStepResult::failure(status);
+    }
+    runtime.stage = PdfOutlineEncodeStage::Complete;
+    return PdfStepResult::completed();
   }
-  uint8_t encodedCrc[kCrcBytes]{};
-  putU32(encodedCrc, crc);
-  return pdfWriteExact(destination, encodedCrc, sizeof(encodedCrc));
+
+  return runtime.stage == PdfOutlineEncodeStage::Complete
+             ? PdfStepResult::completed()
+             : PdfStepResult::failure(
+                   PdfStatus::failure(PdfError::InvalidArgument));
+}
+
+PdfStatus pdfEncodeOutline(const PdfOutlineEntrySource& entries,
+                           const PdfByteSink& destination) {
+  PdfOutlineEncodeRuntime runtime{};
+  PdfOutlineEncodeWorkspace workspace{};
+  PdfWorkBudget budget{UINT32_MAX, SIZE_MAX};
+  for (;;) {
+    const PdfStepResult result = pdfStepEncodeOutline(
+        entries, destination, runtime, workspace, budget);
+    if (result.failed()) {
+      return result.status;
+    }
+    if (result.complete()) {
+      return PdfStatus::success();
+    }
+  }
 }
 
 PdfStatus pdfDecodeOutline(const PdfByteSource& source, PdfOutlineHeader* const header,

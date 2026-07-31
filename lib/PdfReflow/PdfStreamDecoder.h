@@ -42,6 +42,15 @@ class PdfStreamDecoder {
   PdfStepResult step(PdfWorkBudget& budget);
 
   uint64_t inputBytes() const { return inputBytes_; }
+  // Direct Flate fills a bounded raw look-ahead buffer before inflate runs.
+  // Exclude bytes still buffered after TINF_DONE so callers can locate the
+  // encoded stream's exact boundary without treating following container
+  // bytes as input. Pre-Flate text filters stop pulling raw bytes at their own
+  // terminator, so inputBytes_ is already the raw encoded boundary for them.
+  uint64_t consumedInputBytes() const {
+    return hasFlate_ && preFlateStages_ == 0 ? inputBytes_ - inflateInputLength_
+                                             : inputBytes_;
+  }
   uint64_t outputBytes() const { return outputBytes_; }
   bool omitted() const { return omitted_; }
   bool usesExternalDictionary() const { return inflateInitialized_ && inflateContext_.reader.usesExternalDictionary(); }

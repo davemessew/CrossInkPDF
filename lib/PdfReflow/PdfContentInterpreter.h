@@ -87,6 +87,7 @@ class PdfContentInterpreter {
  private:
   struct GraphicsState {
     PdfMatrix ctm{};
+    uint8_t nonstrokingLuminance = 0;
   };
 
   struct TextState {

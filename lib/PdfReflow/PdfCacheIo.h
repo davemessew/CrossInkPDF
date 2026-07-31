@@ -44,6 +44,9 @@ struct PdfCacheDirEntry {
 };
 
 using PdfCacheListVisitor = PdfStatus (*)(void* context, const PdfCacheDirEntry& entry);
+using PdfCacheRenameFn = PdfStatus (*)(void* context,
+                                       const char* sourcePath,
+                                       const char* destinationPath);
 
 struct PdfCacheIo {
   using OpenFn = PdfStatus (*)(void* context, const char* path, PdfCacheOpenMode mode, PdfCacheHandle* handle);

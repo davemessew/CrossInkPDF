@@ -1,0 +1,17 @@
+{
+  "error": null,
+  "fixture": "jpeg_cover_caption",
+  "geometry_order": [
+    "JPEG cover caption."
+  ],
+  "image_hashes": {
+    "image-6-cover-jpeg": "7bd0d9a34c79c3054431974247b46ee6daef96793b4af67a7ec3d5268335fd50"
+  },
+  "outline_link_map": {
+    "links": [],
+    "outline": []
+  },
+  "transcript": "JPEG cover caption.",
+  "warning": null,
+  "word_count": 3
+}

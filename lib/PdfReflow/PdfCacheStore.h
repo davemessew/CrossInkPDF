@@ -70,6 +70,13 @@ struct PdfCacheTrackedWriter {
   bool failed = false;
 };
 
+inline constexpr size_t PDF_CACHE_CLEANUP_GENERATION_CAPACITY = 32;
+
+struct PdfCacheGenerationList {
+  uint32_t generations[PDF_CACHE_CLEANUP_GENERATION_CAPACITY]{};
+  uint8_t count = 0;
+};
+
 PdfStatus pdfInitializeCacheBudget(uint64_t sourceSize, const PdfCacheCapacity& capacity, uint64_t requiredReserve,
                                    PdfCacheBudget* budget);
 PdfStatus pdfReserveCacheBytes(PdfCacheBudget* budget, uint64_t bytes, PdfCacheFileKind kind);
@@ -93,7 +100,11 @@ class PdfCacheStore {
   PdfStatus loadCheckpointSlots(const PdfSourceIdentity& expectedSource, PdfBuildCheckpointSelection* selection) const;
   PdfStatus commitCheckpoint(const PdfBuildCheckpoint& checkpoint) const;
 
+  PdfStatus listGenerations(PdfCacheGenerationList* generations) const;
+  PdfStatus removeGeneration(uint32_t generation) const;
   PdfStatus cleanupUnreferencedGenerations() const;
+  PdfStatus cleanupUnreferencedGenerations(
+      const PdfCacheManifestSelection& manifests) const;
 
  private:
   PdfStatus formatPath(const char* leaf, char* destination, size_t capacity) const;

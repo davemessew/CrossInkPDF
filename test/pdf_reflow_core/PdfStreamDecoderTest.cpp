@@ -88,6 +88,8 @@ std::vector<uint8_t> ascii85Encode(const std::vector<uint8_t>& input) {
 struct DecodeResult {
   PdfStepResult result{};
   std::vector<uint8_t> bytes;
+  uint64_t inputBytes = 0;
+  uint64_t consumedInputBytes = 0;
   bool omitted = false;
   bool externalDictionary = false;
 };
@@ -120,6 +122,8 @@ DecodeResult decode(const std::vector<uint8_t>& encoded, const std::vector<PdfSt
     }
   }
   decoded.bytes = output.bytes();
+  decoded.inputBytes = decoder.inputBytes();
+  decoded.consumedInputBytes = decoder.consumedInputBytes();
   decoded.omitted = decoder.omitted();
   decoded.externalDictionary = decoder.usesExternalDictionary();
   return decoded;
@@ -164,6 +168,23 @@ TEST(PdfStreamDecoderTest, HandlesAscii85ZeroTerminatorWhitespaceAndOddHexNibble
   const DecodeResult odd = decode(bytes("48656c6c6f2>"), {PdfStreamFilter::ASCIIHex});
   ASSERT_TRUE(odd.result.complete());
   EXPECT_EQ(odd.bytes, (std::vector<uint8_t>{'H', 'e', 'l', 'l', 'o', 0x20}));
+}
+
+TEST(PdfStreamDecoderTest, ReportsExactFlateBoundaryWithoutContainerReadAhead) {
+  const std::vector<uint8_t> expected = bytes("inline flate");
+  const std::vector<uint8_t> encoded = storedZlib(expected);
+  std::vector<uint8_t> withFollowingOperators = encoded;
+  const std::vector<uint8_t> following = bytes(" EI Q BT (after) Tj ET");
+  withFollowingOperators.insert(withFollowingOperators.end(), following.begin(),
+                                following.end());
+
+  const DecodeResult result =
+      decode(withFollowingOperators, {PdfStreamFilter::Flate});
+
+  ASSERT_TRUE(result.result.complete());
+  EXPECT_EQ(result.bytes, expected);
+  EXPECT_GT(result.inputBytes, encoded.size());
+  EXPECT_EQ(result.consumedInputBytes, encoded.size());
 }
 
 TEST(PdfStreamDecoderTest, ProducesIdenticalBytesAcrossEveryInputAndOutputSplit) {

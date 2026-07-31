@@ -1,0 +1,15 @@
+{
+  "error": null,
+  "fixture": "unsupported_jpx_caption",
+  "geometry_order": [
+    "Text survives."
+  ],
+  "image_hashes": {},
+  "outline_link_map": {
+    "links": [],
+    "outline": []
+  },
+  "transcript": "Text survives.",
+  "warning": null,
+  "word_count": 2
+}

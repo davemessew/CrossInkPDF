@@ -5,14 +5,22 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <new>
 
 #include "PdfCheckedMath.h"
+
+#if defined(__GNUC__) || defined(__clang__)
+#define PDF_CACHE_STORE_NOINLINE __attribute__((noinline))
+#elif defined(_MSC_VER)
+#define PDF_CACHE_STORE_NOINLINE __declspec(noinline)
+#else
+#define PDF_CACHE_STORE_NOINLINE
+#endif
 
 namespace {
 
 constexpr char kManifestNames[2][11] = {"manifest.a", "manifest.b"};
 constexpr char kCheckpointNames[2][8] = {"build.a", "build.b"};
-constexpr size_t kCleanupGenerationCapacity = 32;
 
 struct CacheHandleSource {
   const PdfCacheIo* io = nullptr;
@@ -71,6 +79,93 @@ bool checkpointsEqual(const PdfBuildCheckpoint& left, const PdfBuildCheckpoint& 
          left.warningFlags == right.warningFlags;
 }
 
+PDF_CACHE_STORE_NOINLINE PdfStatus loadManifestSlot(
+    const PdfCacheIo& io, const char* const path,
+    const PdfSourceIdentity& expectedSource,
+    PdfCacheManifestSlotState* const state) {
+  if (state == nullptr) {
+    return PdfStatus::failure(PdfError::InvalidArgument);
+  }
+  PdfCacheHandle handle{};
+  PdfStatus status =
+      io.open(io.context, path, PdfCacheOpenMode::Read, &handle);
+  if (!status) {
+    return status;
+  }
+  PdfCacheFileMetadata metadata{};
+  status = io.metadata(io.context, handle, &metadata);
+  if (status && !metadata.directory && !metadata.symlinkLike) {
+    CacheHandleSource source{&io, handle, metadata.size};
+    status = pdfDecodeCacheManifest(source.source(), &state->manifest, {});
+  } else if (status) {
+    status = PdfStatus::failure(PdfError::Malformed);
+  }
+  status = closeHandle(io, &handle, status);
+  if (!status || !state->manifest.completed) {
+    return status;
+  }
+  state->valid = true;
+  state->sourceMatches =
+      pdfSourceIdentityEqual(state->manifest.source, expectedSource);
+  return PdfStatus::success();
+}
+
+PDF_CACHE_STORE_NOINLINE PdfStatus loadCheckpointSlot(
+    const PdfCacheIo& io, const char* const path,
+    const PdfSourceIdentity& expectedSource,
+    PdfBuildCheckpointSlotState* const state) {
+  if (state == nullptr) {
+    return PdfStatus::failure(PdfError::InvalidArgument);
+  }
+  PdfCacheHandle handle{};
+  PdfStatus status =
+      io.open(io.context, path, PdfCacheOpenMode::Read, &handle);
+  if (!status) {
+    return status;
+  }
+  PdfCacheFileMetadata metadata{};
+  status = io.metadata(io.context, handle, &metadata);
+  if (status && !metadata.directory && !metadata.symlinkLike) {
+    CacheHandleSource source{&io, handle, metadata.size};
+    status =
+        pdfDecodeBuildCheckpoint(source.source(), &state->checkpoint);
+  } else if (status) {
+    status = PdfStatus::failure(PdfError::Malformed);
+  }
+  status = closeHandle(io, &handle, status);
+  if (!status) {
+    return status;
+  }
+  state->valid = true;
+  state->sourceMatches =
+      pdfSourceIdentityEqual(state->checkpoint.source, expectedSource);
+  return PdfStatus::success();
+}
+
+PDF_CACHE_STORE_NOINLINE PdfStatus verifyCheckpointFile(
+    const PdfCacheIo& io, const char* const path,
+    const PdfBuildCheckpoint& checkpoint) {
+  PdfCacheHandle handle{};
+  PdfStatus status =
+      io.open(io.context, path, PdfCacheOpenMode::Read, &handle);
+  if (!status) {
+    return status;
+  }
+  PdfCacheFileMetadata metadata{};
+  status = io.metadata(io.context, handle, &metadata);
+  PdfBuildCheckpoint verified{};
+  if (status && !metadata.directory && !metadata.symlinkLike) {
+    CacheHandleSource source{&io, handle, metadata.size};
+    status = pdfDecodeBuildCheckpoint(source.source(), &verified);
+    if (status && !checkpointsEqual(verified, checkpoint)) {
+      status = PdfStatus::failure(PdfError::Malformed);
+    }
+  } else if (status) {
+    status = PdfStatus::failure(PdfError::Malformed);
+  }
+  return closeHandle(io, &handle, status);
+}
+
 bool safeRoot(const char* const root) {
   if (root == nullptr || root[0] != '/' || root[1] == '\0' || std::strchr(root, '\\') != nullptr ||
       std::strchr(root, ':') != nullptr) {
@@ -121,26 +216,44 @@ bool parseGenerationName(const PdfCacheDirEntry& entry, uint32_t* const generati
   return true;
 }
 
-struct CleanupList {
-  uint32_t generations[kCleanupGenerationCapacity]{};
-  size_t count = 0;
+PDF_CACHE_STORE_NOINLINE PdfStatus removeGenerationPath(
+    const PdfCacheIo& io, const char* const root,
+    const uint32_t generation) {
+  char path[PDF_CACHE_PATH_CAPACITY];
+  const int length =
+      std::snprintf(path, sizeof(path), "%s/gen_%lu", root,
+                    static_cast<unsigned long>(generation));
+  if (length < 0 || static_cast<size_t>(length) >= sizeof(path)) {
+    return PdfStatus::failure(PdfError::LimitExceeded);
+  }
+  const PdfStatus status = io.remove(io.context, path, true);
+  return !status && status.error == PdfError::InvalidOffset
+             ? PdfStatus::success()
+             : status;
+}
 
-  static PdfStatus collect(void* context, const PdfCacheDirEntry& entry) {
-    auto& self = *static_cast<CleanupList*>(context);
-    uint32_t generation = 0;
-    if (!parseGenerationName(entry, &generation)) {
-      return PdfStatus::success();
-    }
-    if (self.count == kCleanupGenerationCapacity) {
-      return PdfStatus::failure(PdfError::LimitExceeded);
-    }
-    self.generations[self.count++] = generation;
+PdfStatus collectGeneration(void* const context,
+                            const PdfCacheDirEntry& entry) {
+  auto& self = *static_cast<PdfCacheGenerationList*>(context);
+  uint32_t generation = 0;
+  if (!parseGenerationName(entry, &generation)) {
     return PdfStatus::success();
   }
-};
+  if (self.count == PDF_CACHE_CLEANUP_GENERATION_CAPACITY) {
+    return PdfStatus::failure(PdfError::LimitExceeded);
+  }
+  self.generations[self.count++] = generation;
+  return PdfStatus::success();
+}
 
 uint8_t slotIndex(const PdfCacheSlot slot) { return slot == PdfCacheSlot::A ? 0 : 1; }
 PdfCacheSlot opposite(const PdfCacheSlot slot) { return slot == PdfCacheSlot::A ? PdfCacheSlot::B : PdfCacheSlot::A; }
+
+template <typename T>
+void resetInPlace(T& value) {
+  value.~T();
+  new (&value) T();
+}
 
 }  // namespace
 
@@ -206,7 +319,7 @@ PdfStatus pdfOpenTrackedCacheWriter(const PdfCacheIo& io, const char* const full
   if (!io.valid() || fullPath == nullptr || relativePath == nullptr || writer == nullptr || byteLimit == 0) {
     return PdfStatus::failure(PdfError::InvalidArgument);
   }
-  *writer = {};
+  resetInPlace(*writer);
   const size_t fullLength = std::strlen(fullPath);
   const size_t relativeLength = std::strlen(relativePath);
   if (fullLength == 0 || fullLength >= sizeof(writer->fullPath) ||
@@ -222,7 +335,7 @@ PdfStatus pdfOpenTrackedCacheWriter(const PdfCacheIo& io, const char* const full
   writer->byteLimit = byteLimit;
   const PdfStatus status = io.open(io.context, fullPath, PdfCacheOpenMode::WriteTruncate, &writer->handle);
   if (!status) {
-    *writer = {};
+    resetInPlace(*writer);
     return status;
   }
   writer->open = true;
@@ -331,49 +444,34 @@ PdfStatus PdfCacheStore::loadManifestSlots(const PdfSourceIdentity& expectedSour
   if (!io_.valid() || selection == nullptr) {
     return PdfStatus::failure(PdfError::InvalidArgument);
   }
-  *selection = PdfCacheManifestSelection{};
+  resetInPlace(*selection);
   for (uint8_t index = 0; index < 2; ++index) {
+    auto& state = selection->slots[index];
     char path[PDF_CACHE_PATH_CAPACITY];
     PdfStatus status = formatPath(kManifestNames[index], path, sizeof(path));
     if (!status) {
       return status;
     }
-    PdfCacheHandle handle{};
-    status = io_.open(io_.context, path, PdfCacheOpenMode::Read, &handle);
+    status = loadManifestSlot(io_, path, expectedSource, &state);
     if (!status) {
-      if (status.error == PdfError::InvalidOffset) {
+      if (status.error == PdfError::InvalidOffset ||
+          isRecoverableSlotError(status.error)) {
+        resetInPlace(state);
         continue;
       }
       return status;
     }
-    PdfCacheFileMetadata metadata{};
-    status = io_.metadata(io_.context, handle, &metadata);
-    PdfCacheManifest decoded{};
-    if (status && !metadata.directory && !metadata.symlinkLike) {
-      CacheHandleSource context{&io_, handle, metadata.size};
-      status = pdfDecodeCacheManifest(context.source(), &decoded, {});
-    } else if (status) {
-      status = PdfStatus::failure(PdfError::Malformed);
-    }
-    const PdfStatus finalStatus = closeHandle(io_, &handle, status);
-    if (!finalStatus) {
-      if (isRecoverableSlotError(finalStatus.error)) {
-        continue;
-      }
-      return finalStatus;
-    }
-    if (!decoded.completed) {
+    if (!state.valid) {
+      resetInPlace(state);
       continue;
     }
-    auto& state = selection->slots[index];
-    state.valid = true;
-    state.sourceMatches = pdfSourceIdentityEqual(decoded.source, expectedSource);
-    state.manifest = decoded;
     if (state.sourceMatches &&
-        (!selection->selected || pdfCacheSequenceNewer(decoded.sequence, selection->manifest.sequence))) {
+        (!selection->selected ||
+         pdfCacheSequenceNewer(state.manifest.sequence,
+                               selection->manifest.sequence))) {
       selection->selected = true;
       selection->selectedSlot = index == 0 ? PdfCacheSlot::A : PdfCacheSlot::B;
-      selection->manifest = decoded;
+      selection->manifest = state.manifest;
     }
   }
   return PdfStatus::success();
@@ -475,46 +573,30 @@ PdfStatus PdfCacheStore::loadCheckpointSlots(const PdfSourceIdentity& expectedSo
   if (!io_.valid() || selection == nullptr) {
     return PdfStatus::failure(PdfError::InvalidArgument);
   }
-  *selection = PdfBuildCheckpointSelection{};
+  resetInPlace(*selection);
   for (uint8_t index = 0; index < 2; ++index) {
+    auto& state = selection->slots[index];
     char path[PDF_CACHE_PATH_CAPACITY];
     PdfStatus status = formatPath(kCheckpointNames[index], path, sizeof(path));
     if (!status) {
       return status;
     }
-    PdfCacheHandle handle{};
-    status = io_.open(io_.context, path, PdfCacheOpenMode::Read, &handle);
+    status = loadCheckpointSlot(io_, path, expectedSource, &state);
     if (!status) {
-      if (status.error == PdfError::InvalidOffset) {
+      if (status.error == PdfError::InvalidOffset ||
+          isRecoverableSlotError(status.error)) {
+        resetInPlace(state);
         continue;
       }
       return status;
     }
-    PdfCacheFileMetadata metadata{};
-    status = io_.metadata(io_.context, handle, &metadata);
-    PdfBuildCheckpoint decoded{};
-    if (status && !metadata.directory && !metadata.symlinkLike) {
-      CacheHandleSource context{&io_, handle, metadata.size};
-      status = pdfDecodeBuildCheckpoint(context.source(), &decoded);
-    } else if (status) {
-      status = PdfStatus::failure(PdfError::Malformed);
-    }
-    const PdfStatus finalStatus = closeHandle(io_, &handle, status);
-    if (!finalStatus) {
-      if (isRecoverableSlotError(finalStatus.error)) {
-        continue;
-      }
-      return finalStatus;
-    }
-    auto& state = selection->slots[index];
-    state.valid = true;
-    state.sourceMatches = pdfSourceIdentityEqual(decoded.source, expectedSource);
-    state.checkpoint = decoded;
     if (state.sourceMatches &&
-        (!selection->selected || pdfCacheSequenceNewer(decoded.sequence, selection->checkpoint.sequence))) {
+        (!selection->selected ||
+         pdfCacheSequenceNewer(state.checkpoint.sequence,
+                               selection->checkpoint.sequence))) {
       selection->selected = true;
       selection->selectedSlot = index == 0 ? PdfCacheSlot::A : PdfCacheSlot::B;
-      selection->checkpoint = decoded;
+      selection->checkpoint = state.checkpoint;
     }
   }
   return PdfStatus::success();
@@ -553,23 +635,28 @@ PdfStatus PdfCacheStore::commitCheckpoint(const PdfBuildCheckpoint& checkpoint) 
   if (!status) {
     return status;
   }
-  status = io_.open(io_.context, path, PdfCacheOpenMode::Read, &handle);
-  if (!status) {
-    return status;
+  return verifyCheckpointFile(io_, path, checkpoint);
+}
+
+PdfStatus PdfCacheStore::listGenerations(
+    PdfCacheGenerationList* const generations) const {
+  if (!io_.valid() || generations == nullptr) {
+    return PdfStatus::failure(PdfError::InvalidArgument);
   }
-  PdfCacheFileMetadata metadata{};
-  status = io_.metadata(io_.context, handle, &metadata);
-  PdfBuildCheckpoint verified{};
-  if (status && !metadata.directory && !metadata.symlinkLike) {
-    CacheHandleSource source{&io_, handle, metadata.size};
-    status = pdfDecodeBuildCheckpoint(source.source(), &verified);
-    if (status && !checkpointsEqual(verified, checkpoint)) {
-      status = PdfStatus::failure(PdfError::Malformed);
-    }
-  } else if (status) {
-    status = PdfStatus::failure(PdfError::Malformed);
+  *generations = {};
+  const PdfStatus status = io_.list(
+      io_.context, root_, collectGeneration, generations);
+  return !status && status.error == PdfError::InvalidOffset
+             ? PdfStatus::success()
+             : status;
+}
+
+PdfStatus PdfCacheStore::removeGeneration(
+    const uint32_t generation) const {
+  if (!io_.valid() || generation == 0) {
+    return PdfStatus::failure(PdfError::InvalidArgument);
   }
-  return closeHandle(io_, &handle, status);
+  return removeGenerationPath(io_, root_, generation);
 }
 
 PdfStatus PdfCacheStore::cleanupUnreferencedGenerations() const {
@@ -581,11 +668,16 @@ PdfStatus PdfCacheStore::cleanupUnreferencedGenerations() const {
   if (!status) {
     return status;
   }
-  CleanupList candidates;
-  status = io_.list(io_.context, root_, CleanupList::collect, &candidates);
-  if (!status && status.error == PdfError::InvalidOffset) {
-    return PdfStatus::success();
+  return cleanupUnreferencedGenerations(manifests);
+}
+
+PdfStatus PdfCacheStore::cleanupUnreferencedGenerations(
+    const PdfCacheManifestSelection& manifests) const {
+  if (!io_.valid()) {
+    return PdfStatus::failure(PdfError::InvalidArgument);
   }
+  PdfCacheGenerationList candidates{};
+  PdfStatus status = listGenerations(&candidates);
   if (!status) {
     return status;
   }
@@ -598,18 +690,8 @@ PdfStatus PdfCacheStore::cleanupUnreferencedGenerations() const {
     if (protectedGeneration) {
       continue;
     }
-    char leaf[20];
-    const int length = std::snprintf(leaf, sizeof(leaf), "gen_%lu", static_cast<unsigned long>(generation));
-    if (length < 0 || static_cast<size_t>(length) >= sizeof(leaf)) {
-      return PdfStatus::failure(PdfError::LimitExceeded);
-    }
-    char path[PDF_CACHE_PATH_CAPACITY];
-    status = formatPath(leaf, path, sizeof(path));
+    status = removeGenerationPath(io_, root_, generation);
     if (!status) {
-      return status;
-    }
-    status = io_.remove(io_.context, path, true);
-    if (!status && status.error != PdfError::InvalidOffset) {
       return status;
     }
   }

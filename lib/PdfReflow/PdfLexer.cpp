@@ -109,7 +109,7 @@ PdfStepResult PdfLexer::next(PdfToken& token, PdfWorkBudget& budget) {
   }
 
   if (!operationCharged_) {
-    if (budget.stopRequested()) {
+    if (budget.cancelRequested()) {
       return PdfStepResult::failure(PdfStatus::failure(PdfError::Cancelled, position_));
     }
     if (!budget.consumeOperation()) {
@@ -519,6 +519,19 @@ bool PdfLexer::unread(const PdfToken& token) {
   return true;
 }
 
+bool PdfLexer::bufferedRange(const uint64_t sourceOffset, size_t* const bufferOffset, size_t* const length) const {
+  if (bufferOffset == nullptr || length == nullptr || position_ < bufferPosition_) {
+    return false;
+  }
+  const uint64_t bufferSourceOffset = position_ - bufferPosition_;
+  if (sourceOffset < bufferSourceOffset || sourceOffset - bufferSourceOffset > bufferedBytes_) {
+    return false;
+  }
+  *bufferOffset = static_cast<size_t>(sourceOffset - bufferSourceOffset);
+  *length = bufferedBytes_ - *bufferOffset;
+  return true;
+}
+
 PdfLexer::ByteResult PdfLexer::peek(uint8_t& byte, PdfWorkBudget& budget, PdfStatus& status) {
   if (bufferPosition_ < bufferedBytes_) {
     byte = sourceBuffer_[bufferPosition_];
@@ -527,7 +540,7 @@ PdfLexer::ByteResult PdfLexer::peek(uint8_t& byte, PdfWorkBudget& budget, PdfSta
   if (position_ >= source_.size) {
     return ByteResult::End;
   }
-  if (budget.stopRequested()) {
+  if (budget.cancelRequested()) {
     status = PdfStatus::failure(PdfError::Cancelled, position_);
     return ByteResult::Failed;
   }

@@ -175,6 +175,159 @@ TEST(PdfObjectParserTest, ParsesReferencesNestedContainersAndDecodedKeys) {
   EXPECT_TRUE(pdfTextEquals(arena, arena.values[valueIndex], "A (nested) label)"));
 }
 
+TEST(PdfObjectParserTest, PreservesIntegerImmediatelyBeforeAnIndirectReference) {
+  const std::string input = "[/Indexed /DeviceRGB 3 23 1 R]";
+  PdfTestByteSource memory(std::vector<uint8_t>(input.begin(), input.end()));
+  auto source = memory.source();
+  std::array<uint8_t, 4096> sourceBuffer{};
+  PdfLexer lexer(source, sourceBuffer.data(), sourceBuffer.size());
+  ArenaStorage storage;
+  PdfObjectArena arena = storage.arena();
+  PdfObjectParser parser(lexer, arena);
+  parser.begin();
+
+  PdfStepResult result;
+  do {
+    PdfWorkBudget budget{1, 1};
+    result = parser.step(budget);
+  } while (result.yielded());
+
+  ASSERT_TRUE(result.complete());
+  ASSERT_NE(parser.rootIndex(), PDF_INVALID_INDEX);
+  const PdfValue& array = arena.values[parser.rootIndex()];
+  ASSERT_EQ(array.kind, PdfValueKind::Array);
+  ASSERT_EQ(array.count, 4);
+
+  uint16_t valueIndex = PDF_INVALID_INDEX;
+  ASSERT_TRUE(pdfArrayAt(arena, parser.rootIndex(), 2, &valueIndex));
+  ASSERT_EQ(arena.values[valueIndex].kind, PdfValueKind::Integer);
+  EXPECT_EQ(arena.values[valueIndex].integerValue, 3);
+
+  ASSERT_TRUE(pdfArrayAt(arena, parser.rootIndex(), 3, &valueIndex));
+  ASSERT_EQ(arena.values[valueIndex].kind, PdfValueKind::Reference);
+  EXPECT_EQ(arena.values[valueIndex].objectNumber, 23u);
+  EXPECT_EQ(arena.values[valueIndex].generation, 1u);
+}
+
+TEST(PdfObjectParserTest, PreservesArbitraryIntegerRunsBeforeAnIndirectReference) {
+  const std::string input = "[1 2 3 4 0 R]";
+  PdfTestByteSource memory(std::vector<uint8_t>(input.begin(), input.end()));
+  auto source = memory.source();
+  std::array<uint8_t, 4096> sourceBuffer{};
+  PdfLexer lexer(source, sourceBuffer.data(), sourceBuffer.size());
+  ArenaStorage storage;
+  PdfObjectArena arena = storage.arena();
+  PdfObjectParser parser(lexer, arena);
+  parser.begin();
+
+  PdfStepResult result;
+  do {
+    PdfWorkBudget budget{1, 1};
+    result = parser.step(budget);
+  } while (result.yielded());
+
+  ASSERT_TRUE(result.complete());
+  ASSERT_NE(parser.rootIndex(), PDF_INVALID_INDEX);
+  const PdfValue& array = arena.values[parser.rootIndex()];
+  ASSERT_EQ(array.kind, PdfValueKind::Array);
+  ASSERT_EQ(array.count, 4);
+
+  uint16_t valueIndex = PDF_INVALID_INDEX;
+  for (uint16_t ordinal = 0; ordinal < 3; ++ordinal) {
+    ASSERT_TRUE(pdfArrayAt(arena, parser.rootIndex(), ordinal, &valueIndex));
+    ASSERT_EQ(arena.values[valueIndex].kind, PdfValueKind::Integer);
+    EXPECT_EQ(arena.values[valueIndex].integerValue, static_cast<int64_t>(ordinal + 1));
+  }
+
+  ASSERT_TRUE(pdfArrayAt(arena, parser.rootIndex(), 3, &valueIndex));
+  ASSERT_EQ(arena.values[valueIndex].kind, PdfValueKind::Reference);
+  EXPECT_EQ(arena.values[valueIndex].objectNumber, 4u);
+  EXPECT_EQ(arena.values[valueIndex].generation, 0u);
+}
+
+TEST(PdfObjectParserTest, FlushesPendingIntegersBeforeANonReferenceAndArrayEnd) {
+  const std::string input = "[1 2 3 /Stop]";
+  PdfTestByteSource memory(std::vector<uint8_t>(input.begin(), input.end()));
+  auto source = memory.source();
+  std::array<uint8_t, 4096> sourceBuffer{};
+  PdfLexer lexer(source, sourceBuffer.data(), sourceBuffer.size());
+  ArenaStorage storage;
+  PdfObjectArena arena = storage.arena();
+  PdfObjectParser parser(lexer, arena);
+  parser.begin();
+
+  PdfStepResult result;
+  do {
+    PdfWorkBudget budget{1, 1};
+    result = parser.step(budget);
+  } while (result.yielded());
+
+  ASSERT_TRUE(result.complete());
+  ASSERT_NE(parser.rootIndex(), PDF_INVALID_INDEX);
+  const PdfValue& array = arena.values[parser.rootIndex()];
+  ASSERT_EQ(array.kind, PdfValueKind::Array);
+  ASSERT_EQ(array.count, 4);
+
+  uint16_t valueIndex = PDF_INVALID_INDEX;
+  for (uint16_t ordinal = 0; ordinal < 3; ++ordinal) {
+    ASSERT_TRUE(pdfArrayAt(arena, parser.rootIndex(), ordinal, &valueIndex));
+    ASSERT_EQ(arena.values[valueIndex].kind, PdfValueKind::Integer);
+    EXPECT_EQ(arena.values[valueIndex].integerValue, static_cast<int64_t>(ordinal + 1));
+  }
+  ASSERT_TRUE(pdfArrayAt(arena, parser.rootIndex(), 3, &valueIndex));
+  EXPECT_TRUE(pdfTextEquals(arena, arena.values[valueIndex], "Stop"));
+}
+
+TEST(PdfObjectParserTest, CompletesRootIntegerAndLeavesTheFollowingTokenUnread) {
+  const std::string input = "17 /After";
+  PdfTestByteSource memory(std::vector<uint8_t>(input.begin(), input.end()));
+  auto source = memory.source();
+  std::array<uint8_t, 4096> sourceBuffer{};
+  PdfLexer lexer(source, sourceBuffer.data(), sourceBuffer.size());
+  ArenaStorage storage;
+  PdfObjectArena arena = storage.arena();
+  PdfObjectParser parser(lexer, arena);
+  parser.begin();
+
+  PdfStepResult result;
+  do {
+    PdfWorkBudget budget{1, 1};
+    result = parser.step(budget);
+  } while (result.yielded());
+
+  ASSERT_TRUE(result.complete());
+  ASSERT_NE(parser.rootIndex(), PDF_INVALID_INDEX);
+  ASSERT_EQ(arena.values[parser.rootIndex()].kind, PdfValueKind::Integer);
+  EXPECT_EQ(arena.values[parser.rootIndex()].integerValue, 17);
+
+  PdfToken following;
+  result = nextWithBudgetOne(lexer, following);
+  ASSERT_TRUE(result.complete());
+  EXPECT_EQ(following.kind, PdfTokenKind::Name);
+  EXPECT_EQ(std::string(following.bytes, following.length), "After");
+}
+
+TEST(PdfObjectParserTest, RejectsOverflowingReferenceAfterAnIntegerRun) {
+  const std::string input = "[1 2 4294967296 0 R]";
+  PdfTestByteSource memory(std::vector<uint8_t>(input.begin(), input.end()));
+  auto source = memory.source();
+  std::array<uint8_t, 4096> sourceBuffer{};
+  PdfLexer lexer(source, sourceBuffer.data(), sourceBuffer.size());
+  ArenaStorage storage;
+  PdfObjectArena arena = storage.arena();
+  PdfObjectParser parser(lexer, arena);
+  parser.begin();
+
+  PdfStepResult result;
+  do {
+    PdfWorkBudget budget{1, 1};
+    result = parser.step(budget);
+  } while (result.yielded());
+
+  EXPECT_TRUE(result.failed());
+  EXPECT_EQ(result.status.error, PdfError::Malformed);
+}
+
 TEST(PdfObjectParserTest, RejectsMalformedNesting) {
   const std::string input = "<< /Broken [1 2 >>";
   PdfTestByteSource memory(std::vector<uint8_t>(input.begin(), input.end()));

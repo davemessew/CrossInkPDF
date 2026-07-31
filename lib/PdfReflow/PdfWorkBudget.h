@@ -10,9 +10,16 @@ struct PdfWorkBudget {
   size_t bytesRemaining = 0;
   void* stopContext = nullptr;
   StopRequestedFn stopRequestedFn = nullptr;
+  void* yieldContext = nullptr;
+  StopRequestedFn yieldRequestedFn = nullptr;
+
+  constexpr bool cancelRequested() const {
+    return stopRequestedFn != nullptr && stopRequestedFn(stopContext);
+  }
 
   constexpr bool stopRequested() const {
-    return stopRequestedFn != nullptr && stopRequestedFn(stopContext);
+    return cancelRequested() ||
+           (yieldRequestedFn != nullptr && yieldRequestedFn(yieldContext));
   }
 
   constexpr bool consumeOperation() {

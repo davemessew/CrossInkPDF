@@ -12,3 +12,5 @@ struct PdfHalCacheIoContext {
 };
 
 PdfCacheIo pdfHalCacheIo(PdfHalCacheIoContext& context);
+PdfStatus pdfHalCacheRename(void* context, const char* sourcePath,
+                            const char* destinationPath);

@@ -1,0 +1,17 @@
+{
+  "error": null,
+  "fixture": "inline_image_caption",
+  "geometry_order": [
+    "Inline caption."
+  ],
+  "image_hashes": {
+    "inline-gray8": "95f9475b812385c09c122fd408e97cd239084ada05bdbd8ee7170de9d67a3b48"
+  },
+  "outline_link_map": {
+    "links": [],
+    "outline": []
+  },
+  "transcript": "Inline caption.",
+  "warning": null,
+  "word_count": 2
+}

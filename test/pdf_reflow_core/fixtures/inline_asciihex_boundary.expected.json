@@ -1,0 +1,15 @@
+{
+  "error": null,
+  "fixture": "inline_asciihex_boundary",
+  "geometry_order": [
+    "Inline asciihex boundary survives."
+  ],
+  "image_hashes": {},
+  "outline_link_map": {
+    "links": [],
+    "outline": []
+  },
+  "transcript": "Inline asciihex boundary survives.",
+  "warning": null,
+  "word_count": 4
+}

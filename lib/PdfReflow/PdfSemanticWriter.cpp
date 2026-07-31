@@ -273,6 +273,34 @@ PdfStatus PdfSemanticWriter::writeText(const uint8_t* const text, const size_t l
   return status.ok() ? status : fail(status);
 }
 
+PdfStatus PdfSemanticWriter::writeRetainedImage(const uint8_t* const resource, const size_t length,
+                                                const uint16_t width, const uint16_t height) {
+  if (!status_.ok()) {
+    return status_;
+  }
+  if (!blockOpen_ || linkOpen_ || resource == nullptr || length == 0 || width == 0 || height == 0) {
+    return fail(PdfStatus::failure(PdfError::InvalidArgument));
+  }
+  PdfStatus status = validateUtf8(resource, length);
+  if (!status.ok()) {
+    return fail(status);
+  }
+  char dimensions[48]{};
+  const int written = std::snprintf(dimensions, sizeof(dimensions), "\" width=\"%u\" height=\"%u\" alt=\"\"/>",
+                                    static_cast<unsigned>(width), static_cast<unsigned>(height));
+  if (written <= 0 || static_cast<size_t>(written) >= sizeof(dimensions)) {
+    return fail(PdfStatus::failure(PdfError::LimitExceeded));
+  }
+  status = appendLiteral("<img src=\"");
+  if (status.ok()) {
+    status = appendEscaped(resource, length, true);
+  }
+  if (status.ok()) {
+    status = appendLiteral(dimensions);
+  }
+  return status.ok() ? status : fail(status);
+}
+
 PdfStatus PdfSemanticWriter::beginInternalLink(const uint8_t* const href, const size_t length) {
   if (!status_.ok()) {
     return status_;

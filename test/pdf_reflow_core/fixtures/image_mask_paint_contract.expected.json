@@ -1,0 +1,19 @@
+{
+  "error": null,
+  "fixture": "image_mask_paint_contract",
+  "geometry_order": [
+    "Gray stencil figure.",
+    "Black stencil figure."
+  ],
+  "image_hashes": {
+    "image-6-gray-stencil": "c19a797fa1fd590cd2e5b42d1cf5f246e29b91684e2f87404b81dc345c7a56a0",
+    "image-7-black-stencil": "c19a797fa1fd590cd2e5b42d1cf5f246e29b91684e2f87404b81dc345c7a56a0"
+  },
+  "outline_link_map": {
+    "links": [],
+    "outline": []
+  },
+  "transcript": "Gray stencil figure. Black stencil figure.",
+  "warning": null,
+  "word_count": 6
+}

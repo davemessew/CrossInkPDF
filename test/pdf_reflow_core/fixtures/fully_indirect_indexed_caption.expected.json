@@ -1,0 +1,15 @@
+{
+  "error": null,
+  "fixture": "fully_indirect_indexed_caption",
+  "geometry_order": [
+    "Indirect indexed caption."
+  ],
+  "image_hashes": {},
+  "outline_link_map": {
+    "links": [],
+    "outline": []
+  },
+  "transcript": "Indirect indexed caption.",
+  "warning": null,
+  "word_count": 3
+}

@@ -1,0 +1,24 @@
+{
+  "error": null,
+  "fixture": "ten_page_figures_repeated_header",
+  "geometry_order": [
+    "Unique figure 1.",
+    "Unique figure 2.",
+    "Unique figure 3.",
+    "Unique figure 4.",
+    "Unique figure 5.",
+    "Unique figure 6.",
+    "Unique figure 7.",
+    "Unique figure 8.",
+    "Unique figure 9.",
+    "Unique figure 10."
+  ],
+  "image_hashes": {},
+  "outline_link_map": {
+    "links": [],
+    "outline": []
+  },
+  "transcript": "Unique figure 1. Unique figure 2. Unique figure 3. Unique figure 4. Unique figure 5. Unique figure 6. Unique figure 7. Unique figure 8. Unique figure 9. Unique figure 10.",
+  "warning": null,
+  "word_count": 30
+}

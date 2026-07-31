@@ -55,6 +55,9 @@ struct PreparationHarness {
   PdfPreparationConfig config() {
     return {
         storage.io(), "/books/minimal.pdf", "/.crosspoint", this, now, {this, measure, resourceEvent},
+        storage.renameCallback(),
+        800,
+        480,
     };
   }
 

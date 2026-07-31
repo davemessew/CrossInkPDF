@@ -6,6 +6,7 @@
 #include "PdfMetadataStore.h"
 #include "PdfObjectParser.h"
 #include "PdfTypes.h"
+#include "PdfWorkBudget.h"
 
 namespace PdfOutlineLimits {
 
@@ -235,6 +236,32 @@ struct PdfOutlineEntryVisitor {
   constexpr bool valid() const { return accept != nullptr; }
 };
 
+enum class PdfOutlineEncodeStage : uint8_t {
+  Idle,
+  Header,
+  Records,
+  Crc,
+  Complete,
+};
+
+struct PdfOutlineEncodeRuntime {
+  uint32_t crc32 = 0;
+  uint16_t recordIndex = 0;
+  PdfOutlineEncodeStage stage = PdfOutlineEncodeStage::Idle;
+};
+
+struct PdfOutlineEncodeWorkspace {
+  PdfOutlineEntry entry{};
+  PdfOutlineEntry parent{};
+  uint8_t encoded[PdfOutlineLimits::EncodedRecordBytes]{};
+};
+
+PdfStepResult pdfStepEncodeOutline(
+    const PdfOutlineEntrySource& entries,
+    const PdfByteSink& destination,
+    PdfOutlineEncodeRuntime& runtime,
+    PdfOutlineEncodeWorkspace& workspace,
+    PdfWorkBudget& budget);
 PdfStatus pdfEncodeOutline(const PdfOutlineEntrySource& entries, const PdfByteSink& destination);
 PdfStatus pdfDecodeOutline(const PdfByteSource& source, PdfOutlineHeader* header,
                            const PdfOutlineEntryVisitor& entries);

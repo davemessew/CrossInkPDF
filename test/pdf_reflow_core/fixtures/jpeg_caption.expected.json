@@ -1,0 +1,17 @@
+{
+  "error": null,
+  "fixture": "jpeg_caption",
+  "geometry_order": [
+    "Figure caption."
+  ],
+  "image_hashes": {
+    "image-6-jpeg": "9ecd5dab3544e66972857d3a90f46847737f3daec4b29acd1ab8db7dd1a0cc7d"
+  },
+  "outline_link_map": {
+    "links": [],
+    "outline": []
+  },
+  "transcript": "Figure caption.",
+  "warning": null,
+  "word_count": 2
+}

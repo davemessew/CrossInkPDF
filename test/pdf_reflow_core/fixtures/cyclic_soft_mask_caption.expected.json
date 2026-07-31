@@ -1,0 +1,15 @@
+{
+  "error": null,
+  "fixture": "cyclic_soft_mask_caption",
+  "geometry_order": [
+    "Cyclic mask text survives."
+  ],
+  "image_hashes": {},
+  "outline_link_map": {
+    "links": [],
+    "outline": []
+  },
+  "transcript": "Cyclic mask text survives.",
+  "warning": null,
+  "word_count": 4
+}

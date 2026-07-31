@@ -1,0 +1,17 @@
+{
+  "error": null,
+  "fixture": "rotated_crop_raster_caption",
+  "geometry_order": [
+    "Rotated crop caption."
+  ],
+  "image_hashes": {
+    "image-6-rotated-crop-gray8": "d37a4c2900bb85dfd24592c0b52e8dcd72e0ea45c47fa2db0cf1c4c132c80c66"
+  },
+  "outline_link_map": {
+    "links": [],
+    "outline": []
+  },
+  "transcript": "Rotated crop caption.",
+  "warning": null,
+  "word_count": 3
+}

@@ -1,0 +1,17 @@
+{
+  "error": null,
+  "fixture": "mixed_form_image_caption",
+  "geometry_order": [
+    "Mixed resource caption."
+  ],
+  "image_hashes": {
+    "image-7-flate-gray8": "03b722a15d4658be01f1eb9def5e8be124710cc0e88842f78107abfda3e23ea8"
+  },
+  "outline_link_map": {
+    "links": [],
+    "outline": []
+  },
+  "transcript": "Mixed resource caption.",
+  "warning": null,
+  "word_count": 3
+}
