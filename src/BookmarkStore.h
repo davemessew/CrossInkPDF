@@ -74,6 +74,13 @@ class BookmarkStore {
   // bookType must be "epub", "pdf", "xtc", or "txt".
   static bool deleteForFilePath(const std::string& filePath, const std::string& bookType);
 
+  // Crash-safe PDF moves copy and read back the destination before deleting
+  // the old path-keyed store in a later journal phase. bookType must be "pdf".
+  static bool copyForFilePath(const std::string& oldFilePath, const std::string& newFilePath,
+                              const std::string& bookType);
+  static bool verifyCopyForFilePath(const std::string& oldFilePath, const std::string& newFilePath,
+                                    const std::string& bookType);
+
   // Rewrite bookmark storage to follow a file move/rename while preserving existing bookmarks.
   // oldFilePath and newFilePath must refer to the same logical book.
   static bool migrateForFilePath(const std::string& oldFilePath, const std::string& newFilePath,
@@ -97,6 +104,7 @@ class BookmarkStore {
   bool readFromFile();
   bool readFromFile(const std::string& path, std::vector<Bookmark>& out, bool& needsRewrite) const;
   bool writeToFile() const;
+  bool writeMigrationPayload(void* fileContext) const;
   bool writePdfTransaction(const Bookmark* appended, size_t removeIndex, bool clear) const;
   bool verifyPdfTransaction(const std::string& path, const Bookmark* appended, size_t removeIndex, bool clear) const;
   bool recoverPdfTransaction() const;

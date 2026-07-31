@@ -61,11 +61,13 @@ uint32_t crc32(const uint8_t* const bytes, const size_t length) {
   return ~crc;
 }
 
-bool validPhase(const Phase phase) {
-  return phase >= Phase::Prepared && phase <= Phase::Abandoned;
-}
+bool validPhase(const Phase phase) { return phase >= Phase::Prepared && phase <= Phase::Abandoned; }
 
-bool validFormat(const BookFormat format) { return format == BookFormat::Epub || format == BookFormat::Pdf; }
+bool validFormat(const BookFormat format) { return format == BookFormat::Pdf; }
+
+bool validRecentsPolicy(const RecentsPolicy policy) {
+  return policy == RecentsPolicy::Keep || policy == RecentsPolicy::Remove;
+}
 
 bool validPath(const StringView path) {
   if (path.data == nullptr || path.length == 0 || path.length > kMaxPathBytes || path.data[0] != '/') {
@@ -75,8 +77,8 @@ bool validPath(const StringView path) {
 }
 
 Status validateRecord(const Record& record) {
-  if (!validPhase(record.phase) || !validFormat(record.format) || !validPath(record.oldPath) ||
-      !validPath(record.newPath)) {
+  if (!validPhase(record.phase) || !validFormat(record.format) || !validRecentsPolicy(record.recentsPolicy) ||
+      !validPath(record.oldPath) || !validPath(record.newPath)) {
     if (record.oldPath.length > kMaxPathBytes || record.newPath.length > kMaxPathBytes) {
       return Status::LimitExceeded;
     }
@@ -151,7 +153,7 @@ Status readSlot(const Io& io, const Scratch scratch, const Slot slot, SlotRead* 
 
 bool recordsEqual(const Record& left, const Record& right) {
   return left.sequence == right.sequence && left.phase == right.phase && left.format == right.format &&
-         left.oldHash == right.oldHash && left.newHash == right.newHash &&
+         left.oldHash == right.oldHash && left.newHash == right.newHash && left.recentsPolicy == right.recentsPolicy &&
          left.oldPath.length == right.oldPath.length && left.newPath.length == right.newPath.length &&
          std::memcmp(left.oldPath.data, right.oldPath.data, left.oldPath.length) == 0 &&
          std::memcmp(left.newPath.data, right.newPath.data, left.newPath.length) == 0;
@@ -224,19 +226,13 @@ ReadState readStateFor(const Selection& selection) {
   if (!selection.selected) {
     return {};
   }
-  const bool activated = selection.record.phase == Phase::Activated ||
-                         selection.record.phase == Phase::OldStateRemoved;
-  return {Status::Ok,
-          true,
-          activated ? HashResolution::NewHash : HashResolution::OldHashFallback,
-          activated ? selection.record.newHash : selection.record.oldHash,
-          selection.record.phase};
+  const bool activated = selection.record.phase == Phase::Activated || selection.record.phase == Phase::OldStateRemoved;
+  return {Status::Ok, true, activated ? HashResolution::NewHash : HashResolution::OldHashFallback,
+          activated ? selection.record.newHash : selection.record.oldHash, selection.record.phase};
 }
 
 StepResult failure(const Status status, const Selection& selection) {
-  return {status,
-          StepDisposition::Idle,
-          selection.selected ? selection.record.phase : Phase::Prepared,
+  return {status, StepDisposition::Idle, selection.selected ? selection.record.phase : Phase::Prepared,
           readStateFor(selection)};
 }
 
@@ -267,10 +263,9 @@ bool Io::valid() const {
 
 bool MigrationOperations::valid() const {
   return context != nullptr && locateSource != nullptr && renameSource != nullptr && copyCache != nullptr &&
-         verifyCache != nullptr && copyBookmarks != nullptr && verifyBookmarks != nullptr &&
-         copyClippings != nullptr && verifyClippings != nullptr && verifyState != nullptr &&
-         activateRecent != nullptr && activateOpenPath != nullptr && verifyActivation != nullptr &&
-         removeOldState != nullptr;
+         verifyCache != nullptr && copyBookmarks != nullptr && verifyBookmarks != nullptr && copyClippings != nullptr &&
+         verifyClippings != nullptr && verifyState != nullptr && activateRecent != nullptr &&
+         activateOpenPath != nullptr && verifyActivation != nullptr && removeOldState != nullptr;
 }
 
 bool sequenceNewer(const uint32_t candidate, const uint32_t reference) {
@@ -302,7 +297,7 @@ Status encode(const Record& record, const Scratch scratch, size_t* const encoded
   bytes[12] = static_cast<uint8_t>(record.phase);
   bytes[13] = static_cast<uint8_t>(record.format);
   bytes[14] = kCommittedMarker;
-  bytes[15] = 0;
+  bytes[15] = static_cast<uint8_t>(record.recentsPolicy);
   writeU64(bytes + 16, record.oldHash);
   writeU64(bytes + 24, record.newHash);
   writeU16(bytes + 32, static_cast<uint16_t>(record.oldPath.length));
@@ -324,8 +319,8 @@ Status decode(const uint8_t* const bytes, const size_t length, Record* const rec
     return Status::Corrupt;
   }
   if (std::memcmp(bytes, kMagic, sizeof(kMagic)) != 0 || readU16(bytes + 4) != kVersion ||
-      readU16(bytes + 6) != kEncodedPrefixBytes || bytes[14] != kCommittedMarker || bytes[15] != 0 ||
-      readU16(bytes + 38) != 0) {
+      readU16(bytes + 6) != kEncodedPrefixBytes || bytes[14] != kCommittedMarker ||
+      !validRecentsPolicy(static_cast<RecentsPolicy>(bytes[15])) || readU16(bytes + 38) != 0) {
     return Status::Corrupt;
   }
   const Phase phase = static_cast<Phase>(bytes[12]);
@@ -333,8 +328,8 @@ Status decode(const uint8_t* const bytes, const size_t length, Record* const rec
   const size_t oldLength = readU16(bytes + 32);
   const size_t newLength = readU16(bytes + 34);
   const size_t payloadLength = readU16(bytes + 36);
-  if (!validPhase(phase) || !validFormat(format) || oldLength == 0 || newLength == 0 ||
-      oldLength > kMaxPathBytes || newLength > kMaxPathBytes || payloadLength != oldLength + newLength ||
+  if (!validPhase(phase) || !validFormat(format) || oldLength == 0 || newLength == 0 || oldLength > kMaxPathBytes ||
+      newLength > kMaxPathBytes || payloadLength != oldLength + newLength ||
       length != kEncodedPrefixBytes + payloadLength + kEncodedCrcBytes) {
     return Status::Corrupt;
   }
@@ -349,7 +344,8 @@ Status decode(const uint8_t* const bytes, const size_t length, Record* const rec
                  readU64(bytes + 16),
                  readU64(bytes + 24),
                  {reinterpret_cast<const char*>(bytes + kEncodedPrefixBytes), oldLength},
-                 {reinterpret_cast<const char*>(bytes + kEncodedPrefixBytes + oldLength), newLength}};
+                 {reinterpret_cast<const char*>(bytes + kEncodedPrefixBytes + oldLength), newLength},
+                 static_cast<RecentsPolicy>(bytes[15])};
   if (!validPath(decoded.oldPath) || !validPath(decoded.newPath) ||
       (oldLength == newLength && std::memcmp(decoded.oldPath.data, decoded.newPath.data, oldLength) == 0)) {
     return Status::Corrupt;
@@ -527,8 +523,7 @@ StepResult recoverOne(Journal& journal, const MigrationOperations& operations) {
     }
     case Phase::SourceMoved:
       status = runPair(operations.copyCache, operations.verifyCache, operations.context, record);
-      return status == Status::Ok ? advanceResult(journal, selection, Phase::CacheCopied)
-                                  : failure(status, selection);
+      return status == Status::Ok ? advanceResult(journal, selection, Phase::CacheCopied) : failure(status, selection);
     case Phase::CacheCopied:
       status = runPair(operations.copyBookmarks, operations.verifyBookmarks, operations.context, record);
       return status == Status::Ok ? advanceResult(journal, selection, Phase::BookmarksCopied)
@@ -549,22 +544,19 @@ StepResult recoverOne(Journal& journal, const MigrationOperations& operations) {
       if (status == Status::Ok) {
         status = operations.verifyActivation(operations.context, record);
       }
-      return status == Status::Ok ? advanceResult(journal, selection, Phase::Activated)
-                                  : failure(status, selection);
+      return status == Status::Ok ? advanceResult(journal, selection, Phase::Activated) : failure(status, selection);
     case Phase::Activated:
       status = operations.removeOldState(operations.context, {record.oldPath, record.oldHash, record.format});
       return status == Status::Ok ? advanceResult(journal, selection, Phase::OldStateRemoved)
                                   : failure(status, selection);
     case Phase::OldStateRemoved:
       status = journal.cleanup(selection);
-      return status == Status::Ok
-                 ? StepResult{Status::Ok, StepDisposition::Complete, Phase::OldStateRemoved, {}}
-                 : failure(status, selection);
+      return status == Status::Ok ? StepResult{Status::Ok, StepDisposition::Complete, Phase::OldStateRemoved, {}}
+                                  : failure(status, selection);
     case Phase::Abandoned:
       status = journal.cleanup(selection);
-      return status == Status::Ok
-                 ? StepResult{Status::Ok, StepDisposition::Abandoned, Phase::Abandoned, {}}
-                 : failure(status, selection);
+      return status == Status::Ok ? StepResult{Status::Ok, StepDisposition::Abandoned, Phase::Abandoned, {}}
+                                  : failure(status, selection);
   }
   return failure(Status::Corrupt, selection);
 }

@@ -341,6 +341,7 @@ add_executable(PdfSavedItemsSessionTest
   ${REPO_ROOT}/src/activities/reader/PdfSavedItemsSession.cpp
   ${REPO_ROOT}/src/BookmarkStore.cpp
   ${REPO_ROOT}/src/ClippingStore.cpp
+  ${REPO_ROOT}/src/util/BookMoveDurableFile.cpp
   PdfSavedItemsSessionTest.cpp
 )
 

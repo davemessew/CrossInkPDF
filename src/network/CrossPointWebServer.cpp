@@ -9,6 +9,7 @@
 #include <HalGPIO.h>
 #include <HalStorage.h>
 #include <Logging.h>
+#include <PdfDeleteJournal.h>
 #include <WiFi.h>
 #include <esp_efuse.h>
 #include <esp_efuse_table.h>
@@ -36,6 +37,8 @@
 #include "html/js/jszip_minJs.generated.h"
 #include "mbedtls/sha256.h"
 #include "util/BookCacheUtils.h"
+#include "util/BookMoveUtils.h"
+#include "util/PdfDeleteUtils.h"
 #include "util/StringUtils.h"
 
 namespace {
@@ -1130,13 +1133,26 @@ void CrossPointWebServer::handleRename() const {
     return;
   }
 
-  clearBookCache(itemPath.c_str());
-  const bool success = file.rename(newPath.c_str());
-  file.close();
+  const bool journaledPdf = FsHelpers::hasPdfExtension(itemPath);
+  bool success = false;
+  BookMoveUtils::MoveResult moveResult = BookMoveUtils::MoveResult::Unsupported;
+  if (journaledPdf) {
+    file.close();
+    moveResult = BookMoveUtils::moveBook(itemPath.c_str(), newPath.c_str());
+    success = moveResult == BookMoveUtils::MoveResult::Complete;
+  } else {
+    clearBookCache(itemPath.c_str());
+    success = file.rename(newPath.c_str());
+    file.close();
+  }
 
   if (success) {
     LOG_DBG("WEB", "Renamed file: %s -> %s", itemPath.c_str(), newPath.c_str());
     server->send(200, "text/plain", "Renamed successfully");
+  } else if (journaledPdf && moveResult == BookMoveUtils::MoveResult::Conflict) {
+    server->send(409, "text/plain", "A book move is already pending");
+  } else if (journaledPdf && Storage.exists(newPath.c_str())) {
+    server->send(503, "text/plain", "File moved, but its reading data could not be updated. Restart to retry.");
   } else {
     LOG_ERR("WEB", "Failed to rename file: %s -> %s", itemPath.c_str(), newPath.c_str());
     server->send(500, "text/plain", "Failed to rename file");
@@ -1221,13 +1237,26 @@ void CrossPointWebServer::handleMove() const {
     return;
   }
 
-  clearBookCache(itemPath.c_str());
-  const bool success = file.rename(newPath.c_str());
-  file.close();
+  const bool journaledPdf = FsHelpers::hasPdfExtension(itemPath);
+  bool success = false;
+  BookMoveUtils::MoveResult moveResult = BookMoveUtils::MoveResult::Unsupported;
+  if (journaledPdf) {
+    file.close();
+    moveResult = BookMoveUtils::moveBook(itemPath.c_str(), newPath.c_str());
+    success = moveResult == BookMoveUtils::MoveResult::Complete;
+  } else {
+    clearBookCache(itemPath.c_str());
+    success = file.rename(newPath.c_str());
+    file.close();
+  }
 
   if (success) {
     LOG_DBG("WEB", "Moved file: %s -> %s", itemPath.c_str(), newPath.c_str());
     server->send(200, "text/plain", "Moved successfully");
+  } else if (journaledPdf && moveResult == BookMoveUtils::MoveResult::Conflict) {
+    server->send(409, "text/plain", "A book move is already pending");
+  } else if (journaledPdf && Storage.exists(newPath.c_str())) {
+    server->send(503, "text/plain", "File moved, but its reading data could not be updated. Restart to retry.");
   } else {
     LOG_ERR("WEB", "Failed to move file: %s -> %s", itemPath.c_str(), newPath.c_str());
     server->send(500, "text/plain", "Failed to move file");
@@ -1290,6 +1319,12 @@ void CrossPointWebServer::handleDelete() const {
       itemPath = "/" + itemPath;
     }
 
+    if (itemPath.endsWith(PdfDelete::kTombstoneSuffix)) {
+      failedItems += itemPath + " (reserved PDF deletion state); ";
+      allSuccess = false;
+      continue;
+    }
+
     // Security check: prevent deletion of protected items
     if (isProtectedPath(itemPath)) {
       failedItems += itemPath + " (protected path); ";
@@ -1322,8 +1357,14 @@ void CrossPointWebServer::handleDelete() const {
     } else {
       // It's a file (or couldn't open as dir) — remove file
       if (f) f.close();
-      success = Storage.remove(itemPath.c_str());
-      clearBookCache(itemPath.c_str());
+      // PDF_DELETE_ADAPTER_BEGIN
+      if (FsHelpers::hasPdfExtension(itemPath)) {
+        success = PdfDeleteUtils::deletePdfBook(itemPath.c_str()) == PdfDeleteUtils::Result::Complete;
+      } else {
+        success = Storage.remove(itemPath.c_str());
+        clearBookCache(itemPath.c_str());
+      }
+      // PDF_DELETE_ADAPTER_END
     }
 
     if (!success) {

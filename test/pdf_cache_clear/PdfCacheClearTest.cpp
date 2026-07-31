@@ -6,6 +6,7 @@
 #include <string>
 
 #include "BookCacheUtils.h"
+#include "BookMoveUtils.h"
 #include "Memory.h"
 #include "PdfSourceIdentity.h"
 #include "TestStorage.h"
@@ -19,6 +20,7 @@ class PdfCacheClearTest : public testing::Test {
     Storage.reset(root_);
     TestMemory::failNextAllocation = false;
     TestMemory::successfulAllocations = 0;
+    BookMoveUtils::TEST_MIGRATION_CACHE_HASH.reset();
   }
 
   void TearDown() override {
@@ -235,6 +237,57 @@ TEST_F(PdfCacheClearTest, MissingPdfCacheIsAlreadyClear) {
   EXPECT_EQ(TestMemory::successfulAllocations, 0U);
   EXPECT_EQ(Storage.maxOpenHandleCount(), 0U);
   EXPECT_EQ(Storage.childWrapperAllocationCount(), 0U);
+}
+
+TEST_F(PdfCacheClearTest, ResolverFailureProtectsPdfDerivedStateBeforeAllocationOrDeletion) {
+  constexpr char sourcePath[] = "/Books/Pending.pdf";
+  const std::string cacheRoot = cacheRootFor(sourcePath);
+  write(cacheRoot + "/manifest.a");
+  BookMoveUtils::TEST_MIGRATION_CACHE_HASH.succeeds = false;
+  BookMoveUtils::TEST_MIGRATION_CACHE_HASH.readOnlyFallback = true;
+
+  EXPECT_FALSE(clearBookCachePreservingUserState(sourcePath));
+  EXPECT_TRUE(Storage.exists((cacheRoot + "/manifest.a").c_str()));
+  EXPECT_EQ(BookMoveUtils::TEST_MIGRATION_CACHE_HASH.calls, 1U);
+  EXPECT_EQ(TestMemory::successfulAllocations, 0U);
+  EXPECT_EQ(Storage.openCallCount(), 0U);
+  EXPECT_EQ(Storage.removeCallCount(), 0U);
+  EXPECT_EQ(Storage.removeDirCallCount(), 0U);
+}
+
+TEST_F(PdfCacheClearTest, ReadOnlyMigrationFallbackNeverDeletesOldOrNormalPdfCache) {
+  constexpr char oldPath[] = "/Books/Old.pdf";
+  constexpr char newPath[] = "/Books/New.pdf";
+  const uint64_t oldHash = pdfPathHash64(oldPath, sizeof(oldPath) - 1);
+  const std::string oldCacheRoot = cacheRootFor(oldPath);
+  const std::string newCacheRoot = cacheRootFor(newPath);
+  write(oldCacheRoot + "/manifest.a");
+  write(newCacheRoot + "/manifest.a");
+  BookMoveUtils::TEST_MIGRATION_CACHE_HASH.useNormalHash = false;
+  BookMoveUtils::TEST_MIGRATION_CACHE_HASH.resolvedHash = oldHash;
+  BookMoveUtils::TEST_MIGRATION_CACHE_HASH.readOnlyFallback = true;
+
+  EXPECT_FALSE(clearBookCachePreservingUserState(newPath));
+  EXPECT_TRUE(Storage.exists((oldCacheRoot + "/manifest.a").c_str()));
+  EXPECT_TRUE(Storage.exists((newCacheRoot + "/manifest.a").c_str()));
+  EXPECT_EQ(Storage.openCallCount(), 0U);
+  EXPECT_EQ(Storage.removeCallCount(), 0U);
+}
+
+TEST_F(PdfCacheClearTest, NonNormalMigrationHashIsRejectedEvenAfterReadOnlyPhase) {
+  constexpr char oldPath[] = "/Books/ActivatedOldPath.pdf";
+  constexpr char currentPath[] = "/Books/ActivatedCurrentPath.pdf";
+  const uint64_t oldHash = pdfPathHash64(oldPath, sizeof(oldPath) - 1);
+  const std::string currentCacheRoot = cacheRootFor(currentPath);
+  write(currentCacheRoot + "/manifest.a");
+  BookMoveUtils::TEST_MIGRATION_CACHE_HASH.useNormalHash = false;
+  BookMoveUtils::TEST_MIGRATION_CACHE_HASH.resolvedHash = oldHash;
+  BookMoveUtils::TEST_MIGRATION_CACHE_HASH.readOnlyFallback = false;
+
+  EXPECT_FALSE(clearBookCachePreservingUserState(currentPath));
+  EXPECT_TRUE(Storage.exists((currentCacheRoot + "/manifest.a").c_str()));
+  EXPECT_EQ(Storage.openCallCount(), 0U);
+  EXPECT_EQ(Storage.removeCallCount(), 0U);
 }
 
 TEST_F(PdfCacheClearTest, DirectoryBasedClearUsesTheSamePdfSelectivePolicy) {

@@ -1,6 +1,9 @@
 #include "RecentBooksActivity.h"
 
 #include <Arduino.h>
+#if defined(CROSSINK_ENABLE_PDF) && CROSSINK_ENABLE_PDF
+#include <FsHelpers.h>
+#endif
 #include <GfxRenderer.h>
 #include <HalStorage.h>
 #include <I18n.h>
@@ -27,6 +30,9 @@ constexpr unsigned long LONG_PRESS_MS = 1000;
 
 void RecentBooksActivity::loadRecentBooks() {
   recentBooks.clear();
+#if defined(CROSSINK_ENABLE_PDF) && CROSSINK_ENABLE_PDF
+  pdfProductCache.reset();
+#endif
   const auto& books = RECENT_BOOKS.getBooks();
   recentBooks.reserve(std::min(books.size(), MAX_LIST_RECENT_BOOKS));
 
@@ -37,7 +43,13 @@ void RecentBooksActivity::loadRecentBooks() {
     if (RecentBooksStore::isMissing(book)) {
       continue;
     }
+#if defined(CROSSINK_ENABLE_PDF) && CROSSINK_ENABLE_PDF
+    RecentBook displayBook = book;
+    RecentBookProgress::hydratePdfBook(pdfProductCache, displayBook);
+    recentBooks.push_back(std::move(displayBook));
+#else
     recentBooks.push_back(book);
+#endif
   }
 }
 
@@ -60,6 +72,9 @@ void RecentBooksActivity::onEnter() {
 void RecentBooksActivity::onExit() {
   Activity::onExit();
   recentBooks.clear();
+#if defined(CROSSINK_ENABLE_PDF) && CROSSINK_ENABLE_PDF
+  pdfProductCache.reset();
+#endif
 }
 
 void RecentBooksActivity::loop() {
@@ -142,13 +157,25 @@ void RecentBooksActivity::promptDeleteBook(const RecentBook& book) {
     }
 
     LOG_DBG("RBA", "Attempting to delete: %s", path.c_str());
-    BookActions::clearFileMetadata(path);
-    if (!Storage.remove(path.c_str())) {
-      LOG_ERR("RBA", "Failed to delete file: %s", path.c_str());
-      return;
+    // PDF_DELETE_ADAPTER_BEGIN
+#if defined(CROSSINK_ENABLE_PDF) && CROSSINK_ENABLE_PDF
+    if (FsHelpers::hasPdfExtension(path)) {
+      if (!BookActions::deletePdfBook(path)) {
+        LOG_ERR("RBA", "Failed to delete PDF safely: %s", path.c_str());
+        return;
+      }
+    } else {
+#endif
+      BookActions::clearFileMetadata(path);
+      if (!Storage.remove(path.c_str())) {
+        LOG_ERR("RBA", "Failed to delete file: %s", path.c_str());
+        return;
+      }
+      RECENT_BOOKS.removeByPath(path);
+#if defined(CROSSINK_ENABLE_PDF) && CROSSINK_ENABLE_PDF
     }
-
-    RECENT_BOOKS.removeByPath(path);
+#endif
+    // PDF_DELETE_ADAPTER_END
     reloadAfterBookAction();
   };
 

@@ -1131,6 +1131,24 @@ void moveFinishedBookToReadFolder(const std::string& srcPath, const std::string&
                                        !SETTINGS.removeReadBooksFromRecents);
 }
 
+void moveFinishedPdfToReadFolder(const std::string& srcPath,
+                                 const std::string& dstPath,
+                                 const std::string& title) {
+  LOG_INF("ERS", "Moving finished PDF: %s -> %s", srcPath.c_str(),
+          dstPath.c_str());
+  const BookMoveUtils::MoveResult result = BookMoveUtils::moveBook(
+      srcPath, dstPath, !SETTINGS.removeReadBooksFromRecents);
+  if (result != BookMoveUtils::MoveResult::Complete) {
+    LOG_ERR("ERS", "Failed to move finished PDF to '/Read' folder");
+    snprintf(APP_STATE.pendingAlertTitle, sizeof(APP_STATE.pendingAlertTitle),
+             "%s", tr(STR_MOVE_TO_READ_FAILED_TITLE));
+    snprintf(APP_STATE.pendingAlertBody, sizeof(APP_STATE.pendingAlertBody),
+             tr(STR_MOVE_TO_READ_FAILED_BODY), title.c_str());
+    APP_STATE.pendingAlertGoHomeOnBack.store(false, std::memory_order_relaxed);
+    APP_STATE.hasPendingAlert.store(true, std::memory_order_release);
+  }
+}
+
 }  // namespace
 
 uint8_t EpubReaderActivity::loadBookRenderMode(const std::string& filePath) {
@@ -2218,13 +2236,20 @@ void EpubReaderActivity::onExit() {
   section.reset();
 
   if (pendingReadFolderMove && document) {
+    const bool isPdf =
+        document->getFormat() == ReflowDocumentFormat::Pdf;
     const std::string srcPath = document->getPath();
     const std::string oldCachePath = document->getCachePath();
     const std::string title = document->getTitle();
     const std::string author = document->getAuthor();
     const std::string dstPath = BookMoveUtils::buildReadFolderDestination(srcPath);
     document.reset();  // release the Epub (and any open handles) before renaming on the SD card
-    moveFinishedBookToReadFolder(srcPath, dstPath, oldCachePath, title, author);
+    if (isPdf) {
+      moveFinishedPdfToReadFolder(srcPath, dstPath, title);
+    } else {
+      moveFinishedBookToReadFolder(srcPath, dstPath, oldCachePath, title,
+                                   author);
+    }
   } else {
     document.reset();
   }

@@ -364,7 +364,7 @@ PdfCachedProductStateLoadResult cacheFailure(const PdfStatus status) {
 }
 
 void scanManifestSlot(const PdfCacheIo& io, const char* const cacheRoot, const char* const name,
-                      const PdfSourceIdentity& expectedSource, Workspace* const workspace, SlotScan* const scan) {
+                       const PdfSourceIdentity* const expectedSource, Workspace* const workspace, SlotScan* const scan) {
   *scan = {};
   PdfStatus status = formatJoinedPath(cacheRoot, name, workspace->path, sizeof(workspace->path));
   if (!status) {
@@ -401,7 +401,7 @@ void scanManifestSlot(const PdfCacheIo& io, const char* const cacheRoot, const c
   }
   if (!scan->manifest.completed) {
     scan->kind = SlotKind::Incomplete;
-  } else if (!pdfSourceIdentityEqual(scan->manifest.source, expectedSource)) {
+  } else if (expectedSource != nullptr && !pdfSourceIdentityEqual(scan->manifest.source, *expectedSource)) {
     scan->kind = SlotKind::Stale;
   } else if (scan->records.sectionCount == 0 || scan->records.seen != kAllArtifacts) {
     scan->kind = SlotKind::Corrupt;
@@ -703,6 +703,8 @@ PdfStatus decodeMetadataArtifact(const PdfCacheIo& io, const char* const cacheRo
     cumulativeBytes = nextCumulativeBytes;
     cumulativeWords += wordCount;
     if (index == workspace->candidate.currentSection) {
+      workspace->candidate.currentSectionFirstWordOrdinal = firstWordOrdinal;
+      workspace->candidate.currentSectionWordCount = wordCount;
       *tocIndex = sectionTocIndex;
     }
   }
@@ -781,11 +783,12 @@ PdfStatus decodeOutlineArtifact(const PdfCacheIo& io, const char* const cacheRoo
 }
 
 PDF_CACHED_PRODUCT_NOINLINE PdfCachedProductStateLoadResult selectCompletedManifest(const PdfCacheIo& io,
-                                                                                    Workspace* const workspace,
-                                                                                    const SlotScan** const selected) {
+                                                                                     Workspace* const workspace,
+                                                                                     const PdfSourceIdentity* expectedSource,
+                                                                                     const SlotScan** const selected) {
   *selected = nullptr;
   for (size_t index = 0; index < 2; ++index) {
-    scanManifestSlot(io, workspace->cacheRoot, kManifestNames[index], workspace->sourceIdentity, workspace,
+    scanManifestSlot(io, workspace->cacheRoot, kManifestNames[index], expectedSource, workspace,
                      &workspace->slots[index]);
   }
   bool hasStale = false;
@@ -870,12 +873,36 @@ PDF_CACHED_PRODUCT_NOINLINE PdfCachedProductStateLoadResult loadWithWorkspace(co
         status);
   }
   const SlotScan* selected = nullptr;
-  const PdfCachedProductStateLoadResult selection = selectCompletedManifest(io, workspace, &selected);
+  const PdfCachedProductStateLoadResult selection =
+      selectCompletedManifest(io, workspace, &workspace->sourceIdentity, &selected);
   if (!selection.available()) {
     return selection;
   }
   return loadSelectedArtifacts(io, productState, workspace, *selected);
 }
+
+#if defined(CROSSINK_ENABLE_PDF) && CROSSINK_ENABLE_PDF
+PDF_CACHED_PRODUCT_NOINLINE PdfCachedProductStateLoadResult
+loadForSleepWithWorkspace(const PdfCacheIo& io, const char* const sourcePath, const char* const cacheDirectory,
+                          PdfCachedProductState* const productState, Workspace* const workspace,
+                          const uint64_t* const cacheHashOverride) {
+  const PdfStatus status =
+      cacheHashOverride == nullptr
+          ? pdfFormatCacheRoot(cacheDirectory, sourcePath, workspace->cacheRoot, sizeof(workspace->cacheRoot))
+          : pdfFormatCacheRootForHash(cacheDirectory, *cacheHashOverride, workspace->cacheRoot,
+                                      sizeof(workspace->cacheRoot));
+  if (!status) {
+    return result(PdfCachedProductStateKind::Error, status);
+  }
+  const SlotScan* selected = nullptr;
+  const PdfCachedProductStateLoadResult selection = selectCompletedManifest(io, workspace, nullptr, &selected);
+  if (!selection.available()) {
+    return selection;
+  }
+  workspace->sourceIdentity = selected->manifest.source;
+  return loadSelectedArtifacts(io, productState, workspace, *selected);
+}
+#endif
 
 }  // namespace
 
@@ -907,3 +934,24 @@ PdfCachedProductStateLoadResult pdfLoadCachedProductState(const PdfCacheIo& io, 
   }
   return loadWithWorkspace(io, sourcePath, cacheDirectory, productState, workspace, cacheHashOverride);
 }
+
+#if defined(CROSSINK_ENABLE_PDF) && CROSSINK_ENABLE_PDF
+PdfCachedProductStateLoadResult pdfLoadCachedProductStateForSleep(
+    const PdfCacheIo& io, const char* const sourcePath, const char* const cacheDirectory,
+    PdfCachedProductState* const productState, const uint64_t* const cacheHashOverride) {
+  if (productState != nullptr) {
+    *productState = {};
+  }
+  if (!io.valid() || sourcePath == nullptr || sourcePath[0] == '\0' || cacheDirectory == nullptr ||
+      cacheDirectory[0] == '\0' || productState == nullptr) {
+    return result(PdfCachedProductStateKind::Error, PdfStatus::failure(PdfError::InvalidArgument));
+  }
+  const PdfCachedProductStateAllocator allocator{nullptr, defaultAllocate, defaultRelease};
+  WorkspaceOwner owner(allocator);
+  Workspace* const workspace = owner.get();
+  if (workspace == nullptr) {
+    return result(PdfCachedProductStateKind::Error, PdfStatus::failure(PdfError::InsufficientMemory));
+  }
+  return loadForSleepWithWorkspace(io, sourcePath, cacheDirectory, productState, workspace, cacheHashOverride);
+}
+#endif

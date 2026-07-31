@@ -102,8 +102,9 @@ uint8_t migrateTiltDirectionValue(uint8_t direction) {
 
 // ---- CrossPointState ----
 
-bool JsonSettingsIO::saveState(const CrossPointState& s, const char* path) {
-  JsonDocument doc;
+namespace {
+
+void populateStateDocument(const CrossPointState& s, JsonDocument& doc) {
   // Persisted-state compatibility: retain the legacy member and JSON key.
   doc["openEpubPath"] = s.openEpubPath;
   doc["favoriteSleepImagePath"] = s.favoriteSleepImagePath;
@@ -119,10 +120,23 @@ bool JsonSettingsIO::saveState(const CrossPointState& s, const char* path) {
   doc["pendingBookmarkParagraphIndex"] = s.pendingBookmarkParagraphIndex;
   doc["pendingClippingIndex"] = s.pendingClippingIndex;
   doc["showBootScreen"] = s.showBootScreen;
+}
+
+}  // namespace
+
+bool JsonSettingsIO::saveState(const CrossPointState& s, const char* path) {
+  JsonDocument doc;
+  populateStateDocument(s, doc);
 
   String json;
   serializeJson(doc, json);
   return Storage.writeFile(path, json);
+}
+
+bool JsonSettingsIO::writeState(const CrossPointState& s, Print& output) {
+  JsonDocument doc;
+  populateStateDocument(s, doc);
+  return serializeJson(doc, output) != 0;
 }
 
 bool JsonSettingsIO::loadState(CrossPointState& s, const char* json) {

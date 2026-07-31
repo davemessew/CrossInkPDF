@@ -5,6 +5,9 @@
 #include <string>
 #include <vector>
 
+#if defined(CROSSINK_ENABLE_PDF) && CROSSINK_ENABLE_PDF
+#include "RecentBookProgress.h"
+#endif
 #include "RecentBooksStore.h"
 #include "activities/Activity.h"
 #include "util/ButtonNavigator.h"
@@ -21,6 +24,9 @@ class RecentBooksActivity final : public Activity {
 
   // Recent tab state
   std::vector<RecentBook> recentBooks;
+#if defined(CROSSINK_ENABLE_PDF) && CROSSINK_ENABLE_PDF
+  RecentBookProgress::PdfProductCache pdfProductCache;
+#endif
 
   // Data loading
   void loadRecentBooks();

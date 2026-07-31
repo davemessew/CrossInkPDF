@@ -5,6 +5,7 @@
 #include <I18n.h>
 #include <Memory.h>
 #include <PdfHalReflowDocument.h>
+#include <PdfSourceIdentity.h>
 
 #include "CrossPointSettings.h"
 #include "Epub.h"
@@ -19,6 +20,7 @@
 #include "activities/util/BmpViewerActivity.h"
 #include "activities/util/FullScreenMessageActivity.h"
 #include "components/UITheme.h"
+#include "util/BookMoveUtils.h"
 
 bool ReaderActivity::isXtcFile(const std::string& path) { return FsHelpers::hasXtcExtension(path); }
 
@@ -178,8 +180,25 @@ bool ReaderActivity::openTextRoute() {
 
 bool ReaderActivity::openPdfRoute() {
 #if defined(CROSSINK_ENABLE_PDF) && CROSSINK_ENABLE_PDF
+  const uint64_t normalCacheHash = pdfPathHash64(initialBookPath.c_str(), initialBookPath.size());
+  uint64_t resolvedCacheHash = normalCacheHash;
+  bool readOnlyFallback = true;
+  const bool cacheResolved =
+      BookMoveUtils::migrationCacheHash(initialBookPath, normalCacheHash, &resolvedCacheHash, &readOnlyFallback);
+  if (!cacheResolved || readOnlyFallback) {
+    LOG_ERR("READER", "PDF open blocked by read-only migration cache state");
+    onGoBack();
+    return false;
+  }
+  if (!Storage.exists(initialBookPath.c_str())) {
+    LOG_ERR("READER", "PDF file does not exist: %s", initialBookPath.c_str());
+    onGoBack();
+    return false;
+  }
+  const uint64_t* const cacheHashOverride = resolvedCacheHash == normalCacheHash ? nullptr : &resolvedCacheHash;
   PdfStatus status{};
-  auto document = loadPdfHalReflowDocumentNoThrow(initialBookPath.c_str(), "/.crosspoint", &status);
+  auto document =
+      loadPdfHalReflowDocumentNoThrow(initialBookPath.c_str(), "/.crosspoint", &status, cacheHashOverride);
   if (document) {
     onGoToReflowReader(std::move(document));
     return true;

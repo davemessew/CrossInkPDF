@@ -22,6 +22,8 @@
 #include "components/UITheme.h"
 #include "components/themes/minimal/MinimalTheme.h"
 #include "fontIds.h"
+#include "util/PdfDeleteUtils.h"
+#include "util/PdfDirectoryDeleteScan.h"
 
 namespace {
 constexpr unsigned long GO_HOME_MS = 1000;
@@ -80,14 +82,17 @@ bool hasHeapForFileEntryAppend(const std::vector<std::string>& files, size_t ent
          ESP.getMaxAllocHeap() >= largestNeeded + FILE_BROWSER_APPEND_MIN_MAX_ALLOC_AFTER_ALLOC;
 }
 
-bool hasFileMetadata(const std::string& path) {
-  const bool existingFormat = FsHelpers::hasEpubExtension(path) || FsHelpers::hasXtcExtension(path) ||
-                              FsHelpers::hasTxtExtension(path) || FsHelpers::hasMarkdownExtension(path);
+bool deleteDirectoryPdf(void*, const char* const path) {
 #if defined(CROSSINK_ENABLE_PDF) && CROSSINK_ENABLE_PDF
-  return existingFormat || FsHelpers::hasPdfExtension(path);
+  return path != nullptr && BookActions::deletePdfBook(path);
 #else
-  return existingFormat;
+  (void)path;
+  return false;
 #endif
+}
+
+void clearDirectoryLegacyMetadata(void*, const std::string& path) {
+  BookActions::clearFileMetadata(path);
 }
 
 bool isSupportedBrowserFile(std::string_view filename) {
@@ -143,27 +148,6 @@ bool containsHiddenPathSegment(const std::string& path) {
     segmentStart = segmentEnd + 1;
   }
   return false;
-}
-
-void collectMetadataPathsRecursively(const std::string& dirPath, std::vector<std::string>& paths) {
-  auto dir = Storage.open(dirPath.c_str());
-  if (!dir || !dir.isDirectory()) {
-    LOG_ERR("FileBrowser", "Failed to scan directory metadata before delete: %s", dirPath.c_str());
-    return;
-  }
-
-  char name[256];
-  for (auto file = dir.openNextFile(); file; file = dir.openNextFile()) {
-    file.getName(name, sizeof(name));
-    const std::string childPath = buildFullPath(dirPath, name);
-    if (file.isDirectory()) {
-      collectMetadataPathsRecursively(childPath, paths);
-    } else if (hasFileMetadata(childPath)) {
-      paths.push_back(childPath);
-    }
-    file.close();
-  }
-  dir.close();
 }
 
 std::string getFileName(std::string filename);
@@ -374,11 +358,20 @@ void FileBrowserActivity::promptDeleteFile(const std::string& fullPath, const st
     }
 
     LOG_DBG("FileBrowser", "Attempting to delete: %s", fullPath.c_str());
-    BookActions::clearFileMetadata(fullPath);
-    if (!Storage.remove(fullPath.c_str())) {
-      LOG_ERR("FileBrowser", "Failed to delete file: %s", fullPath.c_str());
-      return;
+    // PDF_DELETE_ADAPTER_BEGIN
+    if (FsHelpers::hasPdfExtension(fullPath)) {
+      if (!BookActions::deletePdfBook(fullPath)) {
+        LOG_ERR("FileBrowser", "Failed to delete PDF safely: %s", fullPath.c_str());
+        return;
+      }
+    } else {
+      BookActions::clearFileMetadata(fullPath);
+      if (!Storage.remove(fullPath.c_str())) {
+        LOG_ERR("FileBrowser", "Failed to delete file: %s", fullPath.c_str());
+        return;
+      }
     }
+    // PDF_DELETE_ADAPTER_END
 
     LOG_DBG("FileBrowser", "Deleted successfully");
     if (isPinnedSleepFavorite(fullPath)) {
@@ -408,19 +401,26 @@ void FileBrowserActivity::promptDeleteDirectory(const std::string& fullPath, con
       return;
     }
 
-    std::vector<std::string> metadataPaths;
-    collectMetadataPathsRecursively(dirPath, metadataPaths);
+    const PdfDeleteUtils::Result deleteRecovery = PdfDeleteUtils::recoverPendingPdfDelete();
+    if (deleteRecovery != PdfDeleteUtils::Result::Complete &&
+        deleteRecovery != PdfDeleteUtils::Result::NoPendingDelete) {
+      LOG_ERR("FileBrowser", "Pending PDF deletion blocked directory delete: %u",
+              static_cast<unsigned>(deleteRecovery));
+      return;
+    }
 
     LOG_DBG("FileBrowser", "Attempting to delete directory: %s", dirPath.c_str());
-    if (!Storage.removeDir(dirPath.c_str())) {
-      LOG_ERR("FileBrowser", "Failed to delete directory: %s", dirPath.c_str());
+    const PdfDirectoryDeleteScan::DeleteCallbacks callbacks{
+        nullptr, &deleteDirectoryPdf, &clearDirectoryLegacyMetadata};
+    const PdfDirectoryDeleteScan::Status status =
+        PdfDirectoryDeleteScan::deleteDirectoryNoThrow(dirPath, callbacks);
+    if (status != PdfDirectoryDeleteScan::Status::Complete) {
+      LOG_ERR("FileBrowser", "Directory delete failed for %s: %u",
+              dirPath.c_str(), static_cast<unsigned>(status));
       return;
     }
 
     LOG_DBG("FileBrowser", "Deleted successfully");
-    for (const auto& metadataPath : metadataPaths) {
-      BookActions::clearFileMetadata(metadataPath);
-    }
 
     const std::string favoritePrefix = dirPath + "/";
     if (!APP_STATE.favoriteSleepImagePath.empty() && APP_STATE.favoriteSleepImagePath.rfind(favoritePrefix, 0) == 0) {

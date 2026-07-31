@@ -28,6 +28,7 @@ add_executable(PdfCacheClearTest
   ${REPO_ROOT}/src/util/BookCacheUtils.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfSourceIdentity.cpp
   PdfCacheClearTest.cpp
+  stubs/BookMoveUtils.cpp
   stubs/TestStorage.cpp
 )
 

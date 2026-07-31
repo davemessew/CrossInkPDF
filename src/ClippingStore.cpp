@@ -12,6 +12,8 @@
 #include <functional>
 #include <limits>
 
+#include "util/BookMoveDurableFile.h"
+
 namespace {
 constexpr uint8_t VERSION = 1;
 constexpr size_t INITIAL_CLIPPING_RESERVE = 4;
@@ -34,8 +36,10 @@ struct PdfClippingMigrationScratch {
   std::vector<Clipping> destination;
   std::string sourcePath;
   std::string destinationPath;
+  std::string temporaryPath;
+  std::string backupPath;
 };
-static_assert(sizeof(PdfClippingMigrationScratch) <= 384);
+static_assert(sizeof(PdfClippingMigrationScratch) <= 512);
 
 bool readExpectedBytes(FsFile& file, const void* const expected, const size_t length) {
   const auto* expectedBytes = static_cast<const uint8_t*>(expected);
@@ -210,6 +214,49 @@ bool ClippingStore::loadForBook(const std::string& filePath, const std::string& 
   }
 
   return readFromFile();
+}
+
+bool clippingsMatchExactly(const Clipping& left, const Clipping& right) {
+  return left.spineIndex == right.spineIndex && left.startPage == right.startPage &&
+         left.endPage == right.endPage && left.pageCount == right.pageCount &&
+         left.startWordIndex == right.startWordIndex && left.endWordIndex == right.endWordIndex &&
+         left.wordCount == right.wordCount && left.paragraphIndex == right.paragraphIndex &&
+         left.timestamp == right.timestamp &&
+         std::memcmp(left.chapterTitle, right.chapterTitle, sizeof(left.chapterTitle)) == 0 &&
+         left.text == right.text;
+}
+
+bool mergeAuthoritativeClippings(std::vector<Clipping>& destination, const std::vector<Clipping>& source,
+                                 const bool stablePdfIds) {
+  for (const Clipping& clipping : source) {
+    auto found = destination.end();
+    if (stablePdfIds && clipping.paragraphIndex != 0 && clipping.paragraphIndex != UINT16_MAX) {
+      found = std::find_if(destination.begin(), destination.end(), [&](const Clipping& existing) {
+        return existing.paragraphIndex == clipping.paragraphIndex;
+      });
+    } else {
+      found = std::find_if(destination.begin(), destination.end(), [&](const Clipping& existing) {
+        return clippingsMatchExactly(existing, clipping);
+      });
+    }
+    if (found != destination.end()) {
+      *found = clipping;
+      continue;
+    }
+    if (destination.size() >= CLIPPING_MAX_PER_BOOK) {
+      LOG_ERR("CLIP", "Clipping limit reached while copying moved-book state");
+      return false;
+    }
+    destination.push_back(clipping);
+  }
+  return true;
+}
+
+bool containsAllClippings(const std::vector<Clipping>& destination, const std::vector<Clipping>& source) {
+  return std::all_of(source.begin(), source.end(), [&](const Clipping& expected) {
+    return std::any_of(destination.begin(), destination.end(),
+                       [&](const Clipping& actual) { return clippingsMatchExactly(actual, expected); });
+  });
 }
 
 bool ClippingStore::reloadPdfFromDisk() {
@@ -492,6 +539,36 @@ bool ClippingStore::writeToFile() const {
   return true;
 }
 
+bool ClippingStore::writeMigrationPayload(void* const fileContext) const {
+  if (fileContext == nullptr) return false;
+  auto& file = *static_cast<FsFile*>(fileContext);
+  const uint16_t count = static_cast<uint16_t>(
+      std::min<size_t>(clippings.size(), CLIPPING_MAX_PER_BOOK));
+  bool wrote = serialization::tryWritePod(file, VERSION) &&
+               serialization::tryWritePod(file, count) &&
+               serialization::tryWriteString(file, bookTitle) &&
+               serialization::tryWriteString(file, bookAuthor) &&
+               serialization::tryWriteString(file, bookFilePath);
+  for (uint16_t index = 0; wrote && index < count; ++index) {
+    const Clipping& clipping = clippings[index];
+    wrote =
+        serialization::tryWritePod(file, clipping.spineIndex) &&
+        serialization::tryWritePod(file, clipping.startPage) &&
+        serialization::tryWritePod(file, clipping.endPage) &&
+        serialization::tryWritePod(file, clipping.pageCount) &&
+        serialization::tryWritePod(file, clipping.startWordIndex) &&
+        serialization::tryWritePod(file, clipping.endWordIndex) &&
+        serialization::tryWritePod(file, clipping.wordCount) &&
+        serialization::tryWritePod(file, clipping.paragraphIndex) &&
+        serialization::tryWritePod(file, clipping.timestamp) &&
+        file.write(reinterpret_cast<const uint8_t*>(clipping.chapterTitle),
+                   sizeof(clipping.chapterTitle)) ==
+            sizeof(clipping.chapterTitle) &&
+        serialization::tryWriteString(file, clipping.text);
+  }
+  return wrote;
+}
+
 bool ClippingStore::writePdfTransaction(const Clipping* const appended, const size_t removeIndex,
                                         const bool clear) const {
   if (storeFilePath.empty()) {
@@ -694,6 +771,119 @@ bool ClippingStore::deleteForFilePath(const std::string& filePath, const std::st
   }
   const std::string path = storeFilePathForBook(filePath, bookType);
   return deleteStorePath(path, "clipping canonical");
+}
+
+bool ClippingStore::copyForFilePath(const std::string& oldFilePath, const std::string& newFilePath,
+                                    const std::string& bookType) {
+  if (bookType != "pdf" || oldFilePath.empty() || newFilePath.empty() ||
+      oldFilePath == newFilePath) {
+    return oldFilePath == newFilePath && bookType == "pdf";
+  }
+
+  // Clipping text makes the vectors dynamic; retain both vectors and their
+  // Store/path controls in one fallible cold-path allocation.
+  auto scratch = makeUniqueNoThrow<PdfClippingMigrationScratch>();
+  if (!scratch) {
+    LOG_ERR("CLIP", "Out of memory allocating clipping copy scratch");
+    return false;
+  }
+  if (!pdfClippingStoreFilePathForBook(oldFilePath, scratch->sourcePath) ||
+      !pdfClippingStoreFilePathForBook(newFilePath, scratch->destinationPath)) {
+    return false;
+  }
+  if (scratch->sourcePath == scratch->destinationPath) {
+    LOG_ERR("CLIP", "Refusing clipping copy across a path-key collision");
+    return false;
+  }
+
+  scratch->store.bookFilePath = oldFilePath;
+  scratch->store.storeFilePath = scratch->sourcePath;
+  if (!scratch->store.recoverPdfTransaction()) return false;
+  if (!Storage.exists(scratch->sourcePath.c_str())) return true;
+
+  const std::string sourceName =
+      scratch->sourcePath.substr(scratch->sourcePath.rfind('/') == std::string::npos
+                                     ? 0
+                                     : scratch->sourcePath.rfind('/') + 1U);
+  ClippingFileHeader header;
+  if (!readClippingFileHeader(scratch->sourcePath, sourceName.c_str(), header) || header.path != oldFilePath ||
+      !scratch->store.readFromFile(scratch->sourcePath, scratch->source)) {
+    return false;
+  }
+
+  scratch->store.bookFilePath = newFilePath;
+  scratch->store.storeFilePath = scratch->destinationPath;
+  scratch->temporaryPath =
+      scratch->destinationPath + PDF_TRANSACTION_TEMP_SUFFIX;
+  scratch->backupPath =
+      scratch->destinationPath + PDF_TRANSACTION_BACKUP_SUFFIX;
+  const char* destinationSnapshot = nullptr;
+  if (Storage.exists(scratch->destinationPath.c_str())) {
+    destinationSnapshot = scratch->destinationPath.c_str();
+  } else if (Storage.exists(scratch->backupPath.c_str())) {
+    destinationSnapshot = scratch->backupPath.c_str();
+  }
+  if (destinationSnapshot != nullptr &&
+      !scratch->store.readFromFile(destinationSnapshot,
+                                   scratch->destination)) {
+    // Retry from the still-authoritative source instead of treating a torn
+    // destination as permanent.
+    scratch->destination.clear();
+  }
+  if (!mergeAuthoritativeClippings(scratch->destination, scratch->source, true)) {
+    return false;
+  }
+
+  scratch->store.bookTitle = std::move(header.title);
+  scratch->store.bookAuthor = std::move(header.author);
+  scratch->store.clippings = std::move(scratch->destination);
+  const BookMoveDurableFile::Payload payload{
+      &scratch->store,
+      [](void* context, void* fileContext) {
+        return static_cast<ClippingStore*>(context)
+            ->writeMigrationPayload(fileContext);
+      },
+      [](void* context, const char* path) {
+        return static_cast<ClippingStore*>(context)->verifyPdfTransaction(
+            path, nullptr, std::numeric_limits<size_t>::max(), false);
+      }};
+  Storage.mkdir("/.crosspoint");
+  Storage.mkdir(CLIPPINGS_DIR);
+  const bool wrote = BookMoveDurableFile::replace(
+      scratch->destinationPath.c_str(), scratch->temporaryPath.c_str(),
+      scratch->backupPath.c_str(), payload);
+  if (!wrote) {
+    LOG_ERR("CLIP", "Failed to copy clipping state: %s -> %s", oldFilePath.c_str(), newFilePath.c_str());
+  }
+  return wrote;
+}
+
+bool ClippingStore::verifyCopyForFilePath(const std::string& oldFilePath, const std::string& newFilePath,
+                                          const std::string& bookType) {
+  if (bookType != "pdf" || oldFilePath.empty() || newFilePath.empty() ||
+      oldFilePath == newFilePath) {
+    return oldFilePath == newFilePath && bookType == "pdf";
+  }
+
+  auto scratch = makeUniqueNoThrow<PdfClippingMigrationScratch>();
+  if (!scratch) {
+    LOG_ERR("CLIP", "Out of memory allocating clipping verification scratch");
+    return false;
+  }
+  if (!pdfClippingStoreFilePathForBook(oldFilePath, scratch->sourcePath) ||
+      !pdfClippingStoreFilePathForBook(newFilePath, scratch->destinationPath)) {
+    return false;
+  }
+  if (!Storage.exists(scratch->sourcePath.c_str())) return true;
+
+  scratch->store.bookFilePath = oldFilePath;
+  if (!scratch->store.readFromFile(scratch->sourcePath, scratch->source)) return false;
+  if (scratch->source.empty()) return true;
+  if (!Storage.exists(scratch->destinationPath.c_str())) return false;
+
+  scratch->store.bookFilePath = newFilePath;
+  return scratch->store.readFromFile(scratch->destinationPath, scratch->destination) &&
+         containsAllClippings(scratch->destination, scratch->source);
 }
 
 bool ClippingStore::migratePdfForFilePath(const std::string& oldFilePath, const std::string& newFilePath,

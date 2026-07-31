@@ -2,6 +2,7 @@
 
 class CrossPointSettings;
 class CrossPointState;
+class Print;
 
 namespace JsonSettingsIO {
 
@@ -11,6 +12,7 @@ bool loadSettings(CrossPointSettings& s, const char* json, bool* needsResave = n
 
 // CrossPointState
 bool saveState(const CrossPointState& s, const char* path);
+bool writeState(const CrossPointState& s, Print& output);
 bool loadState(CrossPointState& s, const char* json);
 
 }  // namespace JsonSettingsIO

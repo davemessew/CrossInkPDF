@@ -53,13 +53,33 @@ class RecentBooksStore : public PersistableStore<RecentBooksStore> {
   // Persistence is best-effort: a failed save is logged, not reflected in the return.
   bool removeByPath(const std::string& path);
 
+  // PDF deletion journals advance only after this result-bearing replacement
+  // has written, synced, and read-verified recent.json. Replays are
+  // idempotent, including cleanup of an interrupted prior replacement.
+  bool removeByPathDurably(const std::string& path);
+
   // Repoint an entry's path (and coverBmpPath, if it lived under the old cache dir) after the
   // backing file and cache dir were moved on disk. No-op if no entry matches oldPath.
   // Persists on success. Keeps the entry's list position (does not reorder).
   void updatePath(const std::string& oldPath, const std::string& newPath, const std::string& oldCachePath,
                   const std::string& newCachePath);
 
+  // Journaled moves use a result-bearing, idempotent activation API so a
+  // durable phase is never advanced after a failed recent-books write.
+  bool activatePathMigration(const std::string& oldPath, const std::string& newPath,
+                             const std::string& oldCachePath,
+                             const std::string& newCachePath,
+                             bool keepInRecents = true);
+  bool verifyPathMigration(const std::string& oldPath,
+                           const std::string& newPath,
+                           bool keepInRecents = true) const;
+  bool verifyPersistedPathMigration(const std::string& oldPath,
+                                    const std::string& newPath,
+                                    bool keepInRecents) const;
+
   // True if the book's backing file is no longer present on the SD card.
+  // Missing PDFs with unresolved/pre-activation move state are retained until
+  // recovery can prove which path is authoritative.
   static bool isMissing(const RecentBook& book);
 
   // Remove entries whose backing file is no longer on the SD card.

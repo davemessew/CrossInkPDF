@@ -1,4 +1,5 @@
 #include "BookCacheUtils.h"
+#include "BookMoveUtils.h"
 
 #include <Epub.h>
 #include <FsHelpers.h>
@@ -305,8 +306,18 @@ std::unique_ptr<PdfCacheClearWorkspace> allocatePdfCacheClearWorkspace() {
 }
 
 [[gnu::noinline]] bool clearPdfDerivedCache(const std::string& path) {
+  const uint64_t normalCacheHash = pdfPathHash64(path.c_str(), path.size());
+  uint64_t resolvedCacheHash = normalCacheHash;
+  bool readOnlyFallback = true;
+  if (!BookMoveUtils::migrationCacheHash(path, normalCacheHash, &resolvedCacheHash, &readOnlyFallback) ||
+      readOnlyFallback || resolvedCacheHash != normalCacheHash) {
+    LOG_ERR("BookCache", "Refusing PDF cache deletion while migration state is unresolved");
+    return false;
+  }
+
   char cachePath[PDF_CACHE_PATH_CAPACITY]{};
-  const PdfStatus status = pdfFormatCacheRoot("/.crosspoint", path.c_str(), cachePath, sizeof(cachePath));
+  const PdfStatus status =
+      pdfFormatCacheRootForHash("/.crosspoint", normalCacheHash, cachePath, sizeof(cachePath));
   if (!status) {
     LOG_ERR("BookCache", "Failed to resolve PDF cache path: %s", path.c_str());
     return false;

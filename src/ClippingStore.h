@@ -66,6 +66,12 @@ class ClippingStore {
   static bool hasAnyClippings();
   static bool getAllClippedBooks(std::vector<ClippedBookEntry>& out);
   static bool deleteForFilePath(const std::string& filePath, const std::string& bookType);
+  // Journaled copy/verification is PDF-only. Legacy formats keep using
+  // migrateForFilePath after their source rename.
+  static bool copyForFilePath(const std::string& oldFilePath, const std::string& newFilePath,
+                              const std::string& bookType);
+  static bool verifyCopyForFilePath(const std::string& oldFilePath, const std::string& newFilePath,
+                                    const std::string& bookType);
   static bool migrateForFilePath(const std::string& oldFilePath, const std::string& newFilePath,
                                  const std::string& title, const std::string& author, const std::string& bookType);
 
@@ -82,6 +88,7 @@ class ClippingStore {
   bool readFromFile();
   bool readFromFile(const std::string& path, std::vector<Clipping>& out) const;
   bool writeToFile() const;
+  bool writeMigrationPayload(void* fileContext) const;
   bool writePdfTransaction(const Clipping* appended, size_t removeIndex, bool clear) const;
   bool verifyPdfTransaction(const std::string& path, const Clipping* appended, size_t removeIndex, bool clear) const;
   bool recoverPdfTransaction() const;

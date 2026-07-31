@@ -65,9 +65,14 @@ struct StringView {
 };
 
 enum class BookFormat : uint8_t {
-  Unknown,
-  Epub,
-  Pdf,
+  Unknown = 0,
+  // Value 1 remains unused so an accidental legacy/non-PDF record is rejected.
+  Pdf = 2,
+};
+
+enum class RecentsPolicy : uint8_t {
+  Keep = 0,
+  Remove = 1,
 };
 
 enum class Phase : uint8_t {
@@ -90,6 +95,9 @@ struct Record {
   uint64_t newHash = 0;
   StringView oldPath{};
   StringView newPath{};
+  // Stored in the journal so boot recovery applies the same user-visible
+  // recent-books policy as the move that was originally requested.
+  RecentsPolicy recentsPolicy = RecentsPolicy::Keep;
 };
 
 enum class Slot : uint8_t {

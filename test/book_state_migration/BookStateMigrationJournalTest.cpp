@@ -738,7 +738,7 @@ TEST(BookStateMigrationCodec, ExactGoldenAndStrictTruncationAndCrcValidation) {
 
 TEST(BookStateMigrationCodec, RejectsOversizeAndNullScratchWithoutMutation) {
   std::string tooLong(kMaxPathBytes + 1, 'x');
-  const Record input{0, Phase::Prepared, BookFormat::Epub, 1, 2, {tooLong.data(), tooLong.size()}, {"b", 1}};
+  const Record input{0, Phase::Prepared, BookFormat::Pdf, 1, 2, {tooLong.data(), tooLong.size()}, {"b", 1}};
   size_t encodedLength = 77;
   EXPECT_EQ(encode(input, {nullptr, 0}, &encodedLength), Status::ScratchTooSmall);
   EXPECT_EQ(encodedLength, 77u);
@@ -746,6 +746,21 @@ TEST(BookStateMigrationCodec, RejectsOversizeAndNullScratchWithoutMutation) {
   scratch.fill(0x7a);
   EXPECT_EQ(encode(input, {scratch.data(), scratch.size()}, &encodedLength), Status::LimitExceeded);
   EXPECT_TRUE(std::all_of(scratch.begin(), scratch.end(), [](uint8_t byte) { return byte == 0x7a; }));
+}
+
+TEST(BookStateMigrationCodec, RejectsReservedNonPdfFormatEvenWithValidCrc) {
+  std::array<uint8_t, kScratchCapacity> scratch{};
+  const std::string oldPath = "/Books/old.pdf";
+  const std::string newPath = "/Read/old.pdf";
+  const Record input{
+      7, Phase::Prepared, BookFormat::Pdf, 11, 22, {oldPath.data(), oldPath.size()}, {newPath.data(), newPath.size()}};
+  size_t encodedLength = 0;
+  ASSERT_EQ(encode(input, {scratch.data(), scratch.size()}, &encodedLength), Status::Ok);
+
+  scratch[13] = 1;
+  ASSERT_EQ(reseal(scratch.data(), encodedLength), Status::Ok);
+  Record decoded{};
+  EXPECT_EQ(decode(scratch.data(), encodedLength, &decoded), Status::Corrupt);
 }
 
 TEST(BookStateMigrationSlots, SelectsNewestValidSlotAcrossSequenceWrap) {

@@ -30,6 +30,8 @@ struct PdfCachedProductState {
   uint32_t generation = 0;
   uint32_t totalWords = 0;
   uint32_t currentWord = 0;
+  uint32_t currentSectionFirstWordOrdinal = 0;
+  uint32_t currentSectionWordCount = 0;
   uint16_t currentSection = 0;
   bool hasProgress = false;
 };
@@ -61,7 +63,17 @@ PdfCachedProductStateLoadResult pdfLoadCachedProductState(const PdfCacheIo& io, 
                                                           PdfCachedProductState* productState,
                                                           const uint64_t* cacheHashOverride = nullptr);
 PdfCachedProductStateLoadResult pdfLoadCachedProductState(const PdfCacheIo& io, const char* sourcePath,
-                                                          const char* cacheDirectory,
-                                                          PdfCachedProductState* productState,
-                                                          const PdfCachedProductStateAllocator& allocator,
-                                                          const uint64_t* cacheHashOverride = nullptr);
+                                                           const char* cacheDirectory,
+                                                           PdfCachedProductState* productState,
+                                                           const PdfCachedProductStateAllocator& allocator,
+                                                           const uint64_t* cacheHashOverride = nullptr);
+
+#if defined(CROSSINK_ENABLE_PDF) && CROSSINK_ENABLE_PDF
+// Sleep-only transient view: identifies the cache by source path/hash but never
+// opens sourcePath. It selects the newest structurally valid completed
+// manifest, then validates progress against that manifest's embedded source
+// identity. Do not use this stale-tolerant view for Home or Reader state.
+PdfCachedProductStateLoadResult pdfLoadCachedProductStateForSleep(
+    const PdfCacheIo& io, const char* sourcePath, const char* cacheDirectory,
+    PdfCachedProductState* productState, const uint64_t* cacheHashOverride = nullptr);
+#endif

@@ -13,6 +13,7 @@
 #include <HalTiltSensor.h>
 #include <I18n.h>
 #include <Logging.h>
+#include <PdfSourceIdentity.h>
 #include <SPI.h>
 #include <ScratchWorkspace.h>
 #include <builtinFonts/all.h>
@@ -91,6 +92,8 @@ inline esp_sleep_wakeup_cause_t esp_sleep_get_wakeup_cause() { return ESP_SLEEP_
 #endif
 #include "images/LoadingIcon.h"
 #include "util/ButtonNavigator.h"
+#include "util/BookMoveUtils.h"
+#include "util/PdfDeleteUtils.h"
 #include "util/ScreenshotUtil.h"
 
 MappedInputManager mappedInputManager(gpio);
@@ -754,6 +757,36 @@ void setup() {
 #endif
   APP_STATE.loadFromFile();
   RECENT_BOOKS.loadFromFile();
+  const PdfDeleteUtils::Result deleteRecovery = PdfDeleteUtils::recoverPendingPdfDelete();
+  const bool bookDeleteRecoveryBlocked = deleteRecovery == PdfDeleteUtils::Result::Pending ||
+                                         deleteRecovery == PdfDeleteUtils::Result::Conflict ||
+                                         deleteRecovery == PdfDeleteUtils::Result::Invalid;
+  if (bookDeleteRecoveryBlocked) {
+    LOG_ERR("MAIN", "PDF delete recovery remains pending (%u)", static_cast<unsigned>(deleteRecovery));
+  }
+  const BookMoveUtils::MoveResult moveRecovery =
+      bookDeleteRecoveryBlocked ? BookMoveUtils::MoveResult::Pending : BookMoveUtils::recoverPendingBookMove();
+  const bool bookMoveRecoveryBlocked = moveRecovery == BookMoveUtils::MoveResult::Pending ||
+                                       moveRecovery == BookMoveUtils::MoveResult::Conflict ||
+                                       moveRecovery == BookMoveUtils::MoveResult::Invalid;
+  if (bookMoveRecoveryBlocked) {
+    LOG_ERR("MAIN", "Book move recovery remains pending (%u)", static_cast<unsigned>(moveRecovery));
+  }
+  bool bookMoveResumeBlocked = false;
+  if (FsHelpers::hasPdfExtension(APP_STATE.openBookPath())) {
+    const std::string& openBookPath = APP_STATE.openBookPath();
+    const BookMutationFence deleteFence = PdfDeleteUtils::mutationFenceForPath(openBookPath);
+    bookMoveResumeBlocked = deleteFence == BookMutationFence::MatchingPending ||
+                            deleteFence == BookMutationFence::Indeterminate;
+    if (!bookMoveResumeBlocked && bookMoveRecoveryBlocked) {
+      const uint64_t normalCacheHash = pdfPathHash64(openBookPath.c_str(), openBookPath.size());
+      uint64_t resolvedCacheHash = normalCacheHash;
+      bool readOnlyFallback = true;
+      const bool cacheResolved =
+          BookMoveUtils::migrationCacheHash(openBookPath, normalCacheHash, &resolvedCacheHash, &readOnlyFallback);
+      bookMoveResumeBlocked = !cacheResolved || readOnlyFallback;
+    }
+  }
   I18N.setLanguage(static_cast<Language>(SETTINGS.language));
   KOREADER_STORE.loadFromFile();
   OPDS_STORE.loadFromFile();
@@ -855,6 +888,10 @@ void setup() {
   } else if (HalSystem::isRebootFromPanic()) {
     // If we rebooted from a panic, go to crash report screen to show the panic info
     activityManager.goToCrashReport();
+  } else if (bookMoveResumeBlocked) {
+    // Never resume the affected PDF while its path-keyed move is unresolved.
+    // Home can still render retained read-only products without preparing or saving.
+    activityManager.goHome();
   } else if (resume == BootResume::Silent && snapshotTarget == SILENT_REBOOT_TARGET_READER &&
              !APP_STATE.openBookPath().empty()) {
     activityManager.goToReader(APP_STATE.openBookPath());

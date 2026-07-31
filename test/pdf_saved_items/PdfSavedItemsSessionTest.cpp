@@ -173,6 +173,19 @@ void seedPdfBookmarkCurrentAndLegacyArtifacts(const char* const bookPath, std::s
   Storage.addFile(*legacyPath + ".bak", legacyBytes);
 }
 
+std::vector<uint8_t> makePdfBookmarkFile(const char* const bookPath, const uint16_t spineIndex, const float progress,
+                                         const char* const chapterTitle, const uint16_t itemId,
+                                         const char* const snippet) {
+  Storage.reset();
+  BookmarkStore store;
+  EXPECT_TRUE(store.loadForBook(bookPath, "Title", "Author", "pdf"));
+  EXPECT_EQ(store.addPdfBookmark(spineIndex, progress, chapterTitle, itemId, snippet), BookmarkStore::AddResult::Added);
+  const std::string path = pdfCompatibilityPath("/.crosspoint/bookmarks", bookPath);
+  const auto found = Storage.files().find(path);
+  EXPECT_NE(found, Storage.files().end());
+  return found == Storage.files().end() ? std::vector<uint8_t>{} : found->second;
+}
+
 void seedPdfClippingArtifacts(ClippingStore* const store, std::string* const canonicalPath,
                               const char* const bookPath = "/books/book.pdf") {
   ASSERT_NE(store, nullptr);
@@ -471,6 +484,59 @@ TEST_F(LegacyStoreTest, PdfBookmarkMigrationMergesDestinationByStableIdRatherTha
   ASSERT_EQ(moved.getBookmarks().size(), 2U);
   EXPECT_EQ(moved.getBookmarks()[0].paragraphIndex, 12);
   EXPECT_EQ(moved.getBookmarks()[1].paragraphIndex, 11);
+}
+
+TEST_F(LegacyStoreTest, PdfJournalCopyKeepsCanonicalSourceRecordOverStaleLegacySameId) {
+  constexpr char oldPath[] = "/books/canonical-source.pdf";
+  constexpr char newPath[] = "/books/canonical-destination.pdf";
+  constexpr uint16_t itemId = 77;
+  const std::vector<uint8_t> canonicalBytes =
+      makePdfBookmarkFile(oldPath, 2, 0.25F, "Canonical chapter", itemId, "canonical payload");
+  const std::vector<uint8_t> staleLegacyBytes =
+      makePdfBookmarkFile(oldPath, 9, 0.75F, "Stale chapter", itemId, "stale payload");
+  const std::vector<uint8_t> staleDestinationBytes =
+      makePdfBookmarkFile(newPath, 9, 0.75F, "Stale chapter", itemId, "stale payload");
+
+  Storage.reset();
+  const std::string sourceCurrent = pdfCompatibilityPath("/.crosspoint/bookmarks", oldPath);
+  const std::string sourceLegacy = pdfBookmarkLegacyCompatibilityPath(oldPath);
+  const std::string destination = pdfCompatibilityPath("/.crosspoint/bookmarks", newPath);
+  Storage.addFile(sourceCurrent, canonicalBytes);
+  Storage.addFile(sourceLegacy, staleLegacyBytes);
+  Storage.addFile(destination, staleDestinationBytes);
+
+  EXPECT_FALSE(BookmarkStore::verifyCopyForFilePath(oldPath, newPath, "pdf"));
+  ASSERT_TRUE(BookmarkStore::copyForFilePath(oldPath, newPath, "pdf"));
+  EXPECT_TRUE(BookmarkStore::verifyCopyForFilePath(oldPath, newPath, "pdf"));
+
+  BookmarkStore copied;
+  ASSERT_TRUE(copied.loadForBook(newPath, "Title", "Author", "pdf"));
+  ASSERT_EQ(copied.getBookmarks().size(), 1U);
+  const Bookmark& canonical = copied.getBookmarks()[0];
+  EXPECT_EQ(canonical.paragraphIndex, itemId);
+  EXPECT_EQ(canonical.spineIndex, 2);
+  EXPECT_FLOAT_EQ(canonical.progress, 0.25F);
+  EXPECT_STREQ(canonical.chapterTitle, "Canonical chapter");
+  EXPECT_STREQ(canonical.snippet, "canonical payload");
+
+  Storage.addFile(destination, {0xba, 0xd0});
+  Storage.addFile(destination + ".tmp", {0xaa});
+  Storage.addFile(destination + ".bak", staleDestinationBytes);
+  ASSERT_TRUE(BookmarkStore::copyForFilePath(oldPath, newPath, "pdf"));
+  EXPECT_TRUE(BookmarkStore::verifyCopyForFilePath(oldPath, newPath, "pdf"));
+
+  BookmarkStore retried;
+  ASSERT_TRUE(retried.loadForBook(newPath, "Title", "Author", "pdf"));
+  ASSERT_EQ(retried.getBookmarks().size(), 1U);
+  const Bookmark& recovered = retried.getBookmarks()[0];
+  EXPECT_EQ(recovered.paragraphIndex, itemId);
+  EXPECT_EQ(recovered.spineIndex, 2);
+  EXPECT_FLOAT_EQ(recovered.progress, 0.25F);
+  EXPECT_STREQ(recovered.chapterTitle, "Canonical chapter");
+  EXPECT_STREQ(recovered.snippet, "canonical payload");
+  EXPECT_FALSE(Storage.exists((destination + ".tmp").c_str()));
+  EXPECT_FALSE(Storage.exists((destination + ".bak").c_str()));
+  EXPECT_LE(Storage.maximumOpenHandles(), 1U);
 }
 
 TEST_F(LegacyStoreTest, PdfBookmarkLoadRejectsARealCrcCollisionWithoutRewriting) {

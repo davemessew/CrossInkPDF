@@ -40,6 +40,10 @@ class CrossPointState {
   static CrossPointState& getInstance() { return instance; }
 
   bool saveToFile() const;
+  bool activateOpenPathMigration(const std::string& oldPath,
+                                 const std::string& newPath);
+  bool verifyPersistedOpenPathMigration(const std::string& oldPath,
+                                        const std::string& newPath) const;
 
   bool loadFromFile();
   uint16_t pendingBookmarkSpine = UINT16_MAX;
