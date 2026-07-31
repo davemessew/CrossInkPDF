@@ -70,19 +70,27 @@ uint64_t pdfFingerprintSourceWindow(const PdfSourceFingerprintWindow window, con
   return fingerprint(domain, domainLength, sourceSize, offset, length, bytes);
 }
 
-PdfStatus pdfFormatCacheRoot(const char* const cacheDirectory, const char* const sourcePath, char* const destination,
-                             const size_t destinationCapacity) {
-  if (cacheDirectory == nullptr || sourcePath == nullptr || destination == nullptr || destinationCapacity == 0) {
+PdfStatus pdfFormatCacheRootForHash(const char* const cacheDirectory, const uint64_t cacheHash,
+                                    char* const destination, const size_t destinationCapacity) {
+  if (cacheDirectory == nullptr || destination == nullptr || destinationCapacity == 0) {
     return PdfStatus::failure(PdfError::InvalidArgument);
   }
-  const size_t sourceLength = std::strlen(sourcePath);
   const int written = std::snprintf(destination, destinationCapacity, "%s/pdf_%llu", cacheDirectory,
-                                    static_cast<unsigned long long>(pdfPathHash64(sourcePath, sourceLength)));
+                                    static_cast<unsigned long long>(cacheHash));
   if (written < 0 || static_cast<size_t>(written) >= destinationCapacity) {
     destination[0] = '\0';
     return PdfStatus::failure(PdfError::LimitExceeded);
   }
   return PdfStatus::success();
+}
+
+PdfStatus pdfFormatCacheRoot(const char* const cacheDirectory, const char* const sourcePath, char* const destination,
+                             const size_t destinationCapacity) {
+  if (sourcePath == nullptr) {
+    return PdfStatus::failure(PdfError::InvalidArgument);
+  }
+  return pdfFormatCacheRootForHash(cacheDirectory, pdfPathHash64(sourcePath, std::strlen(sourcePath)), destination,
+                                   destinationCapacity);
 }
 
 PdfStatus pdfComputeSourceIdentity(const PdfCacheIo& io, const char* const sourcePath, uint8_t* const workspace,

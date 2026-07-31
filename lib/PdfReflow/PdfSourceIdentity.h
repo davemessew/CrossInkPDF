@@ -24,6 +24,8 @@ bool pdfSourceIdentityEqual(const PdfSourceIdentity& left, const PdfSourceIdenti
 uint64_t pdfPathHash64(const char* path, size_t length);
 uint64_t pdfFingerprintSourceWindow(PdfSourceFingerprintWindow window, uint64_t sourceSize, uint64_t offset,
                                     const uint8_t* bytes, size_t length);
+PdfStatus pdfFormatCacheRootForHash(const char* cacheDirectory, uint64_t cacheHash, char* destination,
+                                    size_t destinationCapacity);
 PdfStatus pdfFormatCacheRoot(const char* cacheDirectory, const char* sourcePath, char* destination,
                              size_t destinationCapacity);
 PdfStatus pdfComputeSourceIdentity(const PdfCacheIo& io, const char* sourcePath, uint8_t* workspace,
