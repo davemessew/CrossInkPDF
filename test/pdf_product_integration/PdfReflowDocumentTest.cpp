@@ -77,15 +77,18 @@ struct CacheFixture {
   std::string cacheRoot;
   std::string sectionPath;
 
-  void build() {
+  void build(const char* const sourcePath = kSourcePath, const uint64_t* const cacheHashOverride = nullptr) {
     const std::string source = "%PDF-host-fixture-with-enough-identity-bytes";
-    storage.addFile(kSourcePath, std::vector<uint8_t>(source.begin(), source.end()), 42, true);
+    storage.addFile(sourcePath, std::vector<uint8_t>(source.begin(), source.end()), 42, true);
     std::array<uint8_t, PDF_SOURCE_FINGERPRINT_BYTES> workspace{};
-    ASSERT_TRUE(
-        pdfComputeSourceIdentity(storage.io(), kSourcePath, workspace.data(), workspace.size(), &identity).ok());
+    ASSERT_TRUE(pdfComputeSourceIdentity(storage.io(), sourcePath, workspace.data(), workspace.size(), &identity).ok());
 
     std::array<char, PDF_CACHE_PATH_CAPACITY> root{};
-    ASSERT_TRUE(pdfFormatCacheRoot(kCacheDirectory, kSourcePath, root.data(), root.size()).ok());
+    const PdfStatus rootStatus =
+        cacheHashOverride == nullptr
+            ? pdfFormatCacheRoot(kCacheDirectory, sourcePath, root.data(), root.size())
+            : pdfFormatCacheRootForHash(kCacheDirectory, *cacheHashOverride, root.data(), root.size());
+    ASSERT_TRUE(rootStatus.ok());
     cacheRoot = root.data();
     sectionPath = cacheRoot + "/gen_7/sections/000000.xhtml";
 
@@ -102,6 +105,20 @@ struct CacheFixture {
     PdfRequiredFileRecord sectionRecord{};
     ASSERT_TRUE(pdfCloseTrackedCacheFile(&writer, &sectionRecord).ok());
     records.values.push_back(sectionRecord);
+
+    const auto addArtifact = [&](const std::string& relative, const std::string& bytes) {
+      const std::string path = cacheRoot + "/" + relative;
+      storage.addFile(path, bytes);
+      PdfRequiredFileRecord record{};
+      ASSERT_LT(relative.size(), sizeof(record.path));
+      std::memcpy(record.path, relative.data(), relative.size());
+      record.pathLength = static_cast<uint8_t>(relative.size());
+      record.size = bytes.size();
+      record.crc32 = pdfCacheCrc32(bytes.data(), bytes.size());
+      records.values.push_back(record);
+    };
+    addArtifact("gen_7/cover.bmp", "BMcover");
+    addArtifact("gen_7/thumb.bmp", "BMthumb");
 
     PdfMetadataBuilder metadataBuilder;
     ASSERT_TRUE(metadataBuilder.begin(reinterpret_cast<const uint8_t*>("minimal"), 7).ok());
@@ -267,6 +284,40 @@ TEST(PdfReflowDocument, ClosesSourceBeforeValidatingCacheAndNeverReopensItForRea
   EXPECT_STREQ(loadedPosition.blockAnchor, "b00000000");
   EXPECT_EQ(fixture.storage.openCallsForPath(kSourcePath), sourceOpensBefore + 1);
   EXPECT_EQ(fixture.storage.openHandleCount(), 0U);
+}
+
+TEST(PdfReflowDocument, LoadsReadOnlyCacheFromCallerSuppliedMigrationHash) {
+  constexpr char oldPath[] = "/books/original.pdf";
+  constexpr char newPath[] = "/books/migrated.pdf";
+  const uint64_t oldHash = pdfPathHash64(oldPath, sizeof(oldPath) - 1U);
+  CacheFixture fixture;
+  fixture.build(newPath, &oldHash);
+
+  PdfReflowDocument normal;
+  ASSERT_TRUE(normal.initialize(fixture.storage.io(), newPath, kCacheDirectory).ok());
+  EXPECT_FALSE(normal.loadCompletedCache().ok());
+
+  fixture.storage.clearEvents();
+  PdfReflowDocument migrated;
+  ASSERT_TRUE(migrated.initialize(fixture.storage.io(), newPath, kCacheDirectory, &oldHash).ok());
+  const PdfStatus migratedStatus = migrated.loadCompletedCache();
+  ASSERT_TRUE(migratedStatus.ok())
+      << "error=" << static_cast<unsigned>(migratedStatus.error) << " offset=" << migratedStatus.offset;
+
+  EXPECT_EQ(migrated.getSectionCount(), 1U);
+  ReflowResource section;
+  ASSERT_TRUE(migrated.getImmutableLocalSection(0, section));
+  EXPECT_EQ(section.localPath, fixture.sectionPath);
+  EXPECT_EQ(fixture.storage.openHandleCount(), 0U);
+
+  const auto& events = fixture.storage.events();
+  const auto sourceClose = std::find(events.begin(), events.end(), std::string("close:") + newPath);
+  ASSERT_NE(sourceClose, events.end());
+  const auto firstCacheOpen = std::find_if(sourceClose + 1, events.end(), [&](const std::string& event) {
+    return event.rfind(std::string("open:") + fixture.cacheRoot + "/", 0) == 0;
+  });
+  ASSERT_NE(firstCacheOpen, events.end());
+  EXPECT_LT(sourceClose, firstCacheOpen);
 }
 
 TEST(PdfReflowDocument, MasksSavedItemsUntilMatchingCompletedCacheInitializesPersistence) {

@@ -16,9 +16,29 @@
 #include "PdfSavedItemWordMap.h"
 #include "PdfSavedItemsStore.h"
 
+enum class PdfCachedResourceKind : uint8_t {
+  None,
+  PixelCache,
+  Jpeg,
+};
+
+struct PdfCachedResourceRecord {
+  uint64_t contentHash = 0;
+  uint64_t encodedLength = 0;
+  uint64_t fileSize = 0;
+  uint32_t nameCrc32 = 0;
+  uint32_t fileCrc32 = 0;
+  uint16_t width = 0;
+  uint16_t height = 0;
+  PdfCachedResourceKind kind = PdfCachedResourceKind::None;
+};
+
+static_assert(sizeof(PdfCachedResourceRecord) <= 40, "cached PDF resource records must remain compact");
+
 class PdfReflowDocument : public ReflowDocument {
  public:
-  PdfStatus initialize(const PdfCacheIo& io, const char* sourcePath, const char* cacheDirectory);
+  PdfStatus initialize(const PdfCacheIo& io, const char* sourcePath, const char* cacheDirectory,
+                       const uint64_t* cacheHashOverride = nullptr);
   PdfStatus loadCompletedCache();
   PdfStatus lastStatus() const { return status_; }
 
@@ -114,16 +134,36 @@ class PdfReflowDocument : public ReflowDocument {
                                 PdfLayoutWordRange* ranges);
   };
 
-  static PdfStatus validateRequiredFile(void* context, const PdfRequiredFileRecord& record);
+  enum class ManifestFileStage : uint8_t {
+    Sections,
+    Images,
+    Cover,
+    Thumbnail,
+    Metadata,
+    Outline,
+  };
+
+  static constexpr uint8_t MaxCachedResources = 64;
+
+  static PdfStatus captureRequiredFile(void* context, const PdfRequiredFileRecord& record);
   static PdfStatus captureMetadataSection(void* context, uint16_t index, const PdfMetadataSection& record);
   static PdfStatus validateOutlineEntry(void* context, uint16_t index, const PdfOutlineEntry& record);
-  PdfStatus validateFile(const PdfRequiredFileRecord& record);
+  PdfStatus captureFile(const PdfRequiredFileRecord& record);
+  PdfStatus validateCapturedFiles();
+  PdfStatus validateCachedFile(const char* path, uint64_t expectedSize, uint32_t expectedCrc32,
+                               PdfCachedResourceRecord* resource);
+  PdfStatus validateResourceFile(uint8_t resourceIndex);
+  PdfStatus selectCompletedManifest(PdfCacheSlot* selectedSlot);
+  PdfStatus decodeSelectedManifest(PdfCacheSlot selectedSlot);
   PdfStatus loadMetadataCache();
   PdfStatus loadOutlineCache();
   bool readOutlineEntry(int tocIndex, PdfOutlineEntry* entry) const;
   bool formatSectionHref(int sectionIndex, char* output, size_t capacity) const;
   bool formatSectionPath(int sectionIndex, char* output, size_t capacity) const;
   bool streamCachedFile(const std::string& path, uint64_t fileSize, Print& out, size_t chunkSize) const;
+  bool formatResourcePath(const PdfCachedResourceRecord& resource, char* output, size_t capacity) const;
+  const PdfCachedResourceRecord* findResource(int sectionIndex, const std::string& href) const;
+  static void fitResourceDimensions(uint16_t sourceWidth, uint16_t sourceHeight, uint16_t* width, uint16_t* height);
   bool formatLayoutWordIndexPath(const std::string& sectionCachePath, char destination[PDF_CACHE_PATH_CAPACITY]) const;
   bool openLayoutWordIndex(const char* path, ManifestSource& source) const;
   bool closeLayoutWordIndex(ManifestSource& source) const;
@@ -138,9 +178,13 @@ class PdfReflowDocument : public ReflowDocument {
   std::string language_;
   std::string metadataPath_;
   std::string outlinePath_;
+  std::string coverPath_;
+  std::string thumbnailPath_;
   PdfSourceIdentity sourceIdentity_{};
   PdfCacheManifest manifest_{};
   PdfMetadata metadata_{};
+  PdfRequiredFileRecord coverRecord_{};
+  PdfRequiredFileRecord thumbnailRecord_{};
   PdfRequiredFileRecord metadataRecord_{};
   PdfRequiredFileRecord outlineRecord_{};
   PdfProgressStore progressStore_{};
@@ -148,7 +192,10 @@ class PdfReflowDocument : public ReflowDocument {
   std::unique_ptr<PdfMetadataSection[]> sections_;
   std::unique_ptr<uint8_t[]> ioWorkspace_;
   std::array<uint32_t, PdfMetadataLimits::MaxSections> manifestSectionSizes_{};
+  std::array<uint32_t, PdfMetadataLimits::MaxSections> manifestSectionCrcs_{};
   std::array<uint8_t, (PdfMetadataLimits::MaxSections + 7) / 8> manifestSectionSeen_{};
+  std::array<PdfCachedResourceRecord, MaxCachedResources> resources_{};
+  std::array<char, PDF_CACHE_PATH_CAPACITY> validationPath_{};
   mutable PdfOutlineEntry cachedOutlineEntry_{};
   mutable int cachedOutlineIndex_ = -1;
   // PDF-only four-record decode window: kept off the 4 KiB reader task stack
@@ -161,8 +208,10 @@ class PdfReflowDocument : public ReflowDocument {
   uint32_t validationGeneration_ = 0;
   uint32_t requiredFilesSeen_ = 0;
   uint32_t xhtmlFilesSeen_ = 0;
+  uint8_t resourceCount_ = 0;
   uint16_t metadataFilesSeen_ = 0;
   uint16_t outlineFilesSeen_ = 0;
+  ManifestFileStage manifestFileStage_ = ManifestFileStage::Sections;
   bool loaded_ = false;
   bool savedItemsReady_ = false;
   PdfStatus status_{};
