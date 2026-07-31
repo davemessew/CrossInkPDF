@@ -391,6 +391,20 @@ HalFile HalFile::openNextFile() {
   return HalFile(file.openNextFile());
 }
 
+HalDirectoryNextStatus HalFile::openNextFile(HalFile& entry) {
+  if (!file || !file.isDirectory() || &entry == this) {
+    return HalDirectoryNextStatus::Error;
+  }
+  entry.close();
+  entry.file = file.openNextFile();
+  if (!entry.file) {
+    return HalDirectoryNextStatus::End;
+  }
+  entry.countedOpen = true;
+  ++qemuStorageOpenCount;
+  return HalDirectoryNextStatus::Entry;
+}
+
 bool HalFile::isOpen() const { return static_cast<bool>(file); }
 
 bool HalFile::modificationTime(uint64_t* const packedFatDateTime) {

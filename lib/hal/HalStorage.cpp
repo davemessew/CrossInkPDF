@@ -164,6 +164,7 @@ void HalStorage::installDateTimeCallback(const uint8_t* utcOffsetQuarterHoursBia
 
 class HalFile::Impl {
  public:
+  Impl() = default;
   Impl(FsFile&& fsFile) : file(std::move(fsFile)) {}
   FsFile file;
 };
@@ -349,6 +350,36 @@ HalFile HalFile::openNextFile() {
     return HalFile();
   }
   return HalFile(std::move(childImpl));
+}
+HalDirectoryNextStatus HalFile::openNextFile(HalFile& entry) {
+  if (impl == nullptr || &entry == this) {
+    return HalDirectoryNextStatus::Error;
+  }
+
+  HalStorage::StorageLock lock;
+  if (!impl->file.isDirectory()) {
+    return HalDirectoryNextStatus::Error;
+  }
+  if (!entry.impl) {
+    entry.impl = makeUniqueNoThrow<Impl>();
+    if (!entry.impl) {
+      LOG_ERR("SD", "OOM: reusable directory entry wrapper (%u free, %u max alloc)", ESP.getFreeHeap(),
+              ESP.getMaxAllocHeap());
+      return HalDirectoryNextStatus::Error;
+    }
+  } else if (entry.impl->file.isOpen() && !entry.impl->file.close()) {
+    LOG_ERR("SD", "Failed to close reusable directory entry");
+    return HalDirectoryNextStatus::Error;
+  }
+
+  if (entry.impl->file.openNext(&impl->file)) {
+    return HalDirectoryNextStatus::Entry;
+  }
+  if (impl->file.getError() != 0) {
+    LOG_ERR("SD", "Directory iteration failed (error %u)", static_cast<unsigned>(impl->file.getError()));
+    return HalDirectoryNextStatus::Error;
+  }
+  return HalDirectoryNextStatus::End;
 }
 bool HalFile::isOpen() const { return impl != nullptr && impl->file.isOpen(); }  // already thread-safe, no need to wrap
 bool HalFile::modificationTime(uint64_t* const packedFatDateTime) {

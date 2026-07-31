@@ -4,6 +4,7 @@
 #include <common/FsApiConstants.h>  // for oflag_t
 #include <freertos/semphr.h>
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -21,6 +22,12 @@ struct HalStorageCapacityInfo {
 };
 
 class HalFile;
+
+enum class HalDirectoryNextStatus : uint8_t {
+  Entry,
+  End,
+  Error,
+};
 
 class HalStorage {
  public:
@@ -108,6 +115,10 @@ class HalFile : public Print {
   void rewindDirectory();
   bool close();
   HalFile openNextFile();
+  // Reuses `entry` across a directory scan. Do not close `entry` between
+  // calls; this method closes the previous child before opening the next one.
+  // The caller must close `entry` once after Entry, End, or Error.
+  HalDirectoryNextStatus openNextFile(HalFile& entry);
   bool isOpen() const;
   bool modificationTime(uint64_t* packedFatDateTime);
   operator bool() const;
