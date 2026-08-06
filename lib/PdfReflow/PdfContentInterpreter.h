@@ -46,17 +46,25 @@ struct PdfContentXObject {
   PdfByteSource content{};
   const PdfContentResources* resources = nullptr;
   PdfMatrix matrix{};
+  PdfRectangle bbox{};
   uint32_t pixelWidth = 0;
   uint32_t pixelHeight = 0;
+  bool hasBBox = false;
 };
 
 struct PdfContentResources {
   using ResolveFontFn = PdfStatus (*)(void* context, const uint8_t* name, size_t length, PdfFontMap** font);
   using ResolveXObjectFn = PdfStatus (*)(void* context, const uint8_t* name, size_t length, PdfContentXObject* xobject);
+  using ConsumeInlineImageTokenFn = PdfStatus (*)(void* context, const PdfToken& token);
+  using FinishInlineImageFn = PdfStepResult (*)(void* context, const PdfByteSource& source, uint64_t idEndOffset,
+                                                PdfWorkBudget& budget, uint64_t* resumeOffset,
+                                                PdfContentXObject* image);
 
   void* context = nullptr;
   ResolveFontFn resolveFont = nullptr;
   ResolveXObjectFn resolveXObject = nullptr;
+  ConsumeInlineImageTokenFn consumeInlineImageToken = nullptr;
+  FinishInlineImageFn finishInlineImage = nullptr;
 };
 
 struct PdfContentInterpreterWorkspace {
@@ -71,6 +79,9 @@ struct PdfContentInterpreterWorkspace {
   uint8_t* markedText = nullptr;
   uint16_t markedTextCapacity = 0;
   uint32_t* documentOperatorCount = nullptr;
+  PdfMatrix pageTransform{};
+  PdfRectangle pageBounds{};
+  bool hasPageBounds = false;
 };
 
 class PdfContentInterpreter {
@@ -87,7 +98,11 @@ class PdfContentInterpreter {
  private:
   struct GraphicsState {
     PdfMatrix ctm{};
+    PdfRectangle clip{};
     uint8_t nonstrokingLuminance = 0;
+    bool hasClip = false;
+    bool clipRepresentable = true;
+    bool visibilityRepresentable = true;
   };
 
   struct TextState {
@@ -102,6 +117,7 @@ class PdfContentInterpreter {
     PdfFontMap* font = nullptr;
     uint8_t renderMode = 0;
     bool active = false;
+    bool clipPending = false;
   };
 
   struct MarkedContentFrame {
@@ -109,7 +125,7 @@ class PdfContentInterpreter {
     uint16_t textLength = 0;
     uint16_t runIndex = UINT16_MAX;
     bool hasActualText = false;
-    bool emitted = false;
+    uint8_t flags = 0;
   };
 
   struct FormFrame {
@@ -145,6 +161,7 @@ class PdfContentInterpreter {
   PdfStatus processOperator(const PdfToken& token);
   PdfStatus processTextOperator(const PdfToken& token);
   PdfStatus processGraphicsOperator(const PdfToken& token);
+  PdfStatus processPathOperator(const PdfToken& token);
   PdfStatus processMarkedContentOperator(const PdfToken& token);
   PdfStatus processXObjectOperator(const PdfToken& token);
   PdfStatus enterForm(const PdfContentXObject& form);
@@ -153,16 +170,23 @@ class PdfContentInterpreter {
   PdfStatus showArray(const PdfContentOperand& array);
   PdfStatus emitActualText(MarkedContentFrame& frame);
   PdfStatus emitDecodedText(const uint8_t* source, size_t length, bool actualText);
+  PdfStatus finishSemanticTextRun();
   PdfStatus advanceVisualText(const uint8_t* source, size_t length);
-  PdfStatus appendInlineImage();
   PdfStatus appendImage(const PdfContentXObject& image, bool inlineImage);
   PdfStatus pushOperand(const PdfContentOperand& operand);
   PdfStatus pushTextOperand(PdfContentOperandKind kind, const uint8_t* text, size_t length);
   PdfStatus pushNumberOperand(const PdfToken& token);
-  PdfStatus pushMarkedContent(const PdfContentOperand* actualText);
+  PdfStatus pushMarkedContent(const PdfContentOperand* actualText, bool suppress);
+  bool markedContentSuppressed() const;
   PdfStatus translateText(PdfFixed16 x, PdfFixed16 y, bool lineMatrix);
   PdfStatus adjustText(PdfFixed16 amount);
   PdfStatus currentTextPoint(PdfFixed16 textX, PdfFixed16 textY, PdfFixed16* x, PdfFixed16* y) const;
+  PdfStatus transformedGraphicsPoint(PdfFixed16 x, PdfFixed16 y, PdfFixed16* transformedX,
+                                     PdfFixed16* transformedY) const;
+  PdfStatus transformedAxisAlignedRectangle(const PdfRectangle& rectangle, PdfRectangle* transformed,
+                                            bool* axisAligned) const;
+  PdfStatus applyClipRectangle(const PdfRectangle& rectangle);
+  void resetCurrentPath();
   PdfStatus currentTextOrigin(PdfFixed16* x, PdfFixed16* y) const;
   PdfStatus currentTextAscent(PdfFixed16* x, PdfFixed16* y) const;
   PdfStatus makeRun(PdfTextRun* run, uint16_t flags) const;
@@ -214,4 +238,7 @@ class PdfContentInterpreter {
   bool dictionaryCapturingActualText_ = false;
   bool dictionaryHasActualText_ = false;
   bool inlineDictionary_ = false;
+  PdfRectangle currentPathRectangle_{};
+  bool currentPathRectangleValid_ = false;
+  bool currentPathUnrepresentable_ = false;
 };

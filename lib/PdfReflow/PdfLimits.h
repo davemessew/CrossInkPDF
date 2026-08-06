@@ -28,6 +28,7 @@ inline constexpr uint8_t MaxXrefEntryBytes = 24;
 inline constexpr uint8_t MaxXrefIndexPairs = 64;
 inline constexpr uint8_t XrefMergeEntries = 64;
 inline constexpr uint32_t MaxCMapRanges = 8192;
+inline constexpr uint16_t MaxPageUniqueGlyphs = 256;
 inline constexpr uint16_t MaxPaletteEntries = 256;
 inline constexpr uint32_t MaxImagePixels = 16000000;
 inline constexpr uint32_t MaxImageDimension = 65535;

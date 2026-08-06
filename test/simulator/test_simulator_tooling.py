@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -55,7 +56,9 @@ class SimulatorToolingTest(unittest.TestCase):
             f"SIM_REFLOW_UNCACHED_PASS {json.dumps(expected)}\n"
             "Simulator smoke test passed\n"
         )
-        parsed = module.parse_reflow_oracle_marker(output, "uncached")
+        parsed = module.parse_reflow_oracle_marker(
+            output.encode("utf-8"), "uncached"
+        )
         self.assertEqual(parsed, expected)
         module.verify_reflow_oracles(expected, [("uncached", parsed)])
 
@@ -69,6 +72,63 @@ class SimulatorToolingTest(unittest.TestCase):
             module.verify_reflow_oracles(
                 expected, [("uncached", changed)]
             )
+
+    def test_invalid_log_byte_does_not_hide_valid_structured_result(
+        self,
+    ) -> None:
+        module = self._load_smoke_runner()
+        self.assertTrue(
+            hasattr(module, "decode_log_output"),
+            "runner must separate diagnostic decoding from marker parsing",
+        )
+        payload = {"metadata": {"title": "Unicode fixture"}}
+        program = (
+            "import json, sys; "
+            "sys.stdout.buffer.write(b'raw-log: \\xe2\\n'); "
+            "sys.stdout.buffer.write(b'SIM_REFLOW_UNCACHED_PASS ' + "
+            f"json.dumps({payload!r}).encode('utf-8') + b'\\n'); "
+            "sys.stdout.buffer.write(b'Simulator smoke test passed\\n')"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", program],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=False,
+            check=False,
+        )
+
+        self.assertEqual(module._validate_process_output(completed), 0)
+        self.assertEqual(
+            module.parse_reflow_oracle_marker(
+                completed.stdout, "uncached"
+            ),
+            payload,
+        )
+        self.assertIn("\\xe2", module.decode_log_output(completed.stdout))
+
+    def test_structured_oracle_payload_remains_strict(self) -> None:
+        module = self._load_smoke_runner()
+        for malformed in (
+            b'SIM_REFLOW_UNCACHED_PASS {"title":"\xe2"}\n',
+            b"SIM_REFLOW_UNCACHED_PASS {not-json}\n",
+        ):
+            with self.subTest(malformed=malformed):
+                try:
+                    module.parse_reflow_oracle_marker(
+                        malformed, "uncached"
+                    )
+                except ValueError as error:
+                    self.assertRegex(
+                        str(error),
+                        r"invalid (UTF-8|JSON)",
+                    )
+                except Exception as error:  # pragma: no cover - RED witness
+                    self.fail(
+                        "structured bytes must fail as a strict ValueError, "
+                        f"not {type(error).__name__}: {error}"
+                    )
+                else:
+                    self.fail("malformed structured payload was accepted")
 
     def test_single_pass_oracle_does_not_require_a_cached_pass(self) -> None:
         module = self._load_smoke_runner()
@@ -89,6 +149,90 @@ class SimulatorToolingTest(unittest.TestCase):
         self.assertIn("--passes", completed.stdout)
         self.assertIn("--page-turns", completed.stdout)
         self.assertIn("--reflow-oracle", completed.stdout)
+
+    def test_embedded_style_override_is_explicit_and_default_preserving(
+        self,
+    ) -> None:
+        module = self._load_smoke_runner()
+
+        with mock.patch.object(sys, "argv", [str(SMOKE_RUNNER)]):
+            default_args = module.parse_args()
+        with mock.patch.object(
+            sys,
+            "argv",
+            [str(SMOKE_RUNNER), "--embedded-style", "0"],
+        ):
+            no_css_args = module.parse_args()
+
+        self.assertIsNone(default_args.embedded_style)
+        self.assertEqual(no_css_args.embedded_style, 0)
+
+        runner = SMOKE_RUNNER.read_text(encoding="utf-8")
+        oracle = ORACLE_SOURCE.read_text(encoding="utf-8")
+        self.assertIn(
+            'env["CROSSINK_SIMULATOR_REFLOW_EMBEDDED_STYLE"] = str(',
+            runner,
+        )
+        self.assertIn(
+            'std::getenv("CROSSINK_SIMULATOR_REFLOW_EMBEDDED_STYLE")',
+            oracle,
+        )
+        self.assertIn("SETTINGS.embeddedStyle = embeddedStyle ? 1 : 0;", oracle)
+        self.assertIn("epub->load(true, !embeddedStyle)", oracle)
+        self.assertIn('oracle["platform_smoke"]', oracle)
+        self.assertIn('platformSmoke["section_index"] = middleSection;', oracle)
+        self.assertIn('platformSmoke["page_count"] = middle.pageCount;', oracle)
+        self.assertIn(
+            'platformSmoke["section_cache_fnv1a64"]',
+            oracle,
+        )
+        self.assertIn(
+            'platformSmoke["framebuffer_hash"] = middle.framebufferHash;',
+            oracle,
+        )
+
+    def test_candidate_bookmark_snippet_is_ascii_bounded_and_receipted(
+        self,
+    ) -> None:
+        module = self._load_smoke_runner()
+        with mock.patch.object(sys, "argv", [str(SMOKE_RUNNER)]):
+            default_args = module.parse_args()
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                str(SMOKE_RUNNER),
+                "--bookmark-snippet",
+                "qemu-epub-smoke",
+            ],
+        ):
+            candidate_args = module.parse_args()
+
+        self.assertIsNone(default_args.bookmark_snippet)
+        self.assertEqual(candidate_args.bookmark_snippet, "qemu-epub-smoke")
+        self.assertEqual(
+            module.ascii_bookmark_snippet("a" * 63),
+            "a" * 63,
+        )
+        for invalid in ("", "block █", "a" * 64):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(Exception):
+                    module.ascii_bookmark_snippet(invalid)
+
+        runner = SMOKE_RUNNER.read_text(encoding="utf-8")
+        oracle = ORACLE_SOURCE.read_text(encoding="utf-8")
+        self.assertIn(
+            'env["CROSSINK_SIMULATOR_REFLOW_BOOKMARK_SNIPPET"] = ',
+            runner,
+        )
+        self.assertIn(
+            'std::getenv("CROSSINK_SIMULATOR_REFLOW_BOOKMARK_SNIPPET")',
+            oracle,
+        )
+        self.assertIn("BOOKMARK_SNIPPET_MAX - 1", oracle)
+        self.assertIn("static_cast<unsigned char>(*cursor) > 0x7F", oracle)
+        self.assertIn("bookmarkSnippet != nullptr ? bookmarkSnippet", oracle)
+        self.assertIn('settings["bookmark_snippet"] = bookmarkSnippet;', oracle)
 
     def test_container_is_pinned_and_self_tests_required_tools(self) -> None:
         source = DOCKERFILE.read_text(encoding="utf-8")

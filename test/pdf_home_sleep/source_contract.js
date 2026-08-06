@@ -212,17 +212,17 @@ function validateSleepLifecycle(sleepSource, sleepAssetsSource) {
   }
   requireContains(onEnter, "loadPdfSleepProducts(",
                   "Sleep onEnter must route through its transient product loader");
-  requireContains(onEnter, "pdfSnapshotBeforeFallback(",
-                  "Sleep onEnter must use the executable snapshot-first seam");
-  const snapshotIndex = onEnter.indexOf("pdfSnapshotBeforeFallback(");
-  const productIndex = onEnter.indexOf("loadPdfSleepProducts(");
-  const fallbackIndex = onEnter.indexOf("pdfSleepPageCache.load(");
-  if (snapshotIndex < 0 || productIndex < 0 || fallbackIndex < 0 ||
-      snapshotIndex > productIndex || productIndex > fallbackIndex) {
-    throw new Error("PDF overlay snapshot must precede every PDF product and page-cache read");
+  const pdfOverlayBranch = extractFunction(onEnter, "if (isPdfOverlay)", "PDF overlay setup branch");
+  for (const forbidden of ["storeBwBuffer(", "restoreBwBuffer(", "pdfSnapshotBeforeFallback("]) {
+    if (pdfOverlayBranch.includes(forbidden)) {
+      throw new Error("PDF overlay path must not snapshot or restore framebuffer clones");
+    }
   }
-  requireContains(onEnter, "pdfSleepPageCache.load(",
-                   "PDF overlay fallback must cold-load the persisted page once in onEnter");
+  const productIndex = pdfOverlayBranch.indexOf("loadPdfSleepProducts(");
+  const pageIndex = pdfOverlayBranch.indexOf("pdfSleepPageCache.load(");
+  if (productIndex < 0 || pageIndex < 0 || productIndex > pageIndex) {
+    throw new Error("PDF overlay must load its persisted page before the sleep popup");
+  }
 
   const cover = extractFunction(
     sleepSource,
@@ -245,7 +245,25 @@ function validateSleepLifecycle(sleepSource, sleepAssetsSource) {
 
   const overlay = extractFunction(sleepSource, "void SleepActivity::renderOverlaySleepScreen", "overlay renderer");
   requireContains(overlay, "pdfSleepPageCache.renderTextAndRelease(renderer)",
-                  "PDF overlay fallback must consume the retained text-only page");
+                   "PDF overlay fallback must consume the retained text-only page");
+  const pdfRebuildIndex = overlay.indexOf("if (isPdfReaderPage)");
+  const restoreIndex = overlay.indexOf("renderer.restoreBwBuffer()");
+  if (pdfRebuildIndex < 0 || restoreIndex < 0 || pdfRebuildIndex > restoreIndex) {
+    throw new Error("PDF overlay must rebuild its persisted page before the non-PDF snapshot restore path");
+  }
+  const pdfRebuildBranch = extractFunction(overlay, "if (isPdfReaderPage)", "PDF overlay rebuild branch");
+  if (pdfRebuildBranch.includes("restoreBwBuffer(")) {
+    throw new Error("PDF overlay path must not snapshot or restore framebuffer clones");
+  }
+  const grayscaleDeclaration = overlay.indexOf("const bool backgroundSupportsGrayscale");
+  const grayscaleDeclarationEnd = overlay.indexOf(";", grayscaleDeclaration);
+  const grayscaleExpression = overlay.slice(grayscaleDeclaration, grayscaleDeclarationEnd);
+  if (grayscaleDeclaration < 0 || grayscaleDeclarationEnd < 0 ||
+      grayscaleExpression.includes("hasPdfExtension") || grayscaleExpression.includes(".pdf")) {
+    throw new Error("PDF overlay must remain excluded from the snapshot-based grayscale pass");
+  }
+  requireContains(overlay, "shouldUseReaderPageBackground && backgroundSupportsGrayscale",
+                  "overlay grayscale pass must remain gated by the non-PDF background capability");
   for (const positiveControl of [
     "XtcReaderActivity::drawCurrentPageToBuffer",
     "TxtReaderActivity::drawCurrentPageToBuffer",
@@ -295,15 +313,10 @@ function validateSleepLifecycle(sleepSource, sleepAssetsSource) {
 }
 
 function validatePdfSleepPageCache(pageSource, pageHeaderSource) {
-  const snapshot = extractFunction(
-    pageSource,
-    "bool pdfSnapshotBeforeFallback",
-    "PDF sleep snapshot-first seam",
-  );
-  const storeIndex = snapshot.indexOf("renderer.storeBwBuffer()");
-  const fallbackIndex = snapshot.indexOf("fallback.load(fallback.context)");
-  if (storeIndex < 0 || fallbackIndex < 0 || storeIndex > fallbackIndex) {
-    throw new Error("PDF overlay fallback must be skipped after a successful snapshot");
+  for (const forbidden of ["storeBwBuffer(", "restoreBwBuffer(", "pdfSnapshotBeforeFallback("]) {
+    if (pageSource.includes(forbidden) || pageHeaderSource.includes(forbidden)) {
+      throw new Error("PDF sleep cache must not own framebuffer snapshot behavior");
+    }
   }
 
   requireContains(pageHeaderSource, "MAX_SERIALIZED_PAGE_BYTES = 64U * 1024U",

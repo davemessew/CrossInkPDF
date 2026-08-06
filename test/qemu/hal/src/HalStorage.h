@@ -73,9 +73,10 @@ class HalFile : public Print {
   friend class HalStorage;
   class Impl;
   explicit HalFile(std::unique_ptr<Impl> impl);
-  explicit HalFile(fs::File file);
+  explicit HalFile(fs::File file, bool writable = false);
   mutable fs::File file;
   bool countedOpen = false;
+  bool writable = false;
 
  public:
   HalFile();
@@ -92,6 +93,7 @@ class HalFile : public Print {
   uint64_t fileSize64();
   bool seek(size_t pos);
   bool seek64(uint64_t pos);
+  bool truncate64(uint64_t length);
   bool seekCur(int64_t offset);
   bool seekSet(size_t offset);
   int available() const;

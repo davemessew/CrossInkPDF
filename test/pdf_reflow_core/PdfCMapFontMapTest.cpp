@@ -36,6 +36,22 @@ struct SourcePhase {
   }
 };
 
+struct WriteOnlyCMapObserver {
+  uint32_t writes = 0;
+
+  static PdfStatus write(void* const context, const uint32_t, const void*, const size_t) {
+    if (context == nullptr) {
+      return PdfStatus::failure(PdfError::InvalidArgument);
+    }
+    ++static_cast<WriteOnlyCMapObserver*>(context)->writes;
+    return PdfStatus::success();
+  }
+
+  PdfFixedRecordStore store() {
+    return {this, 0, sizeof(PdfCMapRecord), nullptr, write};
+  }
+};
+
 struct ArenaStorage {
   std::array<PdfValue, 64> values{};
   std::array<PdfDictionaryEntry, 32> dictionaries{};
@@ -119,6 +135,60 @@ TEST(PdfCMapTest, ParsesOneToFourByteCodesBfcharRangesArraysAndSurrogates) {
     EXPECT_EQ(utf8(lookup.unicode), expected);
     EXPECT_EQ(lookup.sourceLength, encoded.size());
   }
+}
+
+TEST(PdfCMapTest, CodeSpaceOnlyScanCollectsEveryBlockThroughEndCMapWithoutMaterializingMappings) {
+  const std::string source =
+      "begincmap "
+      "1 begincodespacerange <00> <7F> endcodespacerange "
+      "1 beginbfchar <41> <0041> endbfchar "
+      "1 begincodespacerange <8100> <81FF> endcodespacerange "
+      "1 beginbfchar <8142> <03A9> endbfchar "
+      "endcmap end end";
+  PdfTestByteSource input(std::vector<uint8_t>(source.begin(), source.end()));
+  std::array<uint8_t, 64> sourceBuffer{};
+  std::array<PdfCMapRecord, 1> scratchRecord{};
+  WriteOnlyCMapObserver observer;
+  PdfCMap cmap(sourceBuffer.data(), sourceBuffer.size(),
+               {scratchRecord.data(), scratchRecord.size(), observer.store()});
+  ASSERT_TRUE(cmap.begin(input.source()).ok());
+
+  const PdfStepResult result = runCMap(cmap);
+
+  ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error) << "@" << result.status.offset;
+  std::array<PdfCMapCodeSpace, 2> codeSpaces{};
+  uint8_t codeSpaceCount = 0;
+  ASSERT_TRUE(cmap.copyCodeSpaces(codeSpaces.data(), codeSpaces.size(), &codeSpaceCount).ok());
+  ASSERT_EQ(codeSpaceCount, 2U);
+  EXPECT_EQ(codeSpaces[0].first, 0x00U);
+  EXPECT_EQ(codeSpaces[0].last, 0x7FU);
+  EXPECT_EQ(codeSpaces[0].length, 1U);
+  EXPECT_EQ(codeSpaces[1].first, 0x8100U);
+  EXPECT_EQ(codeSpaces[1].last, 0x81FFU);
+  EXPECT_EQ(codeSpaces[1].length, 2U);
+  EXPECT_EQ(cmap.mappingCount(), 2U);
+  EXPECT_EQ(observer.writes, 0U);
+}
+
+TEST(PdfCMapTest, CodeSpaceOnlyScanStillRejectsMalformedMappings) {
+  const std::string source =
+      "begincmap "
+      "1 begincodespacerange <00> <FF> endcodespacerange "
+      "1 beginbfchar <41> /NotAHexDestination endbfchar "
+      "endcmap";
+  PdfTestByteSource input(std::vector<uint8_t>(source.begin(), source.end()));
+  std::array<uint8_t, 64> sourceBuffer{};
+  std::array<PdfCMapRecord, 1> scratchRecord{};
+  WriteOnlyCMapObserver observer;
+  PdfCMap cmap(sourceBuffer.data(), sourceBuffer.size(),
+               {scratchRecord.data(), scratchRecord.size(), observer.store()});
+  ASSERT_TRUE(cmap.begin(input.source()).ok());
+
+  const PdfStepResult result = runCMap(cmap);
+
+  ASSERT_TRUE(result.failed());
+  EXPECT_EQ(result.status.error, PdfError::Malformed);
+  EXPECT_EQ(observer.writes, 0U);
 }
 
 TEST(PdfCMapTest, SpillLookupClosesSourceAndSingleReaderGuardCatchesNegativeWitness) {
@@ -227,6 +297,24 @@ TEST(PdfCMapTest, SortedSpillUsesLogarithmicReadsAndCachesTheLastRange) {
   const uint32_t readsAfterFirstLookup = spill.readCount();
   ASSERT_TRUE(cmap.lookup(encoded.data(), encoded.size(), &lookup).ok());
   EXPECT_EQ(spill.readCount(), readsAfterFirstLookup);
+}
+
+TEST(PdfCMapTest, RejectsUnsortedMappingsBeforeTheyReachSpillStorage) {
+  const std::string sourceText = "1 begincodespacerange <00> <ff> endcodespacerange "
+                                 "1 beginbfchar <02> <0042> endbfchar "
+                                 "1 beginbfchar <01> <0041> endbfchar";
+  PdfTestByteSource source(std::vector<uint8_t>(sourceText.begin(), sourceText.end()));
+  std::array<uint8_t, 128> sourceBuffer{};
+  std::array<PdfCMapRecord, 1> records{};
+  PdfTestRecordStore spill(sizeof(PdfCMapRecord), 2);
+  PdfCMap cmap(sourceBuffer.data(), sourceBuffer.size(), {records.data(), records.size(), spill.store()});
+  ASSERT_TRUE(cmap.begin(source.source()).ok());
+
+  const PdfStepResult result = runCMap(cmap);
+
+  ASSERT_TRUE(result.failed());
+  EXPECT_EQ(result.status.error, PdfError::LimitExceeded);
+  EXPECT_EQ(spill.readCount(), 0U);
 }
 
 TEST(PdfEncodingTest, AppliesDifferencesAndKeepsCommonEncodingTablesInFlash) {
@@ -397,6 +485,20 @@ TEST(PdfFontMapTest, RequiresOneSpillRecordAndDoesNotMaskEncodingIoFailure) {
   const uint8_t encoded = 'A';
   PdfDecodedGlyph glyph;
   EXPECT_EQ(font.decodeNext(&encoded, 1, &glyph).error, PdfError::IoFailure);
+}
+
+TEST(PdfFontMapTest, RejectsUnsortedWidthsBeforeTheyReachSpillStorage) {
+  std::array<PdfFontWidthRecord, 2> widths{};
+  PdfTestRecordStore spill(sizeof(PdfFontWidthRecord), 2);
+  PdfFontMap font({widths.data(), widths.size(), spill.store()});
+  ASSERT_TRUE(font.begin(7, true, nullptr, nullptr, 500).ok());
+  ASSERT_TRUE(font.addWidth(20, 20, 500).ok());
+  ASSERT_TRUE(font.addWidth(10, 10, 600).ok());
+
+  const PdfStatus status = font.addWidth(30, 30, 700);
+
+  EXPECT_EQ(status.error, PdfError::LimitExceeded);
+  EXPECT_EQ(spill.readCount(), 0U);
 }
 
 TEST(PdfFontMapTest, RejectsNegativeFractionalWidthsBeforeTruncation) {

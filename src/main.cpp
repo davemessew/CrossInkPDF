@@ -1063,6 +1063,6 @@ void loop() {
     }
   }
 #ifdef CROSSINK_QEMU
-  qemuAcceptanceTick();
+  qemuAcceptanceTick(mappedInputManager, renderer);
 #endif
 }

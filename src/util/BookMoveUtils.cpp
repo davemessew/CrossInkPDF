@@ -99,6 +99,11 @@ bool sameView(const StringView view, const std::string& value) {
   return view.length == value.size() && view.data != nullptr && std::memcmp(view.data, value.data(), view.length) == 0;
 }
 
+bool sameView(const StringView view, const std::string_view value) {
+  return view.length == value.size() && view.data != nullptr &&
+         std::memcmp(view.data, value.data(), view.length) == 0;
+}
+
 Status journalOpen(void* context, const char* path, const OpenMode mode, Handle* handle) {
   auto& workspace = *static_cast<JournalIoWorkspace*>(context);
   if (path == nullptr || handle == nullptr || handle->valid() || workspace.file.isOpen()) {
@@ -689,6 +694,32 @@ MoveResult recoverPendingBookMove() {
   const JournalPresence presence = journalPresence.load(std::memory_order_acquire);
   if (presence == JournalPresence::KnownAbsent) return MoveResult::NoPendingMove;
   if (presence == JournalPresence::MoveStarting) return MoveResult::Pending;
+
+  // The bounded reader holds only the 2,090-byte journal scratch and one
+  // HalFile wrapper. Keep it off the task stack, and use it to avoid the full
+  // copy/migration workspace on the normal no-journal boot path.
+  {
+    auto reader = makeUniqueNoThrow<JournalReadSession>();
+    if (!reader) {
+      LOG_ERR("BookMove", "Out of memory allocating book-move journal reader");
+      return MoveResult::Pending;
+    }
+    const Status status = reader->journal.load(&reader->selection);
+    if (status != Status::Ok) {
+      return status == Status::Conflict ? MoveResult::Conflict : MoveResult::Pending;
+    }
+    if (!reader->selection.selected) {
+      JournalPresence expected = JournalPresence::LookupRequired;
+      if (!journalPresence.compare_exchange_strong(expected, JournalPresence::KnownAbsent,
+                                                   std::memory_order_acq_rel,
+                                                   std::memory_order_acquire) &&
+          expected == JournalPresence::MoveStarting) {
+        return MoveResult::Pending;
+      }
+      return MoveResult::NoPendingMove;
+    }
+  }
+
   auto session = makeUniqueNoThrow<BookMoveSession>();
   if (!session) {
     LOG_ERR("BookMove", "Out of memory allocating book-move recovery workspace");
@@ -704,6 +735,11 @@ MoveResult recoverPendingBookMove() {
 }
 
 BookMutationFence mutationFenceForPath(const std::string& bookPath) {
+  return mutationFenceForPathNoPathAlloc(bookPath);
+}
+
+BookMutationFence mutationFenceForPathNoPathAlloc(
+    const std::string_view bookPath) {
   const JournalPresence presence = journalPresence.load(std::memory_order_acquire);
   if (presence == JournalPresence::KnownAbsent) return BookMutationFence::Clear;
   if (presence == JournalPresence::MoveStarting) return BookMutationFence::Indeterminate;

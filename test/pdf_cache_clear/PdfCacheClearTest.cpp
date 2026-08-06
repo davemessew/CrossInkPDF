@@ -16,7 +16,10 @@ namespace {
 class PdfCacheClearTest : public testing::Test {
  protected:
   void SetUp() override {
-    root_ = std::filesystem::temp_directory_path() / "crossink-pdf-cache-clear-test";
+    const testing::TestInfo* const testInfo = testing::UnitTest::GetInstance()->current_test_info();
+    ASSERT_NE(testInfo, nullptr);
+    root_ = std::filesystem::temp_directory_path() /
+            (std::string("crossink-pdf-cache-clear-test-") + testInfo->test_suite_name() + "-" + testInfo->name());
     Storage.reset(root_);
     TestMemory::failNextAllocation = false;
     TestMemory::successfulAllocations = 0;

@@ -41,6 +41,9 @@ REFLOW_MARKERS = {
     "uncached": "SIM_REFLOW_UNCACHED_PASS ",
     "cached": "SIM_REFLOW_CACHED_PASS ",
 }
+REFLOW_MARKER_BYTES = {
+    name: marker.encode("ascii") for name, marker in REFLOW_MARKERS.items()
+}
 
 
 def build_simulator() -> None:
@@ -92,8 +95,8 @@ def retain_only_generated_book_cache(temp_root: Path) -> bool:
     return True
 
 
-def parse_reflow_oracle_marker(output: str, pass_name: str) -> dict:
-    marker = REFLOW_MARKERS[pass_name]
+def parse_reflow_oracle_marker(output: bytes, pass_name: str) -> dict:
+    marker = REFLOW_MARKER_BYTES[pass_name]
     payloads = [
         line.split(marker, 1)[1]
         for line in output.splitlines()
@@ -101,18 +104,33 @@ def parse_reflow_oracle_marker(output: str, pass_name: str) -> dict:
     ]
     if len(payloads) != 1:
         raise ValueError(
-            f"expected exactly one {marker.strip()} marker, found "
+            f"expected exactly one {REFLOW_MARKERS[pass_name].strip()} "
+            f"marker, found "
             f"{len(payloads)}"
         )
     try:
-        value = json.loads(payloads[0])
+        payload = payloads[0].decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise ValueError(
+            f"{REFLOW_MARKERS[pass_name].strip()} contains invalid UTF-8: "
+            f"{error}"
+        ) from error
+    try:
+        value = json.loads(payload)
     except json.JSONDecodeError as error:
         raise ValueError(
-            f"{marker.strip()} contains invalid JSON: {error}"
+            f"{REFLOW_MARKERS[pass_name].strip()} contains invalid JSON: "
+            f"{error}"
         ) from error
     if not isinstance(value, dict):
-        raise ValueError(f"{marker.strip()} must contain a JSON object")
+        raise ValueError(
+            f"{REFLOW_MARKERS[pass_name].strip()} must contain a JSON object"
+        )
     return value
+
+
+def decode_log_output(output: bytes) -> str:
+    return output.decode("utf-8", errors="backslashreplace")
 
 
 def _first_difference(expected: object, actual: object, path: str = "") -> str:
@@ -188,7 +206,7 @@ def _load_reflow_oracle(path: Path, book: Path) -> dict:
 
 
 def _validate_process_output(
-    process: subprocess.CompletedProcess[str],
+    process: subprocess.CompletedProcess[bytes],
 ) -> int:
     if process.returncode != 0:
         print(
@@ -199,7 +217,7 @@ def _validate_process_output(
         return process.returncode
 
     for pattern in CRASH_PATTERNS:
-        if pattern in process.stdout:
+        if pattern.encode("ascii") in process.stdout:
             print(
                 f"Simulator smoke test output contained crash pattern: "
                 f"{pattern}",
@@ -207,7 +225,7 @@ def _validate_process_output(
             )
             return 2
 
-    if "Simulator smoke test passed" not in process.stdout:
+    if b"Simulator smoke test passed" not in process.stdout:
         print(
             "Simulator smoke test did not print its success marker",
             file=sys.stderr,
@@ -218,6 +236,7 @@ def _validate_process_output(
 
 def run_smoke(args: argparse.Namespace) -> int:
     book = Path(args.book).resolve()
+    program = Path(args.program).resolve()
     if not book.exists():
         print(f"Smoke test book not found: {book}", file=sys.stderr)
         return 2
@@ -225,8 +244,8 @@ def run_smoke(args: argparse.Namespace) -> int:
     if args.build:
         build_simulator()
 
-    if not PROGRAM.exists():
-        print(f"Simulator binary not found: {PROGRAM}", file=sys.stderr)
+    if not program.exists():
+        print(f"Simulator binary not found: {program}", file=sys.stderr)
         print("Run: pio run -e simulator", file=sys.stderr)
         return 2
 
@@ -274,6 +293,14 @@ def run_smoke(args: argparse.Namespace) -> int:
             if oracle_path is not None:
                 env["CROSSINK_SIMULATOR_REFLOW_ORACLE"] = "1"
                 env["CROSSINK_SIMULATOR_REFLOW_PASS"] = pass_name
+                if args.embedded_style is not None:
+                    env["CROSSINK_SIMULATOR_REFLOW_EMBEDDED_STYLE"] = str(
+                        args.embedded_style
+                    )
+                if args.bookmark_snippet is not None:
+                    env["CROSSINK_SIMULATOR_REFLOW_BOOKMARK_SNIPPET"] = (
+                        args.bookmark_snippet
+                    )
             if args.theme:
                 env["CROSSINK_SIMULATOR_SMOKE_THEME"] = str(
                     THEMES[args.theme]
@@ -287,15 +314,15 @@ def run_smoke(args: argparse.Namespace) -> int:
                 flush=True,
             )
             process = subprocess.run(
-                [str(PROGRAM)],
+                [str(program)],
                 cwd=temp_root,
                 env=env,
-                text=True,
+                text=False,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 timeout=args.timeout,
             )
-            print(process.stdout, end="")
+            sys.stdout.write(decode_log_output(process.stdout))
             result = _validate_process_output(process)
             if result != 0:
                 return result
@@ -337,8 +364,23 @@ def run_smoke(args: argparse.Namespace) -> int:
     return 0
 
 
+def ascii_bookmark_snippet(value: str) -> str:
+    try:
+        encoded = value.encode("ascii")
+    except UnicodeEncodeError as error:
+        raise argparse.ArgumentTypeError(
+            "bookmark snippet must contain ASCII characters only"
+        ) from error
+    if not 1 <= len(encoded) <= 63:
+        raise argparse.ArgumentTypeError(
+            "bookmark snippet must be between 1 and 63 ASCII bytes"
+        )
+    return value
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--program", default=str(PROGRAM), help="Native simulator executable")
     parser.add_argument(
         "--book",
         default=str(DEFAULT_BOOK),
@@ -366,6 +408,25 @@ def parse_args() -> argparse.Namespace:
         "--update-reflow-oracle",
         action="store_true",
         help="Replace the selected oracle with the observed locked output",
+    )
+    parser.add_argument(
+        "--embedded-style",
+        type=int,
+        choices=(0, 1),
+        default=None,
+        help=(
+            "Override embedded styles for oracle derivation; omitted keeps "
+            "the locked default enabled"
+        ),
+    )
+    parser.add_argument(
+        "--bookmark-snippet",
+        type=ascii_bookmark_snippet,
+        default=None,
+        help=(
+            "Use an explicit ASCII bookmark snippet for candidate oracle "
+            "derivation (1-63 bytes)"
+        ),
     )
     parser.add_argument("--theme", choices=sorted(THEMES), help="UI theme to use during the smoke test")
     parser.add_argument("--no-build", dest="build", action="store_false", help="Run the existing simulator binary")

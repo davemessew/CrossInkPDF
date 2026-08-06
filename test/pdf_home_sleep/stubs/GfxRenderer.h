@@ -24,13 +24,6 @@ class GfxRenderer {
     ++clearCalls;
     lastClearColor = color;
   }
-  bool storeBwBuffer() {
-    ++storeBwBufferCalls;
-    if (operationCounter != nullptr) {
-      storeBwBufferOrder = ++*operationCounter;
-    }
-    return storeBwBufferResult;
-  }
   bool isFontCacheScanning() const { return false; }
   int getFontAscenderSize(int) const { return 12; }
   int getSpaceWidth(int, EpdFontFamily::Style) const { return 4; }
@@ -72,13 +65,10 @@ class GfxRenderer {
 
   Orientation orientation_ = Portrait;
   uint32_t clearCalls = 0;
-  uint32_t storeBwBufferCalls = 0;
   uint32_t drawTextCalls = 0;
   uint32_t drawLineCalls = 0;
   uint32_t drawRectCalls = 0;
   uint32_t fillRectCalls = 0;
-  uint32_t storeBwBufferOrder = 0;
-  uint32_t* operationCounter = nullptr;
   int lastFontId = 0;
   int lastTextX = 0;
   int lastTextY = 0;
@@ -91,6 +81,5 @@ class GfxRenderer {
   uint8_t lastClearColor = 0xff;
   bool lastTextBlack = false;
   bool lastLineBlack = false;
-  bool storeBwBufferResult = false;
   char lastText[64]{};
 };

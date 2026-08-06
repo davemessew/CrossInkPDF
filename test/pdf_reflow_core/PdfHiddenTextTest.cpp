@@ -119,3 +119,38 @@ TEST(PdfHiddenTextTest, DoesNotTreatDifferentVisibleContentAsDuplicate) {
 
   EXPECT_EQ(pdfClassifyHiddenText(context, 0), PdfHiddenTextDecision::Qualified);
 }
+
+TEST(PdfHiddenTextTest, KeepsFirstHiddenPeerAndOnlyDeduplicatesAgainstRetainedEarlierRuns) {
+  const std::string first = "OCR body line";
+  const std::string second = "  ocr   BODY line ";
+  const std::string third = "OCR body line";
+  const std::string distinct = "OCR body lime";
+  const std::string text = first + second + third + distinct;
+  std::array<PdfTextRun, 4> runs{
+      runAt(72, 200, 100, 12),
+      runAt(112, 200, 100, 12),
+      runAt(152, 200, 100, 12),
+      runAt(72, 200, 100, 12),
+  };
+  size_t offset = 0;
+  const std::array<size_t, 4> lengths{first.size(), second.size(), third.size(), distinct.size()};
+  for (size_t index = 0; index < runs.size(); ++index) {
+    runs[index].textOffset = static_cast<uint32_t>(offset);
+    runs[index].textLength = static_cast<uint32_t>(lengths[index]);
+    offset += lengths[index];
+  }
+  const std::array<PdfImagePlacement, 1> images{imageAt(0, 0, 612, 792)};
+  std::array<uint8_t, 1> retained{};
+  PdfHiddenTextContext context =
+      contextFor(runs.data(), runs.size(), reinterpret_cast<const uint8_t*>(text.data()), text.size(), images.data(),
+                 images.size());
+  context.retainedHidden = retained.data();
+  context.retainedHiddenBytes = retained.size();
+
+  EXPECT_EQ(pdfClassifyHiddenText(context, 0), PdfHiddenTextDecision::Qualified);
+  EXPECT_EQ(pdfClassifyHiddenText(context, 1), PdfHiddenTextDecision::DuplicateHidden);
+  // Run 1 was suppressed. Run 2 overlaps it, but not retained run 0, so it remains readable.
+  EXPECT_EQ(pdfClassifyHiddenText(context, 2), PdfHiddenTextDecision::Qualified);
+  EXPECT_EQ(pdfClassifyHiddenText(context, 3), PdfHiddenTextDecision::Qualified);
+  EXPECT_EQ(retained[0] & 0x0fU, 0x0dU);
+}

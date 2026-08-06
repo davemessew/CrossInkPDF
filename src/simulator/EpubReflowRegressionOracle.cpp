@@ -80,7 +80,7 @@ class LooseLocalReflowDocument final : public ReflowDocument {
         cachePath_(std::move(cachePath)),
         sectionPath_(std::move(sectionPath)),
         imagePath_(std::move(imagePath)),
-        imageHref_(imagePath_.empty() || imagePath_.front() != '/' ? imagePath_ : imagePath_.substr(1)),
+        imageHref_(imagePath_),
         wordCount_(wordCount) {}
 
   ReflowDocumentFormat getFormat() const override { return ReflowDocumentFormat::Pdf; }
@@ -366,7 +366,7 @@ bool writeOracleFile(const std::string& path, const std::string& contents, std::
   return true;
 }
 
-void pinReaderSettings(GfxRenderer& renderer) {
+void pinReaderSettings(GfxRenderer& renderer, const bool embeddedStyle) {
   RenderLock renderLock;
   SETTINGS.uiTheme = CrossPointSettings::UI_THEME::CLASSIC;
   SETTINGS.fontFamily = CrossPointSettings::FONT_FAMILY::LEXENDDECA;
@@ -376,7 +376,7 @@ void pinReaderSettings(GfxRenderer& renderer) {
   SETTINGS.screenMargin = 5;
   SETTINGS.publisherPageNumbers = 0;
   SETTINGS.paragraphAlignment = CrossPointSettings::PARAGRAPH_ALIGNMENT::BOOK_STYLE;
-  SETTINGS.embeddedStyle = 1;
+  SETTINGS.embeddedStyle = embeddedStyle ? 1 : 0;
   SETTINGS.hyphenationEnabled = 0;
   SETTINGS.textAntiAliasing = 0;
   SETTINGS.readerDarkMode = 0;
@@ -498,7 +498,8 @@ void appendFrame(JsonObject destination, const FrameOracle& frame) {
 }
 
 bool captureProgressAndBookmark(const std::shared_ptr<Epub>& epub, GfxRenderer& renderer, const OracleLayout& layout,
-                                 const FrameOracle& middle, JsonDocument& oracle, std::string& error) {
+                                 const FrameOracle& middle, const char* bookmarkSnippet, JsonDocument& oracle,
+                                 std::string& error) {
   if (!EpubReaderUtils::saveProgress(*epub, middle.sectionIndex, middle.pageIndex, middle.pageCount)) {
     error = "cannot save progress";
     return false;
@@ -547,8 +548,9 @@ bool captureProgressAndBookmark(const std::shared_ptr<Epub>& epub, GfxRenderer& 
   }
   const auto tocIndex = epub->getTocIndexForSectionIndex(middle.sectionIndex);
   const std::string chapter = tocIndex >= 0 ? epub->getTocEntry(tocIndex).title : std::string{};
+  const char* selectedSnippet = bookmarkSnippet != nullptr ? bookmarkSnippet : middle.text.c_str();
   if (BOOKMARKS.addBookmark(static_cast<uint16_t>(middle.sectionIndex), sectionProgress, middle.pageCount,
-                            chapter.c_str(), UINT16_MAX, middle.text.c_str()) != BookmarkStore::AddResult::Added) {
+                            chapter.c_str(), UINT16_MAX, selectedSnippet) != BookmarkStore::AddResult::Added) {
     error = "cannot save bookmark";
     BOOKMARKS.unload();
     return false;
@@ -562,6 +564,12 @@ bool captureProgressAndBookmark(const std::shared_ptr<Epub>& epub, GfxRenderer& 
   }
 
   const Bookmark& bookmark = BOOKMARKS.getBookmarks().front();
+  if (bookmarkSnippet != nullptr && std::strcmp(bookmark.snippet, bookmarkSnippet) != 0) {
+    error = "explicit bookmark snippet did not round-trip";
+    BOOKMARKS.clearAll();
+    BOOKMARKS.unload();
+    return false;
+  }
   JsonObject bookmarkJson = oracle["bookmark"].to<JsonObject>();
   bookmarkJson["section_index"] = bookmark.spineIndex;
   bookmarkJson["page_count"] = middle.pageCount;
@@ -1018,7 +1026,17 @@ bool verifyLooseLocalSource(const char* passName, GfxRenderer& renderer, const O
       imageHashAfter != imageHashBefore || imageBytesAfter != imageBytesBefore || Storage.exists(htmlPath.c_str()) ||
       Storage.exists(tempHtmlPath.c_str()) || document->sectionStreams() != 0 || document->resourceStreams() != 0 ||
       document->localSectionQueries() < 5 || document->resourceQueries() < 1) {
-    error = "borrowed local source was copied, streamed, or mutated";
+    error = "borrowed local source invariant failed: source_hash=" +
+            std::to_string(sourceHashAfter != sourceHashBefore) +
+            " source_size=" + std::to_string(sourceBytesAfter != sourceBytesBefore) +
+            " image_hash=" + std::to_string(imageHashAfter != imageHashBefore) +
+            " image_size=" + std::to_string(imageBytesAfter != imageBytesBefore) +
+            " html_copy=" + std::to_string(Storage.exists(htmlPath.c_str())) +
+            " html_temp=" + std::to_string(Storage.exists(tempHtmlPath.c_str())) +
+            " section_streams=" + std::to_string(document->sectionStreams()) +
+            " resource_streams=" + std::to_string(document->resourceStreams()) +
+            " section_queries=" + std::to_string(document->localSectionQueries()) +
+            " resource_queries=" + std::to_string(document->resourceQueries());
     return false;
   }
   return true;
@@ -1038,7 +1056,36 @@ bool runEpubReflowRegressionOracle(GfxRenderer& renderer, const char* bookPath, 
     return false;
   }
 
-  pinReaderSettings(renderer);
+  bool embeddedStyle = true;
+  if (const char* value = std::getenv("CROSSINK_SIMULATOR_REFLOW_EMBEDDED_STYLE"); value != nullptr) {
+    if (std::strcmp(value, "0") == 0) {
+      embeddedStyle = false;
+    } else if (std::strcmp(value, "1") != 0) {
+      error = "oracle embedded style must be 0 or 1";
+      return false;
+    }
+  }
+
+  const char* bookmarkSnippet = std::getenv("CROSSINK_SIMULATOR_REFLOW_BOOKMARK_SNIPPET");
+  if (bookmarkSnippet != nullptr) {
+    if (embeddedStyle) {
+      error = "explicit bookmark snippet is candidate-only";
+      return false;
+    }
+    const size_t snippetLength = std::strlen(bookmarkSnippet);
+    if (snippetLength == 0 || snippetLength > BOOKMARK_SNIPPET_MAX - 1) {
+      error = "explicit bookmark snippet must contain 1 to 63 ASCII bytes";
+      return false;
+    }
+    for (const char* cursor = bookmarkSnippet; *cursor != '\0'; ++cursor) {
+      if (static_cast<unsigned char>(*cursor) > 0x7F) {
+        error = "explicit bookmark snippet must be ASCII";
+        return false;
+      }
+    }
+  }
+
+  pinReaderSettings(renderer, embeddedStyle);
   OracleLayout layout;
   if (!computeLayout(renderer, layout, error)) {
     return false;
@@ -1054,7 +1101,7 @@ bool runEpubReflowRegressionOracle(GfxRenderer& renderer, const char* bookPath, 
   // document lifetime is one deterministic smoke-test process.
   auto epub = std::make_shared<Epub>(bookPath, CACHE_ROOT);
   resetUserPositionState(*epub);
-  if (!epub->load(true, false)) {
+  if (!epub->load(true, !embeddedStyle)) {
     error = "cannot load EPUB metadata";
     return false;
   }
@@ -1168,6 +1215,9 @@ bool runEpubReflowRegressionOracle(GfxRenderer& renderer, const char* bookPath, 
   settings["embedded_style"] = SETTINGS.embeddedStyle;
   settings["hyphenation"] = SETTINGS.hyphenationEnabled;
   settings["text_antialiasing"] = SETTINGS.textAntiAliasing;
+  if (bookmarkSnippet != nullptr) {
+    settings["bookmark_snippet"] = bookmarkSnippet;
+  }
 
   JsonObject viewport = oracle["viewport"].to<JsonObject>();
   viewport["top"] = layout.top;
@@ -1215,7 +1265,23 @@ bool runEpubReflowRegressionOracle(GfxRenderer& renderer, const char* bookPath, 
   cache["bytes"] = sectionCacheBytes;
   cache["fnv1a64"] = hashHex(sectionCacheHash);
 
-  if (!captureProgressAndBookmark(epub, renderer, layout, middle, oracle, error)) {
+  if (!embeddedStyle) {
+    uint64_t representativeCacheHash = FNV_OFFSET;
+    size_t representativeCacheBytes = 0;
+    const std::string representativeCachePath =
+        epub->getCachePath() + "/sections/" + std::to_string(middleSection) + ".bin";
+    if (!hashFile(representativeCachePath, representativeCacheHash, representativeCacheBytes, error)) {
+      return false;
+    }
+    JsonObject platformSmoke = oracle["platform_smoke"].to<JsonObject>();
+    platformSmoke["section_index"] = middleSection;
+    platformSmoke["page_count"] = middle.pageCount;
+    platformSmoke["section_cache_bytes"] = representativeCacheBytes;
+    platformSmoke["section_cache_fnv1a64"] = hashHex(representativeCacheHash);
+    platformSmoke["framebuffer_hash"] = middle.framebufferHash;
+  }
+
+  if (!captureProgressAndBookmark(epub, renderer, layout, middle, bookmarkSnippet, oracle, error)) {
     return false;
   }
   if (!verifyLooseLocalSource(passName, renderer, layout, error)) {

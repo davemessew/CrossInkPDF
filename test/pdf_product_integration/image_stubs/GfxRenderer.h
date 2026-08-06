@@ -36,6 +36,9 @@ class GfxRenderer {
   int getWriteRows() const { return 4; }
   bool isStripTargetActive() const { return false; }
   bool glyphIntersectsStrip(int, int, int, int) const { return true; }
+  void drawLine(int, int, int, int, bool) {}
+  void drawLine(int, int, int, int, int, bool) {}
+  void drawRect(int, int, int, int, bool) {}
   const std::array<uint8_t, 4>& framebuffer() const { return framebuffer_; }
 
  private:

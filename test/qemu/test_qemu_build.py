@@ -26,7 +26,7 @@ EXPECTED_OFFSETS = {
 
 
 class QemuBuildContractTest(unittest.TestCase):
-    def test_windows_qemu_tracer_is_a_required_ci_gate(self) -> None:
+    def test_windows_qemu_full_acceptance_is_a_required_ci_gate(self) -> None:
         workflow = CI_WORKFLOW.read_text(encoding="utf-8")
         qemu_start = workflow.index("  qemu-tracer:")
         status_start = workflow.index("  test-status:")
@@ -40,12 +40,27 @@ class QemuBuildContractTest(unittest.TestCase):
             "platformio-core/archive/refs/tags/v6.1.19.zip",
             "python scripts/install_qemu_esp32c3.py",
             "pio run -e qemu-esp32c3 -t qemu-image",
-            "--expect QEMU_TRACER_PASS",
+            "--expect QEMU_TEST_PASS",
+            "--timeout 300",
             "scripts/check_qemu_resources.py verify",
             "esp32c3-55.03.37-arduino-3.3.7.json",
         ):
             self.assertIn(required, qemu_job)
         self.assertIn("      - qemu-tracer", status_job)
+
+    def test_production_partition_fit_builds_all_documented_variants(self) -> None:
+        workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+        build_start = workflow.index("  build:")
+        qemu_start = workflow.index("  qemu-tracer:")
+        build_job = workflow[build_start:qemu_start]
+
+        for environment in ("default", "tiny", "xlarge"):
+            with self.subTest(environment=environment):
+                self.assertIn(f"pio run -e {environment}", build_job)
+                self.assertIn(
+                    f".pio/build/{environment}/firmware-{environment}.bin",
+                    build_job,
+                )
 
     def test_unemulated_adc_calibration_is_qemu_only_and_nonblocking(
         self,
@@ -259,6 +274,39 @@ class QemuBuildContractTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "differs"):
                 module.verify_pdf_fixture(canonical, staged)
 
+    def test_positive_pdf_corpus_is_staged_and_source_locked(self) -> None:
+        module = self._load_build_module()
+        expected = (
+            Path("qemu") / "hidden_ocr.pdf",
+            Path("qemu") / "columns_table.pdf",
+            Path("qemu") / "jpeg_caption.pdf",
+        )
+        self.assertEqual(module.PDF_POSITIVE_FIXTURE_RELATIVE_PATHS, expected)
+
+        generator = (
+            REPO_ROOT / "scripts" / "generate_pdf_reflow_fixtures.py"
+        ).read_text(encoding="utf-8")
+        for relative in expected:
+            name = relative.name
+            with self.subTest(fixture=name):
+                self.assertIn(f'"{name}"', generator)
+                self.assertEqual(
+                    (REPO_ROOT / "test" / "qemu" / "data" / relative).read_bytes(),
+                    (REPO_ROOT / "test" / "pdf_reflow_core" / "fixtures" / name).read_bytes(),
+                )
+
+        build_source = (
+            REPO_ROOT / "scripts" / "qemu_build.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "for relative_path in PDF_POSITIVE_FIXTURE_RELATIVE_PATHS:",
+            build_source,
+        )
+        self.assertIn(
+            'positive_pdf_fixture_sha256[relative_path.name] = verify_pdf_fixture(',
+            build_source,
+        )
+
     def test_qemu_config_fingerprint_ignores_unrelated_environments(self) -> None:
         module = self._load_build_module()
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -320,6 +368,10 @@ build_flags =
         self.assertIn('env.DataToBin("$BUILD_DIR/qemu-data"', source)
         self.assertIn('"$PROJECT_DIR/test/qemu/data"', source)
         self.assertIn("$BUILD_DIR/${PROGNAME}.bin", source)
+        self.assertIn("$BUILD_DIR/${PROGNAME}.elf", source)
+        self.assertIn('"artifacts": {', source)
+        self.assertIn('"elf": {', source)
+        self.assertIn('"sha256": _sha256_file(elf)', source)
         self.assertIn('name="qemu-image"', source)
         self.assertIn("setup_python_env(env)", source)
         self.assertIn("FLASH_EXTRA_IMAGES", source)

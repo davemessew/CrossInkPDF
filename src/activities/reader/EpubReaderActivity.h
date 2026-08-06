@@ -68,32 +68,14 @@ class EpubReaderActivity final : public Activity {
   uint16_t cachedPageParagraphIndex = UINT16_MAX;
   uint16_t cachedPageParagraphOffset = 0;
   uint16_t cachedPageParagraphSpan = 0;
-  // Allocated once only for PDF. Ordinary EPUB readers carry just this pointer
-  // and never allocate or initialize PDF progress state.
-  std::unique_ptr<PdfReaderProgressState> pdfProgressState;
-  // PDF-only: 128 fixed PSIT records are too large for the 4 KiB reader task
-  // stack. Allocate this one 7,168-byte block once in onEnter(), reuse it for
-  // the session, and release it in onExit(). EPUB leaves the pointer null.
-  std::unique_ptr<PdfSavedItem[]> pdfSavedItemStorage;
-  PdfSavedItemsBuffer pdfSavedItemsBuffer{};
-  PdfSavedItemsSession pdfSavedItemsSession;
-  struct PdfBookmarkLegacyMutation {
-    uint16_t spineIndex = 0;
-    float progress = 0.0F;
-    const char* chapterTitle = nullptr;
-    const char* snippet = nullptr;
-  } pdfBookmarkLegacyMutation;
-  struct PdfClippingLegacyMutation {
-    uint16_t spineIndex = 0;
-    uint16_t startPage = 0;
-    uint16_t endPage = 0;
-    uint16_t pageCount = 0;
-    uint16_t startWordIndex = 0;
-    uint16_t endWordIndex = 0;
-    uint16_t wordCount = 0;
-    const char* chapterTitle = nullptr;
-    const std::string* text = nullptr;
-  } pdfClippingLegacyMutation;
+  struct PdfReaderSessionState;
+  // The complete PDF-only state, including its 128 fixed saved-item records,
+  // is allocated once on PDF entry. Ordinary EPUB readers carry only this
+  // pointer and perform no PDF-state allocation.
+  std::unique_ptr<PdfReaderSessionState> pdfReaderSession;
+#if UINTPTR_MAX == UINT32_MAX
+  static_assert(sizeof(pdfReaderSession) == 4, "RV32 PDF reader-state handle must remain one pointer");
+#endif
   unsigned long lastPageTurnTime = 0UL;
   unsigned long pageTurnDuration = 0UL;
   unsigned long pageShownAtMs = 0UL;
@@ -293,8 +275,8 @@ class EpubReaderActivity final : public Activity {
 
  public:
   explicit EpubReaderActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
-                              std::unique_ptr<ReflowDocument> document)
-      : Activity("EpubReader", renderer, mappedInput), document(std::move(document)) {}
+                              std::unique_ptr<ReflowDocument> document);
+  ~EpubReaderActivity() override;
   void onEnter() override;
   void onExit() override;
   void loop() override;

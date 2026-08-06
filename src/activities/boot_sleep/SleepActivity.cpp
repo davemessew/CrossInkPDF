@@ -565,24 +565,16 @@ void SleepActivity::onEnter() {
       currentBookPath.empty() ? APP_STATE.openBookPath() : currentBookPath;
   const bool isPdfOverlay = SETTINGS.sleepScreen == CrossPointSettings::SLEEP_SCREEN_MODE::OVERLAY &&
                              FsHelpers::hasPdfExtension(activeBookPath);
-  // Preserve the live framebuffer before any PDF cache I/O.
+  // PDF overlays rebuild from the bounded persisted text page. Never duplicate
+  // the 48 KB framebuffer on this memory-constrained path.
   if (isPdfOverlay) {
-    struct FallbackContext {
-      SleepActivity* activity;
-      const std::string* activeBookPath;
-    } fallbackContext{this, &activeBookPath};
-    overlayBackgroundBufferStored = pdfSnapshotBeforeFallback(
-        renderer, {&fallbackContext, [](void* const opaque) {
-                     auto& context = *static_cast<FallbackContext*>(opaque);
-                     SleepActivity& activity = *context.activity;
-                     if (!activity.pdfOverlayLayout.valid) {
-                       return;
-                     }
-                     activity.loadPdfSleepProducts(*context.activeBookPath);
-                     if (activity.pdfSleepProductCache.available()) {
-                       activity.pdfSleepPageCache.load(activity.pdfSleepProductCache, activity.pdfOverlayLayout);
-                     }
-                   }});
+    overlayBackgroundBufferStored = false;
+    if (pdfOverlayLayout.valid) {
+      loadPdfSleepProducts(activeBookPath);
+      if (pdfSleepProductCache.available()) {
+        pdfSleepPageCache.load(pdfSleepProductCache, pdfOverlayLayout);
+      }
+    }
   } else {
     overlayBackgroundBufferStored =
         SETTINGS.sleepScreen == CrossPointSettings::SLEEP_SCREEN_MODE::OVERLAY && renderer.storeBwBuffer();
@@ -996,6 +988,9 @@ void SleepActivity::renderOverlaySleepScreen() const {
   const std::string path = shouldUseReaderPageBackground
                                ? (currentBookPath.empty() ? APP_STATE.openBookPath() : currentBookPath)
                                : std::string{};
+#if defined(CROSSINK_ENABLE_PDF) && CROSSINK_ENABLE_PDF
+  const bool isPdfReaderPage = FsHelpers::hasPdfExtension(path);
+#endif
 
   auto renderSavedReaderPage = [&]() -> bool {
     if (path.empty()) {
@@ -1024,8 +1019,18 @@ void SleepActivity::renderOverlaySleepScreen() const {
   bool backgroundWasRebuilt = false;
   bool backgroundAvailable = false;
 
-  // Step 1: Restore the screen that was visible before the sleep popup. When
-  // that snapshot is unavailable in the reader, rebuild from the saved position.
+  // Step 1: Rebuild PDFs from the retained persisted page. Other formats keep
+  // their existing snapshot-first path.
+#if defined(CROSSINK_ENABLE_PDF) && CROSSINK_ENABLE_PDF
+  if (isPdfReaderPage) {
+    backgroundWasRebuilt = renderSavedReaderPage();
+    backgroundAvailable = backgroundWasRebuilt;
+    if (!backgroundWasRebuilt) {
+      LOG_DBG("SLP", "PDF page re-render failed, using white background");
+      renderer.clearScreen();
+    }
+  } else
+#endif
   if (overlayBackgroundBufferStored) {
     renderer.restoreBwBuffer();
     backgroundAvailable = true;

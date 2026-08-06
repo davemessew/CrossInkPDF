@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <iostream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -28,6 +29,8 @@ struct CallbackLog {
   std::vector<std::string> clearedLegacy;
   bool failDelete = false;
   bool spoolWasClosedForEveryDelete = true;
+  bool failNextReplayReadAfterFirstClear = false;
+  size_t failLegacyAt = 0;
 };
 
 bool deletePdf(void* const context, const char* const path) {
@@ -41,10 +44,15 @@ bool deletePdf(void* const context, const char* const path) {
   return Storage.remove(exactPath.c_str());
 }
 
-void clearLegacy(void* const context, const std::string& path) {
+bool clearLegacy(void* const context, const std::string_view path) {
   auto& log = *static_cast<CallbackLog*>(context);
-  log.clearedLegacy.push_back(path);
-  Storage.events.emplace_back("clear:" + path);
+  log.clearedLegacy.emplace_back(path);
+  Storage.events.emplace_back(std::string("clear:") + std::string(path));
+  if (log.failNextReplayReadAfterFirstClear &&
+      log.clearedLegacy.size() == 1U) {
+    Storage.failNextRead();
+  }
+  return log.clearedLegacy.size() != log.failLegacyAt;
 }
 
 PdfDirectoryDeleteScan::DeleteCallbacks callbacksFor(CallbackLog& log) {
@@ -87,7 +95,7 @@ void testFirstPdfHasNoCountCapAndClosesSpoolBeforeJournalCallbacks() {
   }
   Storage.putFile("/Books/keep.epub", {2});
   CallbackLog log;
-  const auto status = PdfDirectoryDeleteScan::deleteDirectoryNoThrow(
+  const auto status = PdfDirectoryDeleteScan::deletePdfDirectoryNoThrow(
       "/Books", callbacksFor(log));
 
   expect(status == PdfDirectoryDeleteScan::Status::Complete,
@@ -116,25 +124,31 @@ void testLatePdfDefersSpoolAndQuantifiesMixedCost() {
   }
   Storage.putFile("/Books/zz-last.pdf", {2});
   CallbackLog log;
-  const auto status = PdfDirectoryDeleteScan::deleteDirectoryNoThrow(
+  const auto status = PdfDirectoryDeleteScan::deletePdfDirectoryNoThrow(
       "/Books", callbacksFor(log));
 
   expect(status == PdfDirectoryDeleteScan::Status::Complete &&
              log.deletedPdfs ==
-                 std::vector<std::string>({"/Books/zz-last.pdf"}),
+                 std::vector<std::string>({"/Books/zz-last.pdf"}) &&
+             log.clearedLegacy.size() == kLegacyDirectories,
          "late PDF must be discovered, sealed, validated, and replayed (status=" +
              std::to_string(static_cast<unsigned>(status)) + ")");
   const auto lastLegacyOpen =
       std::find(Storage.events.begin(), Storage.events.end(),
                 "open-direct:/Books/a1069");
+  const auto firstLegacyOpen =
+      std::find(Storage.events.begin(), Storage.events.end(),
+                "open-direct:/Books/a1000");
   const auto firstSpoolOpen =
       std::find(Storage.events.begin(), Storage.events.end(),
                 std::string("open-file-write:") +
                     PdfDirectoryDeleteScan::kSpoolTempPath);
-  expect(lastLegacyOpen != Storage.events.end() &&
+  expect(firstLegacyOpen != Storage.events.end() &&
+             lastLegacyOpen != Storage.events.end() &&
              firstSpoolOpen != Storage.events.end() &&
-             lastLegacyOpen < firstSpoolOpen,
-         "spool must not open until traversal reaches the first PDF");
+             firstLegacyOpen < firstSpoolOpen &&
+             firstSpoolOpen < lastLegacyOpen,
+         "typed spool must open at the first retained legacy path, not allocate per book");
 
   mixedDirectoryIterations = Storage.directoryIterationCalls();
   mixedExplicitHeapBytes = 0;
@@ -153,7 +167,7 @@ void testSpoolFailuresAbortBeforeTreeMutationAndCleanArtifacts() {
   TestMemory::failAllocationCall = 2;
   CallbackLog log;
   expectPreflightFailurePreservesTree(
-      PdfDirectoryDeleteScan::deleteDirectoryNoThrow("/Books",
+      PdfDirectoryDeleteScan::deletePdfDirectoryNoThrow("/Books",
                                                      callbacksFor(log)),
       PdfDirectoryDeleteScan::Status::AllocationFailure, log,
       "spool workspace OOM");
@@ -163,7 +177,7 @@ void testSpoolFailuresAbortBeforeTreeMutationAndCleanArtifacts() {
   Storage.failNextOpenOf(PdfDirectoryDeleteScan::kSpoolTempPath);
   log = {};
   expectPreflightFailurePreservesTree(
-      PdfDirectoryDeleteScan::deleteDirectoryNoThrow("/Books",
+      PdfDirectoryDeleteScan::deletePdfDirectoryNoThrow("/Books",
                                                      callbacksFor(log)),
       PdfDirectoryDeleteScan::Status::SpoolOpenFailure, log,
       "spool create failure");
@@ -173,7 +187,7 @@ void testSpoolFailuresAbortBeforeTreeMutationAndCleanArtifacts() {
   Storage.failNextShortWrite();
   log = {};
   expectPreflightFailurePreservesTree(
-      PdfDirectoryDeleteScan::deleteDirectoryNoThrow("/Books",
+      PdfDirectoryDeleteScan::deletePdfDirectoryNoThrow("/Books",
                                                      callbacksFor(log)),
       PdfDirectoryDeleteScan::Status::SpoolWriteFailure, log,
       "spool short write");
@@ -183,7 +197,7 @@ void testSpoolFailuresAbortBeforeTreeMutationAndCleanArtifacts() {
   Storage.failNextSync();
   log = {};
   expectPreflightFailurePreservesTree(
-      PdfDirectoryDeleteScan::deleteDirectoryNoThrow("/Books",
+      PdfDirectoryDeleteScan::deletePdfDirectoryNoThrow("/Books",
                                                      callbacksFor(log)),
       PdfDirectoryDeleteScan::Status::SpoolSyncFailure, log,
       "spool sync failure");
@@ -193,7 +207,7 @@ void testSpoolFailuresAbortBeforeTreeMutationAndCleanArtifacts() {
   Storage.failNextOpenOf(PdfDirectoryDeleteScan::kSpoolSealedPath);
   log = {};
   expectPreflightFailurePreservesTree(
-      PdfDirectoryDeleteScan::deleteDirectoryNoThrow("/Books",
+      PdfDirectoryDeleteScan::deletePdfDirectoryNoThrow("/Books",
                                                      callbacksFor(log)),
       PdfDirectoryDeleteScan::Status::SpoolOpenFailure, log,
       "sealed spool validation open failure");
@@ -203,7 +217,7 @@ void testSpoolFailuresAbortBeforeTreeMutationAndCleanArtifacts() {
   Storage.failNextRead();
   log = {};
   expectPreflightFailurePreservesTree(
-      PdfDirectoryDeleteScan::deleteDirectoryNoThrow("/Books",
+      PdfDirectoryDeleteScan::deletePdfDirectoryNoThrow("/Books",
                                                      callbacksFor(log)),
       PdfDirectoryDeleteScan::Status::SpoolReadFailure, log,
       "sealed spool validation read failure");
@@ -213,7 +227,7 @@ void testSpoolFailuresAbortBeforeTreeMutationAndCleanArtifacts() {
   Storage.corruptOnNextSyncOf(PdfDirectoryDeleteScan::kSpoolTempPath);
   log = {};
   expectPreflightFailurePreservesTree(
-      PdfDirectoryDeleteScan::deleteDirectoryNoThrow("/Books",
+      PdfDirectoryDeleteScan::deletePdfDirectoryNoThrow("/Books",
                                                      callbacksFor(log)),
       PdfDirectoryDeleteScan::Status::SpoolCorrupt, log,
       "sealed spool CRC corruption");
@@ -225,7 +239,7 @@ void testStaleRebootSpoolsCleanBeforeDiscoveryAndTraversalAliasRejects() {
   Storage.putFile(PdfDirectoryDeleteScan::kSpoolSealedPath, {4, 5, 6});
   Storage.putFile("/Books/keep.epub", {7});
   CallbackLog log;
-  const auto recovered = PdfDirectoryDeleteScan::deleteDirectoryNoThrow(
+  const auto recovered = PdfDirectoryDeleteScan::deletePdfDirectoryNoThrow(
       "/Books", callbacksFor(log));
   expect(recovered == PdfDirectoryDeleteScan::Status::Complete &&
              !Storage.exists(PdfDirectoryDeleteScan::kSpoolTempPath) &&
@@ -246,11 +260,136 @@ void testStaleRebootSpoolsCleanBeforeDiscoveryAndTraversalAliasRejects() {
   reset();
   Storage.putFile("/Books/../escape.pdf", {8});
   log = {};
-  const auto alias = PdfDirectoryDeleteScan::deleteDirectoryNoThrow(
+  const auto alias = PdfDirectoryDeleteScan::deletePdfDirectoryNoThrow(
       "/Books", callbacksFor(log));
   expect(alias == PdfDirectoryDeleteScan::Status::PathLimit &&
              Storage.exists("/Books") && log.deletedPdfs.empty(),
          "dot-dot traversal alias must fail before spool or tree mutation");
+}
+
+void testPreflightAndPostCommitCleanupFailuresRemainDistinct() {
+  reset();
+  putSimpleMixedTree();
+  Storage.putFile(PdfDirectoryDeleteScan::kSpoolSealedPath, {9});
+  Storage.failNextRemoveOf(PdfDirectoryDeleteScan::kSpoolSealedPath);
+  CallbackLog log;
+
+  auto status = PdfDirectoryDeleteScan::deletePdfDirectoryNoThrow(
+      "/Books", callbacksFor(log));
+  expect(status == PdfDirectoryDeleteScan::Status::SpoolCleanupFailure &&
+             Storage.exists("/Books/book.pdf") &&
+             Storage.exists("/Books/keep.epub") && log.deletedPdfs.empty() &&
+             log.clearedLegacy.empty(),
+         "preflight spool cleanup failure must remain a hard failure before mutation");
+
+  reset();
+  putSimpleMixedTree();
+  Storage.failNextRemoveOf(PdfDirectoryDeleteScan::kSpoolSealedPath);
+  log = {};
+  status = PdfDirectoryDeleteScan::deletePdfDirectoryNoThrow(
+      "/Books", callbacksFor(log));
+  expect(status ==
+             PdfDirectoryDeleteScan::Status::CommittedWithCleanupWarning,
+         "strict post-commit spool cleanup failure must be distinguishable success");
+  expect(!Storage.exists("/Books") &&
+             log.deletedPdfs ==
+                 std::vector<std::string>{"/Books/book.pdf"} &&
+             log.clearedLegacy ==
+                 std::vector<std::string>{"/Books/keep.epub"},
+         "strict cleanup warning must retain completed PDF and metadata deletion");
+  expect(Storage.exists(PdfDirectoryDeleteScan::kSpoolSealedPath),
+         "strict cleanup warning must leave the failed spool artifact observable");
+}
+
+void testStrictReplayReadFailureAfterCommitIsDistinguishable() {
+  reset();
+  Storage.putFile("/Books/a.epub", {1});
+  Storage.putFile("/Books/b.epub", {2});
+  Storage.putFile("/Books/z.pdf", {3});
+  CallbackLog log;
+  log.failNextReplayReadAfterFirstClear = true;
+
+  const auto status = PdfDirectoryDeleteScan::deletePdfDirectoryNoThrow(
+      "/Books", callbacksFor(log));
+
+  expect(status ==
+             PdfDirectoryDeleteScan::Status::CommittedWithCleanupWarning,
+         "strict post-commit replay read failure must remain distinguishable committed success");
+  expect(!Storage.exists("/Books") &&
+             log.deletedPdfs ==
+                 std::vector<std::string>{"/Books/z.pdf"} &&
+             log.clearedLegacy ==
+                 std::vector<std::string>{"/Books/a.epub"},
+         "strict replay failure must retain committed PDF/tree deletion and completed metadata prefix");
+}
+
+void testStrictReplayOpenFailureAfterCommitIsDistinguishable() {
+  reset();
+  Storage.putFile("/Books/a.epub", {1});
+  Storage.putFile("/Books/z.pdf", {3});
+  Storage.failNextOpenOfAfterRemoveDir(
+      PdfDirectoryDeleteScan::kSpoolSealedPath);
+  CallbackLog log;
+
+  const auto status = PdfDirectoryDeleteScan::deletePdfDirectoryNoThrow(
+      "/Books", callbacksFor(log));
+
+  expect(status ==
+             PdfDirectoryDeleteScan::Status::CommittedWithCleanupWarning,
+         "strict post-commit replay open allocation failure must remain distinguishable committed success");
+  expect(!Storage.exists("/Books") &&
+             log.deletedPdfs ==
+                 std::vector<std::string>{"/Books/z.pdf"} &&
+             log.clearedLegacy.empty(),
+         "strict replay open failure must retain committed PDF/tree deletion without claiming metadata replay");
+}
+
+void testStrictReplayCloseFailureAfterCommitIsDistinguishable() {
+  reset();
+  Storage.putFile("/Books/a.epub", {1});
+  Storage.putFile("/Books/z.pdf", {3});
+  Storage.failNextCloseOfAfterRemoveDir(
+      PdfDirectoryDeleteScan::kSpoolSealedPath);
+  CallbackLog log;
+
+  const auto status = PdfDirectoryDeleteScan::deletePdfDirectoryNoThrow(
+      "/Books", callbacksFor(log));
+
+  expect(status ==
+             PdfDirectoryDeleteScan::Status::CommittedWithCleanupWarning,
+         "strict post-commit replay close failure must remain distinguishable committed success");
+  expect(!Storage.exists("/Books") &&
+             log.deletedPdfs ==
+                 std::vector<std::string>{"/Books/z.pdf"} &&
+             log.clearedLegacy ==
+                 std::vector<std::string>{"/Books/a.epub"},
+         "strict replay close failure must retain committed PDF/tree deletion and completed metadata replay");
+}
+
+void testStrictMetadataCallbackFailuresWarnAndContinueAfterCommit() {
+  const std::vector<std::string> expectedPaths{
+      "/Books/a.epub", "/Books/b.epub", "/Books/c.epub"};
+  for (size_t failedAt = 1; failedAt <= expectedPaths.size(); ++failedAt) {
+    reset();
+    Storage.putFile(expectedPaths[0], {1});
+    Storage.putFile(expectedPaths[1], {2});
+    Storage.putFile(expectedPaths[2], {3});
+    Storage.putFile("/Books/z.pdf", {4});
+    CallbackLog log;
+    log.failLegacyAt = failedAt;
+
+    const auto status = PdfDirectoryDeleteScan::deletePdfDirectoryNoThrow(
+        "/Books", callbacksFor(log));
+
+    expect(status ==
+               PdfDirectoryDeleteScan::Status::CommittedWithCleanupWarning,
+           "first, middle, and last strict metadata callback failure must report committed warning");
+    expect(!Storage.exists("/Books") &&
+               log.deletedPdfs ==
+                   std::vector<std::string>{"/Books/z.pdf"} &&
+               log.clearedLegacy == expectedPaths,
+           "strict metadata callback failure must preserve PDF/tree commit and continue every later callback");
+  }
 }
 
 }  // namespace
@@ -260,6 +399,11 @@ int main() {
   testLatePdfDefersSpoolAndQuantifiesMixedCost();
   testSpoolFailuresAbortBeforeTreeMutationAndCleanArtifacts();
   testStaleRebootSpoolsCleanBeforeDiscoveryAndTraversalAliasRejects();
+  testPreflightAndPostCommitCleanupFailuresRemainDistinct();
+  testStrictReplayReadFailureAfterCommitIsDistinguishable();
+  testStrictReplayOpenFailureAfterCommitIsDistinguishable();
+  testStrictReplayCloseFailureAfterCommitIsDistinguishable();
+  testStrictMetadataCallbackFailuresWarnAndContinueAfterCommit();
   if (failures != 0) return 1;
   std::cout << "PDF_DIRECTORY_DELETE_SPOOL_PASS"
             << " mixed_iterations=" << mixedDirectoryIterations

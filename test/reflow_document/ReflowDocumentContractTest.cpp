@@ -77,7 +77,18 @@ class FakeReflowDocument final : public ReflowDocument {
 
   int getSectionCount() const override { return 2; }
 
+  bool getSectionHref(const int sectionIndex, std::string& href) const override {
+    ++sectionHrefQueries_;
+    if (sectionIndex < 0 || sectionIndex >= getSectionCount()) {
+      href.clear();
+      return false;
+    }
+    href = sectionIndex == 0 ? "sections/0.xhtml" : "sections/1.xhtml";
+    return true;
+  }
+
   ReflowSectionInfo getSectionInfo(const int sectionIndex) const override {
+    ++sectionInfoQueries_;
     if (sectionIndex == 0) {
       return {
           .href = "sections/0.xhtml",
@@ -280,6 +291,10 @@ class FakeReflowDocument final : public ReflowDocument {
 
   int generatedAdaptiveThumbHeight() const { return generatedAdaptiveThumbHeight_; }
 
+  int sectionHrefQueries() const { return sectionHrefQueries_; }
+
+  int sectionInfoQueries() const { return sectionInfoQueries_; }
+
  private:
   bool* destroyed_;
   const std::string path_ = "/books/sample.pdf";
@@ -301,6 +316,8 @@ class FakeReflowDocument final : public ReflowDocument {
   mutable int generatedThumbHeight_ = 0;
   mutable int generatedAdaptiveThumbWidth_ = 0;
   mutable int generatedAdaptiveThumbHeight_ = 0;
+  mutable int sectionHrefQueries_ = 0;
+  mutable int sectionInfoQueries_ = 0;
 };
 
 TEST(ReflowDocumentContract, CapabilityBitsComposeAndQuery) {
@@ -368,6 +385,12 @@ TEST(ReflowDocumentContract, VirtualDispatchCoversMetadataNavigationResourcesAnd
     EXPECT_TRUE(document->generateAdaptiveThumbBmp(80, 60));
     EXPECT_EQ(observed->generatedAdaptiveThumbWidth(), 80);
     EXPECT_EQ(observed->generatedAdaptiveThumbHeight(), 60);
+
+    std::string sectionHref;
+    ASSERT_TRUE(document->getSectionHref(1, sectionHref));
+    EXPECT_EQ(sectionHref, "sections/1.xhtml");
+    EXPECT_EQ(observed->sectionHrefQueries(), 1);
+    EXPECT_EQ(observed->sectionInfoQueries(), 0);
 
     EXPECT_EQ(document->getSectionCount(), 2);
     const auto section = document->getSectionInfo(1);

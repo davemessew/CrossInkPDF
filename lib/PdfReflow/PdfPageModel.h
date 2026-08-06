@@ -66,6 +66,7 @@ class PdfPageModel {
   const uint8_t* text() const { return workspace_.text; }
   size_t textLength() const { return textLength_; }
   const PdfTextRun* runs() const { return workspace_.runs; }
+  const PdfTextRun* pendingTextRun() const { return runPending_ ? workspace_.runs + runCount_ : nullptr; }
   uint16_t runCount() const { return runCount_; }
   const PdfImagePlacement* images() const { return workspace_.images; }
   uint16_t imageCount() const { return imageCount_; }

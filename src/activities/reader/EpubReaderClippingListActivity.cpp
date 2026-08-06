@@ -228,10 +228,12 @@ void EpubReaderClippingListActivity::rebuildDetailLayoutIfNeeded() {
 void EpubReaderClippingListActivity::deleteSelectedClipping() {
   if (clippings.empty() || selectedIndex < 0 || selectedIndex >= static_cast<int>(clippings.size())) return;
 
-  const Clipping selected = clippings[selectedIndex];
-  const bool removed = deleteCallback != nullptr
-                           ? deleteCallback(deleteContext, selected.paragraphIndex)
-                           : CLIPPINGS.removeClippingAt(static_cast<size_t>(selectedIndex));
+  bool removed = false;
+  if (deleteCallback == nullptr) {
+    removed = CLIPPINGS.removeClippingAt(static_cast<size_t>(selectedIndex));
+  } else {
+    removed = deleteCallback(deleteContext, clippings[selectedIndex].paragraphIndex);
+  }
   if (!removed) return;
 
   detailMode = false;

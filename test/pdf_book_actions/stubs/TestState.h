@@ -55,6 +55,7 @@ struct BookActionTestState {
   bool pdfMoveKeepInRecents = true;
   uint8_t pdfMoveResult = 0;
   uint32_t pdfDeleteCalls = 0;
+  uint32_t pdfDirectoryDeleteCalls = 0;
   std::string pdfDeletePath;
   uint8_t pdfDeleteResult = 0;
   std::string expectedStatsCachePath;
@@ -73,6 +74,10 @@ struct BookActionTestState {
   bool xtcLoadResult = true;
   uint32_t epubStateMigrations = 0;
   bool epubMigrationKeepInRecents = true;
+  uint32_t owningMetadataPathCalls = 0;
+  bool epubNoPathAllocResult = true;
+  bool bookmarkNoPathAllocResult = true;
+  bool clippingNoPathAllocResult = true;
   std::vector<std::string> metadataDeletes;
   uint32_t resetReaderSettingsCalls = 0;
 

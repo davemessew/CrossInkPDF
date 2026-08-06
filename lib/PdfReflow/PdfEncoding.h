@@ -39,6 +39,7 @@ class PdfSimpleEncoding {
   PdfStatus decode(uint8_t code, PdfUtf8Value* value);
 
   uint16_t differenceCount() const { return differenceCount_; }
+  bool fullyResident() const { return spillCount_ == 0; }
 
  private:
   PdfStatus addDifference(uint8_t code, uint32_t scalar);

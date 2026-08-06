@@ -162,6 +162,104 @@ void commit(PdfTestCacheIo& storage, const PdfCacheManifest& value, RecordTable&
 
 }  // namespace
 
+TEST(PdfCacheIo, ReadWriteSeekOverwritesOnlyTheUncommittedTail) {
+  PdfTestCacheIo storage;
+  storage.addFile("/resume.journal", std::vector<uint8_t>{'c', 'o', 'm', 'm', 'i', 't', 't', 'e', 'd', 'b', 'a', 'd'});
+
+  PdfCacheIo io = storage.io();
+  PdfCacheHandle handle{};
+  ASSERT_TRUE(io.open(io.context, "/resume.journal", PdfCacheOpenMode::ReadWrite, &handle).ok());
+  ASSERT_TRUE(pdfCacheSeek(io, handle, 9U).ok());
+
+  constexpr uint8_t replacement[] = {'n', 'e', 'w'};
+  size_t bytesWritten = 0;
+  ASSERT_TRUE(io.write(io.context, handle, replacement, sizeof(replacement), &bytesWritten).ok());
+  ASSERT_EQ(bytesWritten, sizeof(replacement));
+  ASSERT_TRUE(io.flush(io.context, handle).ok());
+  ASSERT_TRUE(io.sync(io.context, handle).ok());
+  ASSERT_TRUE(io.close(io.context, &handle).ok());
+
+  const std::vector<uint8_t> expected = {'c', 'o', 'm', 'm', 'i', 't', 't', 'e', 'd', 'n', 'e', 'w'};
+  EXPECT_EQ(storage.bytes("/resume.journal"), expected);
+}
+
+TEST(PdfCacheIo, TruncateDropsUncommittedTailAndLeavesWriterAtPrefixEnd) {
+  PdfTestCacheIo storage;
+  storage.addFile("/section.xhtml",
+                  std::vector<uint8_t>{'c', 'o', 'm', 'm', 'i', 't', 't', 'e', 'd', 'b', 'a', 'd'});
+
+  PdfCacheIo io = storage.io();
+  PdfCacheHandle handle{};
+  ASSERT_TRUE(io.open(io.context, "/section.xhtml", PdfCacheOpenMode::ReadWrite, &handle).ok());
+  ASSERT_TRUE(pdfCacheTruncate(io, handle, 9U).ok());
+  EXPECT_EQ(storage.openHandleCount(), 1U);
+
+  const std::vector<uint8_t> committedPrefix = {'c', 'o', 'm', 'm', 'i', 't', 't', 'e', 'd'};
+  EXPECT_EQ(storage.bytes("/section.xhtml"), committedPrefix);
+  PdfCacheFileMetadata metadata{};
+  ASSERT_TRUE(io.metadata(io.context, handle, &metadata).ok());
+  EXPECT_EQ(metadata.size, committedPrefix.size());
+
+  constexpr uint8_t replacement[] = {'n', 'e', 'w'};
+  size_t bytesWritten = 0;
+  ASSERT_TRUE(io.write(io.context, handle, replacement, sizeof(replacement), &bytesWritten).ok());
+  ASSERT_EQ(bytesWritten, sizeof(replacement));
+  ASSERT_TRUE(io.close(io.context, &handle).ok());
+
+  const std::vector<uint8_t> expected = {'c', 'o', 'm', 'm', 'i', 't', 't', 'e', 'd', 'n', 'e', 'w'};
+  EXPECT_EQ(storage.bytes("/section.xhtml"), expected);
+}
+
+TEST(PdfCacheIo, TruncateFailuresMatchProductionAndPreserveCallerState) {
+  const std::vector<uint8_t> original = {'c', 'o', 'm', 'm', 'i', 't', 't', 'e', 'd'};
+
+  {
+    PdfTestCacheIo storage;
+    storage.addFile("/read-only.xhtml", original);
+    PdfCacheIo io = storage.io();
+    PdfCacheHandle handle{};
+    ASSERT_TRUE(io.open(io.context, "/read-only.xhtml", PdfCacheOpenMode::Read, &handle).ok());
+
+    const PdfStatus status = pdfCacheTruncate(io, handle, 4U);
+    EXPECT_EQ(status.error, PdfError::IoFailure);
+    EXPECT_EQ(status.offset, 4U);
+    EXPECT_EQ(storage.bytes("/read-only.xhtml"), original);
+    EXPECT_EQ(storage.openHandleCount(), 1U);
+    EXPECT_TRUE(io.close(io.context, &handle).ok());
+  }
+
+  {
+    PdfTestCacheIo storage;
+    storage.addFile("/oversize.xhtml", original);
+    PdfCacheIo io = storage.io();
+    PdfCacheHandle handle{};
+    ASSERT_TRUE(io.open(io.context, "/oversize.xhtml", PdfCacheOpenMode::ReadWrite, &handle).ok());
+
+    const PdfStatus status = pdfCacheTruncate(io, handle, original.size() + 1U);
+    EXPECT_EQ(status.error, PdfError::IoFailure);
+    EXPECT_EQ(status.offset, original.size() + 1U);
+    EXPECT_EQ(storage.bytes("/oversize.xhtml"), original);
+    EXPECT_EQ(storage.openHandleCount(), 1U);
+    EXPECT_TRUE(io.close(io.context, &handle).ok());
+  }
+
+  {
+    PdfTestCacheIo storage;
+    storage.addFile("/removed.xhtml", original);
+    PdfCacheIo io = storage.io();
+    PdfCacheHandle handle{};
+    ASSERT_TRUE(io.open(io.context, "/removed.xhtml", PdfCacheOpenMode::ReadWrite, &handle).ok());
+    ASSERT_TRUE(io.remove(io.context, "/removed.xhtml", false).ok());
+
+    const PdfStatus status = pdfCacheTruncate(io, handle, 4U);
+    EXPECT_EQ(status.error, PdfError::IoFailure);
+    EXPECT_EQ(status.offset, 4U);
+    EXPECT_FALSE(storage.exists("/removed.xhtml"));
+    EXPECT_EQ(storage.openHandleCount(), 1U);
+    EXPECT_TRUE(io.close(io.context, &handle).ok());
+  }
+}
+
 TEST(PdfCacheCodec, ManifestRoundTripsExplicitFieldsAndRecords) {
   RecordTable table{{record("metadata.bin", 12, 0x01020304), record("sections/000000.xhtml", 345, 0xaabbccdd)}};
   PdfCacheManifest expected = manifest(9, 17);
@@ -242,7 +340,8 @@ TEST(PdfCacheCodec, CheckpointRoundTripsAndRejectsEveryTruncatedPrefix) {
   expected.sequence = UINT32_MAX;
   expected.source = identity();
   expected.generation = 21;
-  expected.phase = PdfBuildPhase::EmitSections;
+  expected.phase = PdfBuildPhase::ParsePages;
+  expected.resumePhase = PdfBuildResumePhase::AfterPage;
   expected.lastVerifiedPage = 98;
   expected.lastVerifiedObject = 301;
   expected.emittedSections = 7;
@@ -250,6 +349,7 @@ TEST(PdfCacheCodec, CheckpointRoundTripsAndRejectsEveryTruncatedPrefix) {
   expected.cumulativeWords = 12345;
   expected.outputBytes = 987654;
   expected.warningFlags = 5;
+  expected.journalBytes = 1536;
 
   VectorSink encoded;
   ASSERT_TRUE(pdfEncodeBuildCheckpoint(expected, encoded.sink()));
@@ -261,7 +361,8 @@ TEST(PdfCacheCodec, CheckpointRoundTripsAndRejectsEveryTruncatedPrefix) {
   EXPECT_EQ(actual.sequence, UINT32_MAX);
   EXPECT_TRUE(pdfSourceIdentityEqual(actual.source, expected.source));
   EXPECT_EQ(actual.generation, 21u);
-  EXPECT_EQ(actual.phase, PdfBuildPhase::EmitSections);
+  EXPECT_EQ(actual.phase, PdfBuildPhase::ParsePages);
+  EXPECT_EQ(actual.resumePhase, PdfBuildResumePhase::AfterPage);
   EXPECT_EQ(actual.lastVerifiedPage, 98u);
   EXPECT_EQ(actual.lastVerifiedObject, 301u);
   EXPECT_EQ(actual.emittedSections, 7u);
@@ -269,24 +370,45 @@ TEST(PdfCacheCodec, CheckpointRoundTripsAndRejectsEveryTruncatedPrefix) {
   EXPECT_EQ(actual.cumulativeWords, 12345u);
   EXPECT_EQ(actual.outputBytes, 987654u);
   EXPECT_EQ(actual.warningFlags, 5u);
+  EXPECT_EQ(actual.journalBytes, 1536u);
+  EXPECT_EQ(encoded.bytes[4], PDF_BUILD_CHECKPOINT_CODEC_VERSION);
+  EXPECT_EQ(encoded.bytes[5], 0U);
   EXPECT_EQ(encoded.bytes[8], 0xff);
   EXPECT_EQ(encoded.bytes[9], 0xff);
   EXPECT_EQ(encoded.bytes[10], 0xff);
   EXPECT_EQ(encoded.bytes[11], 0xff);
 
+  PdfBuildCheckpoint ignored{};
   for (const size_t offset : {size_t{0}, size_t{4}}) {
     std::vector<uint8_t> invalidField = encoded.bytes;
     invalidField[offset] ^= 1;
     rewriteTrailingCrc(&invalidField);
     VectorSource invalidInput{&invalidField};
-    PdfBuildCheckpoint ignored{};
     EXPECT_FALSE(pdfDecodeBuildCheckpoint(invalidInput.source(), &ignored).ok()) << "field=" << offset;
   }
+  std::vector<uint8_t> oldCodec = encoded.bytes;
+  oldCodec[4] = 1;
+  oldCodec[5] = 0;
+  rewriteTrailingCrc(&oldCodec);
+  VectorSource oldCodecInput{&oldCodec};
+  EXPECT_FALSE(pdfDecodeBuildCheckpoint(oldCodecInput.source(), &ignored).ok());
+
+  std::vector<uint8_t> zeroResumeCursor = encoded.bytes;
+  writeLe32(&zeroResumeCursor, 56, 0);
+  rewriteTrailingCrc(&zeroResumeCursor);
+  VectorSource zeroResumeCursorInput{&zeroResumeCursor};
+  EXPECT_FALSE(pdfDecodeBuildCheckpoint(zeroResumeCursorInput.source(), &ignored).ok());
+
+  std::vector<uint8_t> invalidResumePhase = encoded.bytes;
+  invalidResumePhase[53] = 0xff;
+  rewriteTrailingCrc(&invalidResumePhase);
+  VectorSource invalidResumePhaseInput{&invalidResumePhase};
+  EXPECT_FALSE(pdfDecodeBuildCheckpoint(invalidResumePhaseInput.source(), &ignored).ok());
+
   std::vector<uint8_t> invalidLength = encoded.bytes;
   writeLe32(&invalidLength, invalidLength.size() - 8, 95);
   rewriteTrailingCrc(&invalidLength);
   VectorSource invalidLengthInput{&invalidLength};
-  PdfBuildCheckpoint ignored{};
   EXPECT_FALSE(pdfDecodeBuildCheckpoint(invalidLengthInput.source(), &ignored).ok());
 
   for (size_t length = 0; length < encoded.bytes.size(); ++length) {
@@ -302,6 +424,14 @@ TEST(PdfSourceIdentity, StablePathHashMatchesEpubFnv64) {
   char root[PDF_CACHE_PATH_CAPACITY]{};
   ASSERT_TRUE(pdfFormatCacheRoot("/.crosspoint", "/Books/Test.pdf", root, sizeof(root)));
   EXPECT_STREQ(root, "/.crosspoint/pdf_8989207754416008753");
+}
+
+TEST(PdfSourceIdentity, FormatsCallerSuppliedMigrationHashWithoutRehashingSourcePath) {
+  char root[PDF_CACHE_PATH_CAPACITY]{};
+
+  ASSERT_TRUE(pdfFormatCacheRootForHash("/.crosspoint", 42, root, sizeof(root)));
+
+  EXPECT_STREQ(root, "/.crosspoint/pdf_42");
 }
 
 TEST(PdfSourceIdentity, UsesOneHandleAndAtMostTwoReadsAtBoundaries) {

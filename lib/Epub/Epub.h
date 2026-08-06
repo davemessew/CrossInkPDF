@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -65,6 +66,13 @@ class Epub : public ReflowDocument {
   const char* getStoreFormatKey() const override;
   ReflowCapabilitySet getCapabilities() const override;
   static std::string cachePathForFilePath(const std::string& filepath, const std::string& cacheDir);
+  // Directory-delete replay already owns the source path. Build the two legacy
+  // cache filenames in bounded stack buffers so replay does not copy that path.
+  static bool clearCacheForFilePathNoPathAlloc(std::string_view filepath, const char* cacheDir);
+#if defined(CROSSINK_PRODUCTION_TEST_SEAMS)
+  static bool formatCachePathForTest(char* output, size_t capacity, const char* cacheDir,
+                                     uint64_t hash);
+#endif
   // True when a metadata cache already exists for this book, i.e. load() will
   // hit the fast path instead of rebuilding. Cheap: no parsing, just a stat.
   static bool hasCache(const std::string& filepath, const std::string& cacheDir);
@@ -137,6 +145,7 @@ class Epub : public ReflowDocument {
   bool getResourceSize(int sectionIndex, const std::string& href, size_t* size) const override;
 
   int getSectionCount() const override;
+  bool getSectionHref(int sectionIndex, std::string& href) const override;
   ReflowSectionInfo getSectionInfo(int sectionIndex) const override;
   bool getSectionSize(int sectionIndex, size_t* size) const override;
   size_t getCumulativeSectionSize(int sectionIndex) const override;

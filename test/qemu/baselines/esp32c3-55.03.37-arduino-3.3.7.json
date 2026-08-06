@@ -1,12 +1,11 @@
 {
   "limits": {
     "allocation": 32768,
-    "free_heap": 65536,
-    "largest_block": 49152,
+    "free_heap": 45056,
+    "largest_block": 40960,
     "pdf_heap": 81920,
     "stack_margin": 1024,
-    "static_dram": 12288,
-    "text": 262144
+    "static_dram": 12288
   },
   "measurements": {
     "code_rodata": 5376104,
@@ -49,7 +48,7 @@
     "partition_sha256": "98e02c50532c388d85cc3b7c96d004142dc713b23368d293c881ecdcb419e44e",
     "platform": "55.03.37",
     "qemu_config_sha256": "a0a5a2d3058dffc67eef72b6052dc18ea725605b4a04cc0b50909cb867a76c93",
-    "qemu_hal_sha256": "735d97386ca377d472c32f8e03d987b753ef736262869e359507d4da628bbea1",
+    "qemu_hal_sha256": "5de8c754015dffb3a8bae3032c2ed0bfb989161b6ebd23247b00378ea9f0198d",
     "toolchain": "14.2.0+20251107"
   },
   "schema_version": 1

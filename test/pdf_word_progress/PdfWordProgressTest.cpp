@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "PdfCacheFormat.h"
@@ -49,6 +50,23 @@ void putU32(std::vector<uint8_t>& bytes, const size_t offset, const uint32_t val
   bytes[offset + 3] = static_cast<uint8_t>(value >> 24U);
 }
 
+void putU16(std::vector<uint8_t>& bytes, const size_t offset, const uint16_t value) {
+  ASSERT_LE(offset + sizeof(uint16_t), bytes.size());
+  bytes[offset] = static_cast<uint8_t>(value);
+  bytes[offset + 1] = static_cast<uint8_t>(value >> 8U);
+}
+
+uint16_t getU16(const std::vector<uint8_t>& bytes, const size_t offset) {
+  EXPECT_LE(offset + sizeof(uint16_t), bytes.size());
+  return static_cast<uint16_t>(bytes[offset]) | static_cast<uint16_t>(bytes[offset + 1]) << 8U;
+}
+
+uint32_t getU32(const std::vector<uint8_t>& bytes, const size_t offset) {
+  EXPECT_LE(offset + sizeof(uint32_t), bytes.size());
+  return static_cast<uint32_t>(bytes[offset]) | static_cast<uint32_t>(bytes[offset + 1]) << 8U |
+         static_cast<uint32_t>(bytes[offset + 2]) << 16U | static_cast<uint32_t>(bytes[offset + 3]) << 24U;
+}
+
 void repairRecordAndAggregateCrc(std::vector<uint8_t>& bytes) {
   ASSERT_GE(bytes.size(), PDF_LAYOUT_WORD_INDEX_HEADER_BYTES + PDF_LAYOUT_WORD_INDEX_FOOTER_BYTES);
   const size_t recordBytes = bytes.size() - PDF_LAYOUT_WORD_INDEX_HEADER_BYTES - PDF_LAYOUT_WORD_INDEX_FOOTER_BYTES;
@@ -56,7 +74,7 @@ void repairRecordAndAggregateCrc(std::vector<uint8_t>& bytes) {
   uint32_t aggregate = pdfCacheCrc32(bytes.data(), PDF_LAYOUT_WORD_INDEX_HEADER_BYTES);
   for (size_t offset = PDF_LAYOUT_WORD_INDEX_HEADER_BYTES; offset < PDF_LAYOUT_WORD_INDEX_HEADER_BYTES + recordBytes;
        offset += PDF_LAYOUT_WORD_INDEX_RECORD_BYTES) {
-    putU32(bytes, offset + 28,
+    putU32(bytes, offset + 36,
            pdfCacheCrc32(bytes.data() + offset, PDF_LAYOUT_WORD_INDEX_RECORD_BYTES - sizeof(uint32_t)));
     aggregate = pdfCacheCrc32(bytes.data() + offset, PDF_LAYOUT_WORD_INDEX_RECORD_BYTES - sizeof(uint32_t), aggregate);
   }
@@ -71,7 +89,11 @@ class CountingByteSource {
 
   PdfByteSource source() { return {this, bytes_.size(), readAt}; }
   uint32_t readCount() const { return readCount_; }
-  void resetReadCount() { readCount_ = 0; }
+  const std::vector<std::pair<uint64_t, size_t>>& reads() const { return reads_; }
+  void resetReadCount() {
+    readCount_ = 0;
+    reads_.clear();
+  }
 
  private:
   static PdfStatus readAt(void* context, const uint64_t offset, uint8_t* destination, const size_t requested,
@@ -81,6 +103,7 @@ class CountingByteSource {
     }
     auto& source = *static_cast<CountingByteSource*>(context);
     ++source.readCount_;
+    source.reads_.emplace_back(offset, requested);
     if (offset > source.bytes_.size()) {
       return PdfStatus::failure(PdfError::InvalidOffset, offset);
     }
@@ -92,7 +115,69 @@ class CountingByteSource {
 
   std::vector<uint8_t> bytes_;
   uint32_t readCount_ = 0;
+  std::vector<std::pair<uint64_t, size_t>> reads_;
 };
+
+class MutableByteFile {
+ public:
+  explicit MutableByteFile(std::vector<uint8_t> bytes) : bytes_(std::move(bytes)) {}
+
+  PdfByteSource source() { return {this, bytes_.size(), readAt}; }
+  PdfLayoutWordIndexPatchSink patch() { return {this, writeAt}; }
+  const std::vector<uint8_t>& bytes() const { return bytes_; }
+
+ private:
+  static PdfStatus readAt(void* context, const uint64_t offset, uint8_t* destination, const size_t requested,
+                          size_t* bytesRead) {
+    if (context == nullptr || destination == nullptr || bytesRead == nullptr ||
+        offset > static_cast<MutableByteFile*>(context)->bytes_.size()) {
+      return PdfStatus::failure(PdfError::InvalidArgument, offset);
+    }
+    auto& file = *static_cast<MutableByteFile*>(context);
+    const size_t count = std::min(requested, file.bytes_.size() - static_cast<size_t>(offset));
+    std::memcpy(destination, file.bytes_.data() + static_cast<size_t>(offset), count);
+    *bytesRead = count;
+    return PdfStatus::success();
+  }
+
+  static PdfStatus writeAt(void* context, const uint64_t offset, const uint8_t* source, const size_t requested,
+                           size_t* bytesWritten) {
+    if (context == nullptr || source == nullptr || bytesWritten == nullptr ||
+        offset > static_cast<MutableByteFile*>(context)->bytes_.size() ||
+        requested > static_cast<MutableByteFile*>(context)->bytes_.size() - static_cast<size_t>(offset)) {
+      return PdfStatus::failure(PdfError::InvalidArgument, offset);
+    }
+    auto& file = *static_cast<MutableByteFile*>(context);
+    std::memcpy(file.bytes_.data() + static_cast<size_t>(offset), source, requested);
+    *bytesWritten = requested;
+    return PdfStatus::success();
+  }
+
+  std::vector<uint8_t> bytes_;
+};
+
+size_t requestedBytes(const CountingByteSource& source) {
+  size_t total = 0;
+  for (const auto& read : source.reads()) {
+    total += read.second;
+  }
+  return total;
+}
+
+std::vector<uint8_t> finalizedSectionCache(std::vector<uint8_t> bytes, const uint32_t pairToken) {
+  constexpr size_t kBindingTrailerBytes = 16;
+  EXPECT_FALSE(bytes.empty());
+  EXPECT_NE(pairToken, 0U);
+  EXPECT_LE(bytes.size(), UINT32_MAX);
+  const uint32_t contentLength = static_cast<uint32_t>(bytes.size());
+  const size_t trailer = bytes.size();
+  bytes.resize(bytes.size() + kBindingTrailerBytes, 0);
+  std::memcpy(bytes.data() + trailer, "PWIB", 4);
+  putU32(bytes, trailer + 4, contentLength);
+  putU32(bytes, trailer + 8, pairToken);
+  putU32(bytes, trailer + 12, pdfCacheCrc32(bytes.data() + trailer, 12));
+  return bytes;
+}
 
 TEST(PdfLayoutWordIndexTest, StoresExactKnownPageOrdinalsAndFindsTheirPages) {
   PdfTestByteSink sink;
@@ -165,7 +250,7 @@ TEST(PdfLayoutWordIndexTest, AggregateFooterRejectsRecordWhoseLocalCrcWasRepaire
   std::vector<uint8_t> aggregateMismatch = sink.bytes();
   const size_t secondRecord = PDF_LAYOUT_WORD_INDEX_HEADER_BYTES + PDF_LAYOUT_WORD_INDEX_RECORD_BYTES;
   aggregateMismatch[secondRecord + 12] ^= 0x01U;
-  putU32(aggregateMismatch, secondRecord + 28,
+  putU32(aggregateMismatch, secondRecord + 36,
          pdfCacheCrc32(aggregateMismatch.data() + secondRecord, PDF_LAYOUT_WORD_INDEX_RECORD_BYTES - sizeof(uint32_t)));
 
   PdfLayoutWordIndexInfo info;
@@ -381,6 +466,60 @@ TEST(PdfLayoutWordIndexTest, ReadsFourPageWindowsAndSearchesInFourRecordBatches)
   EXPECT_EQ(source.readCount(), 4U);
 }
 
+TEST(PdfLayoutWordIndexTest, ReadsValidatedPageRecordsInOneBoundedFourRecordIo) {
+  PdfTestByteSink sink;
+  PdfLayoutWordIndexWriter writer;
+  ASSERT_TRUE(writer.begin(sink.sink(), 0, 0, 4));
+  for (uint32_t ordinal = 0; ordinal < 4; ++ordinal) {
+    ASSERT_TRUE(writer.append(range(ordinal, ordinal, ordinal, "b00000000"),
+                              PdfLayoutPageRecord{ordinal + 1U, static_cast<uint16_t>(ordinal),
+                                                  static_cast<uint16_t>(ordinal + 10U)}));
+  }
+  ASSERT_TRUE(writer.finish());
+
+  CountingByteSource source(sink.bytes());
+  PdfLayoutWordIndexInfo info;
+  ASSERT_TRUE(pdfInspectLayoutWordIndex(source.source(), &info));
+  source.resetReadCount();
+
+  PdfLayoutPageRecord pages[4];
+  ASSERT_TRUE(pdfReadValidatedLayoutPageRecords(source.source(), info, 0, 4, pages));
+  EXPECT_EQ(source.readCount(), 1U);
+  EXPECT_EQ(source.reads(), (std::vector<std::pair<uint64_t, size_t>>{{PDF_LAYOUT_WORD_INDEX_HEADER_BYTES, 160}}));
+  EXPECT_EQ(pages[3].fileOffset, 4U);
+
+  source.resetReadCount();
+  EXPECT_EQ(pdfReadValidatedLayoutPageRecords(source.source(), info, 0, 5, pages).error,
+            PdfError::InvalidArgument);
+  EXPECT_EQ(source.readCount(), 0U);
+  EXPECT_TRUE(source.reads().empty());
+}
+
+TEST(PdfLayoutWordIndexTest, NinePageInspectAndThreeFieldReplayUseExactlyFourteenReads) {
+  constexpr uint16_t pageCount = 9;
+  PdfTestByteSink sink;
+  PdfLayoutWordIndexWriter writer;
+  ASSERT_TRUE(writer.begin(sink.sink(), 0, 0, pageCount));
+  for (uint32_t ordinal = 0; ordinal < pageCount; ++ordinal) {
+    ASSERT_TRUE(writer.append(range(ordinal, ordinal, ordinal, "b00000000"),
+                              PdfLayoutPageRecord{ordinal + 1U, static_cast<uint16_t>(ordinal),
+                                                  static_cast<uint16_t>(ordinal + 10U)}));
+  }
+  ASSERT_TRUE(writer.finish());
+
+  CountingByteSource source(sink.bytes());
+  PdfLayoutWordIndexInfo info;
+  ASSERT_TRUE(pdfInspectLayoutWordIndex(source.source(), &info));
+  PdfLayoutPageRecord pages[4];
+  for (uint8_t field = 0; field < 3; ++field) {
+    for (uint16_t first = 0; first < pageCount; first = static_cast<uint16_t>(first + 4U)) {
+      const uint16_t count = std::min<uint16_t>(4, static_cast<uint16_t>(pageCount - first));
+      ASSERT_TRUE(pdfReadValidatedLayoutPageRecords(source.source(), info, first, count, pages));
+    }
+  }
+  EXPECT_EQ(source.readCount(), 14U);
+}
+
 TEST(PdfLayoutWordIndexTest, CalculatesExactStartMiddleAndFinalWordProgress) {
   float progress = -1.0F;
   EXPECT_FALSE(pdfCalculateWordProgress(0, 0, &progress));
@@ -424,6 +563,214 @@ TEST(PdfLayoutWordIndexTest, RelayoutChangesPageIndexButPreservesSemanticPositio
   ASSERT_TRUE(pdfFindLayoutPage(largeFontBytes.source(), 3, &largeFontPage));
   EXPECT_EQ(compactPage, 0);
   EXPECT_EQ(largeFontPage, 1);
+}
+
+TEST(PdfLayoutWordIndexTest, VersionThreeGoldenRecordPreservesSemanticPayloadAndAddsPageLocation) {
+  PdfTestByteSink sink;
+  PdfLayoutWordIndexWriter writer;
+  ASSERT_TRUE(writer.begin(sink.sink(), 7, 100, 2));
+  const PdfLayoutPageRecord location{0x12345678U, 0x2345U, 0x3456U};
+  ASSERT_TRUE(writer.append(range(100, 101, 9, "b00000007"), location));
+  ASSERT_TRUE(writer.finish());
+
+  const std::vector<uint8_t>& bytes = sink.bytes();
+  ASSERT_EQ(bytes.size(), PDF_LAYOUT_WORD_INDEX_HEADER_BYTES + PDF_LAYOUT_WORD_INDEX_RECORD_BYTES +
+                              PDF_LAYOUT_WORD_INDEX_FOOTER_BYTES);
+  EXPECT_EQ(getU16(bytes, 4), 3U);
+  EXPECT_EQ(getU16(bytes, 10), 40U);
+  const size_t record = PDF_LAYOUT_WORD_INDEX_HEADER_BYTES;
+  EXPECT_EQ(getU32(bytes, record), 100U);
+  EXPECT_EQ(getU32(bytes, record + 4), 101U);
+  EXPECT_EQ(getU32(bytes, record + 8), 9U);
+  EXPECT_EQ(std::memcmp(bytes.data() + record + 12, "b00000007", 9), 0);
+  EXPECT_EQ(bytes[record + 22], 1U);
+  EXPECT_EQ(bytes[record + 23], 9U);
+  EXPECT_EQ(getU32(bytes, record + 24), 0U);
+  EXPECT_EQ(getU32(bytes, record + 28), location.fileOffset);
+  EXPECT_EQ(getU16(bytes, record + 32), location.paragraphIndex);
+  EXPECT_EQ(getU16(bytes, record + 34), location.listItemIndex);
+  EXPECT_EQ(getU32(bytes, record + 36), pdfCacheCrc32(bytes.data() + record, 36));
+
+  PdfTestByteSource source(bytes);
+  PdfLayoutWordIndexInfo info;
+  ASSERT_TRUE(pdfInspectLayoutWordIndex(source.source(), &info));
+  PdfLayoutPageRecord decoded;
+  ASSERT_TRUE(pdfReadValidatedLayoutPageRecords(source.source(), info, 0, 1, &decoded));
+  EXPECT_EQ(decoded.fileOffset, location.fileOffset);
+  EXPECT_EQ(decoded.paragraphIndex, location.paragraphIndex);
+  EXPECT_EQ(decoded.listItemIndex, location.listItemIndex);
+}
+
+TEST(PdfLayoutWordIndexTest, BindsSidecarToExactSameLengthSectionCacheAndRejectsCrossPair) {
+  PdfTestByteSink sink;
+  PdfLayoutWordIndexWriter writer;
+  ASSERT_TRUE(writer.begin(sink.sink(), 7, 100, 2));
+  ASSERT_TRUE(writer.append(range(100, 101, 9, "b00000007"), PdfLayoutPageRecord{123, 4, 5}));
+  ASSERT_TRUE(writer.finish());
+
+  MutableByteFile sidecar(sink.bytes());
+  const std::vector<uint8_t> oldSection = finalizedSectionCache({44, 1, 2, 3, 4, 5, 6, 7}, 0x11223344U);
+  const std::vector<uint8_t> newSection = finalizedSectionCache({44, 1, 2, 3, 4, 5, 6, 8}, 0x55667788U);
+  PdfTestByteSource oldSource(oldSection);
+  PdfTestByteSource newSource(newSection);
+  PdfLayoutCacheBinding oldBinding;
+  PdfLayoutCacheBinding newBinding;
+  ASSERT_TRUE(pdfComputeLayoutCacheBinding(oldSource.source(), &oldBinding));
+  ASSERT_TRUE(pdfComputeLayoutCacheBinding(newSource.source(), &newBinding));
+  ASSERT_EQ(oldBinding.length, newBinding.length);
+  ASSERT_NE(oldBinding.token, newBinding.token);
+
+  ASSERT_TRUE(pdfBindLayoutWordIndex(sidecar.source(), sidecar.patch(), oldBinding));
+  PdfLayoutWordIndexInfo info;
+  ASSERT_TRUE(pdfInspectLayoutWordIndex(sidecar.source(), &info));
+  EXPECT_TRUE(pdfLayoutWordIndexMatchesSectionCache(info, oldBinding));
+  EXPECT_FALSE(pdfLayoutWordIndexMatchesSectionCache(info, newBinding));
+  EXPECT_EQ(info.sectionCacheLength, oldSection.size() - PDF_LAYOUT_CACHE_BINDING_TRAILER_BYTES);
+  EXPECT_EQ(info.sectionCacheToken, oldBinding.token);
+}
+
+TEST(PdfLayoutWordIndexTest, ComputesSectionBindingWithConstantSeekReadBudgetIndependentOfCacheLength) {
+  // Each PdfByteSource read maps one-to-one to HalFile::seek64 + read on the
+  // device. A section reopen must therefore use a fixed I/O budget rather than
+  // walking the complete layout cache in small blocks.
+  std::vector<uint8_t> smallBytes(4U * 1024U);
+  std::vector<uint8_t> largeBytes(1024U * 1024U);
+  for (size_t index = 0; index < smallBytes.size(); ++index) {
+    smallBytes[index] = static_cast<uint8_t>((index * 29U + 7U) & 0xffU);
+  }
+  for (size_t index = 0; index < largeBytes.size(); ++index) {
+    largeBytes[index] = static_cast<uint8_t>((index * 31U + 11U) & 0xffU);
+  }
+
+  smallBytes = finalizedSectionCache(std::move(smallBytes), 0x10203040U);
+  largeBytes = finalizedSectionCache(std::move(largeBytes), 0x50607080U);
+
+  CountingByteSource small(smallBytes);
+  CountingByteSource large(largeBytes);
+  PdfLayoutCacheBinding smallBinding;
+  PdfLayoutCacheBinding largeBinding;
+  ASSERT_TRUE(pdfComputeLayoutCacheBinding(small.source(), &smallBinding));
+  ASSERT_TRUE(pdfComputeLayoutCacheBinding(large.source(), &largeBinding));
+
+  constexpr uint32_t kExpectedReads = 1;
+  constexpr size_t kExpectedBytes = 16;
+  EXPECT_EQ(small.readCount(), kExpectedReads);
+  EXPECT_EQ(large.readCount(), kExpectedReads);
+  EXPECT_EQ(small.readCount(), large.readCount());
+  EXPECT_EQ(requestedBytes(small), kExpectedBytes);
+  EXPECT_EQ(requestedBytes(large), kExpectedBytes);
+  ASSERT_FALSE(small.reads().empty());
+  ASSERT_FALSE(large.reads().empty());
+  EXPECT_EQ(small.reads().front().first, smallBytes.size() - kExpectedBytes);
+  EXPECT_EQ(large.reads().front().first, largeBytes.size() - kExpectedBytes);
+}
+
+TEST(PdfLayoutWordIndexTest, RejectsMissingTruncatedCorruptAndZeroTokenBindingTrailers) {
+  const std::vector<uint8_t> prefix = {44, 1, 2, 3, 4, 5, 6, 7};
+  PdfLayoutCacheBinding binding;
+
+  PdfTestByteSource missing(prefix);
+  EXPECT_FALSE(pdfComputeLayoutCacheBinding(missing.source(), &binding));
+
+  std::vector<uint8_t> truncated = finalizedSectionCache(prefix, 0x11223344U);
+  truncated.pop_back();
+  PdfTestByteSource truncatedSource(truncated);
+  EXPECT_FALSE(pdfComputeLayoutCacheBinding(truncatedSource.source(), &binding));
+
+  std::vector<uint8_t> corrupt = finalizedSectionCache(prefix, 0x11223344U);
+  corrupt.back() ^= 0x80U;
+  PdfTestByteSource corruptSource(corrupt);
+  EXPECT_FALSE(pdfComputeLayoutCacheBinding(corruptSource.source(), &binding));
+
+  std::vector<uint8_t> zeroToken = finalizedSectionCache(prefix, 0x11223344U);
+  const size_t trailer = zeroToken.size() - PDF_LAYOUT_CACHE_BINDING_TRAILER_BYTES;
+  putU32(zeroToken, trailer + 8, 0);
+  putU32(zeroToken, trailer + 12, pdfCacheCrc32(zeroToken.data() + trailer, 12));
+  PdfTestByteSource zeroTokenSource(zeroToken);
+  EXPECT_FALSE(pdfComputeLayoutCacheBinding(zeroTokenSource.source(), &binding));
+}
+
+TEST(PdfLayoutWordIndexTest, RejectsPriorVersionTwoSidecarEvenWhenItsChecksumsAreRepaired) {
+  PdfTestByteSink sink;
+  PdfLayoutWordIndexWriter writer;
+  ASSERT_TRUE(writer.begin(sink.sink(), 0, 0, 1));
+  ASSERT_TRUE(writer.append(range(0, 0, 0, "b00000000")));
+  ASSERT_TRUE(writer.finish());
+
+  std::vector<uint8_t> versionTwo = sink.bytes();
+  putU16(versionTwo, 4, 2);
+  putU32(versionTwo, 28, pdfCacheCrc32(versionTwo.data(), 28));
+  repairRecordAndAggregateCrc(versionTwo);
+  PdfTestByteSource source(versionTwo);
+  PdfLayoutWordIndexInfo info;
+  EXPECT_EQ(pdfInspectLayoutWordIndex(source.source(), &info).error, PdfError::Malformed);
+}
+
+TEST(PdfLayoutWordIndexTest, RejectsVersionOneTruncationCountCrcAndNonmonotonicLocations) {
+  PdfTestByteSink sink;
+  PdfLayoutWordIndexWriter writer;
+  ASSERT_TRUE(writer.begin(sink.sink(), 0, 0, 2));
+  ASSERT_TRUE(writer.append(range(0, 0, 0, "b00000000"), PdfLayoutPageRecord{100, 3, 4}));
+  ASSERT_TRUE(writer.append(range(1, 1, 0, "b00000001"), PdfLayoutPageRecord{200, 5, 6}));
+  ASSERT_TRUE(writer.finish());
+  PdfLayoutWordIndexInfo info;
+
+  std::vector<uint8_t> versionOne = sink.bytes();
+  versionOne[4] = 1;
+  versionOne[5] = 0;
+  putU32(versionOne, 28, pdfCacheCrc32(versionOne.data(), 28));
+  PdfTestByteSource versionOneSource(versionOne);
+  EXPECT_EQ(pdfInspectLayoutWordIndex(versionOneSource.source(), &info).error, PdfError::Malformed);
+
+  std::vector<uint8_t> truncated = sink.bytes();
+  truncated.pop_back();
+  PdfTestByteSource truncatedSource(truncated);
+  EXPECT_FALSE(pdfInspectLayoutWordIndex(truncatedSource.source(), &info));
+
+  std::vector<uint8_t> badCount = sink.bytes();
+  const size_t footer = badCount.size() - PDF_LAYOUT_WORD_INDEX_FOOTER_BYTES;
+  badCount[footer + 4] = 3;
+  putU32(badCount, footer + 12, pdfCacheCrc32(badCount.data() + footer, 12));
+  PdfTestByteSource badCountSource(badCount);
+  EXPECT_EQ(pdfInspectLayoutWordIndex(badCountSource.source(), &info).error, PdfError::Malformed);
+
+  std::vector<uint8_t> badLocalCrc = sink.bytes();
+  badLocalCrc[PDF_LAYOUT_WORD_INDEX_HEADER_BYTES + 28] ^= 1U;
+  PdfTestByteSource badLocalCrcSource(badLocalCrc);
+  EXPECT_EQ(pdfInspectLayoutWordIndex(badLocalCrcSource.source(), &info).error, PdfError::Malformed);
+
+  std::vector<uint8_t> nonmonotonic = sink.bytes();
+  const size_t second = PDF_LAYOUT_WORD_INDEX_HEADER_BYTES + PDF_LAYOUT_WORD_INDEX_RECORD_BYTES;
+  putU32(nonmonotonic, second + 28, 100);
+  putU32(nonmonotonic, second + 36, pdfCacheCrc32(nonmonotonic.data() + second, 36));
+  uint32_t aggregate = pdfCacheCrc32(nonmonotonic.data(), PDF_LAYOUT_WORD_INDEX_HEADER_BYTES);
+  aggregate = pdfCacheCrc32(nonmonotonic.data() + PDF_LAYOUT_WORD_INDEX_HEADER_BYTES, 36, aggregate);
+  aggregate = pdfCacheCrc32(nonmonotonic.data() + second, 36, aggregate);
+  putU32(nonmonotonic, footer + 8, aggregate);
+  putU32(nonmonotonic, footer + 12, pdfCacheCrc32(nonmonotonic.data() + footer, 12));
+  PdfTestByteSource nonmonotonicSource(nonmonotonic);
+  EXPECT_EQ(pdfInspectLayoutWordIndex(nonmonotonicSource.source(), &info).error, PdfError::Malformed);
+}
+
+TEST(PdfLayoutWordIndexTest, SupportsMoreThanTheFormerOneThousandTwentyFourPageHeapBoundary) {
+  constexpr uint16_t pageCount = 1025;
+  PdfTestByteSink sink;
+  PdfLayoutWordIndexWriter writer;
+  ASSERT_TRUE(writer.begin(sink.sink(), 0, 0, 0));
+  for (uint16_t page = 0; page < pageCount; ++page) {
+    ASSERT_TRUE(writer.append(PdfLayoutWordRange{}, PdfLayoutPageRecord{static_cast<uint32_t>(page + 1U), page,
+                                                                       static_cast<uint16_t>(page + 7U)}));
+  }
+  ASSERT_TRUE(writer.finish());
+  PdfTestByteSource source(sink.bytes());
+  PdfLayoutWordIndexInfo info;
+  ASSERT_TRUE(pdfInspectLayoutWordIndex(source.source(), &info));
+  EXPECT_EQ(info.pageCount, pageCount);
+  PdfLayoutPageRecord decoded[4];
+  ASSERT_TRUE(pdfReadValidatedLayoutPageRecords(source.source(), info, 1021, 4, decoded));
+  EXPECT_EQ(decoded[3].fileOffset, 1025U);
+  EXPECT_EQ(decoded[3].paragraphIndex, 1024U);
+  EXPECT_EQ(decoded[3].listItemIndex, 1031U);
 }
 
 TEST(PdfProgressStoreTest, AlternatesPowerSafeSlotsAndLoadsExactSemanticPosition) {

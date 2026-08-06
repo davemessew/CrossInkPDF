@@ -25,6 +25,10 @@ EFUSE_REVISION_BYTE_VALUE = 0x0C
 ESP_IDF_EFUSE_SOURCE = "esp-idf-v5.5.2/tools/idf_py_actions/qemu_ext.py"
 PDF_FIXTURE_RELATIVE_PATH = Path("qemu") / "classic_text.pdf"
 PDF_NAVIGATION_FIXTURE_RELATIVE_PATH = Path("qemu") / "navigation_outline.pdf"
+PDF_POSITIVE_FIXTURE_RELATIVE_PATHS = tuple(
+    Path("qemu") / name
+    for name in ("hidden_ocr.pdf", "columns_table.pdf", "jpeg_caption.pdf")
+)
 
 
 def validate_flash_layout(
@@ -271,6 +275,8 @@ def _write_manifest(
     fixture_bytes: int,
     pdf_fixture_sha256: str,
     pdf_navigation_fixture_sha256: str,
+    positive_pdf_fixture_sha256: dict[str, str],
+    elf: Path,
 ) -> None:
     project_dir = Path(env.subst("$PROJECT_DIR")).resolve()
     fingerprint, tools = _resource_fingerprint(env, project_dir)
@@ -307,8 +313,16 @@ def _write_manifest(
             "writable_headroom": MIN_WRITABLE_HEADROOM,
             "pdf_fixture_sha256": pdf_fixture_sha256,
             "pdf_navigation_fixture_sha256": pdf_navigation_fixture_sha256,
+            "positive_pdf_fixture_sha256": positive_pdf_fixture_sha256,
         },
         "images": images,
+        "artifacts": {
+            "elf": {
+                "path": str(elf.resolve()),
+                "sha256": _sha256_file(elf),
+                "size": elf.stat().st_size,
+            }
+        },
         "resource_fingerprint": fingerprint,
         "tools": tools,
     }
@@ -324,6 +338,7 @@ def _build_qemu_images(target: Any, source: Any, env: Any) -> int:
     manifest_path = Path(str(target[2])).resolve()
     firmware = Path(str(source[0])).resolve()
     filesystem = Path(str(source[1])).resolve()
+    elf = Path(str(source[2])).resolve()
     fixtures = Path(env.subst("$PROJECT_DIR/test/qemu/data")).resolve()
     canonical_pdf = Path(
         env.subst(
@@ -335,6 +350,9 @@ def _build_qemu_images(target: Any, source: Any, env: Any) -> int:
             "$PROJECT_DIR/test/pdf_reflow_core/fixtures/navigation_outline.pdf"
         )
     ).resolve()
+    canonical_pdf_fixtures = Path(
+        env.subst("$PROJECT_DIR/test/pdf_reflow_core/fixtures")
+    ).resolve()
 
     try:
         pdf_fixture_sha256 = verify_pdf_fixture(
@@ -344,6 +362,12 @@ def _build_qemu_images(target: Any, source: Any, env: Any) -> int:
             canonical_navigation_pdf,
             fixtures / PDF_NAVIGATION_FIXTURE_RELATIVE_PATH,
         )
+        positive_pdf_fixture_sha256: dict[str, str] = {}
+        for relative_path in PDF_POSITIVE_FIXTURE_RELATIVE_PATHS:
+            positive_pdf_fixture_sha256[relative_path.name] = verify_pdf_fixture(
+                canonical_pdf_fixtures / relative_path.name,
+                fixtures / relative_path,
+            )
         fixture_bytes = verify_fixture_headroom(fixtures)
         entries = _flash_entries_from_environment(
             env, firmware, filesystem
@@ -379,6 +403,8 @@ def _build_qemu_images(target: Any, source: Any, env: Any) -> int:
             fixture_bytes,
             pdf_fixture_sha256,
             pdf_navigation_fixture_sha256,
+            positive_pdf_fixture_sha256,
+            elf,
         )
     except (OSError, RuntimeError, ValueError) as error:
         sys.stderr.write(f"QEMU image build failed: {error}\n")
@@ -388,6 +414,7 @@ def _build_qemu_images(target: Any, source: Any, env: Any) -> int:
 
 def register_qemu_image_target(env: Any) -> None:
     firmware = env.File("$BUILD_DIR/${PROGNAME}.bin")
+    elf = env.File("$BUILD_DIR/${PROGNAME}.elf")
     filesystem = env.DataToBin("$BUILD_DIR/qemu-data", "$PROJECT_DIR/test/qemu/data")
     outputs = env.Command(
         [
@@ -395,7 +422,7 @@ def register_qemu_image_target(env: Any) -> None:
             "$BUILD_DIR/qemu_efuse.bin",
             "$BUILD_DIR/qemu_manifest.json",
         ],
-        [firmware, filesystem],
+        [firmware, filesystem, elf],
         env.VerboseAction(_build_qemu_images, "Building ESP32-C3 QEMU image"),
     )
     env.AddCustomTarget(

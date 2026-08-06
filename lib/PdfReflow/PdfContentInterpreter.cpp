@@ -96,6 +96,8 @@ bool fixedFromProductRatio(const PdfFixed16 value, const int32_t multiplier, con
 }
 
 constexpr int32_t kPdfColorOne = 65536L;
+constexpr uint8_t kMarkedContentEmitted = 1U << 0;
+constexpr uint8_t kMarkedContentSuppressed = 1U << 1;
 
 int32_t clampColor(const int32_t raw) {
   if (raw <= 0) {
@@ -232,6 +234,10 @@ PdfStatus PdfContentInterpreter::begin(const PdfByteSource* const contentSources
   pageModel_ = &pageModel;
   lexer_.setSource(currentSource_);
   graphics_ = {};
+  if (workspace_.hasPageBounds) {
+    graphics_.clip = workspace_.pageBounds;
+    graphics_.hasClip = true;
+  }
   text_ = {};
   failure_ = {};
   phase_ = Phase::Tokens;
@@ -256,6 +262,7 @@ PdfStatus PdfContentInterpreter::begin(const PdfByteSource* const contentSources
   dictionaryCapturingActualText_ = false;
   dictionaryHasActualText_ = false;
   inlineDictionary_ = false;
+  resetCurrentPath();
   return PdfStatus::success();
 }
 
@@ -281,14 +288,28 @@ PdfStepResult PdfContentInterpreter::step(PdfWorkBudget& budget) {
   }
   while (budget.operationsRemaining != 0 && budget.bytesRemaining != 0 && !budget.stopRequested()) {
     if (phase_ == Phase::InlineImageData) {
-      const PdfStepResult skipResult = lexer_.skipInlineImageData(budget);
-      if (skipResult.yielded()) {
-        return skipResult;
+      if (resources_ == nullptr || resources_->finishInlineImage == nullptr) {
+        return fail(PdfStatus::failure(PdfError::UnsupportedFilter, lexer_.position()));
       }
-      if (skipResult.failed()) {
-        return fail(skipResult.status);
+      uint64_t resumeOffset = 0;
+      PdfContentXObject image;
+      image.kind = PdfContentXObjectKind::Image;
+      image.pixelWidth = inlineWidth_;
+      image.pixelHeight = inlineHeight_;
+      const PdfStepResult finishResult = resources_->finishInlineImage(
+          resources_->context, currentSource_, lexer_.position(), budget, &resumeOffset, &image);
+      if (finishResult.yielded()) {
+        return finishResult;
       }
-      const PdfStatus imageStatus = appendInlineImage();
+      if (finishResult.failed()) {
+        return fail(finishResult.status);
+      }
+      if (image.kind != PdfContentXObjectKind::Image || resumeOffset <= lexer_.position() ||
+          resumeOffset > currentSource_.size) {
+        return fail(PdfStatus::failure(PdfError::Malformed, resumeOffset));
+      }
+      lexer_.setSource(currentSource_, resumeOffset);
+      const PdfStatus imageStatus = appendImage(image, true);
       if (!imageStatus.ok()) {
         return fail(imageStatus);
       }
@@ -461,6 +482,12 @@ PdfStatus PdfContentInterpreter::handleDictionaryToken(const PdfToken& token) {
 }
 
 PdfStatus PdfContentInterpreter::handleInlineDictionaryToken(const PdfToken& token) {
+  if (resources_ != nullptr && resources_->consumeInlineImageToken != nullptr) {
+    const PdfStatus status = resources_->consumeInlineImageToken(resources_->context, token);
+    if (!status.ok()) {
+      return status;
+    }
+  }
   if (token.kind == PdfTokenKind::Keyword && tokenEquals(token, "ID")) {
     phase_ = Phase::InlineImageData;
     return PdfStatus::success();
@@ -526,6 +553,12 @@ PdfStatus PdfContentInterpreter::handleToken(const PdfToken& token) {
         if (!countStatus.ok()) {
           return countStatus;
         }
+        if (resources_ != nullptr && resources_->consumeInlineImageToken != nullptr) {
+          const PdfStatus status = resources_->consumeInlineImageToken(resources_->context, token);
+          if (!status.ok()) {
+            return status;
+          }
+        }
         clearOperands();
         inlineDictionary_ = true;
         inlineKey_ = InlineKey::None;
@@ -571,7 +604,7 @@ PdfStatus PdfContentInterpreter::processOperator(const PdfToken& token) {
       tokenEquals(token, "\"")) {
     return processTextOperator(token);
   }
-  if (tokenEquals(token, "q") || tokenEquals(token, "Q") || tokenEquals(token, "cm") ||
+  if (tokenEquals(token, "q") || tokenEquals(token, "Q") || tokenEquals(token, "cm") || tokenEquals(token, "gs") ||
       tokenEquals(token, "g") || tokenEquals(token, "rg") || tokenEquals(token, "k") ||
       tokenEquals(token, "sc") || tokenEquals(token, "scn")) {
     return processGraphicsOperator(token);
@@ -584,19 +617,30 @@ PdfStatus PdfContentInterpreter::processOperator(const PdfToken& token) {
     return processXObjectOperator(token);
   }
   if (isVectorOperator(token)) {
-    pageModel_->addWarning(PdfPageWarning::VectorArtOmitted);
+    return processPathOperator(token);
   }
   return PdfStatus::success();
 }
 
 PdfStatus PdfContentInterpreter::processTextOperator(const PdfToken& token) {
   if (tokenEquals(token, "BT")) {
+    if (text_.active || operandCount_ != 0) {
+      return failStatus(PdfError::Malformed);
+    }
     text_.matrix = {};
     text_.lineMatrix = {};
     text_.active = true;
+    text_.clipPending = false;
     return PdfStatus::success();
   }
   if (tokenEquals(token, "ET")) {
+    if (!text_.active || operandCount_ != 0) {
+      return failStatus(PdfError::Malformed);
+    }
+    if (text_.clipPending) {
+      graphics_.clipRepresentable = false;
+      text_.clipPending = false;
+    }
     text_.active = false;
     return PdfStatus::success();
   }
@@ -760,9 +804,31 @@ PdfStatus PdfContentInterpreter::processGraphicsOperator(const PdfToken& token) 
     if (operandCount_ != 0 || graphicsDepth_ == 0) {
       return failStatus(PdfError::Malformed);
     }
+    const PdfMatrix textMatrix = text_.matrix;
+    const PdfMatrix lineMatrix = text_.lineMatrix;
+    const bool textActive = text_.active;
+    const bool clipPending = text_.clipPending;
     --graphicsDepth_;
     graphics_ = graphicsStack_[graphicsDepth_];
     text_ = textStack_[graphicsDepth_];
+    // q/Q save text-state parameters, but the text and line matrices and the
+    // current text-object lifetime are not part of the graphics-state stack.
+    // A pending text clip also belongs to the current BT/ET sequence: keep it
+    // until ET either applies it or clears it before a later Q.
+    text_.matrix = textMatrix;
+    text_.lineMatrix = lineMatrix;
+    text_.active = textActive;
+    text_.clipPending = clipPending;
+    return PdfStatus::success();
+  }
+  if (tokenEquals(token, "gs")) {
+    if (operandCount_ != 1 || workspace_.operands[0].kind != PdfContentOperandKind::Name) {
+      return failStatus(PdfError::Malformed);
+    }
+    // ExtGState can make content fully transparent or otherwise invisible.
+    // Until production resolves the resource, suppress paint semantics inside
+    // this graphics state rather than exposing content a PDF viewer may hide.
+    graphics_.visibilityRepresentable = false;
     return PdfStatus::success();
   }
   if (tokenEquals(token, "g") || tokenEquals(token, "rg") || tokenEquals(token, "k")) {
@@ -805,13 +871,145 @@ PdfStatus PdfContentInterpreter::processGraphicsOperator(const PdfToken& token) 
   return PdfStatus::success();
 }
 
-PdfStatus PdfContentInterpreter::pushMarkedContent(const PdfContentOperand* const actualText) {
+void PdfContentInterpreter::resetCurrentPath() {
+  currentPathRectangle_ = {};
+  currentPathRectangleValid_ = false;
+  currentPathUnrepresentable_ = false;
+}
+
+PdfStatus PdfContentInterpreter::transformedGraphicsPoint(const PdfFixed16 x, const PdfFixed16 y,
+                                                          PdfFixed16* const transformedX,
+                                                          PdfFixed16* const transformedY) const {
+  PdfFixed16 userX;
+  PdfFixed16 userY;
+  return pdfTransformPoint(graphics_.ctm, x, y, &userX, &userY) &&
+                 pdfTransformPoint(workspace_.pageTransform, userX, userY, transformedX, transformedY)
+             ? PdfStatus::success()
+             : failStatus(PdfError::LimitExceeded);
+}
+
+PdfStatus PdfContentInterpreter::transformedAxisAlignedRectangle(const PdfRectangle& rectangle,
+                                                                 PdfRectangle* const transformed,
+                                                                 bool* const axisAligned) const {
+  if (transformed == nullptr || axisAligned == nullptr) {
+    return failStatus(PdfError::InvalidArgument);
+  }
+  const PdfFixed16 inputX[] = {{rectangle.xMin}, {rectangle.xMax}, {rectangle.xMin}, {rectangle.xMax}};
+  const PdfFixed16 inputY[] = {{rectangle.yMin}, {rectangle.yMin}, {rectangle.yMax}, {rectangle.yMax}};
+  PdfFixed16 outputX[4];
+  PdfFixed16 outputY[4];
+  for (uint8_t corner = 0; corner < 4; ++corner) {
+    const PdfStatus status = transformedGraphicsPoint(inputX[corner], inputY[corner], &outputX[corner],
+                                                      &outputY[corner]);
+    if (!status.ok()) {
+      return status;
+    }
+  }
+
+  const bool firstEdgeHorizontal = outputY[0].raw == outputY[1].raw;
+  const bool firstEdgeVertical = outputX[0].raw == outputX[1].raw;
+  const bool secondEdgeHorizontal = outputY[0].raw == outputY[2].raw;
+  const bool secondEdgeVertical = outputX[0].raw == outputX[2].raw;
+  *axisAligned = (firstEdgeHorizontal && secondEdgeVertical) || (firstEdgeVertical && secondEdgeHorizontal);
+  if (!*axisAligned) {
+    return PdfStatus::success();
+  }
+
+  *transformed = {outputX[0].raw, outputY[0].raw, outputX[0].raw, outputY[0].raw};
+  for (uint8_t corner = 1; corner < 4; ++corner) {
+    transformed->xMin = std::min(transformed->xMin, outputX[corner].raw);
+    transformed->xMax = std::max(transformed->xMax, outputX[corner].raw);
+    transformed->yMin = std::min(transformed->yMin, outputY[corner].raw);
+    transformed->yMax = std::max(transformed->yMax, outputY[corner].raw);
+  }
+  return PdfStatus::success();
+}
+
+PdfStatus PdfContentInterpreter::applyClipRectangle(const PdfRectangle& rectangle) {
+  if (!graphics_.clipRepresentable) {
+    return PdfStatus::success();
+  }
+  if (!graphics_.hasClip) {
+    graphics_.clip = rectangle;
+    graphics_.hasClip = true;
+    return PdfStatus::success();
+  }
+  graphics_.clip.xMin = std::max(graphics_.clip.xMin, rectangle.xMin);
+  graphics_.clip.yMin = std::max(graphics_.clip.yMin, rectangle.yMin);
+  graphics_.clip.xMax = std::min(graphics_.clip.xMax, rectangle.xMax);
+  graphics_.clip.yMax = std::min(graphics_.clip.yMax, rectangle.yMax);
+  return PdfStatus::success();
+}
+
+PdfStatus PdfContentInterpreter::processPathOperator(const PdfToken& token) {
+  pageModel_->addWarning(PdfPageWarning::VectorArtOmitted);
+  if (tokenEquals(token, "re")) {
+    if (operandCount_ != 4) {
+      return failStatus(PdfError::Malformed);
+    }
+    for (uint8_t index = 0; index < 4; ++index) {
+      if (workspace_.operands[index].kind != PdfContentOperandKind::Number) {
+        return failStatus(PdfError::Malformed);
+      }
+    }
+    if (currentPathRectangleValid_ || currentPathUnrepresentable_) {
+      currentPathUnrepresentable_ = true;
+      currentPathRectangleValid_ = false;
+      return PdfStatus::success();
+    }
+    const PdfFixed16 x{workspace_.operands[0].number};
+    const PdfFixed16 y{workspace_.operands[1].number};
+    PdfFixed16 xEnd;
+    PdfFixed16 yEnd;
+    if (!pdfFixedAdd(x, {workspace_.operands[2].number}, &xEnd) ||
+        !pdfFixedAdd(y, {workspace_.operands[3].number}, &yEnd)) {
+      return failStatus(PdfError::LimitExceeded);
+    }
+    bool axisAligned = false;
+    PdfStatus status = transformedAxisAlignedRectangle({x.raw, y.raw, xEnd.raw, yEnd.raw},
+                                                       &currentPathRectangle_, &axisAligned);
+    if (!status.ok()) {
+      return status;
+    }
+    if (!axisAligned) {
+      currentPathUnrepresentable_ = true;
+      currentPathRectangleValid_ = false;
+      return PdfStatus::success();
+    }
+    currentPathRectangleValid_ = true;
+    return PdfStatus::success();
+  }
+  if (tokenEquals(token, "W") || tokenEquals(token, "W*")) {
+    if (operandCount_ != 0) {
+      return failStatus(PdfError::Malformed);
+    }
+    if (!currentPathRectangleValid_ || currentPathUnrepresentable_) {
+      graphics_.clipRepresentable = false;
+      return PdfStatus::success();
+    }
+    return applyClipRectangle(currentPathRectangle_);
+  }
+  if (tokenEquals(token, "n") || tokenEquals(token, "S") || tokenEquals(token, "s") || tokenEquals(token, "f") ||
+      tokenEquals(token, "F") || tokenEquals(token, "f*") || tokenEquals(token, "B") || tokenEquals(token, "B*") ||
+      tokenEquals(token, "b") || tokenEquals(token, "b*")) {
+    resetCurrentPath();
+    return PdfStatus::success();
+  }
+  currentPathUnrepresentable_ = true;
+  currentPathRectangleValid_ = false;
+  return PdfStatus::success();
+}
+
+PdfStatus PdfContentInterpreter::pushMarkedContent(const PdfContentOperand* const actualText, const bool suppress) {
   if (markedDepth_ >= static_cast<uint8_t>(sizeof(markedStack_) / sizeof(markedStack_[0]))) {
     return failStatus(PdfError::LimitExceeded);
   }
   MarkedContentFrame frame;
   frame.textOffset = markedTextLength_;
-  if (actualText != nullptr) {
+  if (suppress || markedContentSuppressed()) {
+    frame.flags |= kMarkedContentSuppressed;
+  }
+  if (actualText != nullptr && (frame.flags & kMarkedContentSuppressed) == 0) {
     if (actualText->textLength > workspace_.markedTextCapacity - markedTextLength_) {
       return failStatus(PdfError::LimitExceeded);
     }
@@ -825,6 +1023,10 @@ PdfStatus PdfContentInterpreter::pushMarkedContent(const PdfContentOperand* cons
   return PdfStatus::success();
 }
 
+bool PdfContentInterpreter::markedContentSuppressed() const {
+  return markedDepth_ != 0 && (markedStack_[markedDepth_ - 1U].flags & kMarkedContentSuppressed) != 0;
+}
+
 PdfStatus PdfContentInterpreter::processMarkedContentOperator(const PdfToken& token) {
   if (tokenEquals(token, "BDC")) {
     if (operandCount_ < 2 || workspace_.operands[0].kind != PdfContentOperandKind::Name) {
@@ -836,10 +1038,25 @@ PdfStatus PdfContentInterpreter::processMarkedContentOperator(const PdfToken& to
         actualText = &workspace_.operands[index];
       }
     }
-    return pushMarkedContent(actualText);
+    const PdfContentOperand& tag = workspace_.operands[0];
+    const auto tagEquals = [this, &tag](const char* const expected) {
+      const size_t length = std::strlen(expected);
+      return tag.textLength == length &&
+             std::memcmp(workspace_.scratchText + tag.textOffset, expected, length) == 0;
+    };
+    return pushMarkedContent(actualText, tagEquals("Artifact") || tagEquals("OC"));
   }
   if (tokenEquals(token, "BMC")) {
-    return operandCount_ == 1 ? pushMarkedContent(nullptr) : failStatus(PdfError::Malformed);
+    if (operandCount_ != 1 || workspace_.operands[0].kind != PdfContentOperandKind::Name) {
+      return failStatus(PdfError::Malformed);
+    }
+    const PdfContentOperand& tag = workspace_.operands[0];
+    const auto tagEquals = [this, &tag](const char* const expected) {
+      const size_t length = std::strlen(expected);
+      return tag.textLength == length &&
+             std::memcmp(workspace_.scratchText + tag.textOffset, expected, length) == 0;
+    };
+    return pushMarkedContent(nullptr, tagEquals("Artifact") || tagEquals("OC"));
   }
   if (tokenEquals(token, "EMC")) {
     if (operandCount_ != 0 || markedDepth_ == 0) {
@@ -858,6 +1075,9 @@ PdfStatus PdfContentInterpreter::processXObjectOperator(const PdfToken& token) {
       resources_->resolveXObject == nullptr) {
     return failStatus(PdfError::Malformed);
   }
+  if (markedContentSuppressed() || !graphics_.visibilityRepresentable) {
+    return PdfStatus::success();
+  }
   const PdfContentOperand& name = workspace_.operands[0];
   PdfContentXObject object;
   const PdfStatus status = resources_->resolveXObject(resources_->context, workspace_.scratchText + name.textOffset,
@@ -869,6 +1089,10 @@ PdfStatus PdfContentInterpreter::processXObjectOperator(const PdfToken& token) {
 }
 
 PdfStatus PdfContentInterpreter::enterForm(const PdfContentXObject& form) {
+  if (!form.hasBBox) {
+    pageModel_->addWarning(PdfPageWarning::VectorArtOmitted);
+    return PdfStatus::success();
+  }
   if (!form.content.valid() || formDepth_ >= PdfLimits::MaxFormDepth) {
     return failStatus(PdfError::LimitExceeded);
   }
@@ -899,7 +1123,23 @@ PdfStatus PdfContentInterpreter::enterForm(const PdfContentXObject& form) {
     return failStatus(PdfError::LimitExceeded);
   }
   graphics_.ctm = combined;
+  PdfRectangle transformed;
+  bool axisAligned = false;
+  PdfStatus status = transformedAxisAlignedRectangle(form.bbox, &transformed, &axisAligned);
+  if (!status.ok()) {
+    return status;
+  }
+  if (!axisAligned) {
+    graphics_.clipRepresentable = false;
+    pageModel_->addWarning(PdfPageWarning::VectorArtOmitted);
+  } else {
+    status = applyClipRectangle(transformed);
+    if (!status.ok()) {
+      return status;
+    }
+  }
   text_ = {};
+  resetCurrentPath();
   return PdfStatus::success();
 }
 
@@ -960,8 +1200,11 @@ PdfStatus PdfContentInterpreter::currentTextPoint(const PdfFixed16 textX, const 
                                                   PdfFixed16* const y) const {
   PdfFixed16 transformedX;
   PdfFixed16 transformedY;
+  PdfFixed16 userX;
+  PdfFixed16 userY;
   if (!pdfTransformPoint(text_.matrix, textX, textY, &transformedX, &transformedY) ||
-      !pdfTransformPoint(graphics_.ctm, transformedX, transformedY, x, y)) {
+      !pdfTransformPoint(graphics_.ctm, transformedX, transformedY, &userX, &userY) ||
+      !pdfTransformPoint(workspace_.pageTransform, userX, userY, x, y)) {
     return failStatus(PdfError::LimitExceeded);
   }
   return PdfStatus::success();
@@ -1089,11 +1332,30 @@ PdfStatus PdfContentInterpreter::emitActualText(MarkedContentFrame& frame) {
     pageModel_->abortTextRun();
     return status;
   }
-  status = pageModel_->finishTextRun();
-  if (status.ok() && pageModel_->runCount() > runIndex) {
-    frame.runIndex = runIndex;
+  frame.runIndex = runIndex;
+  return PdfStatus::success();
+}
+
+PdfStatus PdfContentInterpreter::finishSemanticTextRun() {
+  const PdfTextRun* const run = pageModel_ == nullptr ? nullptr : pageModel_->pendingTextRun();
+  if (run == nullptr) {
+    return failStatus(PdfError::InvalidArgument);
   }
-  return status;
+  const bool readableArea = run->xMax > run->xMin && run->yMax > run->yMin;
+  const bool intersectsPage =
+      !workspace_.hasPageBounds ||
+      (run->xMax > workspace_.pageBounds.xMin && run->xMin < workspace_.pageBounds.xMax &&
+       run->yMax > workspace_.pageBounds.yMin && run->yMin < workspace_.pageBounds.yMax);
+  const bool intersectsClip =
+      !graphics_.hasClip ||
+      (run->xMax > graphics_.clip.xMin && run->xMin < graphics_.clip.xMax && run->yMax > graphics_.clip.yMin &&
+       run->yMin < graphics_.clip.yMax);
+  if (!readableArea || !intersectsPage || !graphics_.clipRepresentable || !graphics_.visibilityRepresentable ||
+      !intersectsClip) {
+    pageModel_->abortTextRun();
+    return PdfStatus::success();
+  }
+  return pageModel_->finishTextRun();
 }
 
 PdfStatus PdfContentInterpreter::emitDecodedText(const uint8_t* const source, const size_t length,
@@ -1141,7 +1403,7 @@ PdfStatus PdfContentInterpreter::emitDecodedText(const uint8_t* const source, co
     pageModel_->abortTextRun();
     return status;
   }
-  return pageModel_->finishTextRun();
+  return finishSemanticTextRun();
 }
 
 PdfStatus PdfContentInterpreter::advanceVisualText(const uint8_t* const source, const size_t length) {
@@ -1171,6 +1433,12 @@ PdfStatus PdfContentInterpreter::showString(const uint8_t* const source, const s
   if (length == 0) {
     return PdfStatus::success();
   }
+  if (text_.renderMode >= 4) {
+    text_.clipPending = true;
+  }
+  if (text_.renderMode == 7 || markedContentSuppressed() || !graphics_.visibilityRepresentable) {
+    return advanceVisualText(source, length);
+  }
   MarkedContentFrame* actual = nullptr;
   for (uint8_t depth = markedDepth_; depth-- > 0;) {
     if (markedStack_[depth].hasActualText) {
@@ -1179,12 +1447,26 @@ PdfStatus PdfContentInterpreter::showString(const uint8_t* const source, const s
     }
   }
   if (actual != nullptr) {
-    if (!actual->emitted) {
+    if ((actual->flags & kMarkedContentEmitted) == 0) {
       const PdfStatus emitStatus = emitActualText(*actual);
       if (!emitStatus.ok()) {
         return emitStatus;
       }
-      actual->emitted = true;
+      PdfStatus status = advanceVisualText(source, length);
+      if (status.ok() && actual->runIndex != UINT16_MAX) {
+        status = expandRunGeometry(actual->runIndex);
+      }
+      if (status.ok()) {
+        status = finishSemanticTextRun();
+      }
+      if (!status.ok()) {
+        return status;
+      }
+      actual->flags |= kMarkedContentEmitted;
+      if (pageModel_->runCount() <= actual->runIndex) {
+        actual->runIndex = UINT16_MAX;
+      }
+      return PdfStatus::success();
     }
     PdfStatus status = advanceVisualText(source, length);
     if (!status.ok() || actual->runIndex == UINT16_MAX) {
@@ -1226,13 +1508,17 @@ PdfStatus PdfContentInterpreter::showArray(const PdfContentOperand& array) {
 }
 
 PdfStatus PdfContentInterpreter::appendImage(const PdfContentXObject& image, const bool inlineImage) {
+  if (markedContentSuppressed() || !graphics_.visibilityRepresentable) {
+    return PdfStatus::success();
+  }
   const PdfFixed16 one = PdfFixed16::fromInteger(1);
   const PdfFixed16 xInputs[] = {{}, one, {}, one};
   const PdfFixed16 yInputs[] = {{}, {}, one, one};
   PdfFixed16 x;
   PdfFixed16 y;
-  if (!pdfTransformPoint(graphics_.ctm, xInputs[0], yInputs[0], &x, &y)) {
-    return failStatus(PdfError::LimitExceeded);
+  PdfStatus status = transformedGraphicsPoint(xInputs[0], yInputs[0], &x, &y);
+  if (!status.ok()) {
+    return status;
   }
   PdfImagePlacement placement;
   placement.reference = image.reference;
@@ -1244,8 +1530,9 @@ PdfStatus PdfContentInterpreter::appendImage(const PdfContentXObject& image, con
   placement.yMin = y.raw;
   placement.yMax = y.raw;
   for (uint8_t corner = 1; corner < 4; ++corner) {
-    if (!pdfTransformPoint(graphics_.ctm, xInputs[corner], yInputs[corner], &x, &y)) {
-      return failStatus(PdfError::LimitExceeded);
+    status = transformedGraphicsPoint(xInputs[corner], yInputs[corner], &x, &y);
+    if (!status.ok()) {
+      return status;
     }
     placement.xMin = std::min(placement.xMin, x.raw);
     placement.xMax = std::max(placement.xMax, x.raw);
@@ -1254,13 +1541,17 @@ PdfStatus PdfContentInterpreter::appendImage(const PdfContentXObject& image, con
   }
   placement.flags = inlineImage ? PdfImageInline : 0;
   placement.imageMaskPaintLuminance = graphics_.nonstrokingLuminance;
+  const bool intersectsPage =
+      !workspace_.hasPageBounds ||
+      (placement.xMax > workspace_.pageBounds.xMin && placement.xMin < workspace_.pageBounds.xMax &&
+       placement.yMax > workspace_.pageBounds.yMin && placement.yMin < workspace_.pageBounds.yMax);
+  const bool intersectsClip =
+      !graphics_.hasClip ||
+      (placement.xMax > graphics_.clip.xMin && placement.xMin < graphics_.clip.xMax &&
+       placement.yMax > graphics_.clip.yMin && placement.yMin < graphics_.clip.yMax);
+  if (!graphics_.clipRepresentable || !graphics_.visibilityRepresentable || !intersectsPage || !intersectsClip) {
+    pageModel_->addWarning(PdfPageWarning::OptionalImageOmitted);
+    return PdfStatus::success();
+  }
   return pageModel_->appendImage(placement);
-}
-
-PdfStatus PdfContentInterpreter::appendInlineImage() {
-  PdfContentXObject image;
-  image.kind = PdfContentXObjectKind::Image;
-  image.pixelWidth = inlineWidth_;
-  image.pixelHeight = inlineHeight_;
-  return appendImage(image, true);
 }

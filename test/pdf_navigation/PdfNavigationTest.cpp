@@ -188,6 +188,8 @@ struct NavigableCacheFixture {
         "<a href=\"sections/000000.xhtml#b00000000\">Contents</a></p></body></html>";
     const PdfRequiredFileRecord section0Record = addRequired("gen_7/sections/000000.xhtml", section0);
     const PdfRequiredFileRecord section1Record = addRequired("gen_7/sections/000001.xhtml", section1);
+    addRequired("gen_7/cover.bmp", "BMcover");
+    addRequired("gen_7/thumb.bmp", "BMthumb");
 
     PdfMetadataBuilder metadataBuilder;
     ASSERT_TRUE(metadataBuilder.begin(reinterpret_cast<const uint8_t*>("navigation"), 10).ok());

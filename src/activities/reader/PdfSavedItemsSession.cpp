@@ -9,6 +9,7 @@ namespace {
 constexpr uint16_t kInvalidIndex = UINT16_MAX;
 constexpr uint16_t kFirstItemId = 1;
 constexpr uint16_t kLastItemId = UINT16_MAX - 1U;
+static_assert(PDF_SAVED_ITEMS_MAX_BOOKMARKS == PDF_SAVED_ITEMS_MAX_CLIPPINGS);
 
 uint16_t nextUsableItemId(const uint16_t value) {
   return value >= kLastItemId ? kFirstItemId : static_cast<uint16_t>(value + 1U);
@@ -102,9 +103,7 @@ bool PdfSavedItemsSession::probeLegacy(const PdfSavedItemKind kind) {
   const PdfSavedItemsLegacyAccess* const access = accessFor(kind);
   if (access == nullptr || !access->mutableAccess()) return false;
   uint16_t legacyCount = 0;
-  if (!access->count(access->context, &legacyCount) ||
-      legacyCount >
-          (kind == PdfSavedItemKind::Bookmark ? PDF_SAVED_ITEMS_MAX_BOOKMARKS : PDF_SAVED_ITEMS_MAX_CLIPPINGS)) {
+  if (!access->count(access->context, &legacyCount) || legacyCount > PDF_SAVED_ITEMS_MAX_BOOKMARKS) {
     return false;
   }
   for (uint16_t index = 0; index < legacyCount; ++index) {
@@ -315,16 +314,14 @@ const PdfSavedItem* PdfSavedItemsSession::find(const PdfSavedItemKind kind, cons
 const PdfSavedItem* PdfSavedItemsSession::findBookmarkInPage(const uint16_t sectionIndex,
                                                              const uint32_t firstGlobalWordOrdinal,
                                                              const uint32_t lastGlobalWordOrdinal) const {
-  if (!supports(PdfSavedItemKind::Bookmark) || buffer_ == nullptr ||
-      firstGlobalWordOrdinal > lastGlobalWordOrdinal) {
+  if (!supports(PdfSavedItemKind::Bookmark) || buffer_ == nullptr || firstGlobalWordOrdinal > lastGlobalWordOrdinal) {
     return nullptr;
   }
   for (uint16_t index = 0; index < buffer_->count; ++index) {
     const PdfSavedItem& item = buffer_->items[index];
     if (item.kind == PdfSavedItemKind::Bookmark && item.sectionIndex == sectionIndex &&
         (item.flags & PDF_SAVED_ITEM_HAS_START_SEMANTIC) != 0 &&
-        item.startGlobalWordOrdinal >= firstGlobalWordOrdinal &&
-        item.startGlobalWordOrdinal <= lastGlobalWordOrdinal) {
+        item.startGlobalWordOrdinal >= firstGlobalWordOrdinal && item.startGlobalWordOrdinal <= lastGlobalWordOrdinal) {
       return &item;
     }
   }
@@ -342,8 +339,7 @@ PdfSavedItemsSessionResult PdfSavedItemsSession::add(const PdfSavedItem& item, u
     maskCapability(item.kind);
     return PdfSavedItemsSessionResult::Unavailable;
   }
-  const uint16_t kindLimit =
-      item.kind == PdfSavedItemKind::Bookmark ? PDF_SAVED_ITEMS_MAX_BOOKMARKS : PDF_SAVED_ITEMS_MAX_CLIPPINGS;
+  const uint16_t kindLimit = PDF_SAVED_ITEMS_MAX_BOOKMARKS;
   if (legacyCount >= kindLimit || count(item.kind) >= kindLimit || buffer_->count >= buffer_->capacity ||
       buffer_->count >= PDF_SAVED_ITEMS_MAX_RECORDS) {
     return PdfSavedItemsSessionResult::LimitReached;

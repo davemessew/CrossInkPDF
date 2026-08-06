@@ -49,10 +49,13 @@ bool decodeBigEndianCode(const PdfToken& token, uint32_t* code) {
 PdfCMap::PdfCMap(uint8_t* const sourceBuffer, const size_t sourceBufferSize, const PdfCMapWorkspace workspace)
     : workspace_(workspace), lexer_({}, sourceBuffer, sourceBufferSize) {}
 
+bool PdfCMap::observingRecords() const {
+  return workspace_.spill.write != nullptr && workspace_.spill.read == nullptr;
+}
+
+bool PdfCMap::codeSpaceOnly() const { return observingRecords() && workspace_.spill.capacity == 0; }
+
 PdfStatus PdfCMap::setSourceAccess(const bool required) {
-  if (sourceAccessRequired_ == required) {
-    return PdfStatus::success();
-  }
   if (workspace_.setSourceAccess != nullptr) {
     const PdfStatus status = workspace_.setSourceAccess(workspace_.sourceAccessContext, required);
     if (!status.ok()) {
@@ -67,7 +70,13 @@ PdfStatus PdfCMap::begin(const PdfByteSource& source) {
   if (!source.valid() || workspace_.records == nullptr || workspace_.recordCapacity == 0) {
     return PdfStatus::failure(PdfError::InvalidArgument);
   }
-  if (workspace_.spill.valid() && workspace_.spill.recordSize != sizeof(PdfCMapRecord)) {
+  const bool hasSpillConfiguration = workspace_.spill.context != nullptr || workspace_.spill.capacity != 0 ||
+                                     workspace_.spill.recordSize != 0 || workspace_.spill.read != nullptr ||
+                                     workspace_.spill.write != nullptr;
+  if (hasSpillConfiguration && !workspace_.spill.valid() && !observingRecords()) {
+    return PdfStatus::failure(PdfError::InvalidArgument);
+  }
+  if ((workspace_.spill.valid() || observingRecords()) && workspace_.spill.recordSize != sizeof(PdfCMapRecord)) {
     return PdfStatus::failure(PdfError::InvalidArgument, workspace_.spill.recordSize);
   }
   const PdfStatus accessStatus = setSourceAccess(true);
@@ -131,6 +140,9 @@ PdfStepResult PdfCMap::step(PdfWorkBudget& budget) {
     if (!status.ok()) {
       return fail(status);
     }
+    if (section_ == Section::Done) {
+      return PdfStepResult::completed();
+    }
   }
   return budget.cancelRequested()
              ? fail(PdfStatus::failure(PdfError::Cancelled, lexer_.position()))
@@ -169,6 +181,13 @@ PdfStatus PdfCMap::handleToken(const PdfToken& token) {
       pendingCount_ = count;
       hasPendingCount_ = true;
     }
+    return PdfStatus::success();
+  }
+  if (codeSpaceOnly() && token.kind == PdfTokenKind::Keyword && tokenEquals(token, "endcmap")) {
+    if (mappingCount_ == 0 || codeSpaceCount_ == 0) {
+      return PdfStatus::failure(PdfError::Malformed, lexer_.tokenOffset());
+    }
+    section_ = Section::Done;
     return PdfStatus::success();
   }
   if (token.kind != PdfTokenKind::Keyword || !hasPendingCount_) {
@@ -324,22 +343,39 @@ PdfStatus PdfCMap::addRecord(const PdfCMapRecord& record) {
     return PdfStatus::failure(PdfError::LimitExceeded, mappingCount_);
   }
   const uint64_t key = static_cast<uint64_t>(record.sourceLength) << 32 | record.sourceFirst;
-  if (hasPreviousRecord_ &&
-      (key < previousRecordKey_ || (record.sourceLength == static_cast<uint8_t>(previousRecordKey_ >> 32) &&
-                                    record.sourceFirst <= previousRecordLast_))) {
+  const bool ordered = !hasPreviousRecord_ ||
+                       (key >= previousRecordKey_ &&
+                        (record.sourceLength != static_cast<uint8_t>(previousRecordKey_ >> 32) ||
+                         record.sourceFirst > previousRecordLast_));
+  if ((!ordered || !recordsSorted_) && mappingCount_ >= workspace_.recordCapacity) {
+    // An unsorted SD-backed map would require a linear record scan for every glyph.
+    return PdfStatus::failure(PdfError::LimitExceeded, mappingCount_);
+  }
+  if (!ordered) {
     recordsSorted_ = false;
   }
-  if (mappingCount_ < workspace_.recordCapacity) {
-    workspace_.records[mappingCount_] = record;
-  } else {
-    if (!workspace_.spill.valid() || spillCount_ >= workspace_.spill.capacity) {
-      return PdfStatus::failure(PdfError::LimitExceeded, mappingCount_);
+  if (!codeSpaceOnly()) {
+    if (observingRecords()) {
+      if (mappingCount_ >= workspace_.spill.capacity) {
+        return PdfStatus::failure(PdfError::LimitExceeded, mappingCount_);
+      }
+      const PdfStatus status =
+          workspace_.spill.write(workspace_.spill.context, mappingCount_, &record, sizeof(record));
+      if (!status.ok()) {
+        return status;
+      }
+    } else if (mappingCount_ < workspace_.recordCapacity) {
+      workspace_.records[mappingCount_] = record;
+    } else {
+      if (!workspace_.spill.valid() || spillCount_ >= workspace_.spill.capacity) {
+        return PdfStatus::failure(PdfError::LimitExceeded, mappingCount_);
+      }
+      const PdfStatus status = pdfWriteRecord(workspace_.spill, spillCount_, &record);
+      if (!status.ok()) {
+        return status;
+      }
+      ++spillCount_;
     }
-    const PdfStatus status = pdfWriteRecord(workspace_.spill, spillCount_, &record);
-    if (!status.ok()) {
-      return status;
-    }
-    ++spillCount_;
   }
   previousRecordKey_ = key;
   previousRecordLast_ = record.sourceLast;
@@ -449,7 +485,7 @@ PdfStatus PdfCMap::applyRecord(const PdfCMapRecord& record, const uint32_t code,
 }
 
 PdfStatus PdfCMap::lookup(const uint8_t* const source, const size_t sourceLength, PdfCMapLookup* const result) {
-  if (result == nullptr || section_ != Section::Done) {
+  if (result == nullptr || section_ != Section::Done || observingRecords()) {
     return PdfStatus::failure(PdfError::InvalidArgument);
   }
   uint32_t code = 0;
@@ -502,4 +538,17 @@ PdfStatus PdfCMap::lookup(const uint8_t* const source, const size_t sourceLength
     return applyRecord(record, code, codeLength, result);
   }
   return PdfStatus::failure(PdfError::UnsupportedEncoding, code);
+}
+
+PdfStatus PdfCMap::copyCodeSpaces(PdfCMapCodeSpace* const destination, const size_t capacity,
+                                  uint8_t* const count) const {
+  if (count == nullptr || section_ != Section::Done || (destination == nullptr && codeSpaceCount_ != 0) ||
+      capacity < codeSpaceCount_) {
+    return PdfStatus::failure(PdfError::InvalidArgument, codeSpaceCount_);
+  }
+  for (uint8_t index = 0; index < codeSpaceCount_; ++index) {
+    destination[index] = {codeSpaces_[index].first, codeSpaces_[index].last, codeSpaces_[index].length};
+  }
+  *count = codeSpaceCount_;
+  return PdfStatus::success();
 }

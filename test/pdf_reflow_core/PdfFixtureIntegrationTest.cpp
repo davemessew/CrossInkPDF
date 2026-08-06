@@ -19,6 +19,8 @@ std::vector<uint8_t> loadClassicFixture() {
 }
 
 struct IntegrationWorkspace {
+  IntegrationWorkspace() { traversalStorage.forbidReadsWhile(&traversalReadForbidden); }
+
   std::array<uint8_t, 4096> sourceBuffer{};
   std::array<PdfValue, 128> values{};
   std::array<PdfDictionaryEntry, 128> dictionaries{};
@@ -35,17 +37,46 @@ struct IntegrationWorkspace {
   PdfTestRecordStore traversalStorage{sizeof(PdfPageTreeRecord), 64};
   PdfPageInfo firstPage{};
   uint32_t pageCount = 0;
+  bool sourceOpen = true;
+  bool xrefBlocked = true;
+  bool traversalOpen = false;
+  bool traversalReadForbidden = true;
+  uint32_t traversalOpenCount = 0;
+  uint32_t traversalCloseCount = 0;
 };
 
 template <typename Stepper>
 PdfStepResult runBudgetOne(Stepper& stepper) {
-  while (true) {
-    PdfWorkBudget budget{1, 1};
+  for (uint32_t step = 0; step < 65536U; ++step) {
+    PdfWorkBudget budget{1, sizeof(PdfXrefEntry)};
     const PdfStepResult result = stepper.step(budget);
     if (!result.yielded()) {
       return result;
     }
   }
+  return PdfStepResult::failure(PdfStatus::failure(PdfError::BudgetExhausted));
+}
+
+PdfStepResult runPageTree(PdfPageTreeWalker& walker) {
+  for (uint16_t step = 0; step < 256U; ++step) {
+    PdfWorkBudget budget{32, 4096};
+    const PdfStepResult result = walker.step(budget);
+    if (!result.yielded()) {
+      return result;
+    }
+  }
+  return PdfStepResult::failure(PdfStatus::failure(PdfError::BudgetExhausted));
+}
+
+PdfStepResult runResolver(PdfObjectResolver& resolver) {
+  for (uint16_t step = 0; step < 256U; ++step) {
+    PdfWorkBudget budget{32, 4096};
+    const PdfStepResult result = resolver.step(budget);
+    if (!result.yielded()) {
+      return result;
+    }
+  }
+  return PdfStepResult::failure(PdfStatus::failure(PdfError::BudgetExhausted));
 }
 
 PdfStatus captureFirstPage(void* context, const PdfPageInfo& page) {
@@ -54,6 +85,19 @@ PdfStatus captureFirstPage(void* context, const PdfPageInfo& page) {
     workspace.firstPage = page;
   }
   ++workspace.pageCount;
+  return PdfStatus::success();
+}
+
+PdfStatus setTraversalAccess(void* context, const bool required) {
+  if (context == nullptr) {
+    return PdfStatus::failure(PdfError::InvalidArgument);
+  }
+  auto& workspace = *static_cast<IntegrationWorkspace*>(context);
+  workspace.traversalOpen = required;
+  workspace.traversalReadForbidden = !required;
+  workspace.sourceOpen = false;
+  workspace.xrefBlocked = true;
+  required ? ++workspace.traversalOpenCount : ++workspace.traversalCloseCount;
   return PdfStatus::success();
 }
 
@@ -75,7 +119,7 @@ TEST(PdfFixtureIntegrationTest, ResolvesCatalogPageTreeAndEmitsExactlyHelloPdf) 
   PdfObjectResolver resolver(source, workspace.xref, workspace.sourceBuffer.data(), workspace.sourceBuffer.size(),
                              workspace.arena);
   ASSERT_TRUE(resolver.begin(catalogReference).ok());
-  ASSERT_TRUE(runBudgetOne(resolver).complete());
+  ASSERT_TRUE(runResolver(resolver).complete());
   uint16_t pagesIndex = PDF_INVALID_INDEX;
   ASSERT_TRUE(pdfDictionaryFind(workspace.arena, resolver.result().rootIndex, "Pages", &pagesIndex));
   const PdfValue pages = workspace.arena.values[pagesIndex];
@@ -84,14 +128,21 @@ TEST(PdfFixtureIntegrationTest, ResolvesCatalogPageTreeAndEmitsExactlyHelloPdf) 
   PdfPageTreeWalker walker(resolver, workspace.arena,
                            workspace.traversalStorage.store(),
                            captureFirstPage, &workspace,
-                           &workspace.firstPage);
+                           setTraversalAccess, &workspace,
+                           &workspace.firstPage, PdfLimits::MaxPages);
   ASSERT_TRUE(walker.begin({pages.objectNumber, pages.generation}).ok());
-  ASSERT_TRUE(runBudgetOne(walker).complete());
+  ASSERT_TRUE(runPageTree(walker).complete());
   ASSERT_EQ(workspace.pageCount, 1u);
   ASSERT_EQ(workspace.firstPage.contentCount, 1u);
+  EXPECT_GT(workspace.traversalOpenCount, 0U);
+  EXPECT_EQ(workspace.traversalOpenCount, workspace.traversalCloseCount);
+  EXPECT_FALSE(workspace.traversalOpen);
+  EXPECT_TRUE(workspace.traversalReadForbidden);
+  EXPECT_FALSE(workspace.sourceOpen);
+  EXPECT_TRUE(workspace.xrefBlocked);
 
   ASSERT_TRUE(resolver.begin(workspace.firstPage.contents[0]).ok());
-  ASSERT_TRUE(runBudgetOne(resolver).complete());
+  ASSERT_TRUE(runResolver(resolver).complete());
   const PdfResolvedObject content = resolver.result();
   ASSERT_TRUE(content.hasStream);
 

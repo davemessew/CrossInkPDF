@@ -11,6 +11,7 @@
 #include <functional>
 #include <new>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "BookmarkStore.h"
@@ -2432,6 +2433,222 @@ TEST(PdfSavedItemsSessionTest, CoordinatorAllocatesNothingAcrossLoadMutationAndJ
   EXPECT_EQ(jumpResult, PdfSavedItemsSessionResult::Applied);
   EXPECT_TRUE(pendingFound);
   EXPECT_EQ(watchedAllocationCount, 0U);
+}
+
+TEST_F(LegacyStoreTest, BookmarkNoPathAllocationMatchesOwningCrcAndLegacyHashTrace) {
+  constexpr char paddedPath[] = "/Books/legacy.epub.trailing";
+  const std::string_view exactPath(paddedPath,
+                                   sizeof("/Books/legacy.epub") - 1U);
+  const std::string ownedPath(exactPath);
+  const uint32_t crc = uzlib_crc32(exactPath.data(),
+                                   static_cast<unsigned int>(exactPath.size()), 0);
+  const std::string currentPath = "/.crosspoint/bookmarks/epub_" +
+                                  std::to_string(crc) + ".bin";
+  const std::string legacyPath =
+      "/.crosspoint/bookmarks/epub_" +
+      std::to_string(std::hash<std::string>{}(ownedPath)) + ".bin";
+  ASSERT_NE(currentPath, legacyPath);
+
+  Storage.addFile(currentPath, {1});
+  Storage.addFile(legacyPath, {2});
+  Storage.beginBoundedPathCapture(64U);
+  ASSERT_TRUE(BookmarkStore::deleteForFilePath(ownedPath, "epub"));
+  const auto owningTrace = Storage.capturedPathOperations();
+
+  Storage.reset();
+  Storage.addFile(currentPath, {1});
+  Storage.addFile(legacyPath, {2});
+  Storage.beginBoundedPathCapture(64U);
+  ASSERT_TRUE(BookmarkStore::deleteLegacyForFilePathNoPathAlloc(exactPath,
+                                                                "epub"));
+
+  EXPECT_EQ(Storage.capturedPathOperations(), owningTrace);
+  EXPECT_TRUE(Storage.boundedPathsWereNulTerminated());
+  EXPECT_FALSE(Storage.exists(currentPath.c_str()));
+  EXPECT_FALSE(Storage.exists(legacyPath.c_str()));
+}
+
+TEST_F(LegacyStoreTest, BookmarkNoPathAllocationContinuesAfterCurrentRemoveFailure) {
+  const std::string exactPath = "/Books/legacy.epub";
+  const uint32_t crc = uzlib_crc32(exactPath.data(),
+                                   static_cast<unsigned int>(exactPath.size()), 0);
+  const std::string currentPath = "/.crosspoint/bookmarks/epub_" +
+                                  std::to_string(crc) + ".bin";
+  const std::string legacyPath =
+      "/.crosspoint/bookmarks/epub_" +
+      std::to_string(std::hash<std::string>{}(exactPath)) + ".bin";
+  ASSERT_NE(currentPath, legacyPath);
+  Storage.addFile(currentPath, {1});
+  Storage.addFile(legacyPath, {2});
+  Storage.fail(TestStorageFault::Remove, 1U);
+
+  EXPECT_FALSE(BookmarkStore::deleteLegacyForFilePathNoPathAlloc(exactPath,
+                                                                 "epub"));
+
+  EXPECT_TRUE(Storage.exists(currentPath.c_str()));
+  EXPECT_FALSE(Storage.exists(legacyPath.c_str()));
+}
+
+TEST_F(LegacyStoreTest, ClippingNoPathAllocationMatchesOwningCrcTrace) {
+  constexpr char paddedPath[] = "/Books/legacy.epub.trailing";
+  const std::string_view exactPath(paddedPath,
+                                   sizeof("/Books/legacy.epub") - 1U);
+  const std::string ownedPath(exactPath);
+  const uint32_t crc = uzlib_crc32(exactPath.data(),
+                                   static_cast<unsigned int>(exactPath.size()), 0);
+  const std::string storePath = "/.crosspoint/clippings/epub_" +
+                                std::to_string(crc) + ".bin";
+
+  Storage.addFile(storePath, {1});
+  Storage.beginBoundedPathCapture(64U);
+  ASSERT_TRUE(ClippingStore::deleteForFilePath(ownedPath, "epub"));
+  const auto owningTrace = Storage.capturedPathOperations();
+
+  Storage.reset();
+  Storage.addFile(storePath, {1});
+  Storage.beginBoundedPathCapture(64U);
+  ASSERT_TRUE(ClippingStore::deleteLegacyForFilePathNoPathAlloc(exactPath,
+                                                                "epub"));
+
+  EXPECT_EQ(Storage.capturedPathOperations(), owningTrace);
+  EXPECT_TRUE(Storage.boundedPathsWereNulTerminated());
+  EXPECT_FALSE(Storage.exists(storePath.c_str()));
+}
+
+TEST_F(LegacyStoreTest,
+       PdfBookmarkNoPathAllocationPreservesTransactionalDeleteOrder) {
+  constexpr char paddedPath[] = "/Books/delete.pdf.trailing";
+  const std::string_view exactPath(paddedPath,
+                                   sizeof("/Books/delete.pdf") - 1U);
+  const std::string ownedPath(exactPath);
+  const uint32_t crc = uzlib_crc32(exactPath.data(),
+                                   static_cast<unsigned int>(exactPath.size()), 0);
+  const std::string currentPath = "/.crosspoint/bookmarks/pdf_" +
+                                  std::to_string(crc) + ".bin";
+  const std::string legacyPath =
+      "/.crosspoint/bookmarks/pdf_" +
+      std::to_string(std::hash<std::string>{}(ownedPath)) + ".bin";
+  ASSERT_NE(currentPath, legacyPath);
+  const std::vector<std::string> paths = {
+      currentPath + ".bak", currentPath + ".tmp", legacyPath + ".bak",
+      legacyPath + ".tmp", legacyPath, currentPath};
+  for (const std::string& path : paths) Storage.addFile(path, {1});
+  Storage.beginBoundedPathCapture(68U);
+  ASSERT_TRUE(BookmarkStore::deleteForFilePath(ownedPath, "pdf"));
+  const auto owningTrace = Storage.capturedPathOperations();
+
+  Storage.reset();
+  for (const std::string& path : paths) Storage.addFile(path, {1});
+  Storage.beginBoundedPathCapture(68U);
+  ASSERT_TRUE(BookmarkStore::deletePdfForFilePathNoPathAlloc(exactPath));
+
+  EXPECT_EQ(Storage.capturedPathOperations(), owningTrace);
+  EXPECT_TRUE(Storage.boundedPathsWereNulTerminated());
+  for (const std::string& path : paths) EXPECT_FALSE(Storage.exists(path.c_str()));
+}
+
+TEST_F(LegacyStoreTest,
+       PdfBookmarkNoPathAllocationStopsBeforeAuthoritativePathsOnArtifactFailure) {
+  const std::string exactPath = "/Books/delete.pdf";
+  const uint32_t crc = uzlib_crc32(exactPath.data(),
+                                   static_cast<unsigned int>(exactPath.size()), 0);
+  const std::string currentPath = "/.crosspoint/bookmarks/pdf_" +
+                                  std::to_string(crc) + ".bin";
+  const std::string legacyPath =
+      "/.crosspoint/bookmarks/pdf_" +
+      std::to_string(std::hash<std::string>{}(exactPath)) + ".bin";
+  Storage.addFile(currentPath + ".bak", {1});
+  Storage.addFile(currentPath + ".tmp", {2});
+  Storage.addFile(currentPath, {3});
+  Storage.addFile(legacyPath, {4});
+  Storage.fail(TestStorageFault::Remove, 2U);
+
+  EXPECT_FALSE(BookmarkStore::deletePdfForFilePathNoPathAlloc(exactPath));
+  EXPECT_FALSE(Storage.exists((currentPath + ".bak").c_str()));
+  EXPECT_TRUE(Storage.exists((currentPath + ".tmp").c_str()));
+  EXPECT_TRUE(Storage.exists(currentPath.c_str()));
+  EXPECT_TRUE(Storage.exists(legacyPath.c_str()));
+}
+
+TEST_F(LegacyStoreTest,
+       PdfClippingNoPathAllocationPreservesTransactionalDeleteOrder) {
+  constexpr char paddedPath[] = "/Books/delete.pdf.trailing";
+  const std::string_view exactPath(paddedPath,
+                                   sizeof("/Books/delete.pdf") - 1U);
+  const std::string ownedPath(exactPath);
+  const uint32_t crc = uzlib_crc32(exactPath.data(),
+                                   static_cast<unsigned int>(exactPath.size()), 0);
+  const std::string canonicalPath = "/.crosspoint/clippings/pdf_" +
+                                    std::to_string(crc) + ".bin";
+  const std::vector<std::string> paths = {
+      canonicalPath + ".bak", canonicalPath + ".tmp", canonicalPath};
+  for (const std::string& path : paths) Storage.addFile(path, {1});
+  Storage.beginBoundedPathCapture(68U);
+  ASSERT_TRUE(ClippingStore::deleteForFilePath(ownedPath, "pdf"));
+  const auto owningTrace = Storage.capturedPathOperations();
+
+  Storage.reset();
+  for (const std::string& path : paths) Storage.addFile(path, {1});
+  Storage.beginBoundedPathCapture(68U);
+  ASSERT_TRUE(ClippingStore::deletePdfForFilePathNoPathAlloc(exactPath));
+
+  EXPECT_EQ(Storage.capturedPathOperations(), owningTrace);
+  EXPECT_TRUE(Storage.boundedPathsWereNulTerminated());
+  for (const std::string& path : paths) EXPECT_FALSE(Storage.exists(path.c_str()));
+}
+
+TEST_F(LegacyStoreTest, NoPathAllocationStoreFormattersCheck64ByteBoundaryBeforeMutation) {
+  const std::string exactPath = "/Books/legacy.epub";
+  const uint32_t crc = uzlib_crc32(exactPath.data(),
+                                   static_cast<unsigned int>(exactPath.size()), 0);
+  const size_t legacyHash = std::hash<std::string>{}(exactPath);
+  const std::string bookmarkPrefix = "/.crosspoint/bookmarks/";
+  const std::string currentSuffix = "_" + std::to_string(crc) + ".bin";
+  const std::string legacySuffix = "_" + std::to_string(legacyHash) + ".bin";
+  const size_t bookmarkFixed = bookmarkPrefix.size() +
+                               std::max(currentSuffix.size(), legacySuffix.size());
+  ASSERT_LT(bookmarkFixed, 63U);
+  const std::string exactBookmarkType(63U - bookmarkFixed, 'b');
+  const std::string currentBookmarkPath = bookmarkPrefix + exactBookmarkType +
+                                          currentSuffix;
+  const std::string legacyBookmarkPath = bookmarkPrefix + exactBookmarkType +
+                                         legacySuffix;
+  Storage.addFile(currentBookmarkPath, {1});
+  Storage.addFile(legacyBookmarkPath, {2});
+  Storage.beginBoundedPathCapture(64U);
+
+  ASSERT_TRUE(BookmarkStore::deleteLegacyForFilePathNoPathAlloc(
+      exactPath, exactBookmarkType));
+  EXPECT_TRUE(Storage.boundedPathsWereNulTerminated());
+
+  Storage.reset();
+  Storage.addFile(currentBookmarkPath, {1});
+  Storage.addFile(legacyBookmarkPath, {2});
+  const std::string overflowingBookmarkType = exactBookmarkType + "x";
+  EXPECT_FALSE(BookmarkStore::deleteLegacyForFilePathNoPathAlloc(
+      exactPath, overflowingBookmarkType));
+  EXPECT_TRUE(Storage.exists(currentBookmarkPath.c_str()));
+  EXPECT_TRUE(Storage.exists(legacyBookmarkPath.c_str()));
+
+  const std::string clippingPrefix = "/.crosspoint/clippings/";
+  const size_t clippingFixed = clippingPrefix.size() + currentSuffix.size();
+  ASSERT_LT(clippingFixed, 63U);
+  const std::string exactClippingType(63U - clippingFixed, 'c');
+  const std::string clippingPath = clippingPrefix + exactClippingType +
+                                   currentSuffix;
+  Storage.reset();
+  Storage.addFile(clippingPath, {3});
+  Storage.beginBoundedPathCapture(64U);
+  ASSERT_TRUE(ClippingStore::deleteLegacyForFilePathNoPathAlloc(
+      exactPath, exactClippingType));
+  EXPECT_TRUE(Storage.boundedPathsWereNulTerminated());
+
+  Storage.reset();
+  Storage.addFile(clippingPath, {3});
+  const std::string overflowingClippingType = exactClippingType + "x";
+  EXPECT_FALSE(ClippingStore::deleteLegacyForFilePathNoPathAlloc(
+      exactPath, overflowingClippingType));
+  EXPECT_TRUE(Storage.exists(clippingPath.c_str()));
 }
 
 }  // namespace

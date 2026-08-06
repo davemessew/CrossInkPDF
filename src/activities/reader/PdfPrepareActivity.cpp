@@ -20,6 +20,10 @@ namespace {
 
 constexpr char kCacheDirectory[] = "/.crosspoint";
 
+#if defined(SIMULATOR) || defined(CROSSINK_QEMU)
+PdfPrepareActivity* activePdfPrepareActivity = nullptr;
+#endif
+
 uint32_t currentStackMargin() {
   // ESP-IDF reports this high-water mark in bytes (unlike upstream FreeRTOS).
   return static_cast<uint32_t>(uxTaskGetStackHighWaterMark(nullptr));
@@ -60,36 +64,18 @@ void PdfPrepareActivity::resourceEvent(void*, const PdfResourceEvent& event) {
 }
 
 const char* PdfPrepareActivity::errorMessage(const PdfError error) {
-  switch (error) {
-    case PdfError::NoReadableText:
-      return tr(STR_PDF_NO_READABLE_TEXT);
-    case PdfError::Encrypted:
-      return tr(STR_PDF_ENCRYPTED);
-    case PdfError::UnsupportedFilter:
-      return tr(STR_PDF_UNSUPPORTED_FILTER);
-    case PdfError::UnsupportedEncoding:
-      return tr(STR_PDF_UNSUPPORTED_ENCODING);
-    case PdfError::InsufficientMemory:
-      return tr(STR_PDF_INSUFFICIENT_MEMORY);
-    case PdfError::InsufficientStorage:
-      return tr(STR_PDF_INSUFFICIENT_STORAGE);
-    case PdfError::Cancelled:
-      return tr(STR_PDF_PREPARATION_PAUSED);
-    case PdfError::ExpansionLimit:
-    case PdfError::LimitExceeded:
-    case PdfError::Malformed:
-    case PdfError::InvalidOffset:
-    case PdfError::UnexpectedEof:
-      return tr(STR_PDF_DAMAGED_OR_UNSAFE);
-    case PdfError::Unsupported:
-      return tr(STR_PDF_UNSUPPORTED);
-    default:
-      return tr(STR_PDF_PREPARATION_FAILED);
-  }
+  return I18N.get(pdfPrepareErrorTranslationKey(error));
 }
 
 void PdfPrepareActivity::onEnter() {
+#if defined(SIMULATOR) || defined(CROSSINK_QEMU)
+  activePdfPrepareActivity = this;
+#endif
   Activity::onEnter();
+  if (!initialFailure_.ok()) {
+    setFailure(initialFailure_);
+    return;
+  }
   preparation_ = makeUniqueNoThrow<PdfPreparation>();
   if (!preparation_) {
     setFailure(PdfStatus::failure(PdfError::InsufficientMemory));
@@ -116,12 +102,35 @@ void PdfPrepareActivity::onEnter() {
 }
 
 void PdfPrepareActivity::onExit() {
+#if defined(SIMULATOR) || defined(CROSSINK_QEMU)
+  if (activePdfPrepareActivity == this) {
+    activePdfPrepareActivity = nullptr;
+  }
+#endif
+  pendingDocument_.reset();
   preparation_.reset();
   Activity::onExit();
 }
 
 bool PdfPrepareActivity::skipLoopDelay() { return state_ == State::Preparing && preparation_ != nullptr; }
 bool PdfPrepareActivity::preventAutoSleep() { return state_ == State::Preparing && preparation_ != nullptr; }
+
+#if defined(SIMULATOR) || defined(CROSSINK_QEMU)
+bool PdfPrepareActivity::acceptanceObserveFailure(
+    PdfPrepareAcceptanceObservation* const observation) const {
+  if (observation == nullptr || state_ != State::Failed) {
+    return false;
+  }
+  *observation = pdfPrepareAcceptanceObservationFor(failure_.error);
+  return true;
+}
+
+bool pdfObserveActivePrepareFailure(
+    PdfPrepareAcceptanceObservation* const observation) {
+  return activePdfPrepareActivity != nullptr &&
+         activePdfPrepareActivity->acceptanceObserveFailure(observation);
+}
+#endif
 
 void PdfPrepareActivity::setFailure(const PdfStatus status) {
   failure_ = status;
@@ -144,8 +153,21 @@ void PdfPrepareActivity::finishPreparation() {
     setFailure(status);
     return;
   }
-  std::unique_ptr<ReflowDocument> reflowDocument = std::move(document);
-  auto reader = makeUniqueNoThrow<EpubReaderActivity>(renderer, mappedInput, std::move(reflowDocument));
+  if (document->optionalContentWasSkipped()) {
+    pendingDocument_ = std::move(document);
+    state_ = State::Warning;
+    requestUpdate();
+    return;
+  }
+  openPreparedDocument(std::move(document));
+}
+
+void PdfPrepareActivity::openPreparedDocument(std::unique_ptr<ReflowDocument> document) {
+  if (!document) {
+    setFailure(PdfStatus::failure(PdfError::InvalidArgument));
+    return;
+  }
+  auto reader = makeUniqueNoThrow<EpubReaderActivity>(renderer, mappedInput, std::move(document));
   if (!reader) {
     setFailure(PdfStatus::failure(PdfError::InsufficientMemory));
     return;
@@ -154,6 +176,14 @@ void PdfPrepareActivity::finishPreparation() {
 }
 
 void PdfPrepareActivity::loop() {
+  if (state_ == State::Warning) {
+    if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
+      openPreparedDocument(std::move(pendingDocument_));
+    } else if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
+      finish();
+    }
+    return;
+  }
   if (state_ != State::Preparing || !preparation_) {
     if (mappedInput.wasReleased(MappedInputManager::Button::Back) ||
         mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
@@ -197,6 +227,11 @@ void PdfPrepareActivity::render(RenderLock&&) {
     renderer.drawCenteredText(UI_10_FONT_ID, height / 2 + 22, progress);
     renderer.drawCenteredText(UI_10_FONT_ID, height / 2 + 48, tr(STR_PDF_CANCEL_RESUME));
     const auto labels = mappedInput.mapLabels(tr(STR_CANCEL), "", "", "");
+    GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+  } else if (state_ == State::Warning) {
+    renderer.drawCenteredText(UI_10_FONT_ID, height / 2 - 12, tr(STR_PDF_OPTIONAL_CONTENT_SKIPPED), true,
+                              EpdFontFamily::BOLD);
+    const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_CONTINUE_READING), "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
   } else {
     renderer.drawCenteredText(UI_10_FONT_ID, height / 2 - 12, errorMessage(failure_.error), true, EpdFontFamily::BOLD);

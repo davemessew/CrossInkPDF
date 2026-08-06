@@ -15,7 +15,9 @@ The `platformio.ini` `[env:simulator]` section contains hardcoded `-arch arm64` 
 
 - Intel Mac users need to remove `-arch arm64` and change Homebrew paths to `/usr/local`.
 - Linux requires similar path changes plus a replacement for `lib/simulator_mock/src/MD5Builder.h`, which uses the macOS-only `CommonCrypto` API.
-- Native Windows is not supported. Use WSL and follow the Linux adjustments.
+- The interactive SDL simulator is not configured for native Windows. Use WSL
+  and follow the Linux adjustments, or use the containerized PDF acceptance
+  replay described below.
 
 ## Prerequisites
 
@@ -29,7 +31,8 @@ sudo apt install libsdl2-dev
 
 ## Setup
 
-Place EPUB books in `./fs_/books/` relative to the project root. That maps to the SD-card `/books/` path on device.
+Place EPUB or PDF books in `./fs_/books/` relative to the project root. That
+maps to the SD-card `/books/` path on device.
 
 ## Build And Run
 
@@ -48,8 +51,36 @@ pio run -e simulator
 | Escape | Back |
 | P | Power |
 
+## PDF Acceptance Replay
+
+The repository includes a deterministic, headless PDF acceptance runner. Its
+container mode supplies the pinned Ubuntu and SDL environment, so it is also
+the preferred PDF simulator gate on Windows:
+
+```powershell
+python scripts/run_pdf_simulator_acceptance.py --container --headless
+```
+
+The runner builds the simulator, stages its own PDF fixtures in a temporary SD
+card image, and exercises cancelled preparation, resumed preparation, a clean
+uncached open, and a cached reopen. It checks semantic reflow output, progress
+and navigation behavior, images, cache artifacts, negative fixtures, and an
+EPUB regression fixture against the checked-in oracle. It prints
+`PDF_SIMULATOR_ACCEPTANCE_PASS` only after every phase and oracle check succeeds.
+
+The runner owns its temporary filesystem; it does not need books from
+`./fs_/books/`. Use `--update-oracle` only when an intentional behavior change
+has been reviewed, because that option replaces the expected output instead of
+testing against it.
+
 ## Cache Note
 
-On first open of an EPUB, an **Indexing...** popup appears while the section cache is built in `.crosspoint/`.
+On first open of an EPUB, an **Indexing...** popup appears while the section
+cache is built in `.crosspoint/`. On first open of a supported PDF, a
+**Preparing PDF** popup reports preparation progress and allows
+cancellation; opening the book again resumes from a valid checkpoint when one
+is available.
 
-If rendering looks stale after a code change, delete `./fs_/.crosspoint/` to clear simulator caches.
+If rendering looks stale after a code change, clear the affected book cache in
+the simulated UI. Deleting `./fs_/.crosspoint/` is a full simulator reset and
+also removes progress, bookmarks, settings, and other user state.

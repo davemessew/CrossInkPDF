@@ -161,6 +161,7 @@ add_executable(PdfImagePreparationTest
   ${REPO_ROOT}/lib/PdfReflow/PdfBuildCheckpoint.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfCacheManifest.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfCacheStore.cpp
+  ${REPO_ROOT}/lib/PdfReflow/PdfFixedRecordSpool.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfIo.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfImageBuildSpool.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfImageCache.cpp
@@ -168,6 +169,7 @@ add_executable(PdfImagePreparationTest
   ${REPO_ROOT}/lib/PdfReflow/PdfImageObject.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfImagePreparation.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfJpegPreview.cpp
+  ${REPO_ROOT}/lib/PdfReflow/PdfLayoutWordIndex.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfMaskSpool.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfPixelCacheWriter.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfLexer.cpp
@@ -177,7 +179,11 @@ add_executable(PdfImagePreparationTest
   ${REPO_ROOT}/lib/PdfReflow/PdfOutline.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfPageTree.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfPreparation.cpp
+  ${REPO_ROOT}/lib/PdfReflow/PdfProgressStore.cpp
+  ${REPO_ROOT}/lib/PdfReflow/PdfReflowDocument.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfResourceTracker.cpp
+  ${REPO_ROOT}/lib/PdfReflow/PdfSavedItemWordMap.cpp
+  ${REPO_ROOT}/lib/PdfReflow/PdfSavedItemsStore.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfSemanticWriter.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfSourceIdentity.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfStreamDecoder.cpp
@@ -192,11 +198,16 @@ add_executable(PdfImagePreparationTest
   PdfImagePreparationTest.cpp
 )
 
+target_include_directories(PdfImagePreparationTest BEFORE PRIVATE
+  ${REPO_ROOT}/test/pdf_product_integration/stubs
+)
+
 target_include_directories(PdfImagePreparationTest PRIVATE
   ${REPO_ROOT}/lib/InflateReader
   ${REPO_ROOT}/lib/Memory
   ${REPO_ROOT}/lib/PixelCache
   ${REPO_ROOT}/lib/PdfReflow
+  ${REPO_ROOT}/lib/Reflow
   ${REPO_ROOT}/lib/uzlib/src
   ${REPO_ROOT}/test/pdf_cache_recovery
   ${REPO_ROOT}/test/pdf_reflow_core

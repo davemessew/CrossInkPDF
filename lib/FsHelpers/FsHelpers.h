@@ -11,7 +11,7 @@ namespace FsHelpers {
 
 std::string decodeUriEscapes(const std::string& path);
 
-std::string normalisePath(const std::string& path);
+std::string normalisePath(const std::string& path, bool preserveRoot = false);
 
 // Numeric-aware, case-insensitive comparison ("2" < "10"). Returns true when str1 orders
 // before str2. Same ordering sortFileList applies within the file/directory groups.

@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 
 #include "BookMutationFence.h"
 
@@ -32,6 +33,7 @@ MoveResult recoverPendingBookMove();
 // classified by path; an unreadable or concurrently-starting journal fails
 // closed.
 BookMutationFence mutationFenceForPath(const std::string& bookPath);
+BookMutationFence mutationFenceForPathNoPathAlloc(std::string_view bookPath);
 
 // Resolves the cache key for a path while a move is in flight. Before durable
 // activation this returns the old key; from Activated onward it returns new.

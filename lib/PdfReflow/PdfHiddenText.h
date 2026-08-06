@@ -31,6 +31,7 @@ enum class PdfHiddenTextDecision : uint8_t {
   NoImageOverlap,
   MetadataLike,
   DuplicateVisible,
+  DuplicateHidden,
 };
 
 struct PdfTextFingerprint {
@@ -50,6 +51,8 @@ struct PdfHiddenTextContext {
   size_t textLength = 0;
   const PdfImagePlacement* images = nullptr;
   uint16_t imageCount = 0;
+  uint8_t* retainedHidden = nullptr;
+  size_t retainedHiddenBytes = 0;
 };
 
 PdfStatus pdfFingerprintNormalizedText(const uint8_t* text, size_t length, PdfTextFingerprint* fingerprint);

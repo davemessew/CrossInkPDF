@@ -1,12 +1,18 @@
 #pragma once
 
 #include <string>
+#include <string_view>
 
 #include "TestState.h"
 
 class Epub {
  public:
   Epub(const std::string&, const char*) { ++TEST_STATE.epubConstructs; }
+
+  static bool clearCacheForFilePathNoPathAlloc(const std::string_view path, const char*) {
+    TEST_STATE.metadataDeletes.emplace_back("epub-cache:" + std::string(path));
+    return TEST_STATE.epubNoPathAllocResult;
+  }
 
   void clearCache() { TEST_STATE.metadataDeletes.emplace_back("epub-cache"); }
   void setupCacheDir() { ++TEST_STATE.epubSetups; }

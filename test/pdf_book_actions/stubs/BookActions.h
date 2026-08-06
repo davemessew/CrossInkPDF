@@ -1,11 +1,15 @@
 #pragma once
 
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "I18n.h"
 
 class GfxRenderer;
+namespace PdfDeleteUtils {
+class DirectoryDeleteSession;
+}
 
 enum class FileBrowserAction : int {
   Delete = 0,
@@ -39,6 +43,10 @@ std::vector<FileBrowserActionActivity::MenuItem> buildBookActionItems(const std:
                                                                       bool includeRemoveFromRecents);
 bool hasClearableBookCache(const std::string& path);
 void clearFileMetadata(const std::string& fullPath);
+bool clearDirectoryLegacyMetadataNoPathAlloc(std::string_view fullPath);
+bool deleteDirectoryPdfBookNoPathAlloc(
+    PdfDeleteUtils::DirectoryDeleteSession& session,
+    std::string_view fullPath);
 bool deletePdfBook(const std::string& fullPath);
 bool clearBookCache(const std::string& fullPath);
 bool deleteBookStats(const std::string& fullPath);

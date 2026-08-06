@@ -81,6 +81,7 @@ class HalStorage {
     failRemoveDir_ = false;
     failRemovePath_.clear();
     failOpenPath_.clear();
+    failOpenAfterRemoveDirPath_.clear();
     failDirectoryIterationPath_.clear();
     activeDirectDirectoryReaders_ = 0;
     maximumDirectDirectoryReaders_ = 0;
@@ -88,6 +89,7 @@ class HalStorage {
     pathOpenCounts_.clear();
     pathReadBytes_.clear();
     pathWrittenBytes_.clear();
+    fileOpenCalls_ = 0;
     corruptOnSyncPath_.clear();
     events.clear();
     mkdir("/");
@@ -135,6 +137,14 @@ class HalStorage {
       }
     }
     events.emplace_back(std::string("remove-dir:") + path);
+    if (!failOpenAfterRemoveDirPath_.empty()) {
+      failOpenPath_ = failOpenAfterRemoveDirPath_;
+      failOpenAfterRemoveDirPath_.clear();
+    }
+    if (!failCloseAfterRemoveDirPath_.empty()) {
+      failClosePath_ = failCloseAfterRemoveDirPath_;
+      failCloseAfterRemoveDirPath_.clear();
+    }
     return true;
   }
   HalFile open(const char* path, int flags = O_RDONLY) {
@@ -146,6 +156,7 @@ class HalStorage {
     if ((flags & O_TRUNC) != 0 && nodes_.contains(path)) nodes_[path].bytes.clear();
     if (!nodes_.contains(path)) return {};
     ++pathOpenCounts_[path];
+    ++fileOpenCalls_;
     events.emplace_back(std::string(
                             (flags & (O_WRONLY | O_RDWR)) != 0
                                 ? "open-file-write:"
@@ -165,11 +176,13 @@ class HalStorage {
   bool openFileForRead(const char*, const char* path, HalFile& file) {
     file.close();
     if (!nodes_.contains(path)) return false;
+    ++fileOpenCalls_;
     openInto(file, path, false);
     return true;
   }
   bool openFileForWrite(const char*, const char* path, HalFile& file) {
     file.close();
+    ++fileOpenCalls_;
     nodes_[path] = {};
     openInto(file, path, true);
     return true;
@@ -196,6 +209,12 @@ class HalStorage {
   void failNextRemoveDir() { failRemoveDir_ = true; }
   void failNextRemoveOf(const std::string& path) { failRemovePath_ = path; }
   void failNextOpenOf(const std::string& path) { failOpenPath_ = path; }
+  void failNextOpenOfAfterRemoveDir(const std::string& path) {
+    failOpenAfterRemoveDirPath_ = path;
+  }
+  void failNextCloseOfAfterRemoveDir(const std::string& path) {
+    failCloseAfterRemoveDirPath_ = path;
+  }
   void failNextDirectoryIterationOf(const std::string& path) { failDirectoryIterationPath_ = path; }
   void corruptOnNextSyncOf(const std::string& path) {
     corruptOnSyncPath_ = path;
@@ -216,6 +235,23 @@ class HalStorage {
     const auto found = pathWrittenBytes_.find(path);
     return found == pathWrittenBytes_.end() ? 0U : found->second;
   }
+  size_t fileOpenCalls() const { return fileOpenCalls_; }
+  size_t totalReadBytes() const {
+    size_t total = 0;
+    for (const auto& [path, bytes] : pathReadBytes_) {
+      (void)path;
+      total += bytes;
+    }
+    return total;
+  }
+  size_t totalWrittenBytes() const {
+    size_t total = 0;
+    for (const auto& [path, bytes] : pathWrittenBytes_) {
+      (void)path;
+      total += bytes;
+    }
+    return total;
+  }
   std::vector<std::string> events;
 
  private:
@@ -234,6 +270,9 @@ class HalStorage {
   bool failRemoveDir_ = false;
   std::string failRemovePath_;
   std::string failOpenPath_;
+  std::string failOpenAfterRemoveDirPath_;
+  std::string failClosePath_;
+  std::string failCloseAfterRemoveDirPath_;
   std::string failDirectoryIterationPath_;
   size_t activeDirectDirectoryReaders_ = 0;
   size_t maximumDirectDirectoryReaders_ = 0;
@@ -241,6 +280,7 @@ class HalStorage {
   std::unordered_map<std::string, size_t> pathOpenCounts_;
   std::unordered_map<std::string, size_t> pathReadBytes_;
   std::unordered_map<std::string, size_t> pathWrittenBytes_;
+  size_t fileOpenCalls_ = 0;
   std::string corruptOnSyncPath_;
 
   void ensureParents(const std::string& path) {
@@ -292,9 +332,17 @@ inline HalFile& HalFile::operator=(HalFile&& other) noexcept {
 inline size_t HalFile::getName(char* name, size_t length) {
   const size_t slash = path_.rfind('/');
   const std::string leaf = slash == std::string::npos ? path_ : path_.substr(slash + 1);
+#if defined(PDF_DIRECTORY_DELETE_TRUNCATING_GET_NAME)
+  if (length == 0) return 0;
+  const size_t copied = std::min(leaf.size(), length - 1U);
+  std::memcpy(name, leaf.data(), copied);
+  name[copied] = '\0';
+  return copied;
+#else
   if (length == 0 || leaf.size() >= length) return 0;
-  std::memcpy(name, leaf.c_str(), leaf.size() + 1);
+  std::memcpy(name, leaf.c_str(), leaf.size() + 1U);
   return leaf.size();
+#endif
 }
 
 inline uint64_t HalFile::fileSize64() const { return isOpen() ? storage_->nodes_.at(path_).bytes.size() : 0; }
@@ -375,6 +423,10 @@ inline bool HalFile::close() {
   directDirectoryReader_ = false;
   storage->events.emplace_back(std::string("close:") + path);
   ++storage->closeCalls_;
+  if (storage->failClosePath_ == path) {
+    storage->failClosePath_.clear();
+    return false;
+  }
   if (storage->failCloseCall_ != 0 && storage->closeCalls_ == storage->failCloseCall_) {
     storage->failCloseCall_ = 0;
     return false;

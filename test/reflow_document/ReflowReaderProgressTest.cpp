@@ -36,6 +36,7 @@ class ReaderDocument final : public ReflowDocument {
   bool generateAdaptiveThumbBmp(int, int, const GfxRenderer* = nullptr, int = 0) const override { return false; }
   int getSectionCount() const override { return 2; }
   ReflowSectionInfo getSectionInfo(const int sectionIndex) const override {
+    ++sectionInfoQueries_;
     if (sectionIndex == 0) {
       return {.href = "section-0.xhtml",
               .title = "Opening",
@@ -129,6 +130,7 @@ class ReaderDocument final : public ReflowDocument {
   CssParser* getCssParser() const override { return nullptr; }
 
   int lastStreamedSection() const { return lastStreamedSection_; }
+  int sectionInfoQueries() const { return sectionInfoQueries_; }
 
  private:
   ReflowDocumentFormat format_;
@@ -142,7 +144,17 @@ class ReaderDocument final : public ReflowDocument {
   mutable ReflowReadingPosition position_;
   mutable bool hasPosition_ = false;
   mutable int lastStreamedSection_ = -1;
+  mutable int sectionInfoQueries_ = 0;
 };
+
+TEST(ReflowReaderProgress, DefaultHrefAccessorPreservesExistingDerivedDocumentSemantics) {
+  ReaderDocument document(ReflowDocumentFormat::Epub, 0, "epub");
+  std::string href;
+
+  ASSERT_TRUE(document.getSectionHref(1, href));
+  EXPECT_EQ(href, "section-1.xhtml");
+  EXPECT_EQ(document.sectionInfoQueries(), 1);
+}
 
 TEST(ReflowReaderProgress, UsesSharedSectionTocAndInternalHrefContracts) {
   ReaderDocument document(ReflowDocumentFormat::Pdf, 0, "pdf");

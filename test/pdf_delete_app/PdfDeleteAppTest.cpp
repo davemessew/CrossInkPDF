@@ -1,8 +1,11 @@
 #include <iostream>
+#include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <HalStorage.h>
+#include <Memory.h>
 #include <PdfSourceIdentity.h>
 
 #include "BookmarkStore.h"
@@ -59,6 +62,7 @@ void resetState() {
   RecentBooksStore::failNextCanonicalParse = false;
   RecentBooksStore::canonicalBytes =
       R"({"books":[{"path":"/Books/delete-me.pdf"},{"path":"/Books/keep-me.pdf"}]})";
+  RecentBooksStore::exerciseCheckedScratchAllocation = false;
   BookMoveUtils::testFence = BookMutationFence::Clear;
   BookMoveUtils::fenceQueries = 0;
   PdfDeleteUtils::resetPresenceForTest();
@@ -80,6 +84,27 @@ void expectCompletelyDeleted() {
   expect(BookmarkStore::books.contains(kUnrelated), "unrelated bookmarks must remain");
   expect(ClippingStore::books.contains(kUnrelated), "unrelated clippings must remain");
   expect(RecentBooksStore::paths.contains(kUnrelated), "unrelated recent entry must remain");
+}
+
+void testEmptyBootRecoverySkipsFullDeleteWorkspace() {
+  resetState();
+  TestMemory::reset();
+
+  expect(PdfDeleteUtils::recoverPendingPdfDelete() ==
+             PdfDeleteUtils::Result::NoPendingDelete,
+         "empty boot storage must report no pending PDF delete");
+  expect(TestMemory::allocations == 1U,
+         "empty boot recovery must allocate only one bounded journal reader");
+  expect(TestMemory::allocationSizes.size() == 1U &&
+             TestMemory::allocationSizes.front() <= 7U * 1024U,
+         "empty boot recovery must not allocate the full PDF delete workspace");
+  expect(Storage.fileOpenCalls() == 0U && Storage.maximumFileHandles() == 0U,
+         "absent PDF delete slots must not acquire a journal file handle");
+  if (!TestMemory::allocationSizes.empty()) {
+    std::cout << "PDF_DELETE_BOOT_PREFLIGHT allocation_bytes="
+              << TestMemory::allocationSizes.front() << " opens="
+              << Storage.fileOpenCalls() << '\n';
+  }
 }
 
 void testCompleteDeletePurgesAllPdfState() {
@@ -225,9 +250,146 @@ void testPreexistingTombstoneIsNeverAdopted() {
          "tombstone collision must not create delete intent");
 }
 
+void testDirectorySessionAllocationFailsBeforeMutation() {
+  resetState();
+  TestMemory::reset();
+  TestMemory::failNextAllocation = true;
+
+  auto session = PdfDeleteUtils::makeDirectoryDeleteSessionNoThrow();
+
+  expect(!session, "directory delete session allocation must be fallible");
+  expect(Storage.exists(kSource),
+         "directory session OOM must happen before source mutation");
+  expect(!Storage.exists(PdfDelete::kSlotAPath) &&
+             !Storage.exists(PdfDelete::kSlotBPath),
+         "directory session OOM must not create durable delete intent");
+}
+
+void testPreGateOomDoesNotReleaseAnotherDeleteOwner() {
+  resetState();
+  PdfDeleteUtils::markDeleteStartingForTest();
+  TestMemory::reset();
+  TestMemory::failNextAllocation = true;
+
+  expect(PdfDeleteUtils::deletePdfBook(kUnrelated) ==
+             PdfDeleteUtils::Result::Pending,
+         "pre-gate workspace OOM must report pending while another delete owns the gate");
+
+  TestMemory::reset();
+  expect(PdfDeleteUtils::mutationFenceForPath(kUnrelated) ==
+             BookMutationFence::Indeterminate,
+         "pre-gate OOM must not release another task's active delete gate");
+  expect(TestMemory::allocations == 0U,
+         "an active delete gate probe must not fall through to journal lookup");
+}
+
+void testDirectorySessionUsesExactViewAndReusesOneWorkspaceFor300Pdfs() {
+  Storage.reset();
+  Storage.mkdir("/Books");
+  Storage.mkdir("/.crosspoint");
+  BookmarkStore::books.clear();
+  BookmarkStore::events.clear();
+  ClippingStore::books.clear();
+  ClippingStore::events.clear();
+  RecentBooksStore::paths.clear();
+  RecentBooksStore::persistedPaths.clear();
+  RecentBooksStore::events.clear();
+  RecentBooksStore::canonicalExists = true;
+  RecentBooksStore::failNextDurableRemoval = false;
+  RecentBooksStore::exerciseCheckedScratchAllocation = false;
+  BookMoveUtils::testFence = BookMutationFence::Clear;
+  BookMoveUtils::fenceQueries = 0;
+  PdfDeleteUtils::resetPresenceForTest();
+  TestMemory::reset();
+
+  auto session = PdfDeleteUtils::makeDirectoryDeleteSessionNoThrow();
+  expect(session != nullptr && TestMemory::allocations == 1U,
+         "directory replay must prepare one checked reusable adapter workspace");
+  if (!session) return;
+
+  constexpr size_t kPdfCount = 300U;
+  for (size_t index = 0; index < kPdfCount; ++index) {
+    const std::string source =
+        "/Books/directory-" + std::to_string(1000U + index) + ".pdf";
+    Storage.putFile(source, {1});
+    BookmarkStore::books.insert(source);
+    ClippingStore::books.insert(source);
+    RecentBooksStore::paths.insert(source);
+    RecentBooksStore::persistedPaths.insert(source);
+    RecentBooksStore::canonicalBytes = "canonical-before-delete";
+
+    const std::string padded = source + ".trailing";
+    const auto result = PdfDeleteUtils::deletePdfBookNoPathAlloc(
+        *session, std::string_view(padded.data(), source.size()));
+    expect(result == PdfDeleteUtils::Result::Complete,
+           "every directory PDF must complete through the reusable view adapter");
+    expect(!Storage.exists(source.c_str()),
+           "the exact sliced PDF source must be removed");
+    expect(Storage.exists(padded.c_str()) == false,
+           "the trailing sentinel must never be treated as part of the source");
+  }
+
+  expect(TestMemory::allocations == 1U,
+         "300 directory PDFs must not allocate another DeleteWorkspace");
+  expect(Storage.maximumFileHandles() <= 1U,
+         "300 directory PDFs must retain at most one SD handle");
+  expect(Storage.fileOpenCalls() > 0U &&
+             Storage.fileOpenCalls() <= kPdfCount * 40U,
+         "journal open work must remain linearly bounded per PDF");
+  expect(Storage.totalReadBytes() <= kPdfCount * 8192U &&
+             Storage.totalWrittenBytes() <= kPdfCount * 8192U,
+         "journal I/O must remain bounded per PDF");
+  std::cout << "PDF_DIRECTORY_ADAPTER_300 allocations="
+            << TestMemory::allocations << " opens=" << Storage.fileOpenCalls()
+            << " read_bytes=" << Storage.totalReadBytes()
+            << " written_bytes=" << Storage.totalWrittenBytes() << '\n';
+}
+
+void testDirectorySessionDownstreamOomPreservesCommittedPrefixAndPendingPdf() {
+  resetState();
+  TestMemory::reset();
+  auto session = PdfDeleteUtils::makeDirectoryDeleteSessionNoThrow();
+  expect(session != nullptr, "directory workspace fixture must allocate");
+  if (!session) return;
+
+  expect(PdfDeleteUtils::deletePdfBookNoPathAlloc(*session, kSource) ==
+             PdfDeleteUtils::Result::Complete,
+         "first directory PDF must commit before the later OOM");
+  expect(!Storage.exists(kSource),
+         "the committed directory prefix must remain deleted");
+
+  constexpr char kSecond[] = "/Books/second.pdf";
+  Storage.putFile(kSecond, {5});
+  BookmarkStore::books.insert(kSecond);
+  ClippingStore::books.insert(kSecond);
+  RecentBooksStore::paths.insert(kSecond);
+  RecentBooksStore::persistedPaths.insert(kSecond);
+  RecentBooksStore::exerciseCheckedScratchAllocation = true;
+  TestMemory::failNextAllocation = true;
+
+  expect(PdfDeleteUtils::deletePdfBookNoPathAlloc(*session, kSecond) ==
+             PdfDeleteUtils::Result::Pending,
+         "checked downstream OOM must leave the current PDF journaled pending");
+  expect(!Storage.exists(kSource) && !Storage.exists(kSecond) &&
+             Storage.exists("/Books/.second.pdf.crossink-delete"),
+         "later OOM must preserve the committed prefix and hide only the journaled current PDF");
+  expect(Storage.exists(PdfDelete::kSlotAPath) ||
+             Storage.exists(PdfDelete::kSlotBPath),
+         "later OOM must retain durable intent for exact recovery");
+
+  PdfDeleteUtils::resetPresenceForTest();
+  expect(PdfDeleteUtils::recoverPendingPdfDelete() ==
+             PdfDeleteUtils::Result::Complete,
+         "recovery must finish the precise PDF left pending by OOM");
+  expect(!Storage.exists("/Books/.second.pdf.crossink-delete") &&
+             !RecentBooksStore::persistedPaths.contains(kSecond),
+         "OOM recovery must remove only the pending PDF state");
+}
+
 }  // namespace
 
 int main() {
+  testEmptyBootRecoverySkipsFullDeleteWorkspace();
   testCompleteDeletePurgesAllPdfState();
   testDurableRecentFailureRecoversAfterReboot();
   testCanonicalRecentLoadFailuresPreserveExactBytesAndUnrelatedEntries();
@@ -236,6 +398,10 @@ int main() {
   testDeleteFenceIsPathAwareAndFailClosed();
   testInvalidAndNonPdfPathsDoNothing();
   testPreexistingTombstoneIsNeverAdopted();
+  testDirectorySessionAllocationFailsBeforeMutation();
+  testPreGateOomDoesNotReleaseAnotherDeleteOwner();
+  testDirectorySessionUsesExactViewAndReusesOneWorkspaceFor300Pdfs();
+  testDirectorySessionDownstreamOomPreservesCommittedPrefixAndPendingPdf();
   if (failures != 0) {
     std::cerr << failures << " PDF deletion adapter test(s) failed\n";
     return 1;

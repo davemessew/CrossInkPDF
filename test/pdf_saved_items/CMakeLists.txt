@@ -179,6 +179,7 @@ class FsFile {
 class HalStorage {
  public:
   bool exists(const char* path) const {
+    recordCapturedPath("exists:", path);
     if (path == nullptr) return false;
     return files_.contains(path) || directories_.contains(path);
   }
@@ -188,6 +189,7 @@ class HalStorage {
     return true;
   }
   bool remove(const char* path) {
+    recordCapturedPath("remove:", path);
     if (path == nullptr || shouldFail(TestStorageFault::Remove)) return false;
     return files_.erase(path) != 0;
   }
@@ -243,6 +245,9 @@ class HalStorage {
     directories_.clear();
     openHandles_ = 0;
     maximumOpenHandles_ = 0;
+    capturedPathOperations_.clear();
+    boundedPathCapacity_ = 0;
+    boundedPathsWereNulTerminated_ = true;
     clearFault();
   }
   void addFile(const std::string& path, const std::vector<uint8_t>& bytes) { files_[path] = bytes; }
@@ -258,6 +263,17 @@ class HalStorage {
   }
   const std::map<std::string, std::vector<uint8_t>>& files() const { return files_; }
   size_t maximumOpenHandles() const { return maximumOpenHandles_; }
+  void beginBoundedPathCapture(size_t capacity) {
+    capturedPathOperations_.clear();
+    boundedPathCapacity_ = capacity;
+    boundedPathsWereNulTerminated_ = true;
+  }
+  const std::vector<std::string>& capturedPathOperations() const {
+    return capturedPathOperations_;
+  }
+  bool boundedPathsWereNulTerminated() const {
+    return boundedPathsWereNulTerminated_;
+  }
   static HalStorage& getInstance() {
     static HalStorage instance;
     return instance;
@@ -281,6 +297,19 @@ class HalStorage {
   TestStorageFault fault_ = TestStorageFault::None;
   uint16_t faultOccurrence_ = 0;
   uint16_t faultCalls_ = 0;
+  mutable std::vector<std::string> capturedPathOperations_;
+  mutable size_t boundedPathCapacity_ = 0;
+  mutable bool boundedPathsWereNulTerminated_ = true;
+
+  void recordCapturedPath(const char* operation, const char* path) const {
+    if (boundedPathCapacity_ == 0) return;
+    if (path == nullptr ||
+        std::memchr(path, '\0', boundedPathCapacity_) == nullptr) {
+      boundedPathsWereNulTerminated_ = false;
+      return;
+    }
+    capturedPathOperations_.emplace_back(std::string(operation) + path);
+  }
 };
 
 inline int FsFile::read(void* destination, size_t count) {
@@ -366,3 +395,23 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
 endif()
 
 gtest_discover_tests(PdfSavedItemsSessionTest TEST_PREFIX "PdfSavedItemsSession")
+
+add_executable(PdfReaderSessionAllocationTest
+  PdfReaderSessionAllocationTest.cpp
+)
+
+target_include_directories(PdfReaderSessionAllocationTest BEFORE PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/allocation_policy_stubs
+)
+
+target_include_directories(PdfReaderSessionAllocationTest PRIVATE
+  ${REPO_ROOT}/src/activities/reader
+  ${REPO_ROOT}/lib/Reflow
+)
+
+target_link_libraries(PdfReaderSessionAllocationTest PRIVATE
+  crosspoint_test_common
+  GTest::gtest_main
+)
+
+gtest_discover_tests(PdfReaderSessionAllocationTest TEST_PREFIX "PdfReaderSessionAllocation")

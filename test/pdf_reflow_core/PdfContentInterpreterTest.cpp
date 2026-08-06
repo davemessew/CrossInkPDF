@@ -30,26 +30,31 @@ struct InterpreterHarness {
   PdfPageModel model;
   PdfContentInterpreter interpreter;
 
-  InterpreterHarness()
+  explicit InterpreterHarness(const PdfRectangle pageBounds = {}, const PdfMatrix pageTransform = {})
       : model({pageText.data(), pageText.size(), runs.data(), static_cast<uint16_t>(runs.size()), images.data(),
                static_cast<uint16_t>(images.size())}),
         interpreter({sourceBuffer.data(), sourceBuffer.size(), operands.data(), static_cast<uint8_t>(operands.size()),
                      arrayItems.data(), static_cast<uint8_t>(arrayItems.size()), scratchText.data(),
                      static_cast<uint16_t>(scratchText.size()), markedText.data(),
-                     static_cast<uint16_t>(markedText.size()), &documentOperatorCount}) {}
+                     static_cast<uint16_t>(markedText.size()), &documentOperatorCount, pageTransform, pageBounds,
+                     pageBounds.xMax > pageBounds.xMin && pageBounds.yMax > pageBounds.yMin}) {}
 };
 
 struct TestResourceTable {
   PdfFontMap* font = nullptr;
   PdfContentXObject image{};
   PdfContentXObject form{};
+  PdfContentXObject secondaryForm{};
   PdfContentXObject loop{};
   PdfContentResources descriptor{};
+  uint64_t inlineImageEncodedLength = 0;
 
   TestResourceTable() {
     descriptor.context = this;
     descriptor.resolveFont = resolveFont;
     descriptor.resolveXObject = resolveXObject;
+    descriptor.consumeInlineImageToken = consumeInlineImageToken;
+    descriptor.finishInlineImage = finishInlineImage;
   }
 
   static PdfStatus resolveFont(void* context, const uint8_t* name, const size_t length, PdfFontMap** font) {
@@ -73,11 +78,63 @@ struct TestResourceTable {
       *object = table.form;
       return PdfStatus::success();
     }
+    if (length == 3 && std::memcmp(name, "Fm2", 3) == 0) {
+      *object = table.secondaryForm;
+      return PdfStatus::success();
+    }
     if (length == 4 && std::memcmp(name, "Loop", 4) == 0) {
       *object = table.loop;
       return PdfStatus::success();
     }
     return PdfStatus::failure(PdfError::Malformed);
+  }
+
+  static PdfStatus consumeInlineImageToken(void* context, const PdfToken&) {
+    return context == nullptr ? PdfStatus::failure(PdfError::InvalidArgument) : PdfStatus::success();
+  }
+
+  static PdfStepResult finishInlineImage(void* context, const PdfByteSource& source, const uint64_t idEndOffset,
+                                         PdfWorkBudget& budget, uint64_t* resumeOffset, PdfContentXObject*) {
+    if (context == nullptr || resumeOffset == nullptr || !source.valid()) {
+      return PdfStepResult::failure(PdfStatus::failure(PdfError::InvalidArgument, idEndOffset));
+    }
+    const uint64_t encodedLength = static_cast<TestResourceTable*>(context)->inlineImageEncodedLength;
+    if (encodedLength == 0) {
+      return PdfStepResult::failure(PdfStatus::failure(PdfError::UnsupportedFilter, idEndOffset));
+    }
+    if (!budget.consumeOperation() || budget.takeBytes(5) != 5) {
+      return PdfStepResult::paused();
+    }
+    uint8_t separator = 0;
+    size_t bytesRead = 0;
+    PdfStatus status = source.readAt(source.context, idEndOffset, &separator, 1, &bytesRead);
+    if (!status.ok() || bytesRead != 1 || (separator != ' ' && separator != '\t' && separator != '\r' &&
+                                           separator != '\n' && separator != '\f' && separator != 0)) {
+      return PdfStepResult::failure(status.ok() ? PdfStatus::failure(PdfError::Malformed, idEndOffset) : status);
+    }
+    uint64_t dataOffset = idEndOffset + 1;
+    if (separator == '\r') {
+      uint8_t lineFeed = 0;
+      status = source.readAt(source.context, dataOffset, &lineFeed, 1, &bytesRead);
+      if (!status.ok() || bytesRead != 1) {
+        return PdfStepResult::failure(status.ok() ? PdfStatus::failure(PdfError::UnexpectedEof, dataOffset) : status);
+      }
+      if (lineFeed == '\n') {
+        ++dataOffset;
+      }
+    }
+    uint8_t terminator[4]{};
+    status = source.readAt(source.context, dataOffset + encodedLength, terminator, sizeof(terminator), &bytesRead);
+    const auto whitespace = [](const uint8_t byte) {
+      return byte == ' ' || byte == '\t' || byte == '\r' || byte == '\n' || byte == '\f' || byte == 0;
+    };
+    if (!status.ok() || bytesRead != sizeof(terminator) || !whitespace(terminator[0]) || terminator[1] != 'E' ||
+        terminator[2] != 'I' || !whitespace(terminator[3])) {
+      return PdfStepResult::failure(status.ok() ? PdfStatus::failure(PdfError::Malformed, dataOffset + encodedLength)
+                                                : status);
+    }
+    *resumeOffset = dataOffset + encodedLength + sizeof(terminator);
+    return PdfStepResult::completed();
   }
 };
 
@@ -107,13 +164,36 @@ PdfStepResult runInterpreter(PdfContentInterpreter& interpreter) {
 
 template <typename Stepper>
 PdfStepResult runBudgetOne(Stepper& stepper) {
-  while (true) {
-    PdfWorkBudget budget{1, 1};
+  for (uint32_t step = 0; step < 65536U; ++step) {
+    PdfWorkBudget budget{1, sizeof(PdfXrefEntry)};
     const PdfStepResult result = stepper.step(budget);
     if (!result.yielded()) {
       return result;
     }
   }
+  return PdfStepResult::failure(PdfStatus::failure(PdfError::BudgetExhausted));
+}
+
+PdfStepResult runPageTree(PdfPageTreeWalker& walker) {
+  for (uint16_t step = 0; step < 256U; ++step) {
+    PdfWorkBudget budget{32, 4096};
+    const PdfStepResult result = walker.step(budget);
+    if (!result.yielded()) {
+      return result;
+    }
+  }
+  return PdfStepResult::failure(PdfStatus::failure(PdfError::BudgetExhausted));
+}
+
+PdfStepResult runResolver(PdfObjectResolver& resolver) {
+  for (uint16_t step = 0; step < 256U; ++step) {
+    PdfWorkBudget budget{32, 4096};
+    const PdfStepResult result = resolver.step(budget);
+    if (!result.yielded()) {
+      return result;
+    }
+  }
+  return PdfStepResult::failure(PdfStatus::failure(PdfError::BudgetExhausted));
 }
 
 std::string transcript(const PdfPageModel& model) {
@@ -131,6 +211,8 @@ std::string transcript(const PdfPageModel& model) {
 std::vector<uint8_t> bytes(const std::string& value) { return {value.begin(), value.end()}; }
 
 struct FixtureWorkspace {
+  FixtureWorkspace() { traversalStorage.forbidReadsWhile(&traversalReadForbidden); }
+
   std::array<uint8_t, 4096> sourceBuffer{};
   std::array<PdfValue, 128> values{};
   std::array<PdfDictionaryEntry, 128> dictionaries{};
@@ -147,6 +229,12 @@ struct FixtureWorkspace {
   PdfTestRecordStore traversalStorage{sizeof(PdfPageTreeRecord), 64};
   PdfPageInfo page{};
   uint32_t pageCount = 0;
+  bool sourceOpen = true;
+  bool xrefBlocked = true;
+  bool traversalOpen = false;
+  bool traversalReadForbidden = true;
+  uint32_t traversalOpenCount = 0;
+  uint32_t traversalCloseCount = 0;
 
   static PdfStatus capturePage(void* context, const PdfPageInfo& page) {
     auto& workspace = *static_cast<FixtureWorkspace*>(context);
@@ -154,6 +242,19 @@ struct FixtureWorkspace {
       workspace.page = page;
     }
     ++workspace.pageCount;
+    return PdfStatus::success();
+  }
+
+  static PdfStatus setTraversalAccess(void* context, const bool required) {
+    if (context == nullptr) {
+      return PdfStatus::failure(PdfError::InvalidArgument);
+    }
+    auto& workspace = *static_cast<FixtureWorkspace*>(context);
+    workspace.traversalOpen = required;
+    workspace.traversalReadForbidden = !required;
+    workspace.sourceOpen = false;
+    workspace.xrefBlocked = true;
+    required ? ++workspace.traversalOpenCount : ++workspace.traversalCloseCount;
     return PdfStatus::success();
   }
 };
@@ -231,7 +332,7 @@ FixtureTextResult interpretFontFixture(const char* filename) {
   PdfObjectResolver resolver(source, workspace.xref, workspace.sourceBuffer.data(), workspace.sourceBuffer.size(),
                              workspace.arena);
   PdfStatus status = resolver.begin(catalog);
-  if (!status.ok() || !(result = runBudgetOne(resolver)).complete()) {
+  if (!status.ok() || !(result = runResolver(resolver)).complete()) {
     return fixtureFailure(status.ok() ? result.status : status);
   }
   uint16_t pagesIndex = PDF_INVALID_INDEX;
@@ -240,14 +341,19 @@ FixtureTextResult interpretFontFixture(const char* filename) {
   }
   const PdfValue pages = workspace.arena.values[pagesIndex];
   PdfPageTreeWalker walker(resolver, workspace.arena, workspace.traversalStorage.store(), FixtureWorkspace::capturePage,
-                           &workspace, &workspace.page);
+                           &workspace, FixtureWorkspace::setTraversalAccess, &workspace, &workspace.page,
+                           PdfLimits::MaxPages);
   status = walker.begin({pages.objectNumber, pages.generation});
-  if (!status.ok() || !(result = runBudgetOne(walker)).complete() || workspace.pageCount != 1 ||
-      workspace.page.contentCount != 1) {
+  if (!status.ok() || !(result = runPageTree(walker)).complete()) {
     return fixtureFailure(status.ok() ? result.status : status);
   }
+  if (workspace.pageCount != 1 || workspace.page.contentCount != 1 || workspace.traversalOpenCount == 0 ||
+      workspace.traversalOpenCount != workspace.traversalCloseCount || workspace.traversalOpen ||
+      !workspace.traversalReadForbidden || workspace.sourceOpen || !workspace.xrefBlocked) {
+    return fixtureFailure(PdfStatus::failure(PdfError::Malformed));
+  }
   status = resolver.begin(workspace.page.contents[0]);
-  if (!status.ok() || !(result = runBudgetOne(resolver)).complete() || !resolver.result().hasStream) {
+  if (!status.ok() || !(result = runResolver(resolver)).complete() || !resolver.result().hasStream) {
     return fixtureFailure(status.ok() ? result.status : status);
   }
   PdfByteRange range;
@@ -314,6 +420,8 @@ TEST(PdfContentInterpreterTest, ResolvesFormAndActualTextBeforeVisualGlyphs) {
   resources.form.reference = {6, 0};
   resources.form.content = form.source();
   resources.form.resources = &resources.descriptor;
+  resources.form.bbox = {0, 0, PdfFixed16::fromInteger(612).raw, PdfFixed16::fromInteger(792).raw};
+  resources.form.hasBBox = true;
   const PdfByteSource source = page.source();
   InterpreterHarness harness;
   ASSERT_TRUE(harness.interpreter.begin(&source, 1, resources.descriptor, harness.model).ok());
@@ -360,6 +468,7 @@ TEST(PdfContentInterpreterTest, RecordsImagePlacementsSkipsInlineDataAndKeepsVec
             "BT /F1 11 Tf 72 470 Td (Figure one: bounded vector caption.) Tj ET"));
   TestResourceTable resources;
   resources.font = &defaultFont.font;
+  resources.inlineImageEncodedLength = 11;
   resources.image.kind = PdfContentXObjectKind::Image;
   resources.image.reference = {9, 0};
   resources.image.pixelWidth = 4;
@@ -383,6 +492,27 @@ TEST(PdfContentInterpreterTest, RecordsImagePlacementsSkipsInlineDataAndKeepsVec
             0u);
 }
 
+TEST(PdfContentInterpreterTest, UsesExactInlineImageBoundaryWhenBinaryContainsEiAndTextOperators) {
+  DefaultFont defaultFont;
+  TestResourceTable resources;
+  resources.font = &defaultFont.font;
+  resources.inlineImageEncodedLength = 16;
+  PdfTestByteSource page(
+      bytes("BT /F1 10 Tf 1 0 0 1 10 10 Tm "
+            "BI /W 16 /H 1 /CS /G /BPC 8 ID AA EI (LEAK) Tj  EI "
+            "(Visible) Tj ET"));
+  const PdfByteSource source = page.source();
+  InterpreterHarness harness;
+  ASSERT_TRUE(harness.interpreter.begin(&source, 1, resources.descriptor, harness.model).ok());
+
+  const PdfStepResult result = runInterpreter(harness.interpreter);
+
+  ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error) << "@" << result.status.offset;
+  EXPECT_EQ(transcript(harness.model), "Visible");
+  ASSERT_EQ(harness.model.imageCount(), 1U);
+  EXPECT_EQ(harness.model.images()[0].flags & PdfImageInline, PdfImageInline);
+}
+
 TEST(PdfContentInterpreterTest, EmptyStringsAndEmptyActualTextAreNoOps) {
   DefaultFont defaultFont;
   TestResourceTable resources;
@@ -397,6 +527,238 @@ TEST(PdfContentInterpreterTest, EmptyStringsAndEmptyActualTextAreNoOps) {
   const PdfStepResult result = runInterpreter(harness.interpreter);
   ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error);
   EXPECT_EQ(transcript(harness.model), "Readable");
+}
+
+TEST(PdfContentInterpreterTest, OmitsClipOnlyOffPageAndCollapsedTextIncludingActualText) {
+  DefaultFont defaultFont;
+  TestResourceTable resources;
+  resources.font = &defaultFont.font;
+  PdfTestByteSource page(
+      bytes("BT /F1 10 Tf "
+            "1 0 0 1 72 700 Tm 7 Tr (UNPAINTED) Tj "
+            "/Span << /ActualText (ACTUAL LEAK) >> BDC (Visual leak) Tj EMC "
+            "0 Tr 1 0 0 1 1000 700 Tm (OFF PAGE) Tj "
+            "1 0 0 1 72 650 Tm 0 Tz (COLLAPSED) Tj "
+            "100 Tz 1 0 0 1 72 620 Tm (Visible) Tj ET"));
+  const PdfByteSource source = page.source();
+  const PdfRectangle pageBounds{0, 0, PdfFixed16::fromInteger(612).raw, PdfFixed16::fromInteger(792).raw};
+  InterpreterHarness harness(pageBounds);
+  ASSERT_TRUE(harness.interpreter.begin(&source, 1, resources.descriptor, harness.model).ok());
+
+  const PdfStepResult result = runInterpreter(harness.interpreter);
+
+  ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error) << "@" << result.status.offset;
+  EXPECT_EQ(transcript(harness.model), "Visible");
+}
+
+TEST(PdfContentInterpreterTest, AppliesTextRenderModeClippingAtEndOfTextObject) {
+  DefaultFont defaultFont;
+  TestResourceTable resources;
+  resources.font = &defaultFont.font;
+  PdfTestByteSource page(
+      bytes("q BT /F1 10 Tf 1 0 0 1 10 10 Tm 4 Tr (Painted four) Tj ET "
+            "BT /F1 10 Tf 1 0 0 1 10 30 Tm 0 Tr (LEAK FOUR) Tj ET Q "
+            "q BT /F1 10 Tf 1 0 0 1 10 50 Tm 5 Tr (Painted five) Tj ET "
+            "BT /F1 10 Tf 1 0 0 1 10 70 Tm 0 Tr (LEAK FIVE) Tj ET Q "
+            "q BT /F1 10 Tf 1 0 0 1 10 90 Tm 6 Tr (Painted six) Tj ET "
+            "BT /F1 10 Tf 1 0 0 1 10 110 Tm 0 Tr (LEAK SIX) Tj ET Q "
+            "q BT /F1 10 Tf 1 0 0 1 10 130 Tm 7 Tr (UNPAINTED SEVEN) Tj ET "
+            "BT /F1 10 Tf 1 0 0 1 10 150 Tm 0 Tr (LEAK SEVEN) Tj ET Q "
+            "BT /F1 10 Tf 1 0 0 1 10 180 Tm (Visible) Tj ET"));
+  const PdfByteSource source = page.source();
+  const PdfRectangle pageBounds{0, 0, PdfFixed16::fromInteger(200).raw, PdfFixed16::fromInteger(200).raw};
+  InterpreterHarness harness(pageBounds);
+  ASSERT_TRUE(harness.interpreter.begin(&source, 1, resources.descriptor, harness.model).ok());
+
+  const PdfStepResult result = runInterpreter(harness.interpreter);
+
+  ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error) << "@" << result.status.offset;
+  EXPECT_EQ(transcript(harness.model), "Painted four Painted five Painted six Visible");
+}
+
+TEST(PdfContentInterpreterTest, GraphicsRestoreDoesNotRewindTextPositionInsideTextObject) {
+  DefaultFont defaultFont;
+  TestResourceTable resources;
+  resources.font = &defaultFont.font;
+  PdfTestByteSource page(bytes("BT /F1 10 Tf 1 0 0 1 10 20 Tm (A) Tj q 20 Tc (B) Tj Q (C) Tj ET"));
+  const PdfByteSource source = page.source();
+  InterpreterHarness harness;
+  ASSERT_TRUE(harness.interpreter.begin(&source, 1, resources.descriptor, harness.model).ok());
+
+  const PdfStepResult result = runInterpreter(harness.interpreter);
+
+  ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error) << "@" << result.status.offset;
+  ASSERT_EQ(harness.model.runCount(), 3U);
+  EXPECT_EQ(transcript(harness.model), "A B C");
+  EXPECT_EQ(harness.model.runs()[2].xMin, harness.model.runs()[1].xMax);
+}
+
+TEST(PdfContentInterpreterTest, GraphicsRestoreKeepsPendingTextClipUntilEndOfTextObject) {
+  DefaultFont defaultFont;
+  TestResourceTable resources;
+  resources.font = &defaultFont.font;
+  PdfTestByteSource page(
+      bytes("BT /F1 10 Tf 1 0 0 1 10 20 Tm q 7 Tr (UNPAINTED) Tj Q (Painted) Tj ET "
+            "BT /F1 10 Tf 1 0 0 1 10 40 Tm (LEAK) Tj ET"));
+  const PdfByteSource source = page.source();
+  InterpreterHarness harness;
+  ASSERT_TRUE(harness.interpreter.begin(&source, 1, resources.descriptor, harness.model).ok());
+
+  const PdfStepResult result = runInterpreter(harness.interpreter);
+
+  ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error) << "@" << result.status.offset;
+  EXPECT_EQ(transcript(harness.model), "Painted");
+}
+
+TEST(PdfContentInterpreterTest, SuppressesArtifactsOptionalContentAndUnknownGraphicsVisibility) {
+  DefaultFont defaultFont;
+  TestResourceTable resources;
+  resources.font = &defaultFont.font;
+  resources.image.kind = PdfContentXObjectKind::Image;
+  resources.image.reference = {9, 0};
+  resources.image.pixelWidth = 20;
+  resources.image.pixelHeight = 10;
+  PdfTestByteSource page(
+      bytes("/Artifact BMC "
+            "BT /F1 10 Tf 1 0 0 1 10 10 Tm (HEADER) Tj /Span BMC (NESTED HEADER) Tj EMC ET /Im1 Do EMC "
+            "/Artifact << /Type /Pagination >> BDC "
+            "BT /F1 10 Tf 1 0 0 1 10 30 Tm (FOOTER) Tj ET EMC "
+            "/OC /Layer BDC "
+            "BT /F1 10 Tf 1 0 0 1 10 50 Tm (HIDDEN LAYER) Tj ET /Im1 Do EMC "
+            "BT /F1 10 Tf 1 0 0 1 10 70 Tm (Body before) Tj "
+            "q /GS0 gs (ALPHA HIDDEN) Tj Q (Body after) Tj ET /Im1 Do"));
+  const PdfByteSource source = page.source();
+  InterpreterHarness harness;
+  ASSERT_TRUE(harness.interpreter.begin(&source, 1, resources.descriptor, harness.model).ok());
+
+  const PdfStepResult result = runInterpreter(harness.interpreter);
+
+  ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error) << "@" << result.status.offset;
+  EXPECT_EQ(transcript(harness.model), "Body before Body after");
+  ASSERT_EQ(harness.model.runCount(), 2U);
+  EXPECT_GT(harness.model.runs()[1].xMin, harness.model.runs()[0].xMax);
+  EXPECT_EQ(harness.model.imageCount(), 1U);
+}
+
+TEST(PdfContentInterpreterTest, RejectsNestedAndUnbalancedTextObjectsBeforeClipStateCanBeCleared) {
+  DefaultFont defaultFont;
+  TestResourceTable resources;
+  resources.font = &defaultFont.font;
+  PdfTestByteSource nested(
+      bytes("BT /F1 10 Tf 1 0 0 1 10 10 Tm 7 Tr (clip glyphs) Tj "
+            "BT ET BT /F1 10 Tf 1 0 0 1 10 30 Tm (LEAK) Tj ET"));
+  const PdfByteSource nestedSource = nested.source();
+  InterpreterHarness nestedHarness;
+  ASSERT_TRUE(nestedHarness.interpreter.begin(&nestedSource, 1, resources.descriptor, nestedHarness.model).ok());
+  const PdfStepResult nestedResult = runInterpreter(nestedHarness.interpreter);
+  ASSERT_TRUE(nestedResult.failed());
+  EXPECT_EQ(nestedResult.status.error, PdfError::Malformed);
+
+  PdfTestByteSource unbalanced(bytes("ET"));
+  const PdfByteSource unbalancedSource = unbalanced.source();
+  InterpreterHarness unbalancedHarness;
+  ASSERT_TRUE(
+      unbalancedHarness.interpreter.begin(&unbalancedSource, 1, resources.descriptor, unbalancedHarness.model).ok());
+  const PdfStepResult unbalancedResult = runInterpreter(unbalancedHarness.interpreter);
+  ASSERT_TRUE(unbalancedResult.failed());
+  EXPECT_EQ(unbalancedResult.status.error, PdfError::Malformed);
+}
+
+TEST(PdfContentInterpreterTest, AppliesRectangularClipAndFailsClosedForUnrepresentableClip) {
+  DefaultFont defaultFont;
+  TestResourceTable resources;
+  resources.font = &defaultFont.font;
+  PdfTestByteSource page(
+      bytes("q 0 0 50 50 re W n "
+            "BT /F1 10 Tf 1 0 0 1 10 10 Tm (Inside) Tj 1 0 0 1 100 100 Tm (CLIPPED) Tj ET Q "
+            "q 0 0 m 50 0 l 50 50 l h W n "
+            "BT /F1 10 Tf 1 0 0 1 10 10 Tm (UNKNOWN CLIP) Tj ET Q "
+            "BT /F1 10 Tf 1 0 0 1 10 80 Tm (Visible after Q) Tj ET"));
+  const PdfByteSource source = page.source();
+  const PdfRectangle pageBounds{0, 0, PdfFixed16::fromInteger(200).raw, PdfFixed16::fromInteger(200).raw};
+  InterpreterHarness harness(pageBounds);
+  ASSERT_TRUE(harness.interpreter.begin(&source, 1, resources.descriptor, harness.model).ok());
+
+  const PdfStepResult result = runInterpreter(harness.interpreter);
+
+  ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error) << "@" << result.status.offset;
+  EXPECT_EQ(transcript(harness.model), "Inside Visible after Q");
+}
+
+TEST(PdfContentInterpreterTest, FailsClosedForSkewedRectangleClipAndMissingOrSkewedFormBbox) {
+  DefaultFont defaultFont;
+  PdfTestByteSource page(
+      bytes("q 1 0.5 0 1 0 0 cm 0 0 50 50 re W n "
+            "BT /F1 10 Tf 1 0 0 1 10 10 Tm (SKEWED CLIP LEAK) Tj ET Q "
+            "/Fm1 Do /Fm2 Do "
+            "BT /F1 10 Tf 1 0 0 1 10 80 Tm (Visible) Tj ET"));
+  PdfTestByteSource missingBboxForm(bytes("BT /F1 10 Tf 1 0 0 1 10 10 Tm (MISSING BBOX LEAK) Tj ET"));
+  PdfTestByteSource skewedBboxForm(bytes("BT /F1 10 Tf 1 0 0 1 10 10 Tm (SKEWED BBOX LEAK) Tj ET"));
+  TestResourceTable resources;
+  resources.font = &defaultFont.font;
+  resources.form.kind = PdfContentXObjectKind::Form;
+  resources.form.reference = {6, 0};
+  resources.form.content = missingBboxForm.source();
+  resources.form.resources = &resources.descriptor;
+  resources.secondaryForm.kind = PdfContentXObjectKind::Form;
+  resources.secondaryForm.reference = {7, 0};
+  resources.secondaryForm.content = skewedBboxForm.source();
+  resources.secondaryForm.resources = &resources.descriptor;
+  resources.secondaryForm.bbox = {0, 0, PdfFixed16::fromInteger(50).raw, PdfFixed16::fromInteger(50).raw};
+  resources.secondaryForm.hasBBox = true;
+  resources.secondaryForm.matrix = {PdfFixed16::fromInteger(1), {32768}, {}, PdfFixed16::fromInteger(1), {}, {}};
+  const PdfByteSource source = page.source();
+  const PdfRectangle pageBounds{0, 0, PdfFixed16::fromInteger(200).raw, PdfFixed16::fromInteger(200).raw};
+  InterpreterHarness harness(pageBounds);
+  ASSERT_TRUE(harness.interpreter.begin(&source, 1, resources.descriptor, harness.model).ok());
+
+  const PdfStepResult result = runInterpreter(harness.interpreter);
+
+  ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error) << "@" << result.status.offset;
+  EXPECT_EQ(transcript(harness.model), "Visible");
+}
+
+TEST(PdfContentInterpreterTest, AppliesFormBboxClipAndPageTransformToTextAndImages) {
+  DefaultFont defaultFont;
+  PdfTestByteSource page(bytes("q 100 0 0 50 10 20 cm /Im1 Do Q /Fm1 Do"));
+  PdfTestByteSource form(bytes("BT /F1 10 Tf 1 0 0 1 20 30 Tm (Inside form) Tj "
+                               "1 0 0 1 150 80 Tm (OUTSIDE BBOX) Tj ET"));
+  TestResourceTable resources;
+  resources.font = &defaultFont.font;
+  resources.image.kind = PdfContentXObjectKind::Image;
+  resources.image.reference = {9, 0};
+  resources.image.pixelWidth = 100;
+  resources.image.pixelHeight = 50;
+  resources.form.kind = PdfContentXObjectKind::Form;
+  resources.form.reference = {6, 0};
+  resources.form.content = form.source();
+  resources.form.resources = &resources.descriptor;
+  resources.form.bbox = {PdfFixed16::fromInteger(10).raw, PdfFixed16::fromInteger(20).raw,
+                         PdfFixed16::fromInteger(110).raw, PdfFixed16::fromInteger(70).raw};
+  resources.form.hasBBox = true;
+  const PdfByteSource source = page.source();
+  const PdfRectangle pageBounds{0, 0, PdfFixed16::fromInteger(100).raw, PdfFixed16::fromInteger(200).raw};
+  const PdfMatrix pageTransform{{}, PdfFixed16::fromInteger(-1), PdfFixed16::fromInteger(1), {},
+                                PdfFixed16::fromInteger(-20), PdfFixed16::fromInteger(210)};
+  InterpreterHarness harness(pageBounds, pageTransform);
+  ASSERT_TRUE(harness.interpreter.begin(&source, 1, resources.descriptor, harness.model).ok());
+
+  const PdfStepResult result = runInterpreter(harness.interpreter);
+
+  ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error) << "@" << result.status.offset;
+  EXPECT_EQ(transcript(harness.model), "Inside form");
+  ASSERT_EQ(harness.model.imageCount(), 1U);
+  const PdfImagePlacement& image = harness.model.images()[0];
+  EXPECT_EQ(image.xMin, PdfFixed16::fromInteger(0).raw);
+  EXPECT_EQ(image.xMax, PdfFixed16::fromInteger(50).raw);
+  EXPECT_EQ(image.yMin, PdfFixed16::fromInteger(100).raw);
+  EXPECT_EQ(image.yMax, PdfFixed16::fromInteger(200).raw);
+  ASSERT_EQ(harness.model.runCount(), 1U);
+  const PdfTextRun& caption = harness.model.runs()[0];
+  EXPECT_GT(caption.xMax, image.xMin);
+  EXPECT_LT(caption.xMin, image.xMax);
+  EXPECT_GT(caption.yMax, image.yMin);
+  EXPECT_LT(caption.yMin, image.yMax);
 }
 
 TEST(PdfContentInterpreterTest, ActualTextOverridesUnmappedCidButMeaningfulCidFailsClearly) {
@@ -447,6 +809,8 @@ TEST(PdfContentInterpreterTest, RejectsGraphicsOverflowAndFormCyclesAtBoundedDep
   resources.loop.reference = {99, 0};
   resources.loop.content = loop.source();
   resources.loop.resources = &resources.descriptor;
+  resources.loop.bbox = {0, 0, PdfFixed16::fromInteger(612).raw, PdfFixed16::fromInteger(792).raw};
+  resources.loop.hasBBox = true;
   const PdfByteSource pageSource = page.source();
   InterpreterHarness cycleHarness;
   ASSERT_TRUE(cycleHarness.interpreter.begin(&pageSource, 1, resources.descriptor, cycleHarness.model).ok());

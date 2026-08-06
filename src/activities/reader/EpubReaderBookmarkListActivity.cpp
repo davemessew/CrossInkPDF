@@ -36,10 +36,12 @@ void EpubReaderBookmarkListActivity::onExit() { Activity::onExit(); }
 void EpubReaderBookmarkListActivity::deleteSelectedBookmark() {
   if (bookmarks.empty() || selectedIndex < 0 || selectedIndex >= static_cast<int>(bookmarks.size())) return;
 
-  const Bookmark selected = bookmarks[selectedIndex];
-  const bool removed = deleteCallback != nullptr
-                           ? deleteCallback(deleteContext, selected.paragraphIndex)
-                           : BOOKMARKS.removeBookmarkAt(static_cast<size_t>(selectedIndex));
+  bool removed = false;
+  if (deleteCallback == nullptr) {
+    removed = BOOKMARKS.removeBookmarkAt(static_cast<size_t>(selectedIndex));
+  } else {
+    removed = deleteCallback(deleteContext, bookmarks[selectedIndex].paragraphIndex);
+  }
   if (!removed) return;
 
   bookmarks = BOOKMARKS.getBookmarks();
@@ -76,9 +78,9 @@ void EpubReaderBookmarkListActivity::showBookmarkActionMenu(bool ignoreInitialCo
           return;
         }
 
-        const auto it = std::find_if(bookmarks.begin(), bookmarks.end(), [&selectedBookmark](const Bookmark& bm) {
+        const auto it = std::find_if(bookmarks.begin(), bookmarks.end(), [this, &selectedBookmark](const Bookmark& bm) {
           return bm.spineIndex == selectedBookmark.spineIndex && bm.progress == selectedBookmark.progress &&
-                 bm.paragraphIndex == selectedBookmark.paragraphIndex;
+                 (deleteCallback == nullptr || bm.paragraphIndex == selectedBookmark.paragraphIndex);
         });
         if (it != bookmarks.end()) {
           selectedIndex = static_cast<int>(std::distance(bookmarks.begin(), it));

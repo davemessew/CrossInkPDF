@@ -22,7 +22,20 @@ QEMU_CLASSIC_OUTPUT = REPO_ROOT / "test" / "qemu" / "data" / "qemu" / "classic_t
 QEMU_NAVIGATION_OUTPUT = (
     REPO_ROOT / "test" / "qemu" / "data" / "qemu" / "navigation_outline.pdf"
 )
+QEMU_POSITIVE_OUTPUTS = {
+    name: REPO_ROOT / "test" / "qemu" / "data" / "qemu" / name
+    for name in ("hidden_ocr.pdf", "columns_table.pdf", "jpeg_caption.pdf")
+}
 PDF_HEADER = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n"
+# Pillow 12.2.0: L, 16x16 split, quality=90, subsampling=0, progressive=False, optimize=False.
+JPEGDEC_BASELINE_GRAY_SPLIT_JPEG_BASE64 = (
+    b"/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAMCAgMCAgMDAwMEAwMEBQgFBQQEBQoHBwYIDAoMDAsK"
+    b"CwsNDhIQDQ4RDgsLEBYQERMUFRUVDA8XGBYUGBIUFRT/wAALCAAQABABAREA/8QAHwAAAQUBAQEB"
+    b"AQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1Fh"
+    b"ByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZ"
+    b"WmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXG"
+    b"x8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/9oACAEBAAA/APyqr+qiv5V6/qor/9k="
+)
 
 
 def pdf_string(value: str) -> bytes:
@@ -1034,15 +1047,7 @@ def make_image_text_fixture(
 
 
 def make_jpeg_caption_fixture() -> Fixture:
-    jpeg = bytearray((0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01))
-    state = 0xA341316C
-    for _ in range(20 * 1024):
-        state ^= (state << 13) & 0xFFFFFFFF
-        state ^= state >> 17
-        state ^= (state << 5) & 0xFFFFFFFF
-        jpeg.append(state & 0xFF)
-    jpeg.extend((0xFF, 0xD9))
-    jpeg = bytes(jpeg)
+    jpeg = base64.b64decode(JPEGDEC_BASELINE_GRAY_SPLIT_JPEG_BASE64, validate=True)
     pdf = ClassicPdf()
     pdf.add(1, b"<< /Type /Catalog /Pages 2 0 R >>")
     pdf.add(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
@@ -1063,8 +1068,8 @@ def make_jpeg_caption_fixture() -> Fixture:
         6,
         stream(
             jpeg,
-            b"/Type /XObject /Subtype /Image /Width 640 /Height 480 "
-            b"/ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode",
+            b"/Type /XObject /Subtype /Image /Width 16 /Height 16 "
+            b"/ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /DCTDecode",
         ),
     )
     return Fixture(
@@ -2564,6 +2569,7 @@ def check_files(
     files: dict[str, bytes],
     staged_classic: Path | None = None,
     staged_navigation: Path | None = None,
+    staged_positive: dict[str, Path] | None = None,
 ) -> int:
     with tempfile.TemporaryDirectory(prefix="crossink-pdf-fixtures-") as temporary:
         regenerated = Path(temporary)
@@ -2588,6 +2594,9 @@ def check_files(
             or staged_navigation.read_bytes() != files["navigation_outline.pdf"]
         ):
             differences.append("qemu/navigation_outline.pdf")
+        for name, staged in (staged_positive or {}).items():
+            if not staged.is_file() or staged.read_bytes() != files[name]:
+                differences.append(f"qemu/{name}")
         if differences:
             print("PDF fixture corpus differs:")
             for name in sorted(set(differences)):
@@ -2611,6 +2620,7 @@ def main() -> int:
             files,
             QEMU_CLASSIC_OUTPUT if stage_qemu else None,
             QEMU_NAVIGATION_OUTPUT if stage_qemu else None,
+            QEMU_POSITIVE_OUTPUTS if stage_qemu else None,
         )
     write_files(arguments.output, files)
     if stage_qemu:
@@ -2618,6 +2628,9 @@ def main() -> int:
         QEMU_CLASSIC_OUTPUT.write_bytes(files["classic_text.pdf"])
         QEMU_NAVIGATION_OUTPUT.parent.mkdir(parents=True, exist_ok=True)
         QEMU_NAVIGATION_OUTPUT.write_bytes(files["navigation_outline.pdf"])
+        for name, destination in QEMU_POSITIVE_OUTPUTS.items():
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(files[name])
     print(f"Wrote {len(files) - 1} PDF fixture artifacts to {arguments.output}")
     return 0
 

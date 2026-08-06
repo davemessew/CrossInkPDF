@@ -368,6 +368,11 @@ bool RecentBooksStore::removeByPath(const std::string& path) {
 }
 
 bool RecentBooksStore::removeByPathDurably(const std::string& path) {
+  return removeByPathDurablyNoPathAlloc(path);
+}
+
+bool RecentBooksStore::removeByPathDurablyNoPathAlloc(
+    const std::string_view path) {
   if (!prepareRecentDeleteStateForRead()) return false;
 
   auto scratch = makeUniqueNoThrow<RecentRemovalScratch>();
@@ -393,7 +398,11 @@ bool RecentBooksStore::removeByPathDurably(const std::string& path) {
   JsonArray books = doc["books"].as<JsonArray>();
   for (size_t index = books.size(); index > 0; --index) {
     const char* const candidate = books[index - 1U]["path"] | "";
-    if (path == candidate) books.remove(index - 1U);
+    const size_t candidateLength = std::strlen(candidate);
+    if (path.size() == candidateLength &&
+        std::memcmp(path.data(), candidate, candidateLength) == 0) {
+      books.remove(index - 1U);
+    }
   }
 
   bool persisted = false;
@@ -408,8 +417,11 @@ bool RecentBooksStore::removeByPathDurably(const std::string& path) {
   }
   if (!persisted) return false;
 
-  const auto found =
-      std::find_if(recentBooks.begin(), recentBooks.end(), [&](const RecentBook& book) { return book.path == path; });
+  const auto found = std::find_if(
+      recentBooks.begin(), recentBooks.end(), [&](const RecentBook& book) {
+        return book.path.size() == path.size() &&
+               std::memcmp(book.path.data(), path.data(), path.size()) == 0;
+      });
   if (found != recentBooks.end()) recentBooks.erase(found);
   return true;
 }

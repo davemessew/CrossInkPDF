@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -13,6 +14,70 @@ PASS_MARKER = "QEMU_RESOURCE_PASS\n"
 
 
 class QemuResourceCheckTest(unittest.TestCase):
+    def test_capture_rejects_runtime_type_and_heap_relationship_violations(
+        self,
+    ) -> None:
+        cases = {
+            "heap_uint32_one_over": (
+                self._runtime_line(heap_start=4294967296),
+                "uint32_t",
+            ),
+            "stack_uint32_one_over": (
+                self._runtime_line(stack_margin=4294967296),
+                "uint32_t",
+            ),
+            "largest_exceeds_free": (
+                self._runtime_line(min_free=70000, min_max_alloc=70001),
+                "relationships",
+            ),
+            "allocation_exceeds_free": (
+                self._runtime_line(
+                    min_free=1000,
+                    min_max_alloc=900,
+                    max_alloc=1001,
+                ),
+                "relationships",
+            ),
+        }
+        for mode, (runtime, expected_error) in cases.items():
+            with self.subTest(mode=mode):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    paths = self._create_inputs(Path(temporary_directory))
+                    paths["runtime"].write_text(
+                        "\n".join(
+                            (
+                                "QEMU_BOOT seq=0",
+                                runtime,
+                                "QEMU_BOOT seq=1",
+                                self._runtime_line(),
+                                "",
+                            )
+                        ),
+                        encoding="utf-8",
+                    )
+                    captured = self._run_capture(
+                        paths,
+                        self._size_environment(text=1000, static_dram=100),
+                    )
+
+                    self.assertEqual(captured.returncode, 1)
+                    self.assertIn(expected_error, captured.stderr)
+
+    def test_capture_requires_one_runtime_sample_from_each_boot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            paths = self._create_inputs(Path(temporary_directory))
+            paths["runtime"].write_text(
+                "QEMU_BOOT seq=1\n" + self._runtime_line() + "\n",
+                encoding="utf-8",
+            )
+            captured = self._run_capture(
+                paths, self._size_environment(text=1000, static_dram=100)
+            )
+
+            self.assertEqual(captured.returncode, 1)
+            self.assertEqual(captured.stdout, "")
+            self.assertIn("boot 0 and boot 1", captured.stderr)
+
     def test_capture_and_verify_use_worst_boot_measurements(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             paths = self._create_inputs(Path(temporary_directory))
@@ -77,6 +142,113 @@ class QemuResourceCheckTest(unittest.TestCase):
             self.assertEqual(verified.stdout, "")
             self.assertIn("resource fingerprint differs", verified.stderr)
 
+    def test_verify_rejects_flash_or_elf_manifest_binding_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            paths = self._create_inputs(Path(temporary_directory))
+            environment = self._size_environment(text=1000, static_dram=100)
+            self.assertEqual(self._run_capture(paths, environment).returncode, 0)
+
+            original_flash = paths["flash"].read_bytes()
+            paths["flash"].write_bytes(b"tampered-flash")
+            flash_result = self._run_verify(paths, environment)
+            self.assertEqual(flash_result.returncode, 1)
+            self.assertIn("flash SHA-256", flash_result.stderr)
+            paths["flash"].write_bytes(original_flash)
+
+            original_elf = paths["elf"].read_bytes()
+            paths["elf"].write_bytes(b"tampered-elf")
+            elf_result = self._run_verify(paths, environment)
+            self.assertEqual(elf_result.returncode, 1)
+            self.assertIn("ELF SHA-256", elf_result.stderr)
+            paths["elf"].write_bytes(original_elf)
+
+            alternate_elf = paths["elf"].with_name("alternate.elf")
+            alternate_elf.write_bytes(original_elf)
+            original_path = paths["elf"]
+            paths["elf"] = alternate_elf
+            path_result = self._run_verify(paths, environment)
+            self.assertEqual(path_result.returncode, 1)
+            self.assertIn("ELF path differs", path_result.stderr)
+            paths["elf"] = original_path
+
+    def test_verify_allows_qemu_harness_code_growth_beyond_old_release_proxy(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            paths = self._create_inputs(Path(temporary_directory))
+            baseline_environment = self._size_environment(
+                text=1000, static_dram=100
+            )
+            self.assertEqual(
+                self._run_capture(paths, baseline_environment).returncode, 0
+            )
+
+            verified = self._run_verify(
+                paths,
+                self._size_environment(
+                    text=1000 + 262145,
+                    static_dram=100,
+                ),
+            )
+
+            self.assertEqual(verified.returncode, 0)
+            self.assertEqual(verified.stdout, PASS_MARKER)
+            self.assertEqual(verified.stderr, "")
+
+    def test_verify_accepts_each_exact_resource_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            paths = self._create_inputs(Path(temporary_directory))
+            baseline_environment = self._size_environment(
+                text=1000, static_dram=100
+            )
+            self.assertEqual(
+                self._run_capture(paths, baseline_environment).returncode, 0
+            )
+            captured_baseline = json.loads(
+                paths["baseline"].read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                captured_baseline["limits"],
+                {
+                    "allocation": 32768,
+                    "free_heap": 45056,
+                    "largest_block": 40960,
+                    "pdf_heap": 81920,
+                    "stack_margin": 1024,
+                    "static_dram": 12288,
+                },
+            )
+            paths["runtime"].write_text(
+                "\n".join(
+                    (
+                        "QEMU_BOOT seq=0",
+                        self._runtime_line(
+                            heap_start=127976,
+                            min_free=45056,
+                            min_max_alloc=40960,
+                            max_alloc=32768,
+                            stack_margin=1024,
+                        ),
+                        "QEMU_BOOT seq=1",
+                        self._runtime_line(),
+                        "",
+                    )
+                ),
+                encoding="utf-8",
+            )
+
+            verified = self._run_verify(
+                paths,
+                self._size_environment(
+                    text=1000,
+                    static_dram=100 + 12288,
+                ),
+            )
+
+            self.assertEqual(verified.returncode, 0)
+            self.assertEqual(verified.stdout, PASS_MARKER)
+            self.assertEqual(verified.stderr, "")
+
     def test_verify_rejects_each_one_byte_boundary_violation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             paths = self._create_inputs(Path(temporary_directory))
@@ -88,12 +260,6 @@ class QemuResourceCheckTest(unittest.TestCase):
             )
 
             violations = (
-                {
-                    "name": "text",
-                    "text": 1000 + 262145,
-                    "static_dram": 100,
-                    "runtime": self._runtime_line(),
-                },
                 {
                     "name": "static_dram",
                     "text": 1000,
@@ -113,14 +279,16 @@ class QemuResourceCheckTest(unittest.TestCase):
                     "text": 1000,
                     "static_dram": 100,
                     "runtime": self._runtime_line(
-                        heap_start=66535, min_free=65535
+                        heap_start=46055,
+                        min_free=45055,
+                        min_max_alloc=40960,
                     ),
                 },
                 {
                     "name": "largest_block",
                     "text": 1000,
                     "static_dram": 100,
-                    "runtime": self._runtime_line(min_max_alloc=49151),
+                    "runtime": self._runtime_line(min_max_alloc=40959),
                 },
                 {
                     "name": "allocation",
@@ -139,7 +307,15 @@ class QemuResourceCheckTest(unittest.TestCase):
             for violation in violations:
                 with self.subTest(boundary=violation["name"]):
                     paths["runtime"].write_text(
-                        "QEMU_BOOT seq=0\n" + violation["runtime"] + "\n",
+                        "\n".join(
+                            (
+                                "QEMU_BOOT seq=0",
+                                violation["runtime"],
+                                "QEMU_BOOT seq=1",
+                                self._runtime_line(),
+                                "",
+                            )
+                        ),
                         encoding="utf-8",
                     )
                     environment = self._size_environment(
@@ -229,10 +405,29 @@ class QemuResourceCheckTest(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+        elf = directory / "firmware.elf"
+        elf.write_bytes(b"ELF")
+        flash = directory / "qemu_flash.bin"
+        flash.write_bytes(b"FLASH")
         manifest = directory / "qemu_manifest.json"
         manifest.write_text(
             json.dumps(
                 {
+                    "schema_version": 1,
+                    "images": {
+                        "flash": {
+                            "path": str(flash.resolve()),
+                            "sha256": hashlib.sha256(flash.read_bytes()).hexdigest(),
+                            "size": flash.stat().st_size,
+                        }
+                    },
+                    "artifacts": {
+                        "elf": {
+                            "path": str(elf.resolve()),
+                            "sha256": hashlib.sha256(elf.read_bytes()).hexdigest(),
+                            "size": elf.stat().st_size,
+                        }
+                    },
                     "resource_fingerprint": {
                         "toolchain": "riscv32-esp-elf-14.2.0",
                         "platform": "55.03.37",
@@ -255,16 +450,23 @@ class QemuResourceCheckTest(unittest.TestCase):
             ),
             encoding="utf-8",
         )
-        elf = directory / "firmware.elf"
-        elf.write_bytes(b"ELF")
         runtime = directory / "runtime.log"
         runtime.write_text(
-            "QEMU_BOOT seq=0\n" + self._runtime_line() + "\n",
+            "\n".join(
+                (
+                    "QEMU_BOOT seq=0",
+                    self._runtime_line(),
+                    "QEMU_BOOT seq=1",
+                    self._runtime_line(),
+                    "",
+                )
+            ),
             encoding="utf-8",
         )
         return {
             "manifest": manifest,
             "elf": elf,
+            "flash": flash,
             "runtime": runtime,
             "baseline": directory / "baseline.json",
         }

@@ -2,6 +2,7 @@
 
 #include <PixelCache.h>
 #include <Print.h>
+#include <Logging.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -45,6 +46,64 @@ PdfStatus closePreservingStatus(const PdfCacheIo& io, PdfCacheHandle* handle, co
 }
 
 float clampUnit(const float value) { return std::clamp(value, 0.0F, 1.0F); }
+
+bool resolveWordSection(const PdfMetadataSection* const sections, const uint16_t sectionCount,
+                        const uint32_t totalWords, const uint32_t coordinate, const bool allowDocumentEnd,
+                        uint16_t* const sectionIndex) {
+  if (sections == nullptr || sectionIndex == nullptr || sectionCount == 0 || coordinate > totalWords ||
+      (!allowDocumentEnd && coordinate == totalWords)) {
+    return false;
+  }
+  if (allowDocumentEnd && coordinate == totalWords) {
+    *sectionIndex = static_cast<uint16_t>(sectionCount - 1U);
+    return true;
+  }
+  for (uint16_t index = 0; index < sectionCount; ++index) {
+    const uint64_t first = sections[index].firstWordOrdinal;
+    const uint64_t end = first + sections[index].wordCount;
+    if (coordinate >= first && coordinate < end) {
+      *sectionIndex = index;
+      return true;
+    }
+  }
+  return false;
+}
+
+void clearSavedItemPageFallback(PdfSavedItem& item) {
+  item.flags &= static_cast<uint8_t>(~PDF_SAVED_ITEM_HAS_FALLBACK_PAGES);
+  item.fallbackStartPage = 0;
+  item.fallbackEndPage = 0;
+  item.fallbackPageCount = 0;
+  item.fallbackLayoutFingerprint = 0;
+}
+
+bool checkedMultiplySize(const size_t left, const size_t right, size_t* const result) {
+  if (result == nullptr || (right != 0 && left > std::numeric_limits<size_t>::max() / right)) {
+    return false;
+  }
+  *result = left * right;
+  return true;
+}
+
+bool checkedAddSize(const size_t left, const size_t right, size_t* const result) {
+  if (result == nullptr || left > std::numeric_limits<size_t>::max() - right) {
+    return false;
+  }
+  *result = left + right;
+  return true;
+}
+
+bool alignUpSize(const size_t value, const size_t alignment, size_t* const result) {
+  if (result == nullptr || alignment == 0 || (alignment & (alignment - 1U)) != 0) {
+    return false;
+  }
+  size_t withPadding = 0;
+  if (!checkedAddSize(value, alignment - 1U, &withPadding)) {
+    return false;
+  }
+  *result = withPadding & ~(alignment - 1U);
+  return true;
+}
 
 bool parseDecimal(const char* const bytes, const size_t length, uint32_t* const value) {
   if (bytes == nullptr || value == nullptr || length == 0) {
@@ -279,11 +338,6 @@ class JpegDimensionScanner {
   bool failed_ = false;
 };
 
-struct ManifestSelectionWorkspace {
-  PdfCacheStore store;
-  PdfCacheManifestSelection selection{};
-};
-
 }  // namespace
 
 PdfStatus PdfReflowDocument::ManifestSource::read(void* context, const uint64_t offset, uint8_t* destination,
@@ -335,10 +389,10 @@ void PdfReflowDocument::resetLoadedState() {
   coverPath_.clear();
   thumbnailPath_.clear();
   sections_.reset();
-  manifestSectionSizes_.fill(0);
-  manifestSectionCrcs_.fill(0);
-  manifestSectionSeen_.fill(0);
-  resources_.fill({});
+  validationStorage_.reset();
+  validationStorageLayout_ = {};
+  validationSectionCount_ = 0;
+  validationResourceCount_ = 0;
   validationPath_.fill('\0');
   cachedOutlineEntry_ = {};
   cachedOutlineIndex_ = -1;
@@ -347,13 +401,7 @@ void PdfReflowDocument::resetLoadedState() {
   layoutWordWindowStart_ = 0;
   layoutWordWindowCount_ = 0;
   layoutWordIndexAvailable_ = false;
-  validationGeneration_ = 0;
-  requiredFilesSeen_ = 0;
-  xhtmlFilesSeen_ = 0;
-  resourceCount_ = 0;
-  metadataFilesSeen_ = 0;
-  outlineFilesSeen_ = 0;
-  manifestFileStage_ = ManifestFileStage::Sections;
+  manifestCursor_ = {};
 }
 
 void PdfReflowDocument::deriveFallbackTitle() {
@@ -380,105 +428,289 @@ PdfStatus PdfReflowDocument::captureRequiredFile(void* context, const PdfRequire
                             : static_cast<PdfReflowDocument*>(context)->captureFile(record);
 }
 
-PDF_REFLOW_DOCUMENT_NOINLINE PdfStatus PdfReflowDocument::captureFile(const PdfRequiredFileRecord& record) {
-  ++requiredFilesSeen_;
+PdfStatus PdfReflowDocument::countRequiredFile(void* context, const PdfRequiredFileRecord& record) {
+  if (context == nullptr) {
+    return PdfStatus::failure(PdfError::InvalidArgument);
+  }
+  auto& counts = *static_cast<ManifestCountContext*>(context);
+  if (!counts.status) {
+    return PdfStatus::success();
+  }
+  if (counts.manifest == nullptr) {
+    counts.status = PdfStatus::failure(PdfError::InvalidArgument);
+    return PdfStatus::success();
+  }
+  if (!counts.initialized) {
+    counts.cursor.generation = counts.manifest->generation;
+    counts.initialized = true;
+  }
+  ManifestRecordClassification classification;
+  counts.status = classifyManifestRecord(&counts.cursor, record, &classification);
+  // Keep decoding so the manifest CRC/ledger remains the slot-selection oracle.
+  // The selected slot's application-level count error is returned afterwards.
+  return PdfStatus::success();
+}
+
+PdfStatus PdfReflowDocument::computeValidationStorageLayout(const size_t sectionCount, const size_t resourceCount,
+                                                            ValidationStorageLayout* const layout) {
+  if (layout == nullptr) {
+    return PdfStatus::failure(PdfError::InvalidArgument);
+  }
+  *layout = {};
+  if (sectionCount > PdfMetadataLimits::MaxSections || resourceCount > MaxCachedResources) {
+    return PdfStatus::failure(PdfError::LimitExceeded);
+  }
+
+  size_t sectionBytes = 0;
+  if (!checkedMultiplySize(sectionCount, sizeof(ManifestSectionValidationRecord), &sectionBytes)) {
+    return PdfStatus::failure(PdfError::LimitExceeded);
+  }
+  size_t sectionSeenNumerator = 0;
+  if (!checkedAddSize(sectionCount, 7U, &sectionSeenNumerator)) {
+    return PdfStatus::failure(PdfError::LimitExceeded);
+  }
+  const size_t sectionSeenBytes = sectionSeenNumerator / 8U;
+  size_t cursor = 0;
+  if (!checkedAddSize(sectionBytes, sectionSeenBytes, &cursor)) {
+    return PdfStatus::failure(PdfError::LimitExceeded);
+  }
+
+  layout->sectionRecordsOffset = 0;
+  layout->sectionSeenOffset = sectionBytes;
+  layout->resourcesOffset = cursor;
+  if (resourceCount != 0 && !alignUpSize(cursor, alignof(PdfCachedResourceRecord), &layout->resourcesOffset)) {
+    return PdfStatus::failure(PdfError::LimitExceeded);
+  }
+  size_t resourceBytes = 0;
+  if (!checkedMultiplySize(resourceCount, sizeof(PdfCachedResourceRecord), &resourceBytes) ||
+      !checkedAddSize(layout->resourcesOffset, resourceBytes, &layout->bytes) ||
+      layout->bytes > MaxValidationStorageBytes) {
+    return PdfStatus::failure(PdfError::LimitExceeded);
+  }
+  return PdfStatus::success();
+}
+
+PdfStatus PdfReflowDocument::allocateValidationStorage(const uint16_t sectionCount, const uint8_t resourceCount) {
+  validationStorage_.reset();
+  validationStorageLayout_ = {};
+  validationSectionCount_ = 0;
+  validationResourceCount_ = 0;
+  ValidationStorageLayout layout;
+  PdfStatus status = computeValidationStorageLayout(sectionCount, resourceCount, &layout);
+  if (!status) {
+    return status;
+  }
+  if (layout.bytes == 0) {
+    return PdfStatus::success();
+  }
+
+  // One exact-count cold-path block avoids 4,640 bytes of permanent object
+  // storage; stack storage is unsafe on the 4 KiB reader task.
+  validationStorage_ = makeUniqueNoThrow<uint8_t[]>(layout.bytes);
+  if (!validationStorage_) {
+    LOG_ERR("PDF", "Out of memory allocating %u-byte PDF validation storage",
+            static_cast<unsigned>(layout.bytes));
+    return PdfStatus::failure(PdfError::InsufficientMemory);
+  }
+  std::memset(validationStorage_.get(), 0, layout.bytes);
+  validationStorageLayout_ = layout;
+  validationSectionCount_ = sectionCount;
+  validationResourceCount_ = resourceCount;
+  auto* const sectionRecords = manifestSectionRecords();
+  for (uint16_t index = 0; index < sectionCount; ++index) {
+    new (sectionRecords + index) ManifestSectionValidationRecord{};
+  }
+  auto* const resources = cachedResources();
+  for (uint8_t index = 0; index < resourceCount; ++index) {
+    new (resources + index) PdfCachedResourceRecord{};
+  }
+  return PdfStatus::success();
+}
+
+PdfReflowDocument::ManifestSectionValidationRecord* PdfReflowDocument::manifestSectionRecords() {
+  return validationStorage_ ? reinterpret_cast<ManifestSectionValidationRecord*>(
+                                  validationStorage_.get() + validationStorageLayout_.sectionRecordsOffset)
+                            : nullptr;
+}
+
+const PdfReflowDocument::ManifestSectionValidationRecord* PdfReflowDocument::manifestSectionRecords() const {
+  return validationStorage_ ? reinterpret_cast<const ManifestSectionValidationRecord*>(
+                                  validationStorage_.get() + validationStorageLayout_.sectionRecordsOffset)
+                            : nullptr;
+}
+
+uint8_t* PdfReflowDocument::manifestSectionSeen() {
+  return validationStorage_ ? validationStorage_.get() + validationStorageLayout_.sectionSeenOffset : nullptr;
+}
+
+const uint8_t* PdfReflowDocument::manifestSectionSeen() const {
+  return validationStorage_ ? validationStorage_.get() + validationStorageLayout_.sectionSeenOffset : nullptr;
+}
+
+PdfCachedResourceRecord* PdfReflowDocument::cachedResources() {
+  return validationStorage_ && validationResourceCount_ != 0
+             ? reinterpret_cast<PdfCachedResourceRecord*>(validationStorage_.get() +
+                                                          validationStorageLayout_.resourcesOffset)
+             : nullptr;
+}
+
+const PdfCachedResourceRecord* PdfReflowDocument::cachedResources() const {
+  return validationStorage_ && validationResourceCount_ != 0
+             ? reinterpret_cast<const PdfCachedResourceRecord*>(validationStorage_.get() +
+                                                                validationStorageLayout_.resourcesOffset)
+             : nullptr;
+}
+
+PdfStatus PdfReflowDocument::classifyManifestRecord(ManifestRecordCursor* const cursor,
+                                                    const PdfRequiredFileRecord& record,
+                                                    ManifestRecordClassification* const classification) {
+  if (cursor == nullptr || classification == nullptr) {
+    return PdfStatus::failure(PdfError::InvalidArgument);
+  }
+  *classification = {};
+  const uint32_t recordIndex = cursor->filesSeen++;
   uint32_t generation = 0;
   uint16_t sectionIndex = 0;
   if (parseSectionRecordPath(record, &generation, &sectionIndex)) {
-    if (manifestFileStage_ != ManifestFileStage::Sections || generation != validationGeneration_ ||
-        sectionIndex != xhtmlFilesSeen_ || record.size == 0 || record.size > UINT32_MAX) {
-      return PdfStatus::failure(PdfError::Malformed);
+    if (cursor->stage != ManifestFileStage::Sections || generation != cursor->generation ||
+        sectionIndex != cursor->sectionCount || cursor->sectionCount >= PdfMetadataLimits::MaxSections ||
+        record.size == 0 || record.size > UINT32_MAX) {
+      return PdfStatus::failure(PdfError::Malformed, recordIndex);
     }
-    const size_t byteIndex = sectionIndex / 8U;
-    const uint8_t mask = static_cast<uint8_t>(1U << (sectionIndex & 7U));
-    if ((manifestSectionSeen_[byteIndex] & mask) != 0) {
-      return PdfStatus::failure(PdfError::Malformed, sectionIndex);
-    }
-    manifestSectionSeen_[byteIndex] |= mask;
-    manifestSectionSizes_[sectionIndex] = static_cast<uint32_t>(record.size);
-    manifestSectionCrcs_[sectionIndex] = record.crc32;
-    ++xhtmlFilesSeen_;
+    classification->kind = ManifestRecordKind::Section;
+    classification->sectionIndex = sectionIndex;
+    ++cursor->sectionCount;
     return PdfStatus::success();
   }
 
   char expected[PDF_CACHE_REQUIRED_PATH_CAPACITY]{};
   const int imagePrefixLength =
-      std::snprintf(expected, sizeof(expected), "gen_%lu/images/", static_cast<unsigned long>(validationGeneration_));
+      std::snprintf(expected, sizeof(expected), "gen_%lu/images/", static_cast<unsigned long>(cursor->generation));
   if (imagePrefixLength <= 0 || static_cast<size_t>(imagePrefixLength) >= sizeof(expected)) {
-    return PdfStatus::failure(PdfError::LimitExceeded);
+    return PdfStatus::failure(PdfError::LimitExceeded, recordIndex);
   }
   if (record.pathLength > static_cast<size_t>(imagePrefixLength) &&
       std::memcmp(record.path, expected, static_cast<size_t>(imagePrefixLength)) == 0) {
-    if ((manifestFileStage_ != ManifestFileStage::Sections && manifestFileStage_ != ManifestFileStage::Images) ||
-        xhtmlFilesSeen_ == 0) {
-      return PdfStatus::failure(PdfError::Malformed);
+    if ((cursor->stage != ManifestFileStage::Sections && cursor->stage != ManifestFileStage::Images) ||
+        cursor->sectionCount == 0) {
+      return PdfStatus::failure(PdfError::Malformed, recordIndex);
     }
-    if (resourceCount_ >= resources_.size()) {
-      return PdfStatus::failure(PdfError::LimitExceeded, resourceCount_);
+    if (cursor->resourceCount >= MaxCachedResources) {
+      return PdfStatus::failure(PdfError::LimitExceeded, cursor->resourceCount);
     }
     PdfCachedResourceRecord resource{};
     if (!parseImageLeaf(record.path + imagePrefixLength, record.pathLength - imagePrefixLength, &resource) ||
         record.size == 0) {
-      return PdfStatus::failure(PdfError::Malformed, resourceCount_);
+      return PdfStatus::failure(PdfError::Malformed, cursor->resourceCount);
     }
     resource.fileSize = record.size;
     resource.fileCrc32 = record.crc32;
     if (resource.kind == PdfCachedResourceKind::Jpeg &&
         (resource.encodedLength != record.size || resource.nameCrc32 != record.crc32)) {
-      return PdfStatus::failure(PdfError::Malformed, resourceCount_);
+      return PdfStatus::failure(PdfError::Malformed, cursor->resourceCount);
     }
-    for (uint8_t index = 0; index < resourceCount_; ++index) {
-      if (sameResourceIdentity(resources_[index], resource)) {
-        return PdfStatus::failure(PdfError::Malformed, index);
-      }
-    }
-    resources_[resourceCount_++] = resource;
-    manifestFileStage_ = ManifestFileStage::Images;
+    classification->kind = ManifestRecordKind::Resource;
+    classification->resource = resource;
+    ++cursor->resourceCount;
+    cursor->stage = ManifestFileStage::Images;
     return PdfStatus::success();
   }
 
   const auto matchesArtifact = [&](const char* const leaf) {
-    const int length =
-        std::snprintf(expected, sizeof(expected), "gen_%lu/%s", static_cast<unsigned long>(validationGeneration_), leaf);
+    const int length = std::snprintf(expected, sizeof(expected), "gen_%lu/%s",
+                                     static_cast<unsigned long>(cursor->generation), leaf);
     return length > 0 && static_cast<size_t>(length) < sizeof(expected) && recordPathEquals(record, expected);
   };
-
   if (matchesArtifact("cover.bmp")) {
-    if ((manifestFileStage_ != ManifestFileStage::Sections && manifestFileStage_ != ManifestFileStage::Images) ||
-        xhtmlFilesSeen_ == 0 || record.size == 0) {
-      return PdfStatus::failure(PdfError::Malformed);
+    if ((cursor->stage != ManifestFileStage::Sections && cursor->stage != ManifestFileStage::Images) ||
+        cursor->sectionCount == 0 || record.size == 0) {
+      return PdfStatus::failure(PdfError::Malformed, recordIndex);
     }
-    coverRecord_ = record;
-    manifestFileStage_ = ManifestFileStage::Cover;
+    classification->kind = ManifestRecordKind::Cover;
+    cursor->stage = ManifestFileStage::Cover;
     return PdfStatus::success();
   }
   if (matchesArtifact("thumb.bmp")) {
-    if (manifestFileStage_ != ManifestFileStage::Cover || record.size == 0) {
-      return PdfStatus::failure(PdfError::Malformed);
+    if (cursor->stage != ManifestFileStage::Cover || record.size == 0) {
+      return PdfStatus::failure(PdfError::Malformed, recordIndex);
     }
-    thumbnailRecord_ = record;
-    manifestFileStage_ = ManifestFileStage::Thumbnail;
+    classification->kind = ManifestRecordKind::Thumbnail;
+    cursor->stage = ManifestFileStage::Thumbnail;
     return PdfStatus::success();
   }
   if (matchesArtifact("metadata.bin")) {
-    if (manifestFileStage_ != ManifestFileStage::Thumbnail || record.size == 0) {
-      return PdfStatus::failure(PdfError::Malformed);
+    if (cursor->stage != ManifestFileStage::Thumbnail || record.size == 0) {
+      return PdfStatus::failure(PdfError::Malformed, recordIndex);
     }
-    ++metadataFilesSeen_;
-    metadataRecord_ = record;
-    manifestFileStage_ = ManifestFileStage::Metadata;
+    classification->kind = ManifestRecordKind::Metadata;
+    ++cursor->metadataFiles;
+    cursor->stage = ManifestFileStage::Metadata;
     return PdfStatus::success();
   }
   if (matchesArtifact("outline.bin")) {
-    if (manifestFileStage_ != ManifestFileStage::Metadata || record.size == 0) {
-      return PdfStatus::failure(PdfError::Malformed);
+    if (cursor->stage != ManifestFileStage::Metadata || record.size == 0) {
+      return PdfStatus::failure(PdfError::Malformed, recordIndex);
     }
-    ++outlineFilesSeen_;
-    outlineRecord_ = record;
-    manifestFileStage_ = ManifestFileStage::Outline;
+    classification->kind = ManifestRecordKind::Outline;
+    ++cursor->outlineFiles;
+    cursor->stage = ManifestFileStage::Outline;
     return PdfStatus::success();
   }
-  return PdfStatus::failure(PdfError::Malformed, requiredFilesSeen_ - 1U);
+  return PdfStatus::failure(PdfError::Malformed, recordIndex);
+}
+
+PDF_REFLOW_DOCUMENT_NOINLINE PdfStatus PdfReflowDocument::captureFile(const PdfRequiredFileRecord& record) {
+  ManifestRecordClassification classification;
+  PdfStatus status = classifyManifestRecord(&manifestCursor_, record, &classification);
+  if (!status) {
+    return status;
+  }
+  switch (classification.kind) {
+    case ManifestRecordKind::Section: {
+      const uint16_t sectionIndex = classification.sectionIndex;
+      auto* const records = manifestSectionRecords();
+      auto* const seen = manifestSectionSeen();
+      if (records == nullptr || seen == nullptr || sectionIndex >= validationSectionCount_) {
+        return PdfStatus::failure(PdfError::Malformed, sectionIndex);
+      }
+      const size_t byteIndex = sectionIndex / 8U;
+      const uint8_t mask = static_cast<uint8_t>(1U << (sectionIndex & 7U));
+      if ((seen[byteIndex] & mask) != 0) {
+        return PdfStatus::failure(PdfError::Malformed, sectionIndex);
+      }
+      seen[byteIndex] |= mask;
+      records[sectionIndex].size = static_cast<uint32_t>(record.size);
+      records[sectionIndex].crc32 = record.crc32;
+      return PdfStatus::success();
+    }
+    case ManifestRecordKind::Resource: {
+      auto* const resources = cachedResources();
+      const uint8_t resourceIndex = static_cast<uint8_t>(manifestCursor_.resourceCount - 1U);
+      if (resources == nullptr || resourceIndex >= validationResourceCount_) {
+        return PdfStatus::failure(PdfError::LimitExceeded, resourceIndex);
+      }
+      for (uint8_t index = 0; index < resourceIndex; ++index) {
+        if (sameResourceIdentity(resources[index], classification.resource)) {
+          return PdfStatus::failure(PdfError::Malformed, index);
+        }
+      }
+      resources[resourceIndex] = classification.resource;
+      return PdfStatus::success();
+    }
+    case ManifestRecordKind::Cover:
+      coverRecord_ = record;
+      return PdfStatus::success();
+    case ManifestRecordKind::Thumbnail:
+      thumbnailRecord_ = record;
+      return PdfStatus::success();
+    case ManifestRecordKind::Metadata:
+      metadataRecord_ = record;
+      return PdfStatus::success();
+    case ManifestRecordKind::Outline:
+      outlineRecord_ = record;
+      return PdfStatus::success();
+  }
+  return PdfStatus::failure(PdfError::Malformed, manifestCursor_.filesSeen - 1U);
 }
 
 PDF_REFLOW_DOCUMENT_NOINLINE PdfStatus PdfReflowDocument::validateCachedFile(
@@ -563,34 +795,36 @@ PDF_REFLOW_DOCUMENT_NOINLINE PdfStatus PdfReflowDocument::validateCachedFile(
 }
 
 PdfStatus PdfReflowDocument::validateResourceFile(const uint8_t resourceIndex) {
-  if (resourceIndex >= resourceCount_ ||
-      !formatResourcePath(resources_[resourceIndex], validationPath_.data(), validationPath_.size())) {
+  auto* const resources = cachedResources();
+  if (resources == nullptr || resourceIndex >= manifestCursor_.resourceCount ||
+      !formatResourcePath(resources[resourceIndex], validationPath_.data(), validationPath_.size())) {
     return PdfStatus::failure(PdfError::InvalidArgument, resourceIndex);
   }
-  PdfCachedResourceRecord& resource = resources_[resourceIndex];
+  PdfCachedResourceRecord& resource = resources[resourceIndex];
   return validateCachedFile(validationPath_.data(), resource.fileSize, resource.fileCrc32, &resource);
 }
 
 PDF_REFLOW_DOCUMENT_NOINLINE PdfStatus PdfReflowDocument::validateCapturedFiles() {
-  if (manifestFileStage_ != ManifestFileStage::Outline || xhtmlFilesSeen_ == 0 || metadataFilesSeen_ != 1 ||
-      outlineFilesSeen_ != 1) {
+  const auto* const sectionRecords = manifestSectionRecords();
+  if (manifestCursor_.stage != ManifestFileStage::Outline || manifestCursor_.sectionCount == 0 ||
+      manifestCursor_.metadataFiles != 1 || manifestCursor_.outlineFiles != 1 || sectionRecords == nullptr) {
     return PdfStatus::failure(PdfError::Malformed);
   }
 
-  for (uint16_t index = 0; index < xhtmlFilesSeen_; ++index) {
+  for (uint16_t index = 0; index < manifestCursor_.sectionCount; ++index) {
     const int length = std::snprintf(validationPath_.data(), validationPath_.size(),
                                      "%s/gen_%lu/sections/%06u.xhtml", cacheRoot_.c_str(),
-                                     static_cast<unsigned long>(validationGeneration_), static_cast<unsigned>(index));
+                                     static_cast<unsigned long>(manifestCursor_.generation), static_cast<unsigned>(index));
     if (length <= 0 || static_cast<size_t>(length) >= validationPath_.size()) {
       return PdfStatus::failure(PdfError::LimitExceeded, index);
     }
-    const PdfStatus status =
-        validateCachedFile(validationPath_.data(), manifestSectionSizes_[index], manifestSectionCrcs_[index], nullptr);
+    const PdfStatus status = validateCachedFile(validationPath_.data(), sectionRecords[index].size,
+                                                sectionRecords[index].crc32, nullptr);
     if (!status) {
       return status;
     }
   }
-  for (uint8_t index = 0; index < resourceCount_; ++index) {
+  for (uint8_t index = 0; index < manifestCursor_.resourceCount; ++index) {
     const PdfStatus status = validateResourceFile(index);
     if (!status) {
       return status;
@@ -610,7 +844,7 @@ PDF_REFLOW_DOCUMENT_NOINLINE PdfStatus PdfReflowDocument::validateCapturedFiles(
   };
   for (const Artifact& artifact : artifacts) {
     const int length = std::snprintf(validationPath_.data(), validationPath_.size(), "%s/gen_%lu/%s",
-                                     cacheRoot_.c_str(), static_cast<unsigned long>(validationGeneration_),
+                                     cacheRoot_.c_str(), static_cast<unsigned long>(manifestCursor_.generation),
                                      artifact.leaf);
     if (length <= 0 || static_cast<size_t>(length) >= validationPath_.size()) {
       return PdfStatus::failure(PdfError::LimitExceeded);
@@ -659,25 +893,88 @@ PDF_REFLOW_DOCUMENT_NOINLINE PdfStatus PdfReflowDocument::selectCompletedManifes
   if (selectedSlot == nullptr) {
     return PdfStatus::failure(PdfError::InvalidArgument);
   }
-  // This is one bounded cold-path allocation per book open. Keeping the store
-  // plus its three-manifest selection workspace off the reader task stack saves
-  // roughly 400 bytes; it is released before any pagination or rendering.
+  struct SlotScan {
+    PdfCacheManifestSlotState state{};
+    ManifestCountContext counts{};
+  };
+  struct ManifestSelectionWorkspace {
+    SlotScan slots[2]{};
+    bool selected = false;
+    uint8_t selectedIndex = 0;
+  };
+
+  // This bounded cold-path workspace stays off the 4 KiB reader task stack and
+  // is released before cache-file validation, pagination, or rendering.
   auto workspace = makeUniqueNoThrow<ManifestSelectionWorkspace>();
   if (!workspace) {
     return PdfStatus::failure(PdfError::InsufficientMemory);
   }
-  PdfStatus status = workspace->store.initialize(io_, cacheRoot_.c_str());
-  if (status) {
-    status = workspace->store.loadManifestSlots(sourceIdentity_, &workspace->selection);
+
+  static constexpr char manifestNames[2][11] = {"manifest.a", "manifest.b"};
+  for (uint8_t index = 0; index < 2; ++index) {
+    SlotScan& scan = workspace->slots[index];
+    scan.counts.manifest = &scan.state.manifest;
+    const int pathLength = std::snprintf(validationPath_.data(), validationPath_.size(), "%s/%s", cacheRoot_.c_str(),
+                                         manifestNames[index]);
+    if (pathLength < 0 || static_cast<size_t>(pathLength) >= validationPath_.size()) {
+      return PdfStatus::failure(PdfError::LimitExceeded);
+    }
+    PdfCacheHandle handle{};
+    PdfStatus status = io_.open(io_.context, validationPath_.data(), PdfCacheOpenMode::Read, &handle);
+    PdfCacheFileMetadata metadata{};
+    if (status) {
+      status = io_.metadata(io_.context, handle, &metadata);
+    }
+    if (status && (metadata.directory || metadata.symlinkLike)) {
+      status = PdfStatus::failure(PdfError::Malformed);
+    }
+    if (status) {
+      ManifestSource source{&io_, handle, metadata.size};
+      status = pdfDecodeCacheManifest(source.source(), &scan.state.manifest, {&scan.counts, countRequiredFile});
+    }
+    status = closePreservingStatus(io_, &handle, status);
+    if (!status) {
+      const bool recoverable = status.error == PdfError::InvalidOffset || status.error == PdfError::InvalidArgument ||
+                               status.error == PdfError::UnexpectedEof || status.error == PdfError::Malformed ||
+                               status.error == PdfError::LimitExceeded;
+      if (recoverable) {
+        continue;
+      }
+      return status;
+    }
+    if (!scan.state.manifest.completed) {
+      continue;
+    }
+    scan.state.valid = true;
+    scan.state.sourceMatches = pdfSourceIdentityEqual(scan.state.manifest.source, sourceIdentity_);
+    if (scan.state.sourceMatches &&
+        (!workspace->selected ||
+         pdfCacheSequenceNewer(scan.state.manifest.sequence,
+                               workspace->slots[workspace->selectedIndex].state.manifest.sequence))) {
+      workspace->selected = true;
+      workspace->selectedIndex = index;
+    }
   }
+
+  if (!workspace->selected) {
+    return PdfStatus::failure(PdfError::InvalidOffset);
+  }
+  SlotScan& selected = workspace->slots[workspace->selectedIndex];
+  if (!selected.counts.status) {
+    return selected.counts.status;
+  }
+  const ManifestRecordCursor& cursor = selected.counts.cursor;
+  if (!selected.counts.initialized || cursor.filesSeen != selected.state.manifest.requiredFileCount ||
+      cursor.sectionCount == 0 || cursor.metadataFiles != 1 || cursor.outlineFiles != 1 ||
+      cursor.stage != ManifestFileStage::Outline) {
+    return PdfStatus::failure(PdfError::Malformed);
+  }
+  PdfStatus status = allocateValidationStorage(cursor.sectionCount, cursor.resourceCount);
   if (!status) {
     return status;
   }
-  if (!workspace->selection.selected || !workspace->selection.manifest.completed) {
-    return PdfStatus::failure(PdfError::InvalidOffset);
-  }
-  manifest_ = workspace->selection.manifest;
-  *selectedSlot = workspace->selection.selectedSlot;
+  manifest_ = selected.state.manifest;
+  *selectedSlot = workspace->selectedIndex == 0 ? PdfCacheSlot::A : PdfCacheSlot::B;
   return PdfStatus::success();
 }
 
@@ -701,7 +998,8 @@ PDF_REFLOW_DOCUMENT_NOINLINE PdfStatus PdfReflowDocument::decodeSelectedManifest
   }
   PdfCacheManifest decoded{};
   if (status) {
-    validationGeneration_ = manifest_.generation;
+    manifestCursor_ = {};
+    manifestCursor_.generation = manifest_.generation;
     ManifestSource source{&io_, handle, metadata.size};
     status = pdfDecodeCacheManifest(source.source(), &decoded, {this, captureRequiredFile});
   }
@@ -711,8 +1009,10 @@ PDF_REFLOW_DOCUMENT_NOINLINE PdfStatus PdfReflowDocument::decodeSelectedManifest
   }
   if (!decoded.completed || !pdfSourceIdentityEqual(decoded.source, sourceIdentity_) ||
       decoded.generation != manifest_.generation || decoded.sequence != manifest_.sequence ||
-      requiredFilesSeen_ != decoded.requiredFileCount || xhtmlFilesSeen_ == 0 || metadataFilesSeen_ != 1 ||
-      outlineFilesSeen_ != 1 || manifestFileStage_ != ManifestFileStage::Outline) {
+      manifestCursor_.filesSeen != decoded.requiredFileCount || manifestCursor_.sectionCount == 0 ||
+      manifestCursor_.sectionCount != validationSectionCount_ ||
+      manifestCursor_.resourceCount != validationResourceCount_ || manifestCursor_.metadataFiles != 1 ||
+      manifestCursor_.outlineFiles != 1 || manifestCursor_.stage != ManifestFileStage::Outline) {
     return PdfStatus::failure(PdfError::Malformed);
   }
   manifest_ = decoded;
@@ -744,14 +1044,19 @@ PDF_REFLOW_DOCUMENT_NOINLINE PdfStatus PdfReflowDocument::loadMetadataCache() {
   if (!status) {
     return status;
   }
-  if (metadata_.totalWords != manifest_.totalWords || metadata_.sectionCount != xhtmlFilesSeen_ ||
+  if (metadata_.totalWords != manifest_.totalWords || metadata_.sectionCount != manifestCursor_.sectionCount ||
       metadata_.outlineCount == 0) {
+    return PdfStatus::failure(PdfError::Malformed);
+  }
+  const auto* const seen = manifestSectionSeen();
+  const auto* const sectionRecords = manifestSectionRecords();
+  if (seen == nullptr || sectionRecords == nullptr) {
     return PdfStatus::failure(PdfError::Malformed);
   }
   for (uint16_t index = 0; index < metadata_.sectionCount; ++index) {
     const size_t byteIndex = index / 8U;
     const uint8_t mask = static_cast<uint8_t>(1U << (index & 7U));
-    if ((manifestSectionSeen_[byteIndex] & mask) == 0 || manifestSectionSizes_[index] != sections_[index].byteSize) {
+    if ((seen[byteIndex] & mask) == 0 || sectionRecords[index].size != sections_[index].byteSize) {
       return PdfStatus::failure(PdfError::Malformed, index);
     }
   }
@@ -1044,10 +1349,37 @@ bool PdfReflowDocument::resolveProgressPercentToSection(const int percent, int& 
 bool PdfReflowDocument::resolveReferencePage(int, float, uint32_t&, uint32_t&) const { return false; }
 uint32_t PdfReflowDocument::getTotalWordCount() const { return loaded_ ? manifest_.totalWords : 0; }
 bool PdfReflowDocument::loadReadingPosition(ReflowReadingPosition& position) const {
-  if (!loaded_) {
+  if (!loaded_ || !sections_) {
     return false;
   }
-  return progressStore_.load(&position).ok();
+  ReflowReadingPosition loadedPosition;
+  if (!progressStore_.load(&loadedPosition)) {
+    return false;
+  }
+  uint16_t mappedSection = 0;
+  if (loadedPosition.hasSemanticPosition) {
+    if (!resolveWordSection(sections_.get(), metadata_.sectionCount, metadata_.totalWords,
+                            loadedPosition.globalWordOrdinal, false, &mappedSection)) {
+      return false;
+    }
+  } else if (loadedPosition.hasWordCursor) {
+    if (!resolveWordSection(sections_.get(), metadata_.sectionCount, metadata_.totalWords, loadedPosition.wordCursor,
+                            true, &mappedSection)) {
+      return false;
+    }
+  } else {
+    if (loadedPosition.sectionIndex < 0 || loadedPosition.sectionIndex >= metadata_.sectionCount) {
+      return false;
+    }
+    position = loadedPosition;
+    return true;
+  }
+  loadedPosition.sectionIndex = mappedSection;
+  loadedPosition.pageNumber = 0;
+  loadedPosition.pageCount = 0;
+  loadedPosition.hasPageCount = false;
+  position = loadedPosition;
+  return true;
 }
 
 bool PdfReflowDocument::saveReadingPosition(const ReflowReadingPosition& position) const {
@@ -1058,7 +1390,27 @@ bool PdfReflowDocument::saveReadingPosition(const ReflowReadingPosition& positio
 }
 
 PdfStatus PdfReflowDocument::loadPdfSavedItems(PdfSavedItemsBuffer* const output) const {
-  return savedItemsReady_ ? savedItemsStore_.load(output) : PdfStatus::failure(PdfError::InvalidArgument);
+  if (!savedItemsReady_ || !sections_) {
+    return PdfStatus::failure(PdfError::InvalidArgument);
+  }
+  PdfStatus status = savedItemsStore_.load(output);
+  if (!status) {
+    return status;
+  }
+  for (uint16_t index = 0; index < output->count; ++index) {
+    PdfSavedItem& item = output->items[index];
+    uint16_t mappedSection = 0;
+    if (!resolveWordSection(sections_.get(), metadata_.sectionCount, metadata_.totalWords,
+                            item.startGlobalWordOrdinal, false, &mappedSection)) {
+      output->count = 0;
+      return PdfStatus::failure(PdfError::InvalidOffset, item.startGlobalWordOrdinal);
+    }
+    if (item.sectionIndex != mappedSection) {
+      item.sectionIndex = mappedSection;
+      clearSavedItemPageFallback(item);
+    }
+  }
+  return PdfStatus::success();
 }
 
 PdfStatus PdfReflowDocument::savePdfSavedItems(const PdfSavedItem* const items, const uint16_t count) const {
@@ -1195,7 +1547,7 @@ bool PdfReflowDocument::closeLayoutWordIndex(ManifestSource& source) const {
 }
 
 bool PdfReflowDocument::validateLayoutWordIndex(const std::string& sectionCachePath, const int sectionIndex,
-                                                const uint16_t pageCount) const {
+                                                 const uint16_t pageCount) const {
   layoutWordIndexAvailable_ = false;
   layoutWordWindowCount_ = 0;
   char path[PDF_CACHE_PATH_CAPACITY]{};
@@ -1203,6 +1555,26 @@ bool PdfReflowDocument::validateLayoutWordIndex(const std::string& sectionCacheP
       !formatLayoutWordIndexPath(sectionCachePath, path)) {
     return false;
   }
+  ManifestSource sectionSource;
+  sectionSource.io = &io_;
+  PdfStatus bindingStatus = io_.open(io_.context, sectionCachePath.c_str(), PdfCacheOpenMode::Read,
+                                     &sectionSource.handle);
+  PdfCacheFileMetadata sectionMetadata;
+  if (bindingStatus) {
+    bindingStatus = io_.metadata(io_.context, sectionSource.handle, &sectionMetadata);
+  }
+  if (!bindingStatus || sectionMetadata.directory || sectionMetadata.symlinkLike) {
+    closeLayoutWordIndex(sectionSource);
+    return false;
+  }
+  sectionSource.size = sectionMetadata.size;
+  PdfLayoutCacheBinding binding;
+  bindingStatus = pdfComputeLayoutCacheBinding(sectionSource.source(), &binding);
+  const bool sectionClosed = closeLayoutWordIndex(sectionSource);
+  if (!bindingStatus || !sectionClosed) {
+    return false;
+  }
+
   ManifestSource source;
   if (!openLayoutWordIndex(path, source)) {
     return false;
@@ -1211,7 +1583,8 @@ bool PdfReflowDocument::validateLayoutWordIndex(const std::string& sectionCacheP
   const PdfStatus status = pdfInspectLayoutWordIndex(source.source(), &info);
   const bool closed = closeLayoutWordIndex(source);
   const auto& section = sections_[sectionIndex];
-  if (!status || !closed || info.sectionIndex != sectionIndex || info.pageCount != pageCount ||
+  if (!status || !closed || !pdfLayoutWordIndexMatchesSectionCache(info, binding) ||
+      info.sectionIndex != sectionIndex || info.pageCount != pageCount ||
       info.firstGlobalWordOrdinal != section.firstWordOrdinal || info.sectionWordCount != section.wordCount) {
     return false;
   }
@@ -1366,7 +1739,7 @@ bool PdfReflowDocument::formatResourcePath(const PdfCachedResourceRecord& resour
   if (output == nullptr || capacity == 0 || cacheRoot_.empty() || resource.kind == PdfCachedResourceKind::None) {
     return false;
   }
-  const uint32_t generation = loaded_ ? manifest_.generation : validationGeneration_;
+  const uint32_t generation = loaded_ ? manifest_.generation : manifestCursor_.generation;
   int written = -1;
   if (resource.kind == PdfCachedResourceKind::PixelCache) {
     written = std::snprintf(output, capacity, "%s/gen_%lu/images/%016llx-%08lx.pxc", cacheRoot_.c_str(),
@@ -1399,9 +1772,13 @@ const PdfCachedResourceRecord* PdfReflowDocument::findResource(const int section
   if (!parseImageLeaf(href.data() + prefixLength, href.size() - static_cast<size_t>(prefixLength), &requested)) {
     return nullptr;
   }
-  for (uint8_t index = 0; index < resourceCount_; ++index) {
-    if (sameResourceIdentity(resources_[index], requested)) {
-      return &resources_[index];
+  const auto* const resources = cachedResources();
+  if (resources == nullptr) {
+    return nullptr;
+  }
+  for (uint8_t index = 0; index < manifestCursor_.resourceCount; ++index) {
+    if (sameResourceIdentity(resources[index], requested)) {
+      return &resources[index];
     }
   }
   return nullptr;

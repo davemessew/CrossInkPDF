@@ -536,8 +536,14 @@ Extraction is a foreground state machine driven by the activity loop. It does
 not create a persistent background worker.
 
 - Work runs only while the preparation activity is active.
-- A slice ends after 8 ms, 32 parser operations, or one 4 KiB
-  storage/decompression chunk, whichever comes first.
+- The production state machine keeps its 5 ms scheduling deadline. QEMU
+  acceptance permits at most 8 ms of cooperative CPU work, 32 parser
+  operations, or one 4 KiB storage/decompression chunk per step, whichever
+  comes first.
+- Cooperative CPU time is total step time minus time measured inside separately
+  instrumented synchronous HAL callbacks. A callback may extend wall-clock
+  duration beyond 8 ms only under the bounded atomic-callback contract below;
+  uninstrumented time is never subtracted.
 - Long stream inflation checks the budget between input/output chunks.
 - Between slices the app yields, checks cancellation and watchdog health, and
   updates its checkpoint only at safe phase boundaries.
@@ -547,6 +553,16 @@ not create a persistent background worker.
   `HalPowerManager` regain control.
 
 This is race-to-idle, not continuous maximum-frequency polling.
+
+The emulator's bounded atomic-callback exception is stable and deliberately
+narrow. An exceptional slice contains exactly one non-recursive callback and
+at most 500 us of non-callback work. The allowlist is: a 1-1024 byte write up
+to 30 ms, a rename with no payload up to 24 ms, or a read-only open with no
+payload up to 12 ms. Across the cancellation replay, at most 26 exceptions are
+allowed: 22 writes, two renames, and two read-only opens, with at most 3,072
+requested bytes, 550,000 us of callback time, and 5,000 us of non-callback time
+in aggregate. Cancellation is checked immediately after a synchronous callback
+returns; the callback itself is not claimed to be preemptible.
 
 ### 13.2 Allocation Rules
 
@@ -564,22 +580,44 @@ This is race-to-idle, not continuous maximum-frequency polling.
 - Record peak heap loss, lowest free heap, lowest maximum allocation, and task
   stack high-water mark in debug/QEMU acceptance logs.
 
-Before parser expansion begins, the QEMU tracer records the no-PDF baseline.
-The initial hard resource envelope is:
+Before parser expansion begins, the QEMU tracer records the fingerprinted
+baseline. The QEMU runtime resource envelope is:
 
-- release `.text + .rodata` growth of at most 256 KiB;
 - static DRAM/BSS growth of at most 12 KiB;
 - at most 80 KiB of additional live heap owned by PDF preparation, including
   the reusable inflater workspace;
-- at least 64 KiB total free heap and a 48 KiB maximum contiguous allocation
+- at least 44 KiB total free heap and a 40 KiB maximum contiguous allocation
   remaining after the display framebuffer exists;
 - no individual new allocation above 32 KiB;
 - at least 1 KiB stack high-water margin throughout extraction;
 - no new persistent task or idle polling loop.
 
-These are named, instrumented limits with forced-failure positive controls.
-If the target baseline cannot retain them, support is narrowed and this design
-is reviewed again; the limits are not raised merely to pass a fixture.
+QEMU code/rodata size remains recorded as a diagnostic, but acceptance-harness
+growth is not a release flash-capacity proxy. The authoritative flash gate is a
+fresh `default`, `tiny`, and `xlarge` production build. Each `firmware.bin` must
+pass `scripts/check_firmware_size.py` against the smallest OTA application
+partition in `partitions.csv`, currently `0x640000` (6,553,600 bytes). Any
+historical growth comparison must compare the same production variant and
+toolchain; it cannot compare production firmware with the QEMU harness.
+
+**Measured acceptance amendment, 2026-08-03:** the original 64 KiB free-heap,
+48 KiB largest-block, and 256 KiB QEMU code-growth thresholds were revised
+after target evidence exposed what each gate actually measures. The current
+QEMU replay reached 49,612 bytes free and a 45,044-byte largest block; an older
+paired replay reached 47,052 and 42,996 bytes. The maximum PDF allocation was
+32,768 bytes, peak PDF-owned heap was 65,240 bytes, stack margin was 9,412
+bytes, the framebuffer was present, steady-state heap recovered, and 100 cached
+page turns showed no heap erosion. Production build artifacts measured
+5,901,392 bytes (`default`), 5,901,328 bytes (`tiny`), and 5,764,240 bytes
+(`xlarge`), all within the 6,553,600-byte OTA slot. These measurements support
+the amended emulator thresholds and the separate production partition-fit
+gate; they do not claim physical X4 timing, battery, or memory validation. No
+hardware was flashed or probed for this amendment.
+
+The retained limits are named and instrumented with exact-boundary passes and
+one-byte failure controls. If later QEMU or hardware evidence cannot retain
+them, support is narrowed or this design is reviewed again rather than silently
+changing the gate.
 
 ### 13.3 Storage and Display Work
 

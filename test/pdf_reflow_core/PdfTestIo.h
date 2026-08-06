@@ -43,6 +43,10 @@ class PdfTestRecordStore {
 
   PdfFixedRecordStore store();
   void forbidReadsWhile(const bool* flag) { readForbiddenFlag_ = flag; }
+  void requireReaderOwner(const uint8_t* activeOwner, uint8_t requiredOwner) {
+    activeOwner_ = activeOwner;
+    requiredOwner_ = requiredOwner;
+  }
   void setReadFailureOrdinal(uint32_t ordinal) { readFailureOrdinal_ = ordinal; }
   uint32_t readCount() const { return readCount_; }
 
@@ -54,8 +58,10 @@ class PdfTestRecordStore {
   size_t recordSize_ = 0;
   uint32_t capacity_ = 0;
   const bool* readForbiddenFlag_ = nullptr;
+  const uint8_t* activeOwner_ = nullptr;
   uint32_t readFailureOrdinal_ = UINT32_MAX;
   uint32_t readCount_ = 0;
+  uint8_t requiredOwner_ = 0;
 };
 
 class PdfTestByteStore {

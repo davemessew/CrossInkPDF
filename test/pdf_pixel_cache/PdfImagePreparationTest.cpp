@@ -16,9 +16,11 @@
 #include "PdfImageCache.h"
 #include "PdfImagePreparation.h"
 #include "PdfPreparation.h"
+#include "PdfReflowDocument.h"
 #include "PdfSemanticWriter.h"
 #include "PdfTestCacheIo.h"
 #include "PdfTestIo.h"
+#include "Print.h"
 
 namespace {
 
@@ -67,6 +69,16 @@ struct PreparationHarness {
   }
 };
 
+class BufferPrint final : public Print {
+ public:
+  size_t write(const uint8_t* const bytes, const size_t length) override {
+    output.insert(output.end(), bytes, bytes + length);
+    return length;
+  }
+
+  std::vector<uint8_t> output;
+};
+
 struct CountingByteSource {
   explicit CountingByteSource(const std::vector<uint8_t>& value) : bytes(value) {}
 
@@ -98,7 +110,7 @@ struct CountingByteSource {
   std::vector<size_t> readSizes;
 };
 
-std::vector<uint8_t> fixtureJpegBytes() {
+std::vector<uint8_t> largeSyntheticJpegBytes() {
   std::vector<uint8_t> jpeg = {
       0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 'J', 'F', 'I', 'F', 0x00, 0x01,
   };
@@ -250,6 +262,28 @@ std::vector<uint8_t> loadFixture(const char* name) {
   return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
 }
 
+void writeLittleEndian32(std::vector<uint8_t>* const bytes, const size_t offset, const uint32_t value) {
+  ASSERT_NE(bytes, nullptr);
+  ASSERT_LE(offset + sizeof(value), bytes->size());
+  (*bytes)[offset] = static_cast<uint8_t>(value);
+  (*bytes)[offset + 1U] = static_cast<uint8_t>(value >> 8U);
+  (*bytes)[offset + 2U] = static_cast<uint8_t>(value >> 16U);
+  (*bytes)[offset + 3U] = static_cast<uint8_t>(value >> 24U);
+}
+
+uint32_t readLittleEndian32(const std::vector<uint8_t>& bytes, const size_t offset) {
+  EXPECT_LE(offset + sizeof(uint32_t), bytes.size());
+  return static_cast<uint32_t>(bytes[offset]) | static_cast<uint32_t>(bytes[offset + 1U]) << 8U |
+         static_cast<uint32_t>(bytes[offset + 2U]) << 16U | static_cast<uint32_t>(bytes[offset + 3U]) << 24U;
+}
+
+void resealTrailingCrc(std::vector<uint8_t>* const bytes) {
+  ASSERT_NE(bytes, nullptr);
+  ASSERT_GE(bytes->size(), sizeof(uint32_t));
+  writeLittleEndian32(bytes, bytes->size() - sizeof(uint32_t),
+                      pdfCacheCrc32(bytes->data(), bytes->size() - sizeof(uint32_t)));
+}
+
 PdfStepResult runToTerminal(PdfPreparation& preparation, PreparationHarness& harness) {
   for (uint32_t step = 0; step < 20000; ++step) {
     const PdfStepResult result = preparation.step();
@@ -346,6 +380,77 @@ void expectBoundedPreparationStep(const PreparationStepObservation& observation)
   EXPECT_LE(observation.bytesWritten, PdfLimits::SourceBufferBytes);
 }
 
+PdfStepResult cancelToTerminalBounded(PdfPreparation& preparation, PreparationHarness& harness) {
+  preparation.requestCancel();
+  for (uint32_t slice = 0; slice < 256; ++slice) {
+    const PreparationStepObservation observation = observePreparationStep(preparation, harness);
+    expectBoundedPreparationStep(observation);
+    ++harness.nowMs;
+    if (!observation.result.yielded()) {
+      return observation.result;
+    }
+  }
+  ADD_FAILURE() << "cancellation did not reach a terminal state";
+  return PdfStepResult::failure(PdfStatus::failure(PdfError::BudgetExhausted));
+}
+
+void expectRetainedCancelledGeneration(PdfTestCacheIo& storage, const char* cacheRoot, const PdfSourceIdentity& source,
+                                       const uint32_t generation) {
+  const std::string generationRoot = std::string(cacheRoot) + "/gen_" + std::to_string(generation);
+  ASSERT_NE(generation, 0U);
+  EXPECT_TRUE(storage.exists(generationRoot));
+  for (const std::string& path : storage.paths()) {
+    if (!path.starts_with(generationRoot + "/")) {
+      continue;
+    }
+    const size_t leafOffset = path.find_last_of('/');
+    const std::string leaf = path.substr(leafOffset == std::string::npos ? 0 : leafOffset + 1U);
+    EXPECT_FALSE(leaf.starts_with("build."));
+    EXPECT_FALSE(leaf.starts_with("build-"));
+    EXPECT_FALSE(leaf.ends_with(".tmp"));
+  }
+
+  PdfCacheStore cache;
+  ASSERT_TRUE(cache.initialize(storage.io(), cacheRoot).ok());
+  PdfBuildCheckpointSelection checkpoints{};
+  ASSERT_TRUE(cache.loadCheckpointSlots(source, &checkpoints).ok());
+  ASSERT_TRUE(checkpoints.selected);
+  const PdfBuildCheckpointSlotState& selected = checkpoints.slots[static_cast<uint8_t>(checkpoints.selectedSlot)];
+  EXPECT_TRUE(selected.valid);
+  EXPECT_TRUE(selected.sourceMatches);
+  EXPECT_EQ(checkpoints.checkpoint.phase, PdfBuildPhase::Cancelled);
+  EXPECT_EQ(checkpoints.checkpoint.generation, generation);
+}
+
+void expectFreshGenerationRestart(PreparationHarness& harness, const char* sourcePath,
+                                  const uint32_t cancelledGeneration) {
+  PdfPreparation resumed;
+  ASSERT_TRUE(resumed.begin(harness.config(sourcePath)).ok());
+  const PdfStepResult result = runToTerminal(resumed, harness);
+  ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error) << "@" << result.status.offset;
+  EXPECT_FALSE(resumed.resumedFromCheckpoint());
+  EXPECT_NE(resumed.generation(), cancelledGeneration);
+  EXPECT_EQ(harness.storage.openHandleCount(), 0U);
+}
+
+uint64_t observedPathBytes(const std::vector<PdfTestReadObservation>& observations, const std::string_view path) {
+  uint64_t bytes = 0;
+  for (const PdfTestReadObservation& observation : observations) {
+    if (observation.path == path) {
+      bytes += observation.bytesRead;
+    }
+  }
+  return bytes;
+}
+
+uint32_t writeTruncateOpensForPath(const std::vector<PdfTestOpenObservation>& observations,
+                                   const std::string_view path) {
+  return static_cast<uint32_t>(
+      std::count_if(observations.begin(), observations.end(), [&](const PdfTestOpenObservation& observation) {
+        return observation.path == path && observation.mode == PdfCacheOpenMode::WriteTruncate;
+      }));
+}
+
 uint64_t observedSourceRangeBytes(const std::vector<PdfTestReadObservation>& observations,
                                   const std::string_view sourcePath, const uint64_t rangeOffset,
                                   const uint64_t rangeLength) {
@@ -367,8 +472,7 @@ uint64_t observedSourceRangeBytes(const std::vector<PdfTestReadObservation>& obs
 void expectSourceRangeReadOnce(const std::vector<PdfTestReadObservation>& observations,
                                const std::string_view sourcePath, const uint64_t rangeOffset,
                                const uint64_t rangeLength) {
-  const uint64_t sourceBytesRead =
-      observedSourceRangeBytes(observations, sourcePath, rangeOffset, rangeLength);
+  const uint64_t sourceBytesRead = observedSourceRangeBytes(observations, sourcePath, rangeOffset, rangeLength);
   EXPECT_EQ(sourceBytesRead, rangeLength);
 }
 
@@ -383,8 +487,7 @@ TEST(PdfImagePreparation, SourceRangeReadOnceWitnessRejectsDuplicateCoverage) {
       {"/books/inline-dct.pdf", 10, 8, 8},
       {"/books/inline-dct.pdf", 10, 8, 8},
   };
-  EXPECT_NONFATAL_FAILURE(expectSourceRangeReadOnce(duplicated, "/books/inline-dct.pdf", 10, 8),
-                          "sourceBytesRead");
+  EXPECT_NONFATAL_FAILURE(expectSourceRangeReadOnce(duplicated, "/books/inline-dct.pdf", 10, 8), "sourceBytesRead");
 }
 
 TEST(PdfImagePreparation, SingleReaderBackendWitnessRejectsASecondConcurrentReader) {
@@ -526,17 +629,15 @@ TEST(PdfImagePreparation, CapturedInlineJpegsPublishAtomicallyAndDeduplicateWith
   EXPECT_STREQ(repeated.fullPath, first.fullPath);
   EXPECT_EQ(cache.entryCount(), 1U);
   const std::vector<std::string> paths = storage.paths();
-  EXPECT_EQ(std::count_if(paths.begin(), paths.end(),
-                          [](const std::string& path) { return path.ends_with(".jpg"); }),
+  EXPECT_EQ(std::count_if(paths.begin(), paths.end(), [](const std::string& path) { return path.ends_with(".jpg"); }),
             1);
-  EXPECT_EQ(std::count_if(paths.begin(), paths.end(),
-                          [](const std::string& path) { return path.ends_with(".tmp"); }),
+  EXPECT_EQ(std::count_if(paths.begin(), paths.end(), [](const std::string& path) { return path.ends_with(".tmp"); }),
             0);
   EXPECT_EQ(storage.openHandleCount(), 0U);
 }
 
 TEST(PdfImagePreparation, LargeJpegUsesOneSequentialSourcePassWithoutRereadingChunks) {
-  const std::vector<uint8_t> jpeg = fixtureJpegBytes();
+  const std::vector<uint8_t> jpeg = largeSyntheticJpegBytes();
   CountingByteSource source(jpeg);
   PdfTestCacheIo storage;
   storage.addDirectory("/cache");
@@ -1074,7 +1175,10 @@ TEST(PdfImagePreparation, PdfPreparationRetainsJpegBesideCaptionAndRegistersItBe
     return path.starts_with(generationRoot + "/images/") && path.ends_with(".jpg");
   });
   ASSERT_NE(jpegPath, paths.end());
-  EXPECT_EQ(harness.storage.bytes(*jpegPath), fixtureJpegBytes());
+  const std::vector<uint8_t>& cachedJpeg = harness.storage.bytes(*jpegPath);
+  ASSERT_EQ(cachedJpeg.size(), 341U);
+  EXPECT_EQ(pdfCacheFnv64(cachedJpeg.data(), cachedJpeg.size()), 0x73CF4D5248A29162ULL);
+  EXPECT_EQ(pdfCacheCrc32(cachedJpeg.data(), cachedJpeg.size()), 0x43FBC23CU);
   const std::string sectionPath = generationRoot + "/sections/000000.xhtml";
   const std::string xhtml(harness.storage.bytes(sectionPath).begin(), harness.storage.bytes(sectionPath).end());
   EXPECT_NE(xhtml.find("Figure caption."), std::string::npos);
@@ -1087,6 +1191,24 @@ TEST(PdfImagePreparation, PdfPreparationRetainsJpegBesideCaptionAndRegistersItBe
   ASSERT_TRUE(cache.loadManifestSlots(preparation.sourceIdentity(), &selection).ok());
   ASSERT_TRUE(selection.selected);
   EXPECT_EQ(selection.manifest.requiredFileCount, 6U);
+
+  PdfReflowDocument reopened;
+  const PdfStatus initializeStatus =
+      reopened.initialize(harness.storage.io(), "/books/jpeg-caption.pdf", "/.crosspoint");
+  ASSERT_TRUE(initializeStatus.ok()) << "initialize PdfStatus{error=" << static_cast<int>(initializeStatus.error)
+                                     << ", offset=" << initializeStatus.offset << '}';
+  const PdfStatus reopenStatus = reopened.loadCompletedCache();
+  ASSERT_TRUE(reopenStatus.ok()) << "loadCompletedCache PdfStatus{error=" << static_cast<int>(reopenStatus.error)
+                                 << ", offset=" << reopenStatus.offset << '}';
+  ASSERT_EQ(reopened.getSectionCount(), 1);
+  EXPECT_EQ(reopened.getTotalWordCount(), 2U);
+  EXPECT_EQ(reopened.getSectionInfo(0).wordCount, 2U);
+
+  BufferPrint reopenedSection;
+  ASSERT_TRUE(reopened.streamSection(0, reopenedSection, 37U));
+  const std::string reopenedXhtml(reopenedSection.output.begin(), reopenedSection.output.end());
+  EXPECT_NE(reopenedXhtml.find("<img src=\"../images/"), std::string::npos);
+  EXPECT_NE(reopenedXhtml.find("Figure caption."), std::string::npos);
   EXPECT_EQ(harness.storage.openHandleCount(), 0U);
 }
 
@@ -1367,7 +1489,549 @@ TEST(PdfImagePreparation, LargeJpegCopyYieldsAtThePublicPreparationStepBoundary)
   EXPECT_EQ(harness.storage.openHandleCount(), 0U);
 }
 
-TEST(PdfImagePreparation, CancellationDuringLargeRasterPrehashLeavesTheActiveGenerationUntouched) {
+TEST(PdfImagePreparation, ResumeAfterEmitSectionsReusesTextAndContinuesDeferredImages) {
+  constexpr char sourcePath[] = "/books/resume-sections.pdf";
+  const std::vector<uint8_t> fixture = loadFixture("raster_cover_caption.pdf");
+
+  PreparationHarness freshHarness;
+  freshHarness.storage.setMaximumReadHandles(1);
+  freshHarness.storage.addFile(sourcePath, fixture, 1234, true);
+  PdfPreparation fresh;
+  ASSERT_TRUE(fresh.begin(freshHarness.config(sourcePath)).ok());
+  ASSERT_TRUE(runToTerminal(fresh, freshHarness).complete());
+  const std::string freshRoot = std::string(fresh.cacheRoot()) + "/gen_" + std::to_string(fresh.generation());
+  const std::vector<uint8_t> freshSection = freshHarness.storage.bytes(freshRoot + "/sections/000000.xhtml");
+  const std::vector<uint8_t> freshMetadata = freshHarness.storage.bytes(freshRoot + "/metadata.bin");
+  const std::vector<uint8_t> freshOutline = freshHarness.storage.bytes(freshRoot + "/outline.bin");
+  const std::vector<uint8_t> freshCover = freshHarness.storage.bytes(freshRoot + "/cover.bmp");
+  const PdfPreparationWorkCounters freshWork = fresh.workCounters();
+
+  PreparationHarness harness;
+  harness.storage.setMaximumReadHandles(1);
+  harness.storage.addFile(sourcePath, fixture, 1234, true);
+  PdfPreparation preparation;
+  ASSERT_TRUE(preparation.begin(harness.config(sourcePath)).ok());
+  for (uint32_t slice = 0; slice < 20000 && preparation.phase() != PdfPreparationPhase::SpoolNavigation; ++slice) {
+    const PdfStepResult step = preparation.step();
+    ++harness.nowMs;
+    ASSERT_TRUE(step.yielded()) << static_cast<int>(step.status.error) << "@" << step.status.offset;
+  }
+  ASSERT_EQ(preparation.phase(), PdfPreparationPhase::SpoolNavigation);
+  const uint32_t generation = preparation.generation();
+  const std::string generationRoot = std::string(preparation.cacheRoot()) + "/gen_" + std::to_string(generation);
+  const std::string sectionPath = generationRoot + "/sections/000000.xhtml";
+  const std::string deferredPath = generationRoot + "/build.images";
+  ASSERT_TRUE(harness.storage.exists(sectionPath));
+  ASSERT_TRUE(harness.storage.exists(deferredPath));
+  const std::vector<uint8_t> sectionBytes = harness.storage.bytes(sectionPath);
+  const std::vector<uint8_t> deferredBytes = harness.storage.bytes(deferredPath);
+
+  const PdfStepResult cancelled = cancelToTerminalBounded(preparation, harness);
+  ASSERT_TRUE(cancelled.failed());
+  ASSERT_EQ(cancelled.status.error, PdfError::Cancelled);
+  EXPECT_EQ(preparation.durableResumePhase(), PdfBuildResumePhase::AfterEmitSections);
+  PdfCacheStore cache;
+  ASSERT_TRUE(cache.initialize(harness.storage.io(), preparation.cacheRoot()).ok());
+  PdfBuildCheckpointSelection checkpoints{};
+  ASSERT_TRUE(cache.loadCheckpointSlots(preparation.sourceIdentity(), &checkpoints).ok());
+  ASSERT_TRUE(checkpoints.selected);
+  EXPECT_EQ(checkpoints.checkpoint.resumePhase, PdfBuildResumePhase::AfterEmitSections);
+  EXPECT_EQ(checkpoints.checkpoint.generation, generation);
+  EXPECT_EQ(checkpoints.checkpoint.lastVerifiedPage, 1U);
+  EXPECT_EQ(checkpoints.checkpoint.emittedSections, 1U);
+  ASSERT_TRUE(harness.storage.exists(deferredPath));
+  EXPECT_EQ(harness.storage.bytes(deferredPath), deferredBytes);
+  const PreparationHarness cancelledBaseline = harness;
+
+  harness.storage.clearOpenObservations();
+  harness.storage.clearRemoveObservations();
+  harness.storage.clearReadObservations();
+  PdfPreparation resumed;
+  ASSERT_TRUE(resumed.begin(harness.config(sourcePath)).ok());
+  const PdfStepResult result = runToTerminal(resumed, harness);
+  ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error) << "@" << result.status.offset
+                                 << " phase=" << static_cast<int>(resumed.phase());
+  EXPECT_TRUE(resumed.resumedFromCheckpoint());
+  EXPECT_EQ(resumed.resumedPhase(), PdfBuildResumePhase::AfterEmitSections);
+  EXPECT_EQ(resumed.generation(), generation);
+  EXPECT_EQ(harness.storage.bytes(sectionPath), sectionBytes);
+  EXPECT_EQ(harness.storage.bytes(sectionPath), freshSection);
+  EXPECT_EQ(harness.storage.bytes(generationRoot + "/metadata.bin"), freshMetadata);
+  EXPECT_EQ(harness.storage.bytes(generationRoot + "/outline.bin"), freshOutline);
+  EXPECT_EQ(harness.storage.bytes(generationRoot + "/cover.bmp"), freshCover);
+  for (const char* leaf : {"build.images", "build.image-files", "build.image-files.resume", "build.nav", "build.mask",
+                           "resume.sections", "resume.a", "resume.b"}) {
+    EXPECT_FALSE(harness.storage.exists(generationRoot + "/" + leaf)) << leaf;
+  }
+  EXPECT_EQ(writeTruncateOpensForPath(harness.storage.openObservations(), sectionPath), 0U);
+  EXPECT_EQ(
+      std::count(harness.storage.removeObservations().begin(), harness.storage.removeObservations().end(), sectionPath),
+      0);
+  EXPECT_LT(observedPathBytes(harness.storage.readObservations(), sourcePath),
+            observedPathBytes(freshHarness.storage.readObservations(), sourcePath));
+  EXPECT_LT(resumed.workCounters().xrefSteps, freshWork.xrefSteps);
+  EXPECT_LT(resumed.workCounters().pagesWalked, freshWork.pagesWalked);
+  EXPECT_LT(resumed.workCounters().contentTokens, freshWork.contentTokens);
+  EXPECT_LT(resumed.workCounters().sectionsEmitted, freshWork.sectionsEmitted);
+  EXPECT_EQ(harness.storage.openHandleCount(), 0U);
+
+  enum class Mutation : uint8_t {
+    ControlCrc,
+    MissingImageSpool,
+    TruncatedImageSpool,
+  };
+  for (const Mutation mutation : {Mutation::ControlCrc, Mutation::MissingImageSpool, Mutation::TruncatedImageSpool}) {
+    SCOPED_TRACE(static_cast<int>(mutation));
+    PreparationHarness rejected = cancelledBaseline;
+    const std::string controlPath = generationRoot + "/resume.sections";
+    if (mutation == Mutation::ControlCrc) {
+      std::vector<uint8_t> control = rejected.storage.bytes(controlPath);
+      ASSERT_EQ(control.size(), 256U);
+      control.back() ^= 0x01U;
+      rejected.storage.addFile(controlPath, control);
+    } else if (mutation == Mutation::MissingImageSpool) {
+      PdfCacheIo io = rejected.storage.io();
+      ASSERT_TRUE(io.remove(io.context, deferredPath.c_str(), false).ok());
+    } else {
+      ASSERT_GT(rejected.storage.bytes(deferredPath).size(), 1U);
+      rejected.storage.truncateFile(deferredPath, rejected.storage.bytes(deferredPath).size() - 1U);
+    }
+    rejected.storage.clearOpenObservations();
+    rejected.storage.clearRemoveObservations();
+    PdfPreparation freshRestart;
+    ASSERT_TRUE(freshRestart.begin(rejected.config(sourcePath)).ok());
+    const PdfStepResult freshResult = runToTerminal(freshRestart, rejected);
+    ASSERT_TRUE(freshResult.complete()) << static_cast<int>(freshResult.status.error) << "@"
+                                        << freshResult.status.offset;
+    EXPECT_FALSE(freshRestart.resumedFromCheckpoint());
+    EXPECT_NE(freshRestart.generation(), generation);
+    EXPECT_EQ(writeTruncateOpensForPath(rejected.storage.openObservations(), sectionPath), 0U);
+    EXPECT_EQ(std::count(rejected.storage.removeObservations().begin(), rejected.storage.removeObservations().end(),
+                         sectionPath),
+              0);
+    EXPECT_EQ(rejected.storage.openHandleCount(), 0U);
+  }
+}
+
+TEST(PdfImagePreparation, ResumeAfterOneDurableImageSkipsItAndContinuesLaterDeferredImages) {
+  constexpr char sourcePath[] = "/books/resume-after-image.pdf";
+  const std::vector<uint8_t> fixture = loadFixture("three_figures_one_page.pdf");
+
+  PreparationHarness freshHarness;
+  freshHarness.storage.setMaximumReadHandles(1);
+  freshHarness.storage.addFile(sourcePath, fixture, 1234, true);
+  PdfPreparation fresh;
+  ASSERT_TRUE(fresh.begin(freshHarness.config(sourcePath)).ok());
+  ASSERT_TRUE(runToTerminal(fresh, freshHarness).complete());
+  const PdfPreparationWorkCounters freshWork = fresh.workCounters();
+
+  PreparationHarness harness;
+  harness.storage.setMaximumReadHandles(1);
+  harness.storage.addFile(sourcePath, fixture, 1234, true);
+  PdfPreparation interrupted;
+  ASSERT_TRUE(interrupted.begin(harness.config(sourcePath)).ok());
+  for (uint32_t slice = 0; slice < 30000 && (interrupted.phase() != PdfPreparationPhase::DecodeImages ||
+                                             interrupted.workCounters().imagesEmitted != 1U);
+       ++slice) {
+    const PdfStepResult step = interrupted.step();
+    ++harness.nowMs;
+    ASSERT_TRUE(step.yielded()) << static_cast<int>(step.status.error) << "@" << step.status.offset
+                                << " phase=" << static_cast<int>(interrupted.phase());
+  }
+  ASSERT_EQ(interrupted.phase(), PdfPreparationPhase::DecodeImages);
+  ASSERT_EQ(interrupted.workCounters().imagesEmitted, 1U);
+  const uint32_t generation = interrupted.generation();
+  const std::string generationRoot = std::string(interrupted.cacheRoot()) + "/gen_" + std::to_string(generation);
+  const std::vector<std::string> boundaryPaths = harness.storage.paths();
+  const auto firstImage = std::find_if(boundaryPaths.begin(), boundaryPaths.end(), [&](const std::string& path) {
+    return path.starts_with(generationRoot + "/images/") && path.ends_with(".pxc");
+  });
+  ASSERT_NE(firstImage, boundaryPaths.end());
+  const std::string firstImagePath = *firstImage;
+  const std::vector<uint8_t> firstImageBytes = harness.storage.bytes(firstImagePath);
+  ASSERT_FALSE(firstImageBytes.empty());
+
+  const PdfStepResult cancelled = cancelToTerminalBounded(interrupted, harness);
+  ASSERT_TRUE(cancelled.failed());
+  ASSERT_EQ(cancelled.status.error, PdfError::Cancelled);
+  EXPECT_EQ(interrupted.durableResumePhase(), PdfBuildResumePhase::AfterImage);
+  PdfCacheStore cache;
+  ASSERT_TRUE(cache.initialize(harness.storage.io(), interrupted.cacheRoot()).ok());
+  PdfBuildCheckpointSelection checkpoints{};
+  ASSERT_TRUE(cache.loadCheckpointSlots(interrupted.sourceIdentity(), &checkpoints).ok());
+  ASSERT_TRUE(checkpoints.selected);
+  EXPECT_EQ(checkpoints.checkpoint.phase, PdfBuildPhase::Cancelled);
+  EXPECT_EQ(checkpoints.checkpoint.resumePhase, PdfBuildResumePhase::AfterImage);
+  EXPECT_EQ(checkpoints.checkpoint.emittedImages, 1U);
+  EXPECT_GT(checkpoints.checkpoint.journalBytes, 0U);
+  const PreparationHarness cancelledBaseline = harness;
+
+  harness.storage.clearOpenObservations();
+  harness.storage.clearRemoveObservations();
+  PdfPreparation resumed;
+  ASSERT_TRUE(resumed.begin(harness.config(sourcePath)).ok());
+  const PdfStepResult result = runToTerminal(resumed, harness);
+  ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error) << "@" << result.status.offset
+                                 << " phase=" << static_cast<int>(resumed.phase());
+  EXPECT_TRUE(resumed.resumedFromCheckpoint());
+  EXPECT_EQ(resumed.resumedPhase(), PdfBuildResumePhase::AfterImage);
+  EXPECT_EQ(resumed.generation(), generation);
+  EXPECT_EQ(harness.storage.bytes(firstImagePath), firstImageBytes);
+  EXPECT_EQ(writeTruncateOpensForPath(harness.storage.openObservations(), firstImagePath), 0U);
+  EXPECT_EQ(std::count(harness.storage.removeObservations().begin(), harness.storage.removeObservations().end(),
+                       firstImagePath),
+            0);
+  EXPECT_LT(resumed.workCounters().imagesEmitted, freshWork.imagesEmitted);
+  EXPECT_LT(resumed.workCounters().contentTokens, freshWork.contentTokens);
+  EXPECT_LT(resumed.workCounters().sourceBytesRead, freshWork.sourceBytesRead);
+  EXPECT_EQ(harness.storage.openHandleCount(), 0U);
+
+  enum class Mutation : uint8_t {
+    CursorRewind,
+    MissingControl,
+  };
+  for (const Mutation mutation : {Mutation::CursorRewind, Mutation::MissingControl}) {
+    SCOPED_TRACE(static_cast<int>(mutation));
+    PreparationHarness rejected = cancelledBaseline;
+    const std::string controlPath = generationRoot + "/resume.sections";
+    if (mutation == Mutation::CursorRewind) {
+      std::vector<uint8_t> control = rejected.storage.bytes(controlPath);
+      ASSERT_EQ(control.size(), 256U);
+      ASSERT_EQ(control[212], 1U);
+      control[212] = 0;
+      resealTrailingCrc(&control);
+      rejected.storage.addFile(controlPath, control);
+    } else {
+      PdfCacheIo io = rejected.storage.io();
+      ASSERT_TRUE(io.remove(io.context, controlPath.c_str(), false).ok());
+    }
+    rejected.storage.clearOpenObservations();
+    rejected.storage.clearRemoveObservations();
+    PdfPreparation freshRestart;
+    ASSERT_TRUE(freshRestart.begin(rejected.config(sourcePath)).ok());
+    const PdfStepResult freshResult = runToTerminal(freshRestart, rejected);
+    ASSERT_TRUE(freshResult.complete()) << static_cast<int>(freshResult.status.error) << "@"
+                                        << freshResult.status.offset;
+    EXPECT_FALSE(freshRestart.resumedFromCheckpoint());
+    EXPECT_NE(freshRestart.generation(), generation);
+    EXPECT_EQ(writeTruncateOpensForPath(rejected.storage.openObservations(), firstImagePath), 0U);
+    EXPECT_EQ(std::count(rejected.storage.removeObservations().begin(), rejected.storage.removeObservations().end(),
+                         firstImagePath),
+              0);
+    EXPECT_EQ(rejected.storage.openHandleCount(), 0U);
+  }
+}
+
+TEST(PdfImagePreparation, ResumeAfterVerifiedSectionAndImageReusesDurableArtifactsAndDoesLessSourceIo) {
+  constexpr char sourcePath[] = "/books/resume-finalize.pdf";
+  const std::vector<uint8_t> fixture = loadFixture("jpeg_caption.pdf");
+  PreparationHarness harness;
+  harness.storage.setMaximumReadHandles(1);
+  harness.storage.addFile(sourcePath, fixture, 1234, true);
+  PdfPreparation preparation;
+  ASSERT_TRUE(preparation.begin(harness.config(sourcePath)).ok());
+  for (uint32_t slice = 0; slice < 20000 && (preparation.phase() != PdfPreparationPhase::CloseSource ||
+                                             preparation.workCounters().imagesEmitted == 0);
+       ++slice) {
+    const PdfStepResult step = preparation.step();
+    ++harness.nowMs;
+    ASSERT_TRUE(step.yielded()) << static_cast<int>(step.status.error) << "@" << step.status.offset;
+  }
+  ASSERT_EQ(preparation.phase(), PdfPreparationPhase::CloseSource);
+  ASSERT_GT(preparation.workCounters().imagesEmitted, 0U);
+
+  const uint32_t generation = preparation.generation();
+  const std::string generationRoot = std::string(preparation.cacheRoot()) + "/gen_" + std::to_string(generation);
+  const std::string sectionPath = generationRoot + "/sections/000000.xhtml";
+  const std::vector<std::string> durablePaths = harness.storage.paths();
+  const auto image = std::find_if(durablePaths.begin(), durablePaths.end(), [&](const std::string& path) {
+    return path.starts_with(generationRoot + "/images/") && path.ends_with(".jpg");
+  });
+  ASSERT_TRUE(harness.storage.exists(sectionPath));
+  ASSERT_NE(image, durablePaths.end());
+  const std::string imagePath = *image;
+  const std::vector<uint8_t> sectionBytes = harness.storage.bytes(sectionPath);
+  const std::vector<uint8_t> imageBytes = harness.storage.bytes(imagePath);
+  ASSERT_FALSE(sectionBytes.empty());
+  ASSERT_FALSE(imageBytes.empty());
+
+  const PdfStepResult cancelled = cancelToTerminalBounded(preparation, harness);
+  ASSERT_TRUE(cancelled.failed());
+  ASSERT_EQ(cancelled.status.error, PdfError::Cancelled);
+  PdfCacheStore cache;
+  ASSERT_TRUE(cache.initialize(harness.storage.io(), preparation.cacheRoot()).ok());
+  PdfBuildCheckpointSelection checkpoints{};
+  ASSERT_TRUE(cache.loadCheckpointSlots(preparation.sourceIdentity(), &checkpoints).ok());
+  ASSERT_TRUE(checkpoints.selected);
+  EXPECT_EQ(checkpoints.checkpoint.phase, PdfBuildPhase::Cancelled);
+  EXPECT_EQ(checkpoints.checkpoint.resumePhase, PdfBuildResumePhase::AfterImageRepair);
+  EXPECT_GT(checkpoints.checkpoint.journalBytes, 0U);
+  EXPECT_EQ(checkpoints.checkpoint.generation, generation);
+  EXPECT_GE(checkpoints.checkpoint.lastVerifiedPage, 1U);
+  EXPECT_GE(checkpoints.checkpoint.emittedSections, 1U);
+  EXPECT_GE(checkpoints.checkpoint.emittedImages, 1U);
+  const PreparationHarness cancelledBaseline = harness;
+
+  harness.storage.clearOpenObservations();
+  harness.storage.clearRemoveObservations();
+  harness.storage.clearReadObservations();
+  PdfPreparation resumed;
+  ASSERT_TRUE(resumed.begin(harness.config(sourcePath)).ok());
+  const PdfStepResult resumedResult = runToTerminal(resumed, harness);
+  ASSERT_TRUE(resumedResult.complete()) << static_cast<int>(resumedResult.status.error) << "@"
+                                        << resumedResult.status.offset
+                                        << " phase=" << static_cast<int>(resumed.phase());
+  EXPECT_TRUE(resumed.resumedFromCheckpoint());
+  EXPECT_EQ(resumed.resumedPhase(), PdfBuildResumePhase::AfterImageRepair);
+  EXPECT_EQ(resumed.generation(), generation);
+  EXPECT_EQ(harness.storage.bytes(sectionPath), sectionBytes);
+  EXPECT_EQ(harness.storage.bytes(imagePath), imageBytes);
+  EXPECT_EQ(writeTruncateOpensForPath(harness.storage.openObservations(), sectionPath), 0U);
+  EXPECT_EQ(writeTruncateOpensForPath(harness.storage.openObservations(), imagePath), 0U);
+  EXPECT_EQ(
+      std::count(harness.storage.removeObservations().begin(), harness.storage.removeObservations().end(), sectionPath),
+      0);
+  EXPECT_EQ(
+      std::count(harness.storage.removeObservations().begin(), harness.storage.removeObservations().end(), imagePath),
+      0);
+  const uint64_t resumedSourceBytes = observedPathBytes(harness.storage.readObservations(), sourcePath);
+  const PdfPreparationWorkCounters resumedWork = resumed.workCounters();
+
+  PreparationHarness freshHarness;
+  freshHarness.storage.setMaximumReadHandles(1);
+  freshHarness.storage.addFile(sourcePath, fixture, 1234, true);
+  PdfPreparation fresh;
+  ASSERT_TRUE(fresh.begin(freshHarness.config(sourcePath)).ok());
+  ASSERT_TRUE(runToTerminal(fresh, freshHarness).complete());
+  const uint64_t freshSourceBytes = observedPathBytes(freshHarness.storage.readObservations(), sourcePath);
+  const PdfPreparationWorkCounters freshWork = fresh.workCounters();
+  EXPECT_LT(resumedSourceBytes, freshSourceBytes);
+  EXPECT_LT(resumedWork.xrefSteps, freshWork.xrefSteps);
+  EXPECT_LT(resumedWork.pagesWalked, freshWork.pagesWalked);
+  EXPECT_LT(resumedWork.contentTokens, freshWork.contentTokens);
+  EXPECT_LT(resumedWork.sectionsEmitted, freshWork.sectionsEmitted);
+  EXPECT_LT(resumedWork.imagesEmitted, freshWork.imagesEmitted);
+  EXPECT_LT(resumedWork.sourceBytesRead, freshWork.sourceBytesRead);
+  EXPECT_EQ(harness.storage.openHandleCount(), 0U);
+
+  enum class Mutation : uint8_t {
+    InvalidCursor,
+    ControlCrc,
+    MissingControl,
+  };
+  for (const Mutation mutation : {Mutation::InvalidCursor, Mutation::ControlCrc, Mutation::MissingControl}) {
+    SCOPED_TRACE(static_cast<int>(mutation));
+    PreparationHarness rejected = cancelledBaseline;
+    const std::string controlPath = generationRoot + "/resume.sections";
+    if (mutation == Mutation::MissingControl) {
+      PdfCacheIo io = rejected.storage.io();
+      ASSERT_TRUE(io.remove(io.context, controlPath.c_str(), false).ok());
+    } else {
+      std::vector<uint8_t> control = rejected.storage.bytes(controlPath);
+      ASSERT_EQ(control.size(), 256U);
+      ASSERT_EQ(control[212], 0U);
+      if (mutation == Mutation::InvalidCursor) {
+        control[212] = 1U;
+        resealTrailingCrc(&control);
+      } else {
+        control.back() ^= 0x01U;
+      }
+      rejected.storage.addFile(controlPath, control);
+    }
+    rejected.storage.clearOpenObservations();
+    rejected.storage.clearRemoveObservations();
+    PdfPreparation freshRestart;
+    ASSERT_TRUE(freshRestart.begin(rejected.config(sourcePath)).ok());
+    const PdfStepResult freshResult = runToTerminal(freshRestart, rejected);
+    ASSERT_TRUE(freshResult.complete()) << static_cast<int>(freshResult.status.error) << "@"
+                                        << freshResult.status.offset;
+    EXPECT_FALSE(freshRestart.resumedFromCheckpoint());
+    EXPECT_NE(freshRestart.generation(), generation);
+    EXPECT_EQ(writeTruncateOpensForPath(rejected.storage.openObservations(), sectionPath), 0U);
+    EXPECT_EQ(writeTruncateOpensForPath(rejected.storage.openObservations(), imagePath), 0U);
+    EXPECT_EQ(std::count(rejected.storage.removeObservations().begin(), rejected.storage.removeObservations().end(),
+                         sectionPath),
+              0);
+    EXPECT_EQ(std::count(rejected.storage.removeObservations().begin(), rejected.storage.removeObservations().end(),
+                         imagePath),
+              0);
+    EXPECT_EQ(rejected.storage.openHandleCount(), 0U);
+  }
+}
+
+TEST(PdfImagePreparation, ResumeAfterRasterRepairCanonicalizesUnusedDeferredImageMappings) {
+  constexpr char sourcePath[] = "/books/resume-raster-finalize.pdf";
+  PreparationHarness harness;
+  harness.storage.setMaximumReadHandles(1);
+  harness.storage.addFile(sourcePath, loadFixture("raster_cover_caption.pdf"), 1234, true);
+
+  PdfPreparation preparation;
+  ASSERT_TRUE(preparation.begin(harness.config(sourcePath)).ok());
+  for (uint32_t slice = 0; slice < 20000 && (preparation.phase() != PdfPreparationPhase::CloseSource ||
+                                             preparation.workCounters().imagesEmitted == 0);
+       ++slice) {
+    const PdfStepResult step = preparation.step();
+    ++harness.nowMs;
+    ASSERT_TRUE(step.yielded()) << static_cast<int>(step.status.error) << "@" << step.status.offset;
+  }
+  ASSERT_EQ(preparation.phase(), PdfPreparationPhase::CloseSource);
+  ASSERT_GT(preparation.workCounters().imagesEmitted, 0U);
+
+  const uint32_t generation = preparation.generation();
+  const PdfStepResult cancelled = cancelToTerminalBounded(preparation, harness);
+  ASSERT_TRUE(cancelled.failed());
+  ASSERT_EQ(cancelled.status.error, PdfError::Cancelled);
+  ASSERT_EQ(preparation.durableResumePhase(), PdfBuildResumePhase::AfterImageRepair);
+
+  const std::string controlPath =
+      std::string(preparation.cacheRoot()) + "/gen_" + std::to_string(generation) + "/resume.sections";
+  const std::vector<uint8_t> control = harness.storage.bytes(controlPath);
+  ASSERT_EQ(control.size(), 256U);
+  ASSERT_EQ(control[18], 0U);
+  for (size_t index = 0; index < 64U; ++index) {
+    EXPECT_EQ(control[148U + index], UINT8_MAX) << "unused canonical mapping index " << index;
+  }
+
+  PdfPreparation resumed;
+  ASSERT_TRUE(resumed.begin(harness.config(sourcePath)).ok());
+  const PdfStepResult resumedResult = runToTerminal(resumed, harness);
+  ASSERT_TRUE(resumedResult.complete()) << static_cast<int>(resumedResult.status.error) << "@"
+                                        << resumedResult.status.offset;
+  EXPECT_TRUE(resumed.resumedFromCheckpoint());
+  EXPECT_EQ(resumed.resumedPhase(), PdfBuildResumePhase::AfterImageRepair);
+  EXPECT_EQ(resumed.generation(), generation);
+}
+
+TEST(PdfImagePreparation, ResumeStateMutationsFailClosedIntoAFreshGeneration) {
+  constexpr char sourcePath[] = "/books/resume-mutations.pdf";
+  PreparationHarness baseline;
+  baseline.storage.setMaximumReadHandles(1);
+  baseline.storage.addFile(sourcePath, loadFixture("jpeg_caption.pdf"), 1234, true);
+  PdfPreparation preparation;
+  ASSERT_TRUE(preparation.begin(baseline.config(sourcePath)).ok());
+  while (preparation.phase() != PdfPreparationPhase::CommitManifest) {
+    const PdfStepResult step = preparation.step();
+    ++baseline.nowMs;
+    ASSERT_TRUE(step.yielded()) << static_cast<int>(step.status.error) << "@" << step.status.offset;
+  }
+  const PdfStepResult cancelled = cancelToTerminalBounded(preparation, baseline);
+  ASSERT_TRUE(cancelled.failed());
+  ASSERT_EQ(cancelled.status.error, PdfError::Cancelled);
+  EXPECT_EQ(preparation.durableResumePhase(), PdfBuildResumePhase::CommitManifest);
+
+  PdfCacheStore cache;
+  ASSERT_TRUE(cache.initialize(baseline.storage.io(), preparation.cacheRoot()).ok());
+  PdfBuildCheckpointSelection checkpoints{};
+  ASSERT_TRUE(cache.loadCheckpointSlots(preparation.sourceIdentity(), &checkpoints).ok());
+  ASSERT_TRUE(checkpoints.selected);
+  ASSERT_EQ(checkpoints.checkpoint.resumePhase, PdfBuildResumePhase::CommitManifest);
+  const uint32_t cancelledGeneration = checkpoints.checkpoint.generation;
+  const std::string cacheRoot = preparation.cacheRoot();
+  const std::string generationRoot = cacheRoot + "/gen_" + std::to_string(cancelledGeneration);
+  const std::string checkpointPath =
+      cacheRoot + (checkpoints.selectedSlot == PdfCacheSlot::A ? "/build.a" : "/build.b");
+  const char resumeSlot = (checkpoints.checkpoint.sequence & 1U) != 0 ? 'a' : 'b';
+  const std::string resumePath = generationRoot + "/resume." + resumeSlot;
+  const std::string sectionPath = generationRoot + "/sections/000000.xhtml";
+  const std::vector<std::string> paths = baseline.storage.paths();
+  const auto image = std::find_if(paths.begin(), paths.end(), [&](const std::string& path) {
+    return path.starts_with(generationRoot + "/images/") && path.ends_with(".jpg");
+  });
+  ASSERT_NE(image, paths.end());
+  const std::string imagePath = *image;
+  ASSERT_TRUE(baseline.storage.exists(checkpointPath));
+  ASSERT_TRUE(baseline.storage.exists(resumePath));
+
+  PreparationHarness accepted = baseline;
+  accepted.storage.clearOpenObservations();
+  accepted.storage.clearRemoveObservations();
+  PdfPreparation resumedCommit;
+  ASSERT_TRUE(resumedCommit.begin(accepted.config(sourcePath)).ok());
+  const PdfStepResult resumedCommitResult = runToTerminal(resumedCommit, accepted);
+  ASSERT_TRUE(resumedCommitResult.complete())
+      << static_cast<int>(resumedCommitResult.status.error) << "@" << resumedCommitResult.status.offset;
+  EXPECT_TRUE(resumedCommit.resumedFromCheckpoint());
+  EXPECT_EQ(resumedCommit.resumedPhase(), PdfBuildResumePhase::CommitManifest);
+  EXPECT_EQ(resumedCommit.generation(), cancelledGeneration);
+  EXPECT_EQ(writeTruncateOpensForPath(accepted.storage.openObservations(), sectionPath), 0U);
+  EXPECT_EQ(writeTruncateOpensForPath(accepted.storage.openObservations(), imagePath), 0U);
+  EXPECT_EQ(std::count(accepted.storage.removeObservations().begin(), accepted.storage.removeObservations().end(),
+                       sectionPath),
+            0);
+  EXPECT_EQ(
+      std::count(accepted.storage.removeObservations().begin(), accepted.storage.removeObservations().end(), imagePath),
+      0);
+  EXPECT_LT(resumedCommit.workCounters().xrefSteps, preparation.workCounters().xrefSteps);
+  EXPECT_LT(resumedCommit.workCounters().pagesWalked, preparation.workCounters().pagesWalked);
+  EXPECT_LT(resumedCommit.workCounters().contentTokens, preparation.workCounters().contentTokens);
+  EXPECT_LT(resumedCommit.workCounters().sectionsEmitted, preparation.workCounters().sectionsEmitted);
+  EXPECT_LT(resumedCommit.workCounters().imagesEmitted, preparation.workCounters().imagesEmitted);
+  EXPECT_EQ(accepted.storage.openHandleCount(), 0U);
+
+  enum class Mutation : uint8_t {
+    ZeroPageCursor,
+    CheckpointCount,
+    UnderlyingPhase,
+    DeleteSection,
+    TruncateImage,
+    LedgerRecordOffset,
+    LedgerCrc,
+  };
+  constexpr Mutation mutations[] = {
+      Mutation::ZeroPageCursor, Mutation::CheckpointCount,    Mutation::UnderlyingPhase, Mutation::DeleteSection,
+      Mutation::TruncateImage,  Mutation::LedgerRecordOffset, Mutation::LedgerCrc,
+  };
+  for (const Mutation mutation : mutations) {
+    SCOPED_TRACE(static_cast<int>(mutation));
+    PreparationHarness harness = baseline;
+    harness.storage.clearOpenObservations();
+    harness.storage.clearRemoveObservations();
+    if (mutation == Mutation::ZeroPageCursor || mutation == Mutation::CheckpointCount ||
+        mutation == Mutation::UnderlyingPhase) {
+      std::vector<uint8_t> checkpoint = harness.storage.bytes(checkpointPath);
+      ASSERT_EQ(checkpoint.size(), 96U);
+      if (mutation == Mutation::ZeroPageCursor) {
+        writeLittleEndian32(&checkpoint, 56, 0);
+      } else if (mutation == Mutation::CheckpointCount) {
+        writeLittleEndian32(&checkpoint, 64, readLittleEndian32(checkpoint, 64) + 1U);
+      } else {
+        checkpoint[53] = static_cast<uint8_t>(PdfBuildResumePhase::None);
+      }
+      resealTrailingCrc(&checkpoint);
+      harness.storage.addFile(checkpointPath, checkpoint);
+    } else if (mutation == Mutation::DeleteSection) {
+      PdfCacheIo io = harness.storage.io();
+      ASSERT_TRUE(io.remove(io.context, sectionPath.c_str(), false).ok());
+      harness.storage.clearRemoveObservations();
+    } else if (mutation == Mutation::TruncateImage) {
+      ASSERT_GT(harness.storage.bytes(imagePath).size(), 1U);
+      harness.storage.truncateFile(imagePath, harness.storage.bytes(imagePath).size() - 1U);
+    } else {
+      std::vector<uint8_t> ledger = harness.storage.bytes(resumePath);
+      ASSERT_GT(ledger.size(), 100U);
+      if (mutation == Mutation::LedgerRecordOffset) {
+        writeLittleEndian32(&ledger, 84U + 4U, readLittleEndian32(ledger, 84U + 4U) + 1U);
+        resealTrailingCrc(&ledger);
+      } else {
+        ledger.back() ^= 0x01U;
+      }
+      harness.storage.addFile(resumePath, ledger);
+    }
+
+    PdfPreparation restarted;
+    ASSERT_TRUE(restarted.begin(harness.config(sourcePath)).ok());
+    const PdfStepResult result = runToTerminal(restarted, harness);
+    ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error) << "@" << result.status.offset
+                                   << " phase=" << static_cast<int>(restarted.phase());
+    EXPECT_FALSE(restarted.resumedFromCheckpoint());
+    EXPECT_NE(restarted.generation(), cancelledGeneration);
+    EXPECT_EQ(writeTruncateOpensForPath(harness.storage.openObservations(), sectionPath), 0U);
+    EXPECT_EQ(writeTruncateOpensForPath(harness.storage.openObservations(), imagePath), 0U);
+    EXPECT_EQ(harness.storage.openHandleCount(), 0U);
+  }
+}
+
+TEST(PdfImagePreparation, CancellationDuringLargeRasterPrehashRetainsAResumableGeneration) {
   PreparationHarness harness;
   harness.storage.setMaximumReadHandles(1);
   harness.storage.addFile("/books/cancel-prehash.pdf", loadFixture("large_raster_caption.pdf"), 1234, true);
@@ -1404,10 +2068,8 @@ TEST(PdfImagePreparation, CancellationDuringLargeRasterPrehashLeavesTheActiveGen
   ASSERT_TRUE(prehash.result.yielded());
   ASSERT_EQ(rebuild.phase(), PdfPreparationPhase::CacheImage);
 
-  rebuild.requestCancel();
-  const PreparationStepObservation cancellation = observePreparationStep(rebuild, harness);
-  expectBoundedPreparationStep(cancellation);
-  const PdfStepResult cancelled = cancellation.result;
+  const uint32_t cancelledGeneration = rebuild.generation();
+  const PdfStepResult cancelled = cancelToTerminalBounded(rebuild, harness);
 
   ASSERT_TRUE(cancelled.failed());
   EXPECT_EQ(cancelled.status.error, PdfError::Cancelled);
@@ -1417,18 +2079,13 @@ TEST(PdfImagePreparation, CancellationDuringLargeRasterPrehashLeavesTheActiveGen
   EXPECT_EQ(after.manifest.generation, activeGeneration);
   ASSERT_TRUE(harness.storage.exists(activeImagePath));
   EXPECT_EQ(harness.storage.bytes(activeImagePath), activeImageBytes);
-  const std::string cancelledGenerationRoot =
-      std::string(rebuild.cacheRoot()) + "/gen_" + std::to_string(rebuild.generation());
-  const auto pathsAfterCancel = harness.storage.paths();
-  EXPECT_EQ(std::find_if(pathsAfterCancel.begin(), pathsAfterCancel.end(),
-                         [&](const std::string& path) {
-                           return path == cancelledGenerationRoot || path.starts_with(cancelledGenerationRoot + "/");
-                         }),
-            pathsAfterCancel.end());
+  expectRetainedCancelledGeneration(harness.storage, rebuild.cacheRoot(), rebuild.sourceIdentity(),
+                                    cancelledGeneration);
   EXPECT_EQ(harness.storage.openHandleCount(), 0U);
+  expectFreshGenerationRestart(harness, "/books/cancel-prehash.pdf", cancelledGeneration);
 }
 
-TEST(PdfImagePreparation, CancellationDuringLargeJpegCopyRemovesThePartialAndKeepsTheActiveGeneration) {
+TEST(PdfImagePreparation, CancellationDuringLargeJpegCopyRemovesThePartialAndRetainsAResumableGeneration) {
   PreparationHarness harness;
   harness.storage.setMaximumReadHandles(1);
   harness.storage.addFile("/books/cancel-jpeg.pdf", loadFixture("jpeg_caption.pdf"), 1234, true);
@@ -1459,8 +2116,10 @@ TEST(PdfImagePreparation, CancellationDuringLargeJpegCopyRemovesThePartialAndKee
     ASSERT_TRUE(step.yielded());
   }
   ASSERT_NE(rebuild.generation(), activeGeneration);
-  const std::string cancelledImageRoot =
-      std::string(rebuild.cacheRoot()) + "/gen_" + std::to_string(rebuild.generation()) + "/images/";
+  const uint32_t cancelledGeneration = rebuild.generation();
+  const std::string cancelledGenerationRoot =
+      std::string(rebuild.cacheRoot()) + "/gen_" + std::to_string(cancelledGeneration);
+  const std::string cancelledImageRoot = cancelledGenerationRoot + "/images/";
   harness.chargeIoTime = true;
   bool partialWritten = false;
   for (uint8_t slice = 0; slice < 8 && !partialWritten; ++slice) {
@@ -1477,10 +2136,7 @@ TEST(PdfImagePreparation, CancellationDuringLargeJpegCopyRemovesThePartialAndKee
   }
   ASSERT_TRUE(partialWritten);
 
-  rebuild.requestCancel();
-  const PreparationStepObservation cancellation = observePreparationStep(rebuild, harness);
-  expectBoundedPreparationStep(cancellation);
-  const PdfStepResult cancelled = cancellation.result;
+  const PdfStepResult cancelled = cancelToTerminalBounded(rebuild, harness);
 
   ASSERT_TRUE(cancelled.failed());
   EXPECT_EQ(cancelled.status.error, PdfError::Cancelled);
@@ -1490,18 +2146,13 @@ TEST(PdfImagePreparation, CancellationDuringLargeJpegCopyRemovesThePartialAndKee
   EXPECT_EQ(after.manifest.generation, activeGeneration);
   ASSERT_TRUE(harness.storage.exists(activeImagePath));
   EXPECT_EQ(harness.storage.bytes(activeImagePath), activeImageBytes);
-  const auto pathsAfterCancel = harness.storage.paths();
-  EXPECT_EQ(std::find_if(pathsAfterCancel.begin(), pathsAfterCancel.end(),
-                         [&](const std::string& path) {
-                           const std::string cancelledRoot =
-                               cancelledImageRoot.substr(0, cancelledImageRoot.size() - 8);
-                           return path == cancelledRoot || path.starts_with(cancelledRoot + "/");
-                         }),
-            pathsAfterCancel.end());
+  expectRetainedCancelledGeneration(harness.storage, rebuild.cacheRoot(), rebuild.sourceIdentity(),
+                                    cancelledGeneration);
   EXPECT_EQ(harness.storage.openHandleCount(), 0U);
+  expectFreshGenerationRestart(harness, "/books/cancel-jpeg.pdf", cancelledGeneration);
 }
 
-TEST(PdfImagePreparation, CancellationDuringLargeMaskCompositeRemovesPartialStateAndKeepsTheActiveGeneration) {
+TEST(PdfImagePreparation, CancellationDuringLargeMaskCompositeRemovesPartialStateAndRetainsAResumableGeneration) {
   PreparationHarness harness;
   harness.storage.setMaximumReadHandles(1);
   harness.storage.addFile("/books/cancel-mask.pdf", loadFixture("large_raster_caption.pdf"), 1234, true);
@@ -1532,8 +2183,9 @@ TEST(PdfImagePreparation, CancellationDuringLargeMaskCompositeRemovesPartialStat
     ASSERT_TRUE(step.yielded());
   }
   ASSERT_NE(rebuild.generation(), activeGeneration);
+  const uint32_t cancelledGeneration = rebuild.generation();
   const std::string cancelledGenerationRoot =
-      std::string(rebuild.cacheRoot()) + "/gen_" + std::to_string(rebuild.generation());
+      std::string(rebuild.cacheRoot()) + "/gen_" + std::to_string(cancelledGeneration);
   bool partialWritten = false;
   for (uint32_t slice = 0; slice < 2000 && !partialWritten; ++slice) {
     if (rebuild.maskSpoolReadCount() != 0) {
@@ -1557,10 +2209,7 @@ TEST(PdfImagePreparation, CancellationDuringLargeMaskCompositeRemovesPartialStat
   }
   ASSERT_TRUE(partialWritten);
 
-  rebuild.requestCancel();
-  const PreparationStepObservation cancellation = observePreparationStep(rebuild, harness);
-  expectBoundedPreparationStep(cancellation);
-  const PdfStepResult cancelled = cancellation.result;
+  const PdfStepResult cancelled = cancelToTerminalBounded(rebuild, harness);
 
   ASSERT_TRUE(cancelled.failed());
   EXPECT_EQ(cancelled.status.error, PdfError::Cancelled);
@@ -1570,17 +2219,14 @@ TEST(PdfImagePreparation, CancellationDuringLargeMaskCompositeRemovesPartialStat
   EXPECT_EQ(after.manifest.generation, activeGeneration);
   ASSERT_TRUE(harness.storage.exists(activeImagePath));
   EXPECT_EQ(harness.storage.bytes(activeImagePath), activeImageBytes);
-  const auto pathsAfterCancel = harness.storage.paths();
-  EXPECT_EQ(std::find_if(pathsAfterCancel.begin(), pathsAfterCancel.end(),
-                         [&](const std::string& path) {
-                           return path == cancelledGenerationRoot || path.starts_with(cancelledGenerationRoot + "/");
-                         }),
-            pathsAfterCancel.end());
   EXPECT_FALSE(harness.storage.exists(cancelledGenerationRoot + "/build.mask"));
+  expectRetainedCancelledGeneration(harness.storage, rebuild.cacheRoot(), rebuild.sourceIdentity(),
+                                    cancelledGeneration);
   EXPECT_EQ(harness.storage.openHandleCount(), 0U);
+  expectFreshGenerationRestart(harness, "/books/cancel-mask.pdf", cancelledGeneration);
 }
 
-TEST(PdfImagePreparation, CancellationDuringLargeRasterDecodeClosesAndRemovesPartialOutput) {
+TEST(PdfImagePreparation, CancellationDuringLargeRasterDecodeClosesPartialOutputAndRetainsAResumableGeneration) {
   PreparationHarness harness;
   harness.storage.setMaximumReadHandles(1);
   harness.storage.addFile("/books/cancel-raster.pdf", loadFixture("large_raster_caption.pdf"), 1234, true);
@@ -1599,10 +2245,8 @@ TEST(PdfImagePreparation, CancellationDuringLargeRasterDecodeClosesAndRemovesPar
   }
 
   harness.chargeIoTime = true;
-  preparation.requestCancel();
-  const PreparationStepObservation cancellation = observePreparationStep(preparation, harness);
-  expectBoundedPreparationStep(cancellation);
-  const PdfStepResult cancelled = cancellation.result;
+  const uint32_t cancelledGeneration = preparation.generation();
+  const PdfStepResult cancelled = cancelToTerminalBounded(preparation, harness);
 
   ASSERT_TRUE(cancelled.failed());
   EXPECT_EQ(cancelled.status.error, PdfError::Cancelled);
@@ -1611,15 +2255,10 @@ TEST(PdfImagePreparation, CancellationDuringLargeRasterDecodeClosesAndRemovesPar
   PdfCacheManifestSelection selection{};
   ASSERT_TRUE(cache.loadManifestSlots(preparation.sourceIdentity(), &selection).ok());
   EXPECT_FALSE(selection.selected);
-  const auto paths = harness.storage.paths();
-  const std::string cancelledGenerationRoot =
-      std::string(preparation.cacheRoot()) + "/gen_" + std::to_string(preparation.generation());
-  EXPECT_EQ(std::find_if(paths.begin(), paths.end(),
-                         [&](const std::string& path) {
-                           return path == cancelledGenerationRoot || path.starts_with(cancelledGenerationRoot + "/");
-                         }),
-            paths.end());
+  expectRetainedCancelledGeneration(harness.storage, preparation.cacheRoot(), preparation.sourceIdentity(),
+                                    cancelledGeneration);
   EXPECT_EQ(harness.storage.openHandleCount(), 0U);
+  expectFreshGenerationRestart(harness, "/books/cancel-raster.pdf", cancelledGeneration);
 }
 
 TEST(PdfImagePreparation, NavigationSpoolWriteFailurePublishesNoManifestAndLeavesNoOpenHandle) {
@@ -2431,11 +3070,10 @@ TEST(PdfImagePreparation, InlineDctSourceBytesAreReadOnceWhileScanningAndCaching
   const std::vector<uint8_t> fixture = loadFixture("inline_dct_one_pass.pdf");
   const uint8_t jpegStartMarker[] = {0xFF, 0xD8};
   const uint8_t jpegEndMarker[] = {0xFF, 0xD9};
-  const auto jpegBegin = std::search(fixture.begin(), fixture.end(), std::begin(jpegStartMarker),
-                                     std::end(jpegStartMarker));
+  const auto jpegBegin =
+      std::search(fixture.begin(), fixture.end(), std::begin(jpegStartMarker), std::end(jpegStartMarker));
   ASSERT_NE(jpegBegin, fixture.end());
-  const auto jpegEnd = std::search(jpegBegin + 2, fixture.end(), std::begin(jpegEndMarker),
-                                   std::end(jpegEndMarker));
+  const auto jpegEnd = std::search(jpegBegin + 2, fixture.end(), std::begin(jpegEndMarker), std::end(jpegEndMarker));
   ASSERT_NE(jpegEnd, fixture.end());
   const uint64_t jpegOffset = static_cast<uint64_t>(std::distance(fixture.begin(), jpegBegin));
   const uint64_t jpegLength = static_cast<uint64_t>(std::distance(jpegBegin, jpegEnd)) + 2U;
@@ -2448,8 +3086,8 @@ TEST(PdfImagePreparation, InlineDctSourceBytesAreReadOnceWhileScanningAndCaching
   for (uint32_t slice = 0; slice < 20000 && preparation.phase() != PdfPreparationPhase::ExtractText; ++slice) {
     const PreparationStepObservation observation = observePreparationStep(preparation, harness);
     expectBoundedPreparationStep(observation);
-    ASSERT_TRUE(observation.result.yielded()) << static_cast<int>(observation.result.status.error) << "@"
-                                             << observation.result.status.offset;
+    ASSERT_TRUE(observation.result.yielded())
+        << static_cast<int>(observation.result.status.error) << "@" << observation.result.status.offset;
   }
   ASSERT_EQ(preparation.phase(), PdfPreparationPhase::ExtractText);
   harness.storage.clearReadObservations();
@@ -2477,12 +3115,11 @@ TEST(PdfImagePreparation, InlineDctSourceBytesAreReadOnceWhileScanningAndCaching
     return path.starts_with(generationRoot + "/images/") && path.ends_with(".jpg");
   });
   ASSERT_NE(jpegPath, paths.end());
-  EXPECT_EQ(harness.storage.bytes(*jpegPath),
-            std::vector<uint8_t>(jpegBegin, jpegEnd + 2));
+  EXPECT_EQ(harness.storage.bytes(*jpegPath), std::vector<uint8_t>(jpegBegin, jpegEnd + 2));
   EXPECT_EQ(harness.storage.openHandleCount(), 0U);
 }
 
-TEST(PdfImagePreparation, CancellationDuringInlineDctCaptureRemovesThePartialGeneration) {
+TEST(PdfImagePreparation, CancellationDuringInlineDctCaptureRemovesThePartialAndRetainsAResumableGeneration) {
   PreparationHarness harness;
   harness.storage.setMaximumReadHandles(1);
   constexpr char sourcePath[] = "/books/cancel-inline-dct.pdf";
@@ -2496,8 +3133,8 @@ TEST(PdfImagePreparation, CancellationDuringInlineDctCaptureRemovesThePartialGen
   for (uint32_t slice = 0; slice < 20000 && !partialCaptureWritten; ++slice) {
     const PreparationStepObservation observation = observePreparationStep(preparation, harness);
     expectBoundedPreparationStep(observation);
-    ASSERT_TRUE(observation.result.yielded()) << static_cast<int>(observation.result.status.error) << "@"
-                                             << observation.result.status.offset;
+    ASSERT_TRUE(observation.result.yielded())
+        << static_cast<int>(observation.result.status.error) << "@" << observation.result.status.offset;
     if (preparation.generation() == 0) {
       continue;
     }
@@ -2512,18 +3149,16 @@ TEST(PdfImagePreparation, CancellationDuringInlineDctCaptureRemovesThePartialGen
   ASSERT_TRUE(partialCaptureWritten);
   ASSERT_EQ(preparation.phase(), PdfPreparationPhase::ExtractText);
 
-  preparation.requestCancel();
-  const PreparationStepObservation cancellation = observePreparationStep(preparation, harness);
-  expectBoundedPreparationStep(cancellation);
+  const uint32_t cancelledGeneration = preparation.generation();
+  const PdfStepResult cancelled = cancelToTerminalBounded(preparation, harness);
 
-  ASSERT_TRUE(cancellation.result.failed());
-  EXPECT_EQ(cancellation.result.status.error, PdfError::Cancelled);
-  const std::vector<std::string> paths = harness.storage.paths();
-  EXPECT_EQ(std::find_if(paths.begin(), paths.end(), [&](const std::string& path) {
-              return path == generationRoot || path.starts_with(generationRoot + "/");
-            }),
-            paths.end());
+  ASSERT_TRUE(cancelled.failed());
+  EXPECT_EQ(cancelled.status.error, PdfError::Cancelled);
+  EXPECT_EQ(cancelledGeneration, preparation.generation());
+  expectRetainedCancelledGeneration(harness.storage, preparation.cacheRoot(), preparation.sourceIdentity(),
+                                    cancelledGeneration);
   EXPECT_EQ(harness.storage.openHandleCount(), 0U);
+  expectFreshGenerationRestart(harness, sourcePath, cancelledGeneration);
 }
 
 TEST(PdfImagePreparation, LivePlacementTrackingSuppressesAThreeUseLogoBeforeRasterDecode) {
@@ -2661,8 +3296,8 @@ TEST(PdfImagePreparation, FirstRetainedMeaningfulEarlyRasterBecomesCoverAfterDis
     const uint32_t pixelOffset = static_cast<uint32_t>(bmp[10]) | static_cast<uint32_t>(bmp[11]) << 8U |
                                  static_cast<uint32_t>(bmp[12]) << 16U | static_cast<uint32_t>(bmp[13]) << 24U;
     const uint32_t rowBytes = ((static_cast<uint32_t>(width) + 31U) / 32U) * 4U;
-    return static_cast<uint8_t>(
-        (bmp[pixelOffset + static_cast<uint32_t>(y) * rowBytes + x / 8U] >> (7U - x % 8U)) & 0x01U);
+    return static_cast<uint8_t>((bmp[pixelOffset + static_cast<uint32_t>(y) * rowBytes + x / 8U] >> (7U - x % 8U)) &
+                                0x01U);
   };
   EXPECT_EQ(bmpPixel(cover, 240, 119, 200), 0U);
   EXPECT_EQ(bmpPixel(cover, 240, 120, 200), 1U);
@@ -2692,14 +3327,79 @@ TEST(PdfImagePreparation, MeaningfulEarlyJpegProducesImageDerivedCoverAndThumbna
     const uint32_t pixelOffset = static_cast<uint32_t>(bmp[10]) | static_cast<uint32_t>(bmp[11]) << 8U |
                                  static_cast<uint32_t>(bmp[12]) << 16U | static_cast<uint32_t>(bmp[13]) << 24U;
     const uint32_t rowBytes = ((static_cast<uint32_t>(width) + 31U) / 32U) * 4U;
-    return static_cast<uint8_t>(
-        (bmp[pixelOffset + static_cast<uint32_t>(y) * rowBytes + x / 8U] >> (7U - x % 8U)) & 0x01U);
+    return static_cast<uint8_t>((bmp[pixelOffset + static_cast<uint32_t>(y) * rowBytes + x / 8U] >> (7U - x % 8U)) &
+                                0x01U);
   };
   EXPECT_EQ(bmpPixel(cover, 240, 119, 200), 0U);
   EXPECT_EQ(bmpPixel(cover, 240, 120, 200), 1U);
   EXPECT_EQ(bmpPixel(thumb, 96, 47, 80), 0U);
   EXPECT_EQ(bmpPixel(thumb, 96, 48, 80), 1U);
   EXPECT_EQ(harness.storage.openHandleCount(), 0U);
+}
+
+TEST(PdfImagePreparation, CancellationDuringJpegPreviewHeaderOrRowLeavesNoResidueAndFreshRetryCompletes) {
+  enum class CancellationPoint : uint8_t { Header, Row };
+  for (const CancellationPoint point : {CancellationPoint::Header, CancellationPoint::Row}) {
+    SCOPED_TRACE(point == CancellationPoint::Header ? "header" : "row");
+    PreparationHarness harness;
+    harness.storage.setMaximumReadHandles(1);
+    constexpr char sourcePath[] = "/books/cancel-jpeg-preview.pdf";
+    harness.storage.addFile(sourcePath, loadFixture("jpeg_cover_caption.pdf"), 1234, true);
+    PdfPreparation preparation;
+    ASSERT_TRUE(preparation.begin(harness.config(sourcePath)).ok());
+
+    std::string generationRoot;
+    std::string jpegPath;
+    bool reachedCancellationPoint = false;
+    for (uint32_t slice = 0; slice < 30000 && !reachedCancellationPoint; ++slice) {
+      const PreparationStepObservation observation = observePreparationStep(preparation, harness);
+      expectBoundedPreparationStep(observation);
+      ASSERT_TRUE(observation.result.yielded())
+          << static_cast<int>(observation.result.status.error) << "@" << observation.result.status.offset
+          << " phase=" << static_cast<int>(preparation.phase());
+      ++harness.nowMs;
+      if (preparation.generation() == 0) {
+        continue;
+      }
+      generationRoot = std::string(preparation.cacheRoot()) + "/gen_" + std::to_string(preparation.generation());
+      if (jpegPath.empty()) {
+        const std::vector<std::string> paths = harness.storage.paths();
+        const auto jpeg = std::find_if(paths.begin(), paths.end(), [&](const std::string& path) {
+          return path.starts_with(generationRoot + "/images/") && path.ends_with(".jpg");
+        });
+        if (jpeg != paths.end()) {
+          jpegPath = *jpeg;
+        }
+      }
+      const std::string coverPath = generationRoot + "/cover.bmp";
+      if (point == CancellationPoint::Header) {
+        reachedCancellationPoint = !jpegPath.empty() &&
+                                   observedPathBytes(harness.storage.readObservations(), jpegPath) != 0 &&
+                                   !harness.storage.exists(coverPath);
+      } else {
+        reachedCancellationPoint = harness.storage.exists(coverPath) && harness.storage.bytes(coverPath).size() > 62U;
+      }
+    }
+    ASSERT_TRUE(reachedCancellationPoint);
+    const uint32_t cancelledGeneration = preparation.generation();
+
+    const PdfStepResult cancelled = cancelToTerminalBounded(preparation, harness);
+
+    ASSERT_TRUE(cancelled.failed());
+    EXPECT_EQ(cancelled.status.error, PdfError::Cancelled);
+    EXPECT_EQ(harness.storage.openHandleCount(), 0U);
+    EXPECT_FALSE(harness.storage.exists(generationRoot + "/cover.bmp"));
+    EXPECT_FALSE(harness.storage.exists(generationRoot + "/thumb.bmp"));
+    for (const std::string& path : harness.storage.paths()) {
+      if (path.starts_with(generationRoot)) {
+        EXPECT_FALSE(path.ends_with(".tmp")) << path;
+        EXPECT_EQ(path.find("/build-"), std::string::npos) << path;
+      }
+    }
+    expectRetainedCancelledGeneration(harness.storage, preparation.cacheRoot(), preparation.sourceIdentity(),
+                                      cancelledGeneration);
+    expectFreshGenerationRestart(harness, sourcePath, cancelledGeneration);
+  }
 }
 
 TEST(PdfImagePreparation, PreviewUnsupportedJpegCoversFallBackToTypographyWithoutDroppingTextOrImage) {
@@ -2710,8 +3410,8 @@ TEST(PdfImagePreparation, PreviewUnsupportedJpegCoversFallBackToTypographyWithou
     uint8_t frameMarker;
   };
   constexpr TestCase testCases[] = {
-      {"progressive_jpeg_cover_caption.pdf", "/books/progressive-jpeg-cover.pdf",
-       "Progressive JPEG cover caption.", 0xc2},
+      {"progressive_jpeg_cover_caption.pdf", "/books/progressive-jpeg-cover.pdf", "Progressive JPEG cover caption.",
+       0xc2},
       {"sof1_jpeg_cover_caption.pdf", "/books/sof1-jpeg-cover.pdf", "SOF1 JPEG cover caption.", 0xc1},
   };
 
@@ -2723,11 +3423,10 @@ TEST(PdfImagePreparation, PreviewUnsupportedJpegCoversFallBackToTypographyWithou
     const uint8_t jpegStartMarker[] = {0xff, 0xd8};
     const uint8_t jpegEndMarker[] = {0xff, 0xd9};
     const uint8_t frameMarker[] = {0xff, testCase.frameMarker};
-    const auto jpegBegin = std::search(fixture.begin(), fixture.end(), std::begin(jpegStartMarker),
-                                       std::end(jpegStartMarker));
+    const auto jpegBegin =
+        std::search(fixture.begin(), fixture.end(), std::begin(jpegStartMarker), std::end(jpegStartMarker));
     ASSERT_NE(jpegBegin, fixture.end());
-    const auto jpegEnd = std::search(jpegBegin + 2, fixture.end(), std::begin(jpegEndMarker),
-                                     std::end(jpegEndMarker));
+    const auto jpegEnd = std::search(jpegBegin + 2, fixture.end(), std::begin(jpegEndMarker), std::end(jpegEndMarker));
     ASSERT_NE(jpegEnd, fixture.end());
     ASSERT_NE(std::search(jpegBegin, jpegEnd, std::begin(frameMarker), std::end(frameMarker)), jpegEnd);
     const uint64_t jpegOffset = static_cast<uint64_t>(std::distance(fixture.begin(), jpegBegin));
@@ -2773,7 +3472,7 @@ TEST(PdfImagePreparation, PreviewUnsupportedJpegCoversFallBackToTypographyWithou
     }
 
     ASSERT_TRUE(terminal.complete()) << static_cast<int>(terminal.status.error) << "@" << terminal.status.offset
-                                    << " phase=" << static_cast<int>(preparation.phase());
+                                     << " phase=" << static_cast<int>(preparation.phase());
     expectSourceRangeReadOnce(harness.storage.readObservations(), testCase.sourcePath, jpegOffset, jpegLength);
     const std::string generationRoot =
         std::string(preparation.cacheRoot()) + "/gen_" + std::to_string(preparation.generation());
@@ -2798,14 +3497,13 @@ TEST(PdfImagePreparation, PreviewUnsupportedJpegCoversFallBackToTypographyWithou
     const auto bmpPixel = [](const std::vector<uint8_t>& bmp, const uint16_t width, const uint16_t x,
                              const uint16_t y) {
       const uint32_t pixelOffset = static_cast<uint32_t>(bmp[10]) | static_cast<uint32_t>(bmp[11]) << 8U |
-                                   static_cast<uint32_t>(bmp[12]) << 16U |
-                                   static_cast<uint32_t>(bmp[13]) << 24U;
+                                   static_cast<uint32_t>(bmp[12]) << 16U | static_cast<uint32_t>(bmp[13]) << 24U;
       const uint32_t rowBytes = ((static_cast<uint32_t>(width) + 31U) / 32U) * 4U;
-      return static_cast<uint8_t>(
-          (bmp[pixelOffset + static_cast<uint32_t>(y) * rowBytes + x / 8U] >> (7U - x % 8U)) & 0x01U);
+      return static_cast<uint8_t>((bmp[pixelOffset + static_cast<uint32_t>(y) * rowBytes + x / 8U] >> (7U - x % 8U)) &
+                                  0x01U);
     };
-    const auto hasBlackPixel = [&](const std::vector<uint8_t>& bmp, const uint16_t width,
-                                   const uint16_t firstRow, const uint16_t rowCount) {
+    const auto hasBlackPixel = [&](const std::vector<uint8_t>& bmp, const uint16_t width, const uint16_t firstRow,
+                                   const uint16_t rowCount) {
       for (uint16_t row = firstRow; row < static_cast<uint16_t>(firstRow + rowCount); ++row) {
         for (uint16_t x = 0; x < width; ++x) {
           if (bmpPixel(bmp, width, x, row) == 0U) {

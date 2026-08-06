@@ -1,3 +1,21 @@
+## [v1.5.0] - 2026-07-31
+
+### Added
+
+- PDF books can now be reflowed entirely on the device, using the reader's selected font, font size, margins, and orientation instead of shrinking a fixed PDF page.
+- PDF chapters, contents, internal links, publisher page labels, and document index entries now work in the reader.
+- Supported JPEG and raster artwork is retained alongside reflowed PDF text.
+- PDF reading progress now follows words read across the whole book, with resume, bookmarks, and clippings preserved when the layout changes.
+
+### Changed
+
+- Prepared PDF books now reopen and turn pages from saved reading data without repeatedly parsing the original PDF, reducing processor and SD-card work.
+- Existing EPUB and other book formats keep their existing behavior and storage formats.
+
+### Fixed
+
+- Prepared PDF pages now reopen more reliably after interrupted writes or damaged cache data, rebuilding only when the saved reading data cannot be trusted.
+
 ## [v1.4.0.1] - 2026-07-28
 
 ### Added

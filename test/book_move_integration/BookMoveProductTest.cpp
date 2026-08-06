@@ -92,6 +92,27 @@ void seedLegacyEpub(const std::string& oldPath) {
   CrossPointState::persistedPath = oldPath;
 }
 
+void testEmptyBootRecoverySkipsFullMoveWorkspace() {
+  resetState();
+  TestMemory::reset();
+
+  expect(BookMoveUtils::recoverPendingBookMove() ==
+             BookMoveUtils::MoveResult::NoPendingMove,
+         "empty boot storage must report no pending book move");
+  expect(TestMemory::allocations == 1U,
+         "empty boot recovery must allocate only one bounded journal reader");
+  expect(TestMemory::allocationSizes.size() == 1U &&
+             TestMemory::allocationSizes.front() <= 3U * 1024U,
+         "empty boot recovery must not allocate the full book-move workspace");
+  expect(Storage.fileOpenCalls() == 0U && Storage.maximumFileHandles() == 0U,
+         "absent book-move slots must not acquire a journal file handle");
+  if (!TestMemory::allocationSizes.empty()) {
+    std::cout << "BOOK_MOVE_BOOT_PREFLIGHT allocation_bytes="
+              << TestMemory::allocationSizes.front() << " opens="
+              << Storage.fileOpenCalls() << '\n';
+  }
+}
+
 void testCompleteMoveCopiesAndVerifiesBeforeTerminalCleanup() {
   resetState();
   const std::string oldPath = "/Books/book.pdf";
@@ -467,6 +488,7 @@ void testPendingDeleteSerializesPdfMoveBeforeJournalMutation() {
 }  // namespace
 
 int main() {
+  testEmptyBootRecoverySkipsFullMoveWorkspace();
   testCompleteMoveCopiesAndVerifiesBeforeTerminalCleanup();
   testFailureAfterSourceRenameRetainsOldStateAndRebootsIdempotently();
   testPendingMoveFencesOnlyItsAffectedPdfCacheIdentity();

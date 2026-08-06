@@ -76,8 +76,10 @@ uint8_t enumRawValueForDisplayIndex(const SettingInfo& setting, uint8_t displayI
   return setting.enumRawValues[displayIndex];
 }
 
-// WebSocket upload metadata. The file handle and atomic transaction live in
-// CrossPointWebServer::upload so HTTP and WS cannot write concurrently.
+// Legacy WebSocket uploads keep their independent file handle. PDF uploads use
+// the shared atomic transaction in CrossPointWebServer::upload so a PDF can
+// never overlap another transport.
+HalFile wsUploadFile;
 String wsUploadFileName;
 String wsUploadPath;
 size_t wsUploadSize = 0;
@@ -192,6 +194,10 @@ bool invalidateUploadedBookCache(void*, const char* const targetPath) {
 }
 
 BookUpload::AtomicUploadCommitHook uploadCommitHook() { return {nullptr, &invalidateUploadedBookCache}; }
+
+bool isPdfUploadTarget(const String& filePath) {
+  return FsHelpers::hasPdfExtension(filePath);
+}
 
 const char* atomicUploadStatusMessage(const BookUpload::AtomicUploadStatus status) {
   switch (status) {
@@ -436,12 +442,25 @@ void CrossPointWebServer::begin() {
 }
 
 void CrossPointWebServer::abortWsUpload(const char* tag) {
-  const BookUpload::AtomicUploadIo io = atomicUploadIo(upload.file);
-  const BookUpload::AtomicUploadStatus status = BookUpload::abort(upload.transaction, io);
-  if (status != BookUpload::AtomicUploadStatus::Ok) {
-    LOG_ERR(tag, "Failed to clean interrupted WS upload: %s", atomicUploadStatusMessage(status));
+  const bool pdfUpload = isPdfUploadTarget(wsUploadFileName);
+  if (pdfUpload) {
+    const BookUpload::AtomicUploadIo io = atomicUploadIo(upload.file);
+    const BookUpload::AtomicUploadStatus status = BookUpload::abort(upload.transaction, io);
+    if (status != BookUpload::AtomicUploadStatus::Ok) {
+      LOG_ERR(tag, "Failed to clean interrupted PDF upload: %s", atomicUploadStatusMessage(status));
+    }
+    upload.owner = UploadState::Owner::None;
+  } else {
+    wsUploadFile.close();
+    String filePath = wsUploadPath;
+    if (!filePath.endsWith("/")) filePath += "/";
+    filePath += wsUploadFileName;
+    if (Storage.remove(filePath.c_str())) {
+      LOG_DBG(tag, "Deleted incomplete upload: %s", filePath.c_str());
+    } else {
+      LOG_DBG(tag, "Failed to delete incomplete upload: %s", filePath.c_str());
+    }
   }
-  upload.owner = UploadState::Owner::None;
   wsUploadInProgress = false;
   wsUploadClientNum = 255;
   wsLastProgressSent = 0;
@@ -458,17 +477,33 @@ void CrossPointWebServer::stop() {
 
   LOG_DBG("WEB", "[MEM] Free heap before stop: %d bytes", ESP.getFreeHeap());
 
-  // Close any in-progress upload. The atomic helper removes only its hidden
-  // sibling temp and leaves the canonical book untouched.
-  if (BookUpload::isActive(upload.transaction)) {
-    const BookUpload::AtomicUploadIo io = atomicUploadIo(upload.file);
-    const BookUpload::AtomicUploadStatus status = BookUpload::abort(upload.transaction, io);
-    if (status != BookUpload::AtomicUploadStatus::Ok) {
-      LOG_ERR("WEB", "Failed to clean interrupted upload during stop: %s", atomicUploadStatusMessage(status));
+  if (wsUploadInProgress) {
+    abortWsUpload("WEB");
+  }
+  if (upload.owner == UploadState::Owner::Http) {
+    if (isPdfUploadTarget(upload.fileName)) {
+      const BookUpload::AtomicUploadIo io = atomicUploadIo(upload.file);
+      const BookUpload::AtomicUploadStatus status = BookUpload::abort(upload.transaction, io);
+      if (status != BookUpload::AtomicUploadStatus::Ok) {
+        LOG_ERR("WEB", "Failed to clean interrupted upload during stop: %s", atomicUploadStatusMessage(status));
+      }
+    } else {
+      upload.file.close();
+      String filePath = upload.path;
+      if (!filePath.endsWith("/")) filePath += "/";
+      filePath += upload.fileName;
+      if (!Storage.remove(filePath.c_str())) {
+        LOG_DBG("WEB", "Failed to delete interrupted HTTP upload: %s", filePath.c_str());
+      }
     }
     upload.owner = UploadState::Owner::None;
-    wsUploadInProgress = false;
-    wsUploadClientNum = 255;
+    upload.httpPostStatus = UploadState::HttpPostStatus::UploadResult;
+    upload.fileName = "";
+    upload.path = "/";
+    upload.size = 0;
+    upload.success = false;
+    upload.error = "";
+    upload.bufferPos = 0;
   }
 
   // Stop WebSocket server
@@ -831,12 +866,27 @@ static size_t writeCount = 0;
 
 static BookUpload::AtomicUploadStatus flushUploadBuffer(CrossPointWebServer::UploadState& state) {
   if (state.bufferPos == 0) return BookUpload::AtomicUploadStatus::Ok;
-  const unsigned long writeStart = millis();
-  const BookUpload::AtomicUploadIo io = atomicUploadIo(state.file);
-  const BookUpload::AtomicUploadStatus status =
-      BookUpload::write(state.transaction, io, state.buffer.data(), state.bufferPos);
-  totalWriteTime += millis() - writeStart;
-  writeCount++;
+  const bool pdfUpload = isPdfUploadTarget(state.fileName);
+  BookUpload::AtomicUploadStatus status = BookUpload::AtomicUploadStatus::Ok;
+  if (pdfUpload) {
+    const unsigned long writeStart = millis();
+    const BookUpload::AtomicUploadIo io = atomicUploadIo(state.file);
+    status = BookUpload::write(state.transaction, io, state.buffer.data(), state.bufferPos);
+    totalWriteTime += millis() - writeStart;
+    writeCount++;
+  } else {
+    if (!state.file) return BookUpload::AtomicUploadStatus::Ok;
+    esp_task_wdt_reset();
+    const unsigned long writeStart = millis();
+    const size_t written = state.file.write(state.buffer.data(), state.bufferPos);
+    totalWriteTime += millis() - writeStart;
+    writeCount++;
+    esp_task_wdt_reset();
+    if (written != state.bufferPos) {
+      LOG_DBG("WEB", "[UPLOAD] Buffer flush failed: expected %d, wrote %d", state.bufferPos, written);
+      status = BookUpload::AtomicUploadStatus::WriteFailed;
+    }
+  }
   state.bufferPos = 0;
   return status;
 }
@@ -856,45 +906,45 @@ void CrossPointWebServer::handleUpload(UploadState& state) const {
   const HTTPUpload& upload = server->upload();
 
   if (upload.status == UPLOAD_FILE_START) {
-    BookUpload::UploadTransportResponse response{state.success, !state.error.isEmpty()};
-    const BookUpload::AtomicUploadStatus admission =
-        BookUpload::admitTransportStart(BookUpload::isActive(state.transaction), response);
-    state.success = response.success;
-    state.fileName = "";
-    state.error = "";
-    if (admission != BookUpload::AtomicUploadStatus::Ok) {
-      state.error = atomicUploadStatusMessage(admission);
-      LOG_DBG("WEB", "[UPLOAD] START rejected: transaction already active");
+    const String startFileName = StringUtils::sanitizeFilename(upload.filename.c_str()).c_str();
+    const String startPath = server->hasArg("path") ? normalizeWebPath(server->arg("path")) : String("/");
+    String filePath = startPath;
+    if (!filePath.endsWith("/")) filePath += "/";
+    filePath += startFileName;
+    const bool pdfUpload = isPdfUploadTarget(filePath);
+    const bool atomicUploadActive = BookUpload::isActive(state.transaction);
+    BookUpload::AtomicUploadStatus admission = BookUpload::AtomicUploadStatus::Ok;
+    if (pdfUpload) {
+      BookUpload::UploadTransportResponse response{false, false};
+      admission = BookUpload::admitTransportStart(atomicUploadActive, response);
+    }
+
+    // Parse the candidate above, but do not replace active upload metadata.
+    // A PDF excludes both transports; legacy HTTP and WS files stay independent.
+    if (state.owner != UploadState::Owner::None || atomicUploadActive ||
+        admission != BookUpload::AtomicUploadStatus::Ok || (pdfUpload && wsUploadInProgress)) {
+      state.httpPostStatus = UploadState::HttpPostStatus::Busy;
+      LOG_DBG("WEB", "[UPLOAD] START rejected: upload already active");
       return;
     }
+    state.httpPostStatus = UploadState::HttpPostStatus::UploadResult;
 
     // Reset watchdog - this is the critical 1% crash point
     esp_task_wdt_reset();
 
-    state.fileName = StringUtils::sanitizeFilename(upload.filename.c_str()).c_str();
+    state.fileName = startFileName;
+    state.path = startPath;
     state.size = 0;
+    state.success = false;
+    state.error = "";
     uploadStartTime = millis();
     lastLoggedSize = 0;
     state.bufferPos = 0;
     totalWriteTime = 0;
     writeCount = 0;
 
-    // Get upload path from query parameter (defaults to root if not specified)
-    // Note: We use query parameter instead of form data because multipart form
-    // fields aren't available until after file upload completes
-    if (server->hasArg("path")) {
-      state.path = normalizeWebPath(server->arg("path"));
-    } else {
-      state.path = "/";
-    }
-
     LOG_DBG("WEB", "[UPLOAD] START: %s to path: %s", state.fileName.c_str(), state.path.c_str());
     LOG_DBG("WEB", "[UPLOAD] Free heap: %d bytes", ESP.getFreeHeap());
-
-    // Create file path
-    String filePath = state.path;
-    if (!filePath.endsWith("/")) filePath += "/";
-    filePath += state.fileName;
 
     if (isProtectedPath(filePath)) {
       state.error = "Access denied to protected path";
@@ -902,19 +952,35 @@ void CrossPointWebServer::handleUpload(UploadState& state) const {
       return;
     }
 
-    const BookUpload::AtomicUploadIo io = atomicUploadIo(state.file);
-    const BookUpload::AtomicUploadStatus status =
-        BookUpload::begin(state.transaction, io, filePath.c_str(), BookUpload::kUnknownUploadSize);
-    if (status != BookUpload::AtomicUploadStatus::Ok) {
-      state.error = atomicUploadStatusMessage(status);
-      LOG_ERR("WEB", "[UPLOAD] START failed for %s: %s", filePath.c_str(), state.error.c_str());
-      return;
+    if (pdfUpload) {
+      const BookUpload::AtomicUploadIo io = atomicUploadIo(state.file);
+      const BookUpload::AtomicUploadStatus status =
+          BookUpload::begin(state.transaction, io, filePath.c_str(), BookUpload::kUnknownUploadSize);
+      if (status != BookUpload::AtomicUploadStatus::Ok) {
+        state.error = atomicUploadStatusMessage(status);
+        LOG_ERR("WEB", "[UPLOAD] START failed for %s: %s", filePath.c_str(), state.error.c_str());
+        return;
+      }
+      LOG_DBG("WEB", "[UPLOAD] Hidden sibling temp opened for PDF: %s", filePath.c_str());
+    } else {
+      if (Storage.exists(filePath.c_str())) {
+        LOG_DBG("WEB", "[UPLOAD] Overwriting existing file: %s", filePath.c_str());
+        esp_task_wdt_reset();
+        Storage.remove(filePath.c_str());
+      }
+      esp_task_wdt_reset();
+      if (!Storage.openFileForWrite("WEB", filePath, state.file)) {
+        state.error = "Failed to create file on SD card";
+        LOG_DBG("WEB", "[UPLOAD] FAILED to create file: %s", filePath.c_str());
+        return;
+      }
+      esp_task_wdt_reset();
+      LOG_DBG("WEB", "[UPLOAD] File created successfully: %s", filePath.c_str());
     }
-
     state.owner = UploadState::Owner::Http;
-    LOG_DBG("WEB", "[UPLOAD] Hidden sibling temp opened for: %s", filePath.c_str());
   } else if (upload.status == UPLOAD_FILE_WRITE) {
-    if (state.owner == UploadState::Owner::Http && BookUpload::isActive(state.transaction) && state.error.isEmpty()) {
+    if (state.owner == UploadState::Owner::Http && state.file && state.error.isEmpty()) {
+      const bool pdfUpload = isPdfUploadTarget(state.fileName);
       // Buffer incoming data and flush when buffer is full
       // This reduces SD card write operations and improves throughput
       const uint8_t* data = upload.buf;
@@ -933,13 +999,17 @@ void CrossPointWebServer::handleUpload(UploadState& state) const {
         if (state.bufferPos >= UploadState::UPLOAD_BUFFER_SIZE) {
           const BookUpload::AtomicUploadStatus status = flushUploadBuffer(state);
           if (status != BookUpload::AtomicUploadStatus::Ok) {
-            state.error = atomicUploadStatusMessage(status);
+            state.error = pdfUpload ? atomicUploadStatusMessage(status)
+                                    : "Failed to write to SD card - disk may be full";
+            if (!pdfUpload) {
+              state.file.close();
+            }
             return;
           }
         }
       }
 
-      if (upload.currentSize > std::numeric_limits<size_t>::max() - state.size) {
+      if (pdfUpload && upload.currentSize > std::numeric_limits<size_t>::max() - state.size) {
         const BookUpload::AtomicUploadIo io = atomicUploadIo(state.file);
         BookUpload::abort(state.transaction, io);
         state.owner = UploadState::Owner::None;
@@ -960,26 +1030,39 @@ void CrossPointWebServer::handleUpload(UploadState& state) const {
     }
   } else if (upload.status == UPLOAD_FILE_END) {
     if (state.owner == UploadState::Owner::Http) {
+      const bool pdfUpload = isPdfUploadTarget(state.fileName);
       // Flush any remaining buffered data
       if (state.error.isEmpty()) {
         const BookUpload::AtomicUploadStatus writeStatus = flushUploadBuffer(state);
         if (writeStatus != BookUpload::AtomicUploadStatus::Ok) {
-          state.error = atomicUploadStatusMessage(writeStatus);
+          state.error = pdfUpload ? atomicUploadStatusMessage(writeStatus)
+                                  : "Failed to write final data to SD card";
         }
       }
 
-      if (state.error.isEmpty()) {
-        const BookUpload::AtomicUploadIo io = atomicUploadIo(state.file);
-        const BookUpload::AtomicUploadStatus finishStatus = BookUpload::finish(
-            state.transaction, io, state.size, state.buffer.data(), state.buffer.size(), uploadCommitHook());
-        if (finishStatus == BookUpload::AtomicUploadStatus::Ok) {
-          state.success = true;
+      if (pdfUpload) {
+        if (state.error.isEmpty()) {
+          const BookUpload::AtomicUploadIo io = atomicUploadIo(state.file);
+          const BookUpload::AtomicUploadStatus finishStatus = BookUpload::finish(
+              state.transaction, io, state.size, state.buffer.data(), state.buffer.size(), uploadCommitHook());
+          if (finishStatus == BookUpload::AtomicUploadStatus::Ok) {
+            state.success = true;
+          } else {
+            state.error = atomicUploadStatusMessage(finishStatus);
+          }
         } else {
-          state.error = atomicUploadStatusMessage(finishStatus);
+          const BookUpload::AtomicUploadIo io = atomicUploadIo(state.file);
+          BookUpload::abort(state.transaction, io);
         }
       } else {
-        const BookUpload::AtomicUploadIo io = atomicUploadIo(state.file);
-        BookUpload::abort(state.transaction, io);
+        state.file.close();
+        if (state.error.isEmpty()) {
+          state.success = true;
+          String filePath = state.path;
+          if (!filePath.endsWith("/")) filePath += "/";
+          filePath += state.fileName;
+          clearBookCachePreservingUserState(filePath.c_str());
+        }
       }
       state.owner = UploadState::Owner::None;
 
@@ -996,10 +1079,19 @@ void CrossPointWebServer::handleUpload(UploadState& state) const {
   } else if (upload.status == UPLOAD_FILE_ABORTED) {
     state.bufferPos = 0;  // Discard buffered data
     if (state.owner == UploadState::Owner::Http) {
-      const BookUpload::AtomicUploadIo io = atomicUploadIo(state.file);
-      const BookUpload::AtomicUploadStatus status = BookUpload::abort(state.transaction, io);
-      if (status != BookUpload::AtomicUploadStatus::Ok) {
-        LOG_ERR("WEB", "[UPLOAD] Abort cleanup failed: %s", atomicUploadStatusMessage(status));
+      const bool pdfUpload = isPdfUploadTarget(state.fileName);
+      if (pdfUpload) {
+        const BookUpload::AtomicUploadIo io = atomicUploadIo(state.file);
+        const BookUpload::AtomicUploadStatus status = BookUpload::abort(state.transaction, io);
+        if (status != BookUpload::AtomicUploadStatus::Ok) {
+          LOG_ERR("WEB", "[UPLOAD] Abort cleanup failed: %s", atomicUploadStatusMessage(status));
+        }
+      } else if (state.file) {
+        state.file.close();
+        String filePath = state.path;
+        if (!filePath.endsWith("/")) filePath += "/";
+        filePath += state.fileName;
+        Storage.remove(filePath.c_str());
       }
       state.owner = UploadState::Owner::None;
     }
@@ -1009,8 +1101,23 @@ void CrossPointWebServer::handleUpload(UploadState& state) const {
 }
 
 void CrossPointWebServer::handleUploadPost(UploadState& state) const {
-  const BookUpload::UploadTransportResponse response{state.success, !state.error.isEmpty()};
-  if (BookUpload::httpResponseStatus(response) == 200) {
+  if (state.httpPostStatus == UploadState::HttpPostStatus::Busy) {
+    server->send(400, "text/plain", "Upload already in progress");
+    return;
+  }
+
+  if (isPdfUploadTarget(state.fileName)) {
+    const BookUpload::UploadTransportResponse response{state.success, !state.error.isEmpty()};
+    if (BookUpload::httpResponseStatus(response) == 200) {
+      server->send(200, "text/plain", "File uploaded successfully: " + state.fileName);
+    } else {
+      const String error = state.error.isEmpty() ? "Unknown error during upload" : state.error;
+      server->send(400, "text/plain", error);
+    }
+    return;
+  }
+
+  if (state.success) {
     server->send(200, "text/plain", "File uploaded successfully: " + state.fileName);
   } else {
     const String error = state.error.isEmpty() ? "Unknown error during upload" : state.error;
@@ -1835,8 +1942,7 @@ void CrossPointWebServer::onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* 
       // Only clean up if this is the client that owns the active upload.
       // A new client may have already started a fresh upload before this
       // DISCONNECTED event fires (race condition on quick cancel + retry).
-      if (num == wsUploadClientNum && wsUploadInProgress && upload.owner == UploadState::Owner::WebSocket &&
-          BookUpload::isActive(upload.transaction)) {
+      if (num == wsUploadClientNum && wsUploadInProgress) {
         abortWsUpload("WS");
       }
       break;
@@ -1852,70 +1958,112 @@ void CrossPointWebServer::onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* 
       LOG_DBG("WS", "Text from client %u: %s", num, msg.c_str());
 
       if (msg.startsWith("START:")) {
-        // Reject any START while an upload is already active so both transports
-        // keep exactly one transaction/file handle (owning re-START included).
-        if (BookUpload::isActive(upload.transaction)) {
-          wsServer->sendTXT(num, "ERROR:Upload already in progress");
-          break;
-        }
-
         // Parse: START:<filename>:<size>:<path>
         int firstColon = msg.indexOf(':', 6);
         int secondColon = msg.indexOf(':', firstColon + 1);
 
         if (firstColon > 0 && secondColon > 0) {
-          wsUploadFileName = StringUtils::sanitizeFilename(msg.substring(6, firstColon).c_str()).c_str();
-          String sizeToken = msg.substring(firstColon + 1, secondColon);
-          if (!parseUploadSizeToken(sizeToken, wsUploadSize)) {
-            LOG_DBG("WS", "START rejected: invalid size token '%s'", sizeToken.c_str());
+          // Reuse one temporary String throughout START handling to avoid
+          // retaining separate heap-backed candidate, size-token, and path values.
+          String startValue = normalizeWebPath(msg.substring(secondColon + 1));
+          if (!startValue.endsWith("/")) startValue += "/";
+          startValue += StringUtils::sanitizeFilename(msg.substring(6, firstColon).c_str()).c_str();
+          const bool pdfUpload = isPdfUploadTarget(startValue);
+          if (isProtectedPath(startValue)) {
+            wsServer->sendTXT(num, "ERROR:Access denied to protected path");
+            return;
+          }
+
+          decltype(wsUploadSize) startSize = 0;
+          startValue = msg.substring(firstColon + 1, secondColon);
+          bool sizeValid = startValue.length() > 0;
+          int digitStart = (sizeValid && startValue[0] == '+') ? 1 : 0;
+          if (digitStart > 0 && startValue.length() < 2) sizeValid = false;
+          for (int i = digitStart; i < static_cast<int>(startValue.length()) && sizeValid; ++i) {
+            if (!isdigit(static_cast<unsigned char>(startValue[i]))) sizeValid = false;
+          }
+          if (!sizeValid) {
+            LOG_DBG("WS", "START rejected: invalid size token '%s'", startValue.c_str());
             wsServer->sendTXT(num, "ERROR:Invalid START format");
             return;
           }
+
+          startSize = static_cast<decltype(wsUploadSize)>(startValue.toInt());
+          if (pdfUpload && !parseUploadSizeToken(startValue, startSize)) {
+            LOG_DBG("WS", "START rejected: invalid size token '%s'", startValue.c_str());
+            wsServer->sendTXT(num, "ERROR:Invalid START format");
+            return;
+          }
+
+          const bool httpPdfActive =
+              upload.owner == UploadState::Owner::Http && isPdfUploadTarget(upload.fileName);
+          const bool sharedPdfActive = upload.owner == UploadState::Owner::WebSocket || httpPdfActive;
+          if (wsUploadInProgress || sharedPdfActive ||
+              (pdfUpload && upload.owner != UploadState::Owner::None)) {
+            wsServer->sendTXT(num, "ERROR:Upload already in progress");
+            break;
+          }
+
+          // Admission succeeded. Only now publish the new WS target metadata.
+          wsUploadFileName = StringUtils::sanitizeFilename(msg.substring(6, firstColon).c_str()).c_str();
+          wsUploadSize = startSize;
           wsUploadPath = normalizeWebPath(msg.substring(secondColon + 1));
           wsUploadReceived = 0;
           wsLastProgressSent = 0;
           wsUploadStartTime = millis();
 
-          // Build file path
-          String filePath = wsUploadPath;
-          if (!filePath.endsWith("/")) filePath += "/";
-          filePath += wsUploadFileName;
-
-          if (isProtectedPath(filePath)) {
-            wsServer->sendTXT(num, "ERROR:Access denied to protected path");
-            wsUploadInProgress = false;
-            wsUploadClientNum = 255;
-            return;
-          }
+          startValue = wsUploadPath;
+          if (!startValue.endsWith("/")) startValue += "/";
+          startValue += wsUploadFileName;
 
           LOG_DBG("WS", "Starting upload: %s (%d bytes) to %s", wsUploadFileName.c_str(), wsUploadSize,
-                  filePath.c_str());
+                  startValue.c_str());
 
-          const BookUpload::AtomicUploadIo io = atomicUploadIo(upload.file);
-          const BookUpload::AtomicUploadStatus beginStatus =
-              BookUpload::begin(upload.transaction, io, filePath.c_str(), wsUploadSize);
-          if (beginStatus != BookUpload::AtomicUploadStatus::Ok) {
-            wsServer->sendTXT(num, String("ERROR:") + atomicUploadStatusMessage(beginStatus));
-            wsUploadInProgress = false;
-            wsUploadClientNum = 255;
-            return;
+          if (pdfUpload) {
+            const BookUpload::AtomicUploadIo io = atomicUploadIo(upload.file);
+            const BookUpload::AtomicUploadStatus beginStatus =
+                BookUpload::begin(upload.transaction, io, startValue.c_str(), wsUploadSize);
+            if (beginStatus != BookUpload::AtomicUploadStatus::Ok) {
+              wsServer->sendTXT(num, String("ERROR:") + atomicUploadStatusMessage(beginStatus));
+              wsUploadInProgress = false;
+              wsUploadClientNum = 255;
+              return;
+            }
+            upload.owner = UploadState::Owner::WebSocket;
+          } else {
+            esp_task_wdt_reset();
+            if (Storage.exists(startValue.c_str())) {
+              Storage.remove(startValue.c_str());
+            }
+            if (!Storage.openFileForWrite("WS", startValue, wsUploadFile)) {
+              wsServer->sendTXT(num, "ERROR:Failed to create file");
+              wsUploadInProgress = false;
+              wsUploadClientNum = 255;
+              return;
+            }
+            esp_task_wdt_reset();
           }
-          upload.owner = UploadState::Owner::WebSocket;
 
           // Zero-byte upload: complete immediately without waiting for BIN frames
           if (wsUploadSize == 0) {
-            const BookUpload::AtomicUploadStatus finishStatus = BookUpload::finish(
-                upload.transaction, io, 0, upload.buffer.data(), upload.buffer.size(), uploadCommitHook());
-            upload.owner = UploadState::Owner::None;
-            if (finishStatus != BookUpload::AtomicUploadStatus::Ok) {
-              wsServer->sendTXT(num, String("ERROR:") + atomicUploadStatusMessage(finishStatus));
-              wsLastProgressSent = 0;
-              return;
+            if (pdfUpload) {
+              const BookUpload::AtomicUploadIo io = atomicUploadIo(upload.file);
+              const BookUpload::AtomicUploadStatus finishStatus = BookUpload::finish(
+                  upload.transaction, io, 0, upload.buffer.data(), upload.buffer.size(), uploadCommitHook());
+              upload.owner = UploadState::Owner::None;
+              if (finishStatus != BookUpload::AtomicUploadStatus::Ok) {
+                wsServer->sendTXT(num, String("ERROR:") + atomicUploadStatusMessage(finishStatus));
+                wsLastProgressSent = 0;
+                return;
+              }
+            } else {
+              wsUploadFile.close();
+              clearBookCachePreservingUserState(startValue.c_str());
             }
             wsLastCompleteName = wsUploadFileName;
             wsLastCompleteSize = 0;
             wsLastCompleteAt = millis();
-            LOG_DBG("WS", "Zero-byte upload complete: %s", filePath.c_str());
+            LOG_DBG("WS", "Zero-byte upload complete: %s", startValue.c_str());
             wsServer->sendTXT(num, "DONE");
             wsLastProgressSent = 0;
             break;
@@ -1932,8 +2080,11 @@ void CrossPointWebServer::onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* 
     }
 
     case WStype_BIN: {
-      if (!wsUploadInProgress || upload.owner != UploadState::Owner::WebSocket ||
-          !BookUpload::isActive(upload.transaction) || num != wsUploadClientNum) {
+      const bool pdfUpload = isPdfUploadTarget(wsUploadFileName);
+      const bool uploadOpen =
+          pdfUpload ? BookUpload::isActive(upload.transaction) : static_cast<bool>(wsUploadFile);
+      const bool ownsUpload = !pdfUpload || upload.owner == UploadState::Owner::WebSocket;
+      if (!wsUploadInProgress || !ownsUpload || !uploadOpen || num != wsUploadClientNum) {
         wsServer->sendTXT(num, "ERROR:No upload in progress");
         return;
       }
@@ -1945,15 +2096,27 @@ void CrossPointWebServer::onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* 
         wsServer->sendTXT(num, "ERROR:Upload overflow");
         return;
       }
-      const BookUpload::AtomicUploadIo io = atomicUploadIo(upload.file);
-      const BookUpload::AtomicUploadStatus writeStatus = BookUpload::write(upload.transaction, io, payload, length);
-      if (writeStatus != BookUpload::AtomicUploadStatus::Ok) {
-        abortWsUpload("WS");
-        wsServer->sendTXT(num, String("ERROR:") + atomicUploadStatusMessage(writeStatus));
-        return;
+      if (pdfUpload) {
+        const BookUpload::AtomicUploadIo io = atomicUploadIo(upload.file);
+        const BookUpload::AtomicUploadStatus writeStatus =
+            BookUpload::write(upload.transaction, io, payload, length);
+        if (writeStatus != BookUpload::AtomicUploadStatus::Ok) {
+          abortWsUpload("WS");
+          wsServer->sendTXT(num, String("ERROR:") + atomicUploadStatusMessage(writeStatus));
+          return;
+        }
+        wsUploadReceived += length;
+      } else {
+        esp_task_wdt_reset();
+        const size_t written = wsUploadFile.write(payload, length);
+        esp_task_wdt_reset();
+        if (written != length) {
+          abortWsUpload("WS");
+          wsServer->sendTXT(num, "ERROR:Write failed - disk full?");
+          return;
+        }
+        wsUploadReceived += written;
       }
-
-      wsUploadReceived += length;
 
       // Send progress update (every 64KB or at end)
       if (wsUploadReceived - wsLastProgressSent >= 65536 || wsUploadReceived >= wsUploadSize) {
@@ -1964,16 +2127,28 @@ void CrossPointWebServer::onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* 
 
       // Check if upload complete
       if (wsUploadReceived >= wsUploadSize) {
-        const BookUpload::AtomicUploadStatus finishStatus = BookUpload::finish(
-            upload.transaction, io, wsUploadSize, upload.buffer.data(), upload.buffer.size(), uploadCommitHook());
-        upload.owner = UploadState::Owner::None;
+        if (pdfUpload) {
+          const BookUpload::AtomicUploadIo io = atomicUploadIo(upload.file);
+          const BookUpload::AtomicUploadStatus finishStatus = BookUpload::finish(
+              upload.transaction, io, wsUploadSize, upload.buffer.data(), upload.buffer.size(), uploadCommitHook());
+          if (finishStatus != BookUpload::AtomicUploadStatus::Ok) {
+            upload.owner = UploadState::Owner::None;
+            wsUploadInProgress = false;
+            wsUploadClientNum = 255;
+            wsServer->sendTXT(num, String("ERROR:") + atomicUploadStatusMessage(finishStatus));
+            wsLastProgressSent = 0;
+            return;
+          }
+        } else {
+          wsUploadFile.close();
+          String filePath = wsUploadPath;
+          if (!filePath.endsWith("/")) filePath += "/";
+          filePath += wsUploadFileName;
+          clearBookCachePreservingUserState(filePath.c_str());
+        }
+        if (pdfUpload) upload.owner = UploadState::Owner::None;
         wsUploadInProgress = false;
         wsUploadClientNum = 255;
-        if (finishStatus != BookUpload::AtomicUploadStatus::Ok) {
-          wsServer->sendTXT(num, String("ERROR:") + atomicUploadStatusMessage(finishStatus));
-          wsLastProgressSent = 0;
-          return;
-        }
 
         wsLastCompleteName = wsUploadFileName;
         wsLastCompleteSize = wsUploadSize;

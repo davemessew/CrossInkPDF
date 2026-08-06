@@ -72,11 +72,11 @@ bool manifestsEqual(const PdfCacheManifest& left, const PdfCacheManifest& right)
 
 bool checkpointsEqual(const PdfBuildCheckpoint& left, const PdfBuildCheckpoint& right) {
   return left.sequence == right.sequence && pdfSourceIdentityEqual(left.source, right.source) &&
-         left.generation == right.generation && left.phase == right.phase &&
+         left.generation == right.generation && left.phase == right.phase && left.resumePhase == right.resumePhase &&
          left.lastVerifiedPage == right.lastVerifiedPage && left.lastVerifiedObject == right.lastVerifiedObject &&
          left.emittedSections == right.emittedSections && left.emittedImages == right.emittedImages &&
          left.cumulativeWords == right.cumulativeWords && left.outputBytes == right.outputBytes &&
-         left.warningFlags == right.warningFlags;
+         left.warningFlags == right.warningFlags && left.journalBytes == right.journalBytes;
 }
 
 PDF_CACHE_STORE_NOINLINE PdfStatus loadManifestSlot(

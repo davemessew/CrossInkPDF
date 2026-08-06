@@ -3,6 +3,7 @@
 #include <PersistableStore.h>
 
 #include <string>
+#include <string_view>
 #include <vector>
 
 struct RecentBook {
@@ -57,6 +58,7 @@ class RecentBooksStore : public PersistableStore<RecentBooksStore> {
   // has written, synced, and read-verified recent.json. Replays are
   // idempotent, including cleanup of an interrupted prior replacement.
   bool removeByPathDurably(const std::string& path);
+  bool removeByPathDurablyNoPathAlloc(std::string_view path);
 
   // Repoint an entry's path (and coverBmpPath, if it lived under the old cache dir) after the
   // backing file and cache dir were moved on disk. No-op if no entry matches oldPath.

@@ -1,10 +1,24 @@
 #pragma once
 #include <HalStorage.h>
 
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
 
 #include "Block.h"
+
+struct PdfPixelCacheRenderWorkspace {
+  static constexpr size_t READ_BUFFER_BYTES = 4096;
+  static constexpr size_t PATH_BYTES = 160;
+
+  alignas(uint32_t) uint8_t readBuffer[READ_BUFFER_BYTES] = {};
+  char path[PATH_BYTES] = {};
+  bool inUse = false;
+};
+
+static_assert(sizeof(PdfPixelCacheRenderWorkspace) == 4260,
+              "PDF pixel-cache workspace must retain its bounded aligned layout");
 
 class ImageBlock final : public Block {
  public:
@@ -21,6 +35,7 @@ class ImageBlock final : public Block {
   bool isEmpty() override { return false; }
 
   void render(GfxRenderer& renderer, const int x, const int y);
+  void render(GfxRenderer& renderer, int x, int y, PdfPixelCacheRenderWorkspace* pdfWorkspace);
   bool serialize(HalFile& file);
   static std::unique_ptr<ImageBlock> deserialize(HalFile& file);
 

@@ -5,5 +5,5 @@ class GfxRenderer;
 class MappedInputManager;
 
 void qemuAcceptanceBegin(MappedInputManager& input, GfxRenderer& renderer);
-void qemuAcceptanceTick();
+void qemuAcceptanceTick(MappedInputManager& input, GfxRenderer& renderer);
 #endif

@@ -1,4 +1,5 @@
 add_executable(PdfNavigationTest
+  ${REPO_ROOT}/lib/PixelCache/PixelCache.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfIo.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfLexer.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfObjectParser.cpp
@@ -13,6 +14,8 @@ add_executable(PdfNavigationTest
   ${REPO_ROOT}/lib/PdfReflow/PdfMetadataStore.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfOutline.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfProgressStore.cpp
+  ${REPO_ROOT}/lib/PdfReflow/PdfSavedItemWordMap.cpp
+  ${REPO_ROOT}/lib/PdfReflow/PdfSavedItemsStore.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfReflowDocument.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfSemanticWriter.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfUnicode.cpp
@@ -31,6 +34,7 @@ target_include_directories(PdfNavigationTest BEFORE PRIVATE
 
 target_include_directories(PdfNavigationTest PRIVATE
   ${REPO_ROOT}/lib/Memory
+  ${REPO_ROOT}/lib/PixelCache
   ${REPO_ROOT}/lib/InflateReader
   ${REPO_ROOT}/lib/PdfReflow
   ${REPO_ROOT}/lib/Reflow

@@ -12,6 +12,8 @@ struct PdfFontWidthRecord {
   int32_t width = 0;
 };
 
+struct PdfDecodedGlyph;
+
 struct PdfFontMapWorkspace {
   using SourceAccessFn = PdfStatus (*)(void* context, bool sourceRequired);
 
@@ -20,6 +22,8 @@ struct PdfFontMapWorkspace {
   PdfFixedRecordStore spill{};
   void* sourceAccessContext = nullptr;
   SourceAccessFn setSourceAccess = nullptr;
+  PdfDecodedGlyph* materializedGlyphs = nullptr;
+  uint16_t materializedGlyphCapacity = 0;
 };
 
 struct PdfDecodedGlyph {
@@ -35,6 +39,9 @@ class PdfFontMap {
 
   PdfStatus begin(uint16_t fontId, bool cid, PdfCMap* toUnicode, PdfSimpleEncoding* encoding,
                   int32_t defaultWidth = 500);
+  PdfStatus beginMaterialized(uint16_t fontId, bool cid);
+  PdfStatus materializeString(PdfFontMap& sourceFont, const uint8_t* source, size_t sourceLength);
+  PdfStatus addMaterializedGlyph(const PdfDecodedGlyph& glyph);
   PdfStatus addWidth(uint32_t firstCode, uint32_t lastCode, int32_t width);
   PdfStatus loadSimpleWidths(const PdfObjectArena& arena, uint32_t firstChar, uint16_t widthsArrayIndex);
   PdfStatus loadCidWidths(const PdfObjectArena& arena, uint16_t widthsArrayIndex);
@@ -44,8 +51,15 @@ class PdfFontMap {
   uint16_t fontId() const { return fontId_; }
   bool cid() const { return cid_; }
   uint16_t widthCount() const { return widthCount_; }
+  uint16_t materializedGlyphCount() const { return materialized() ? widthCount_ : 0; }
+  bool materialized() const { return defaultWidth_ < 0; }
+  bool fullyResident() const {
+    return spillCount_ == 0 && (toUnicode_ == nullptr || toUnicode_->fullyResident()) &&
+           (encoding_ == nullptr || encoding_->fullyResident());
+  }
 
  private:
+  PdfStatus findMaterializedGlyph(const uint8_t* source, size_t sourceLength, PdfDecodedGlyph* glyph) const;
   PdfStatus readWidth(uint16_t ordinal, PdfFontWidthRecord* width);
   PdfStatus setSourceAccess(bool required);
 

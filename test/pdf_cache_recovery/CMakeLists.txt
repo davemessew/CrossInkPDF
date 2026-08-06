@@ -6,6 +6,7 @@ add_executable(PdfCacheRecoveryTest
   ${REPO_ROOT}/lib/PdfReflow/PdfCacheStore.cpp
   PdfTestCacheIo.cpp
   PdfCacheAllocationTest.cpp
+  PdfCheckpointVerificationTest.cpp
   PdfCacheRecoveryTest.cpp
   PdfCacheFaultInjectionTest.cpp
 )

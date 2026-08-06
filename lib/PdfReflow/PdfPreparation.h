@@ -6,6 +6,7 @@
 #include <optional>
 
 #include "PdfCacheStore.h"
+#include "PdfFixedRecordSpool.h"
 #include "PdfImageBuildSpool.h"
 #include "PdfImageCache.h"
 #include "PdfJpegPreview.h"
@@ -38,6 +39,17 @@ struct PdfCoverCandidateSource {
   bool referenceIsResourceDictionary = false;
 };
 
+struct PdfPreparationWorkCounters {
+  uint32_t xrefSteps = 0;
+  uint32_t pagesWalked = 0;
+  uint32_t contentTokens = 0;
+  uint32_t sectionsEmitted = 0;
+  uint32_t imagesEmitted = 0;
+  uint64_t sourceBytesRead = 0;
+  uint32_t xrefSpoolRecordsRead = 0;
+  uint32_t xrefSpoolRecordsWritten = 0;
+};
+
 enum class PdfPreparationPhase : uint8_t {
   Idle,
   ResourceGate,
@@ -46,14 +58,32 @@ enum class PdfPreparationPhase : uint8_t {
   FingerprintHead,
   FingerprintTail,
   PrepareCache,
+  ResumeEmitSections,
   ParseXref,
+  SortXref,
   ResolveCatalog,
+  InitializePageTree,
   WalkPages,
+  FinalizePageTree,
   ResolveNavigation,
   ReadXmpMetadata,
   ResolveImageResources,
   ResolveContent,
+  SuspendContentNavigation,
+  CheckContentCapacity,
+  OpenContentStore,
+  DecodeContent,
+  RestoreContentNavigation,
+  OpenDecodedContent,
   ExtractText,
+  SpoolFontNavigation,
+  DecodeFonts,
+  ParseFonts,
+  RestoreFontNavigation,
+  ReopenPreparedContent,
+  InterpretContent,
+  CleanupContentStore,
+  OrderText,
   CacheImage,
   SpoolNavigation,
   DecodeImages,
@@ -63,6 +93,7 @@ enum class PdfPreparationPhase : uint8_t {
   OpenSection,
   EmitSection,
   CloseSection,
+  CommitResumePoint,
   OpenMetadata,
   WriteMetadata,
   CloseMetadata,
@@ -108,6 +139,9 @@ class PdfPreparation {
   uint32_t generation() const { return generation_; }
   uint32_t totalWords() const { return totalWords_; }
   bool resumedFromCheckpoint() const { return resumedFromCheckpoint_; }
+  PdfBuildResumePhase durableResumePhase() const { return durableResumePhase_; }
+  PdfBuildResumePhase resumedPhase() const { return resumedPhase_; }
+  uint32_t durableResumePage() const { return durableResumePage_; }
   size_t resourceCurrentBytes() const;
   size_t resourcePeakBytes() const;
   uint8_t coverCandidateSourceCount() const { return coverCandidateSourceCount_; }
@@ -117,13 +151,30 @@ class PdfPreparation {
   uint8_t navigationSpoolReadCount() const { return navigationSpoolReadCount_; }
   uint8_t maskSpoolWriteCount() const { return maskSpoolWriteCount_; }
   uint8_t maskSpoolReadCount() const { return maskSpoolReadCount_; }
+ const PdfPreparationWorkCounters& workCounters() const { return workCounters_; }
 
  private:
+  friend struct PdfPreparationTestAccess;
+
   struct NavigationWorkspace;
   struct ExtractedBlockRecord;
+  struct ReadingOrderWorkspace;
   struct RasterBatchWorkspace;
   struct PlacementWorkspace;
   struct SectionRepairRuntime;
+  struct PreparedContentRuntime;
+  struct PreparedContentOverlay;
+
+  struct PreparedPageRecord {
+    PdfMetadataSection section{};
+    PdfRequiredFileRecord file{};
+    uint32_t sourcePageIndex = UINT32_MAX;
+    uint32_t firstAnchor = UINT32_MAX;
+    uint16_t firstSection = UINT16_MAX;
+    uint16_t width = 0;
+    uint16_t height = 0;
+    uint16_t reserved = 0;
+  };
 
   enum class NavigationTask : uint8_t {
     None,
@@ -137,6 +188,27 @@ class PdfPreparation {
     Complete,
   };
 
+  enum class XrefSortStage : uint8_t {
+    Idle,
+    CloseSource,
+    CloseAppend,
+    OpenInitialInput,
+    OpenInitialOutput,
+    InitialLoad,
+    InitialWrite,
+    ClosePassInput,
+    ClosePassOutput,
+    SelectNextPass,
+    OpenMergeInput,
+    OpenMergeOutput,
+    Merge,
+    OpenCompactInput,
+    OpenCompactOutput,
+    Compact,
+    Adopt,
+    Complete,
+  };
+
   enum class ImageResolveTask : uint8_t {
     None,
     ResourceOwner,
@@ -146,6 +218,9 @@ class PdfPreparation {
     IndexedBaseColorSpace,
     IndexedPalette,
     AuxiliaryImageObject,
+    FontDictionary,
+    FontObject,
+    ToUnicodeObject,
   };
 
   enum class RasterDecodeStage : uint8_t {
@@ -177,6 +252,7 @@ class PdfPreparation {
     OpenTemporary,
     CopyToFinal,
     CloseFinal,
+    UpdateRecord,
     Done,
   };
 
@@ -185,6 +261,17 @@ class PdfPreparation {
     Writing,
     Spilled,
     Reading,
+    FontWriting,
+    FontSpilled,
+    FontReading,
+    ObservedCloseReader,
+    ObservedOpenWriter,
+    ObservedSeekWriter,
+    ObservedWriteNavigation,
+    ObservedWriteRecords,
+    ObservedCloseWriter,
+    ObservedReopenReader,
+    ObservedSpilled,
   };
 
   enum class InlineImageContainer : uint8_t {
@@ -205,6 +292,8 @@ class PdfPreparation {
 
   enum class NavigationSpoolStage : uint8_t {
     None,
+    ObjectStore,
+    ContentStore,
     Writing,
     Flush,
     Sync,
@@ -227,6 +316,8 @@ class PdfPreparation {
 
   enum class ManifestCommitStage : uint8_t {
     Idle,
+    MaterializeImages,
+    CloseMaterializedImageSpool,
     LedgerSections,
     LedgerImages,
     LedgerCovers,
@@ -238,10 +329,12 @@ class PdfPreparation {
     CloseWriter,
     CloseImageSpool,
     OpenVerifier,
+    ReadVerifierMetadata,
     VerifyHeader,
     VerifyRecords,
     VerifyTrailer,
     CloseVerifier,
+    PublishResume,
     Complete,
   };
 
@@ -261,6 +354,52 @@ class PdfPreparation {
     ReadManifestRecordPath,
     ReadManifestTrailer,
     CloseManifestSlot,
+    OpenResumeLedger,
+    OpenResumeJournal,
+    ReadResumeJournalMetadata,
+    ReadResumeDiscoveryHeader,
+    ValidateResumeDiscoveryXref,
+    ValidateResumeDiscoveryPages,
+    ValidateResumeDiscoveryTrailer,
+    RestoreResumeDiscoveryHeader,
+    ValidateResumeDiscoveryCatalog,
+    RestoreResumeDiscoveryXref,
+    ValidateResumeDiscoveryPage,
+    RestoreResumeDiscoveryPages,
+    ReadResumeJournalRecord,
+    CloseResumeJournal,
+    ValidateResumePageOpen,
+    ValidateResumePageMetadata,
+    ValidateResumePageRead,
+    ValidateResumePageClose,
+    ReadResumeMetadata,
+    ReadResumeHeader,
+    ReadResumeRecordHeader,
+    ReadResumeRecordPath,
+    ReadResumeTrailer,
+    CloseResumeLedger,
+    ValidateResumeOpen,
+    ValidateResumeMetadata,
+    ValidateResumeRead,
+    ValidateResumeClose,
+    ValidateEmitSectionsControlOpen,
+    ValidateEmitSectionsControlMetadata,
+    ValidateEmitSectionsControlRead,
+    ValidateEmitSectionsControlClose,
+    ValidateEmitSectionsControlDecode,
+    ValidateEmitSectionsMetadataOpen,
+    ValidateEmitSectionsMetadataMetadata,
+    ValidateEmitSectionsMetadataRead,
+    ValidateEmitSectionsMetadataClose,
+    ValidateEmitSectionsMetadataDecode,
+    ValidateEmitSectionsImageBuildOpen,
+    ValidateEmitSectionsImageBuild,
+    ValidateEmitSectionsImageBuildRecords,
+    ValidateEmitSectionsImageBuildClose,
+    ValidateEmitSectionsImageFilesOpen,
+    ValidateEmitSectionsImageFiles,
+    ValidateEmitSectionsImageFileRecords,
+    ValidateEmitSectionsImageFilesClose,
     SelectGeneration,
     CreateCacheRoot,
     CreateGeneration,
@@ -269,6 +408,8 @@ class PdfPreparation {
     InitializeBudget,
     InitializeImageCache,
     FormatOutputPaths,
+    OpenResumeImageFileWriter,
+    CopyResumeImageFileRecords,
     ReopenSource,
     Complete,
   };
@@ -289,8 +430,88 @@ class PdfPreparation {
     Complete,
   };
 
+  enum class CancelStage : uint8_t {
+    Idle,
+    AbortActiveRasterBeforeNavigationRestore,
+    RestoreCancellationNavigation,
+    RestoreAfterImageNavigation,
+    PrepareEmitSectionsResume,
+    OpenResumeMetadata,
+    WriteResumeMetadata,
+    CloseResumeMetadata,
+    OpenResumeOutline,
+    WriteResumeOutline,
+    CloseResumeOutline,
+    CommitEmitSectionsControl,
+    CommitResumeLedger,
+    DestroyPreparedContentRuntime,
+    ClosePreparedContentStore,
+    RemovePreparedContentStore,
+    CloseInlineNavigationSpool,
+    RemoveInlineNavigationSpool,
+    ResetPreparedContentSnapshot,
+    DestroyParsers,
+    AbortWriters,
+    CloseSource,
+    AbortSectionState,
+    AbortImageState,
+    AbortSpools,
+    CloseAuxiliaryHandles,
+    PrepareGeneration,
+    CommitCheckpoint,
+    Release,
+    Complete,
+  };
+
+  enum class ResumeControlStage : uint8_t {
+    Idle,
+    OpenWriter,
+    Write,
+    CloseWriter,
+    OpenVerifier,
+    ReadVerifierMetadata,
+    ReadVerifier,
+    CloseVerifier,
+    Verify,
+    Publish,
+    Complete,
+  };
+
+  enum class ResumeRecordRestoreStage : uint8_t {
+    Idle,
+    Open,
+    Metadata,
+    Header,
+    RecordHeader,
+    RecordPath,
+    Close,
+    Complete,
+  };
+
+  enum class ResumePointStage : uint8_t {
+    Idle,
+    OpenJournal,
+    SeekJournal,
+    WriteDiscoveryHeader,
+    WriteDiscoveryXref,
+    WriteDiscoveryPages,
+    WriteDiscoveryTrailer,
+    WriteRecord,
+    CloseJournal,
+    CommitCheckpoint,
+    Complete,
+  };
+
+  enum class ResumeReferenceStage : uint8_t {
+    Idle,
+    Lookup,
+    LookupObjectStream,
+    Complete,
+  };
+
   enum class CleanupStage : uint8_t {
     Idle,
+    RemoveBuildArtifacts,
     List,
     Remove,
     Complete,
@@ -315,10 +536,14 @@ class PdfPreparation {
     const PdfCacheIo* io = nullptr;
     PdfCacheHandle* handle = nullptr;
     uint64_t size = 0;
+    uint64_t* bytesRead = nullptr;
   };
 
   static PdfStatus readSource(void* context, uint64_t offset, uint8_t* destination, size_t requested,
                               size_t* bytesRead);
+  static PdfStepResult setResolverSourceAccess(void* context, PdfObjectResolverReader reader,
+                                               PdfWorkBudget& budget);
+  static PdfStatus setPageTraversalAccess(void* context, bool traversalRequired);
   static PdfStatus readMemoryRecord(void* context, uint32_t ordinal, void* record, size_t recordSize);
   static PdfStatus writeMemoryRecord(void* context, uint32_t ordinal, const void* record, size_t recordSize);
   static PdfStatus capturePage(void* context, const PdfPageInfo& page);
@@ -327,6 +552,24 @@ class PdfPreparation {
   static PdfStatus writeOutline(void* context, const uint8_t* source, size_t requested, size_t* bytesWritten);
   static PdfStatus discardInlineImageDecoded(void* context, const uint8_t* source, size_t requested,
                                              size_t* bytesWritten);
+  static PdfStatus readPreparedContentSource(void* context, uint64_t offset, uint8_t* destination,
+                                             size_t requested, size_t* bytesRead);
+  static PdfStatus resetPreparedContentStore(void* context);
+  static uint64_t preparedContentStoreSize(void* context);
+  static PdfStatus readPreparedContentStore(void* context, uint64_t offset, uint8_t* destination,
+                                            size_t requested, size_t* bytesRead);
+  static PdfStatus writePreparedContentStore(void* context, const uint8_t* source, size_t requested,
+                                             size_t* bytesWritten);
+  static PdfStatus readPreparedFontStore(void* context, uint64_t offset, uint8_t* destination,
+                                         size_t requested, size_t* bytesRead);
+  static PdfStatus writePreparedFontStore(void* context, const uint8_t* source, size_t requested,
+                                          size_t* bytesWritten);
+  static PdfStatus readPreparedFontRecord(void* context, uint32_t ordinal, void* record, size_t recordSize);
+  static PdfStatus writePreparedFontRecord(void* context, uint32_t ordinal, const void* record,
+                                           size_t recordSize);
+  static PdfStatus observePreparedFontRecord(void* context, uint32_t ordinal, const void* record,
+                                             size_t recordSize);
+  static PdfStatus setPreparedFontSourceAccess(void* context, bool sourceRequired);
   static PdfStatus emitBlock(void* context, const PdfSemanticBlockRecord& record);
   static PdfStatus readMetadataSection(void* context, uint16_t index, PdfMetadataSection* record);
   static PdfStatus readOutlineEntry(void* context, uint16_t index, PdfOutlineEntry* record);
@@ -339,22 +582,87 @@ class PdfPreparation {
   PdfStepResult pause();
   PdfStepResult fail(PdfStatus status);
   PdfStepResult cancel();
+  bool cancelledGenerationReady() const;
+  bool canPreserveSelectedPageResumeOnCancel() const;
+  PdfStepResult finishCancelledFailure(PdfStatus status);
   PdfStatus closeSource();
   PdfStatus reopenSource();
   void destroyParsers();
+  PdfJpegPreview* constructJpegPreview();
+  void destroyJpegPreview();
   void releaseWorkspaces();
   bool allocateNextWorkspace();
   PdfStatus initializeParserStorage();
+  PdfStatus beginXrefSpool();
+  PdfStepResult stepSortXref(PdfWorkBudget& budget);
+  PdfStepResult stepResolverObjectStoreWriter(PdfWorkBudget& budget);
+  PdfStepResult stepResolverObjectStoreReader(PdfWorkBudget& budget);
+  PdfStatus resetResolverWorkspace();
+  PdfStatus accountResolverStreamBytes();
+  uint64_t resolverObjectStoreCapacity() const;
+  void abortResolverObjectStore();
+  PdfStatus switchResolverSourceAccess(PdfObjectResolverReader reader);
+  PdfStatus switchPageTraversalAccess(bool traversalRequired);
+  PdfStatus formatXrefSpoolPath(uint8_t index, char* output, size_t capacity) const;
+  void abortXrefSpools();
+  PdfStatus beginPageSpools();
+  PdfStatus beginPreparedPageSpool();
+  PdfStatus resumePreparedPageSpool();
+  PdfStatus finishPageDiscoverySpool();
+  PdfStatus finishPreparedPageSpool();
+  PdfStatus sealPreparedPageSpool();
+  PdfStatus loadPageRecord(uint32_t index);
+  PdfStatus readPreparedPageRecord(uint16_t index, PreparedPageRecord* record);
+  PdfStatus writePreparedPageRecord(const PreparedPageRecord& record);
+  PdfStatus rewritePreparedPageRecord(PdfWorkBudget& budget, uint16_t index, const PreparedPageRecord& record);
+  PdfStatus formatPageSpoolPath(bool prepared, char* output, size_t capacity) const;
+  PdfStatus formatTraversalSpoolPath(char* output, size_t capacity) const;
+  void abortPageSpools();
+  PdfStatus readCacheSetupBytes(PdfWorkBudget& budget, uint64_t offset, uint8_t* destination, size_t length);
+  void rejectResumeState();
+  PdfStatus decodeEmitSectionsResumeMetadataPrefix(size_t length);
   PdfStepResult stepSetupCache(PdfWorkBudget& budget);
+  PdfStepResult stepSetupCheckpointAndManifest(PdfWorkBudget& budget);
+  PdfStepResult stepSetupDiscoveryRestore(PdfWorkBudget& budget);
+  PdfStepResult stepSetupResumeProductValidation(PdfWorkBudget& budget);
+  PdfStepResult stepSetupGeneration(PdfWorkBudget& budget);
+  PdfStepResult stepSetupOutputs(PdfWorkBudget& budget);
+  bool canResumeAfterEmitSections() const;
+  PdfStatus encodeEmitSectionsResumeControl(uint8_t* output, size_t capacity) const;
+  PdfStatus decodeEmitSectionsResumeControl(const uint8_t* input, size_t length);
+  PdfStepResult stepCommitEmitSectionsResumeControl(PdfWorkBudget& budget);
+  PdfStatus encodePageResumeRecord(uint8_t* output, size_t capacity) const;
+  PdfStatus decodePageResumeRecord(const uint8_t* input, size_t length, uint32_t expectedSequence,
+                                   uint32_t expectedPage);
+  PdfStatus finalizeDiscoveryXref();
+  PdfStatus encodeDiscoveryHeader(uint8_t* output, size_t capacity) const;
+  PdfStatus decodeDiscoveryHeader(const uint8_t* input, size_t length, bool restore);
+  PdfStatus encodeDiscoveryXrefRecord(uint32_t ordinal, uint8_t* output, size_t capacity);
+  PdfStatus decodeDiscoveryXrefRecord(const uint8_t* input, size_t length, uint32_t ordinal, PdfXrefEntry* entry) const;
+  PdfStatus encodeDiscoveryPageRecord(uint16_t ordinal, uint8_t* output, size_t capacity);
+  PdfStatus decodeDiscoveryPageRecord(const uint8_t* input, size_t length, uint16_t ordinal, PdfPageInfo* page) const;
+  PdfStatus encodeDiscoveryTrailer(uint8_t* output, size_t capacity) const;
+  PdfStatus decodeDiscoveryTrailer(const uint8_t* input, size_t length) const;
+  PdfStatus beginDiscoveryXrefRestore();
+  PdfStatus finishDiscoveryXrefRestore();
+  PdfStatus appendDiscoveryPage(const PdfPageInfo& page);
+  PdfStatus beginResumeReferenceValidation(PdfObjectReference reference, bool allowNull,
+                                           bool validateObjectStream);
+  PdfStepResult stepResumeReferenceValidation(PdfWorkBudget& budget);
+  PdfStepResult writeResumeJournalBuffer(PdfWorkBudget& budget, const uint8_t* source, size_t length);
+  PdfStepResult stepCommitPageResume(PdfWorkBudget& budget);
+  PdfStatus continueAfterPageResume();
+  PdfStepResult stepResumeAfterEmitSections(PdfWorkBudget& budget);
+  PdfStepResult stepRestoreResumeRecords(PdfWorkBudget& budget);
   PdfStatus startXref();
   PdfStatus finishXref();
   PdfStatus finishCatalog();
   PdfStatus finishPageTree();
   PdfStatus beginNavigationDiscovery();
   PdfStatus finishNavigationObject();
-  PdfStatus startNextNavigationObject();
+  PdfStepResult stepStartNextNavigationObject(PdfWorkBudget& budget);
   PdfStatus readXmpMetadata();
-  PdfStatus resolveDestination(const PdfRawDestination& raw, PdfResolvedDestination* destination) const;
+  PdfStatus resolveDestination(const PdfRawDestination& raw, PdfResolvedDestination* destination);
   PdfStatus beginCurrentPageImages();
   PdfStatus finishImageResolution();
   PdfStatus finishAuxiliaryImageResolution();
@@ -362,8 +670,10 @@ class PdfPreparation {
   PdfStatus finishResolvedImageColorSpace(bool indexedBase);
   PdfStatus finishResolvedImagePalette();
   PdfStatus allocateImagePalette(uint8_t** palette);
-  PdfStatus collectImageCandidates(uint16_t dictionaryIndex);
+  PdfStatus collectImageCandidates(uint16_t dictionaryIndex, uint8_t ownerScopeIndex);
+  PdfStatus collectFontCandidates(uint16_t dictionaryIndex, uint8_t scopeIndex);
   PdfStatus beginNextImageObject();
+  PdfStatus beginNextFontObject();
   PdfStepResult cacheCurrentPageImage(PdfWorkBudget& budget);
   PdfStatus appendDeferredImageRecord(uint8_t candidateIndex, uint32_t tagOffset, uint16_t tagLength);
   PdfStatus appendImageFileRecord(const PdfRequiredFileRecord& record);
@@ -386,6 +696,36 @@ class PdfPreparation {
   void abortSectionRepairRuntime();
   PdfStatus beginCurrentPageContent();
   PdfStatus finishContentObject();
+  PdfStatus beginPreparedContentDecode();
+  PdfStepResult suspendContentNavigation(PdfWorkBudget& budget);
+  PdfStepResult checkPreparedContentCapacity(PdfWorkBudget& budget);
+  PdfStepResult openPreparedContentStore(PdfWorkBudget& budget);
+  PdfStepResult decodePreparedContent(PdfWorkBudget& budget);
+  PdfStepResult restoreContentNavigation(PdfWorkBudget& budget);
+  PdfStepResult openDecodedContent(PdfWorkBudget& budget);
+  PdfStepResult cleanupPreparedContentStore(PdfWorkBudget& budget);
+  PdfStatus beginDecodedContentExtraction();
+  PdfStatus beginPreparedFonts();
+  PdfStepResult spoolFontNavigation(PdfWorkBudget& budget);
+  PdfStepResult decodePreparedFonts(PdfWorkBudget& budget);
+  PdfStepResult parsePreparedFonts(PdfWorkBudget& budget);
+  PdfStepResult restoreFontNavigation(PdfWorkBudget& budget);
+  PdfStepResult reopenPreparedContent(PdfWorkBudget& budget);
+  void abortPreparedFontStore();
+  PdfStatus beginContentInterpretation();
+  PdfStepResult stepContentInterpretation(PdfWorkBudget& budget);
+  PdfStatus finishContentInterpretation();
+  void destroyContentInterpretation();
+  PdfStatus observeFontAlias();
+  void clearPendingObservedCodes();
+  void commitPendingObservedCodes();
+  bool observedJournalSpillPending() const;
+  PdfStatus beginObservedJournalSpill(const PdfToken& retryToken);
+  PdfStepResult stepObservedJournalSpill(PdfWorkBudget& budget);
+  uint8_t* preparedNavigationSpillBytes(size_t offset, size_t* contiguousBytes);
+  bool preparedContentRuntimeConstructed() const;
+  void destroyPreparedContentRuntime();
+  void abortPreparedContentStore();
   PdfStatus appendContentToken(const PdfToken& token);
   PdfStatus consumeInlineImageToken(const PdfToken& token);
   void finalizeInlineImageDictionary();
@@ -395,9 +735,10 @@ class PdfPreparation {
   void abortInlineNavigationSpill();
   PdfStatus retainInlineImage(uint64_t dataOffset, uint64_t dataLength);
   PdfStatus finishExtractedPage();
+  PdfStepResult stepReadingOrder(PdfWorkBudget& budget);
   PdfStatus formatCurrentSectionPath();
   PdfStatus formatInternalLink(uint16_t sourcePageIndex, const uint8_t* text, size_t textLength, char* href,
-                               size_t capacity, size_t* hrefLength) const;
+                               size_t capacity, size_t* hrefLength);
   PdfStatus openSection();
   PdfStepResult emitSection(PdfWorkBudget& budget);
   PdfStatus closeSection();
@@ -409,7 +750,7 @@ class PdfPreparation {
   PdfStatus openOutline();
   PdfStepResult stepWriteOutline(PdfWorkBudget& budget);
   PdfStatus closeOutline();
-  PdfStepResult stepCommitManifest(PdfWorkBudget& budget);
+  PdfStepResult stepCommitManifest(PdfWorkBudget& budget, bool resumeLedger = false);
   PdfStepResult stepCommitCheckpoint(PdfWorkBudget& budget, PdfBuildPhase phase);
   PdfStepResult stepCleanup(PdfWorkBudget& budget);
   void abortManifestCommit();
@@ -433,6 +774,7 @@ class PdfPreparation {
   uint8_t allocationIndex_ = 0;
   bool cancelRequested_ = false;
   bool resumedFromCheckpoint_ = false;
+  CancelStage cancelStage_ = CancelStage::Idle;
   uint32_t sliceStartedAtMs_ = 0;
 
   std::optional<PdfResourceTracker> resources_;
@@ -454,6 +796,46 @@ class PdfPreparation {
   std::optional<PdfXrefParser> xrefParser_;
   std::optional<PdfObjectResolver> resolver_;
   std::optional<PdfPageTreeWalker> pageWalker_;
+  PdfFixedRecordSpool xrefSpools_[2]{};
+  PdfFixedRecordSpool pageSpool_{};
+  PdfFixedRecordSpool preparedPageSpool_{};
+  PdfMutableRecordSpool traversalSpool_{};
+  XrefSortStage xrefSortStage_ = XrefSortStage::Idle;
+  PdfObjectReference xrefSortRoot_{};
+  PdfObjectReference xrefSortInfo_{};
+  PdfXrefEntry xrefSortLeft_{};
+  PdfXrefEntry xrefSortRight_{};
+  uint32_t xrefSortTotal_ = 0;
+  uint32_t xrefSortRunLength_ = 0;
+  uint32_t xrefSortRunStart_ = 0;
+  uint32_t xrefSortRunCount_ = 0;
+  uint32_t xrefSortBufferIndex_ = 0;
+  uint32_t xrefSortPairStart_ = 0;
+  uint32_t xrefSortMiddle_ = 0;
+  uint32_t xrefSortEnd_ = 0;
+  uint32_t xrefSortLeftIndex_ = 0;
+  uint32_t xrefSortRightIndex_ = 0;
+  uint32_t xrefSortDestination_ = 0;
+  uint32_t xrefSortUniqueCount_ = 0;
+  uint32_t xrefSortPreviousObject_ = 0;
+  uint8_t xrefSortInput_ = 0;
+  uint8_t xrefSortOutput_ = 1;
+  uint8_t xrefFinalSpool_ = 0xff;
+  bool xrefSortHasInfo_ = false;
+  bool xrefSortLeftLoaded_ = false;
+  bool xrefSortRightLoaded_ = false;
+  bool xrefSortPreviousValid_ = false;
+  bool xrefSortCompacting_ = false;
+  bool xrefSortFastPath_ = false;
+  uint32_t loadedPageIndex_ = UINT32_MAX;
+  uint32_t currentPageFirstAnchor_ = UINT32_MAX;
+  uint32_t nextPageAnchorHint_ = UINT32_MAX;
+  uint32_t nextPageAnchorHintIndex_ = UINT32_MAX;
+  uint16_t currentPageFirstSection_ = UINT16_MAX;
+  uint16_t currentPageWidth_ = 0;
+  uint16_t currentPageHeight_ = 0;
+  bool preparedPageSpoolWriting_ = false;
+  bool preparedPageSpoolUpdating_ = false;
   NavigationWorkspace* navigation_ = nullptr;
   std::optional<PdfNamedDestinationMap> namedDestinations_;
   std::optional<PdfPageLabelMap> pageLabels_;
@@ -562,12 +944,11 @@ class PdfPreparation {
   PdfByteRange contentRange_{};
   std::optional<PdfLexer> contentLexer_;
   size_t transcriptLength_ = 0;
-  int16_t currentFontSize_ = 0;
-  int16_t lastNumericValue_ = 0;
   uint32_t nextAnchorOrdinal_ = 0;
   uint32_t currentSectionFirstWord_ = 0;
   uint32_t currentSectionFirstAnchor_ = 0;
   uint64_t cumulativeSectionBytes_ = 0;
+  uint64_t cumulativeImageBytes_ = 0;
   size_t metadataEncodeBytes_ = 0;
   uint64_t xmpStreamOffset_ = 0;
   uint64_t xmpStreamLength_ = 0;
@@ -577,9 +958,9 @@ class PdfPreparation {
   PdfCacheBudget cacheBudget_{};
   PdfCacheManifestSelection manifestSelection_{};
   PdfBuildCheckpointSelection checkpointSelection_{};
-  PdfCacheTrackedWriter sectionWriter_{};
-  PdfCacheTrackedWriter metadataWriter_{};
-  PdfCacheTrackedWriter outlineWriter_{};
+  // Section, metadata, and outline output phases never overlap. Reuse one
+  // tracked writer so their 320-byte path/record state is paid once on C3.
+  PdfCacheTrackedWriter outputWriter_{};
   PdfOutlineEncodeRuntime outlineEncodeRuntime_{};
   PdfCacheHandle cacheSetupHandle_{};
   uint64_t cacheSetupFileSize_ = 0;
@@ -590,12 +971,48 @@ class PdfPreparation {
   uint32_t cacheSetupRecordIndex_ = 0;
   uint8_t cacheSetupSlot_ = 0;
   CacheSetupStage cacheSetupStage_ = CacheSetupStage::Idle;
+  uint64_t resumeValidationOffset_ = 0;
+  uint32_t resumeValidationCrc32_ = 0;
+  bool resumeLedgerReady_ = false;
+  bool resumeLedgerValid_ = false;
+  bool resumeGenerationRejected_ = false;
+  bool resumeValidationFailed_ = false;
+  bool resumeAfterPage_ = false;
+  bool manifestRecordsMaterialized_ = false;
+  bool cacheGenerationsListed_ = false;
+  bool emitSectionsResumeReady_ = false;
+  bool resumeAfterEmitSections_ = false;
+  bool emitSectionsResumeValidated_ = false;
+  ResumeControlStage resumeControlStage_ = ResumeControlStage::Idle;
+  ResumeRecordRestoreStage resumeRecordRestoreStage_ = ResumeRecordRestoreStage::Idle;
+  ResumePointStage resumePointStage_ = ResumePointStage::Idle;
+  PdfCacheHandle resumeJournalHandle_{};
+  char resumeJournalPath_[PDF_CACHE_PATH_CAPACITY]{};
+  uint64_t resumeJournalCommittedBytes_ = 0;
+  uint64_t resumeJournalScanOffset_ = 0;
+  uint64_t resumeJournalPhysicalBytes_ = 0;
+  uint64_t resumePageValidationOffset_ = 0;
+  uint32_t resumePageValidationCrc32_ = 0;
+  uint32_t resumeJournalRecordSequence_ = 0;
+  uint32_t resumeJournalScanSequence_ = 0;
+  uint32_t durableResumePage_ = 0;
+  uint32_t pendingResumePage_ = 0;
+  uint16_t resumePageValidationIndex_ = 0;
+  uint8_t resumeReferenceIndex_ = 0;
+  bool resumeReferenceValidateObjectStream_ = false;
+  PdfObjectReference resumeReference_{};
+  PdfXrefLookupState resumeXrefLookup_{};
+  PdfXrefEntry resumeXrefEntry_{};
+  ResumeReferenceStage resumeReferenceStage_ = ResumeReferenceStage::Idle;
+  PdfBuildResumePhase durableResumePhase_ = PdfBuildResumePhase::None;
+  PdfBuildResumePhase resumedPhase_ = PdfBuildResumePhase::None;
   PdfCacheHandle checkpointCommitHandle_{};
   CheckpointCommitStage checkpointCommitStage_ = CheckpointCommitStage::Idle;
   uint8_t cleanupIndex_ = 0;
   CleanupStage cleanupStage_ = CleanupStage::Idle;
   PdfCacheHandle manifestHandle_{};
   char manifestPath_[PDF_CACHE_PATH_CAPACITY]{};
+  char resumeLedgerPath_[PDF_CACHE_PATH_CAPACITY]{};
   uint64_t manifestOffset_ = 0;
   uint32_t manifestEncodedBytes_ = 0;
   uint32_t manifestRecordIndex_ = 0;
@@ -603,6 +1020,7 @@ class PdfPreparation {
   uint32_t manifestReadCrc32_ = 0;
   uint8_t manifestTargetSlot_ = 0;
   ManifestCommitStage manifestCommitStage_ = ManifestCommitStage::Idle;
+  bool manifestResumeLedger_ = false;
   PdfRequiredFileRecord sectionRecord_{};
   PdfRequiredFileRecord metadataRecord_{};
   PdfRequiredFileRecord outlineRecord_{};
@@ -622,7 +1040,7 @@ class PdfPreparation {
   uint16_t typographyScaledHeight_ = 0;
   uint16_t typographyOffsetX_ = 0;
   uint16_t typographyOffsetY_ = 0;
-  PdfJpegPreview jpegPreview_{};
+  PdfJpegPreview* jpegPreview_ = nullptr;
   bool meaningfulEarlyImageSeen_ = false;
   bool coverImageFingerprintSelected_ = false;
   bool coverImageRecordAvailable_ = false;
@@ -636,9 +1054,16 @@ class PdfPreparation {
   uint32_t sequence_ = 0;
   uint32_t totalWords_ = 0;
   uint32_t warningFlags_ = 0;
+  PdfPreparationWorkCounters workCounters_{};
   PdfCoverCandidateSource coverCandidateSources_[PdfLimits::MaxCoverCandidateSources]{};
   uint8_t coverCandidateSourceCount_ = 0;
+  uint32_t expandedRequiredBytes_ = 0;
 };
+
+#if UINTPTR_MAX == UINT32_MAX
+static_assert(sizeof(PdfPreparation) <= 12992,
+              "PdfPreparation must retain the JPEG preview workspace overlay RAM saving");
+#endif
 
 static_assert(sizeof(PdfCoverCandidateSource) <= 16, "cover discovery must retain only small object references");
 static_assert(sizeof(PdfPreparation) + PdfLimits::TotalWorkspaceBytes <= PDF_MAX_OWNED_HEAP_BYTES,

@@ -214,6 +214,15 @@ bool duplicateGeometry(const PdfRectangle& page, const PdfTextRun& hidden, const
   return absoluteDistance(hiddenCenter, visibleCenter) <= 2 * std::max(pageThreshold, heightThreshold);
 }
 
+bool retainedHidden(const PdfHiddenTextContext& context, const uint16_t index) {
+  return context.retainedHidden != nullptr && index / 8U < context.retainedHiddenBytes &&
+         (context.retainedHidden[index / 8U] & static_cast<uint8_t>(1U << (index % 8U))) != 0;
+}
+
+void retainHidden(const PdfHiddenTextContext& context, const uint16_t index) {
+  context.retainedHidden[index / 8U] |= static_cast<uint8_t>(1U << (index % 8U));
+}
+
 }  // namespace
 
 PdfStatus pdfFingerprintNormalizedText(const uint8_t* const text, const size_t length,
@@ -249,6 +258,11 @@ PdfStatus pdfFingerprintNormalizedText(const uint8_t* const text, const size_t l
 PdfHiddenTextDecision pdfClassifyHiddenText(const PdfHiddenTextContext& context, const uint16_t candidateIndex) {
   if (context.runs == nullptr || candidateIndex >= context.runCount || context.text == nullptr ||
       !validRect(context.page)) {
+    return PdfHiddenTextDecision::Unmappable;
+  }
+  const size_t retainedBytesRequired = (static_cast<size_t>(context.runCount) + 7U) / 8U;
+  if ((context.retainedHidden == nullptr) != (context.retainedHiddenBytes == 0) ||
+      (context.retainedHidden != nullptr && context.retainedHiddenBytes < retainedBytesRequired)) {
     return PdfHiddenTextDecision::Unmappable;
   }
   const PdfTextRun& candidate = context.runs[candidateIndex];
@@ -309,6 +323,25 @@ PdfHiddenTextDecision pdfClassifyHiddenText(const PdfHiddenTextContext& context,
     if (normalizedEqual(candidateText, candidateLength, visibleText, visibleLength, &equal).ok() && equal) {
       return PdfHiddenTextDecision::DuplicateVisible;
     }
+  }
+  if (context.retainedHidden != nullptr) {
+    for (uint16_t runIndex = 0; runIndex < candidateIndex; ++runIndex) {
+      const PdfTextRun& retained = context.runs[runIndex];
+      if ((retained.flags & PdfTextHidden) == 0 || !retainedHidden(context, runIndex) ||
+          !duplicateGeometry(context.page, candidate, retained)) {
+        continue;
+      }
+      const uint8_t* retainedText = nullptr;
+      size_t retainedLength = 0;
+      if (!slice(context, retained, &retainedText, &retainedLength) || retainedLength == 0) {
+        continue;
+      }
+      bool equal = false;
+      if (normalizedEqual(candidateText, candidateLength, retainedText, retainedLength, &equal).ok() && equal) {
+        return PdfHiddenTextDecision::DuplicateHidden;
+      }
+    }
+    retainHidden(context, candidateIndex);
   }
   return PdfHiddenTextDecision::Qualified;
 }

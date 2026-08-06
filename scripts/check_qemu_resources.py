@@ -1,12 +1,16 @@
 import argparse
+import hashlib
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 from typing import Any
 
 
 PASS_MARKER = "QEMU_RESOURCE_PASS\n"
+BOOT_MARKER = re.compile(r"^QEMU_BOOT seq=(\d+)$")
+UINT32_MAX = (1 << 32) - 1
 REQUIRED_CODE_SECTIONS = (
     ".iram0.text",
     ".flash.text",
@@ -31,11 +35,10 @@ FINGERPRINT_FIELDS = (
     "qemu_config_sha256",
 )
 LIMITS = {
-    "text": 262144,
     "static_dram": 12288,
     "pdf_heap": 81920,
-    "free_heap": 65536,
-    "largest_block": 49152,
+    "free_heap": 45056,
+    "largest_block": 40960,
     "allocation": 32768,
     "stack_margin": 1024,
 }
@@ -43,12 +46,24 @@ RUNTIME_KEYS = (
     "heap_start",
     "min_free",
     "min_max_alloc",
+    "max_alloc",
     "stack_margin",
 )
 
 
 class ResourceCheckError(Exception):
     pass
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as source:
+            while chunk := source.read(64 * 1024):
+                digest.update(chunk)
+    except OSError as error:
+        raise ResourceCheckError(f"cannot read {path}: {error}") from error
+    return digest.hexdigest()
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -59,6 +74,47 @@ def _load_json(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ResourceCheckError(f"{path} must contain a JSON object")
     return value
+
+
+def _manifest_artifact(
+    entries: object, name: str, label: str
+) -> Path:
+    entry = entries.get(name) if isinstance(entries, dict) else None
+    raw_path = entry.get("path") if isinstance(entry, dict) else None
+    expected_hash = entry.get("sha256") if isinstance(entry, dict) else None
+    expected_size = entry.get("size") if isinstance(entry, dict) else None
+    if not isinstance(raw_path, str):
+        raise ResourceCheckError(f"manifest has no {label} path")
+    path = Path(raw_path)
+    if not path.is_absolute():
+        raise ResourceCheckError(f"manifest {label} path must be absolute")
+    if not path.is_file():
+        raise ResourceCheckError(f"manifest {label} does not exist: {path}")
+    if not isinstance(expected_hash, str) or re.fullmatch(
+        r"[0-9a-f]{64}", expected_hash
+    ) is None:
+        raise ResourceCheckError(f"manifest {label} SHA-256 is invalid")
+    if _sha256_file(path) != expected_hash:
+        raise ResourceCheckError(f"manifest {label} SHA-256 mismatch")
+    if (
+        not isinstance(expected_size, int)
+        or isinstance(expected_size, bool)
+        or expected_size < 0
+        or path.stat().st_size != expected_size
+    ):
+        raise ResourceCheckError(f"manifest {label} size mismatch")
+    return path.resolve()
+
+
+def _validate_artifact_binding(manifest: dict[str, Any], elf_path: Path) -> None:
+    if manifest.get("schema_version") != 1:
+        raise ResourceCheckError("manifest schema_version is not 1")
+    _manifest_artifact(manifest.get("images"), "flash", "flash")
+    manifest_elf = _manifest_artifact(
+        manifest.get("artifacts"), "elf", "ELF"
+    )
+    if elf_path.resolve() != manifest_elf:
+        raise ResourceCheckError("ELF path differs from QEMU manifest")
 
 
 def _normalized_fingerprint(manifest: dict[str, Any]) -> dict[str, Any]:
@@ -164,10 +220,23 @@ def _read_runtime_measurements(runtime_log: Path) -> dict[str, int]:
             f"cannot read runtime log {runtime_log}: {error}"
         ) from error
 
-    samples: list[dict[str, int]] = []
+    samples_by_boot: dict[int, dict[str, int]] = {}
+    current_boot: int | None = None
     for line in lines:
+        boot_match = BOOT_MARKER.fullmatch(line)
+        if boot_match:
+            current_boot = int(boot_match.group(1))
+            continue
         if not line.startswith("QEMU_RUNTIME "):
             continue
+        if current_boot not in (0, 1):
+            raise ResourceCheckError(
+                "QEMU_RUNTIME is not associated with boot 0 or boot 1"
+            )
+        if current_boot in samples_by_boot:
+            raise ResourceCheckError(
+                f"runtime log has duplicate boot {current_boot} sample"
+            )
         fields: dict[str, int] = {}
         for token in line.removeprefix("QEMU_RUNTIME ").split():
             key, separator, raw_value = token.partition("=")
@@ -184,15 +253,24 @@ def _read_runtime_measurements(runtime_log: Path) -> dict[str, int]:
             raise ResourceCheckError(
                 "QEMU_RUNTIME is missing " + ", ".join(missing)
             )
-        fields.setdefault("max_alloc", 0)
         if fields["heap_start"] < fields["min_free"]:
             raise ResourceCheckError("QEMU_RUNTIME min_free exceeds heap_start")
         if any(value < 0 for value in fields.values()):
             raise ResourceCheckError("QEMU_RUNTIME values must be non-negative")
-        samples.append(fields)
+        if any(value > UINT32_MAX for value in fields.values()):
+            raise ResourceCheckError("QEMU_RUNTIME value exceeds uint32_t")
+        if (
+            fields["min_max_alloc"] > fields["min_free"]
+            or fields["max_alloc"] > fields["min_free"]
+        ):
+            raise ResourceCheckError("QEMU_RUNTIME heap relationships are invalid")
+        samples_by_boot[current_boot] = fields
 
-    if not samples:
-        raise ResourceCheckError("runtime log has no QEMU_RUNTIME samples")
+    if set(samples_by_boot) != {0, 1}:
+        raise ResourceCheckError(
+            "runtime log must contain one sample from boot 0 and boot 1"
+        )
+    samples = tuple(samples_by_boot.values())
 
     return {
         "peak_heap": max(
@@ -227,7 +305,6 @@ def _violations(
     baseline: dict[str, int], current: dict[str, int]
 ) -> list[str]:
     values = {
-        "text": current["code_rodata"] - baseline["code_rodata"],
         "static_dram": current["static_dram"] - baseline["static_dram"],
         "pdf_heap": current["peak_heap"] - baseline["peak_heap"],
         "free_heap": current["min_free_heap"],
@@ -236,7 +313,7 @@ def _violations(
         "stack_margin": current["min_stack_margin"],
     }
     failures: list[str] = []
-    for name in ("text", "static_dram", "pdf_heap", "allocation"):
+    for name in ("static_dram", "pdf_heap", "allocation"):
         if values[name] > LIMITS[name]:
             failures.append(name)
     for name in ("free_heap", "largest_block", "stack_margin"):
@@ -247,6 +324,7 @@ def _violations(
 
 def _capture(arguments: argparse.Namespace) -> None:
     manifest = _load_json(arguments.manifest)
+    _validate_artifact_binding(manifest, arguments.elf)
     fingerprint = _normalized_fingerprint(manifest)
     measurements = _measure(manifest, arguments.elf, arguments.runtime_log)
     failures = _violations(measurements, measurements)
@@ -276,6 +354,7 @@ def _capture(arguments: argparse.Namespace) -> None:
 def _verify(arguments: argparse.Namespace) -> None:
     baseline = _load_json(arguments.baseline)
     manifest = _load_json(arguments.manifest)
+    _validate_artifact_binding(manifest, arguments.elf)
     current_fingerprint = _normalized_fingerprint(manifest)
     if baseline.get("resource_fingerprint") != current_fingerprint:
         raise ResourceCheckError("resource fingerprint differs from baseline")

@@ -23,6 +23,7 @@ My goal with this fork was to maintain the core Crosspoint firmware while integr
 
 ### Highlights
 
+- On-device [PDF text reflow](./docs/pdf-support.md) for supported born-digital and OCR-text-layer PDFs, using the reader's selected typography instead of shrinking fixed pages.
 - New reader fonts: Lexend Deca and Bitter.
 - Unicode emoji and miscellaneous symbols support (a limited subset).
 - Adjusted font sizes: 8 pt, 9 pt, 10 pt, 12 pt, 14 pt, 16 pt, 18 pt, and 20 pt. See [Font Build Variants](./docs/font-build-variants.md) for more details.
@@ -96,6 +97,7 @@ CrossInk runs on an ESP32-C3 with limited RAM, so very large folders or complex 
 - Text-first EPUBs are the best fit. Large image-heavy EPUBs, scanned books, comics, and omnibus files with thousands of sections may load slowly or fail under memory pressure.
 - As a rough target, EPUBs under 20 MB tend to work the best. Files over 50 MB may still work, but they are more likely to be slow or memory-sensitive, especially if they contain many large images.
 - If an EPUB is unusually slow, try [optimizing](./docs/webserver.md#epub-optimization) it with the built-in web optimizer (via File Transfer) before copying it to the SD card: remove unused high-resolution images, split very large omnibus files, and avoid embedding multiple full font families when possible.
+- PDFs work best when they contain selectable text. Image-only scans need an OCR text layer before they are copied to the reader, and password-protected PDFs are not supported. See [PDF Support](./docs/pdf-support.md) for the full boundary.
 - Use a reliable SD card and leave some free space. CrossInk stores settings, reading progress, cache files, stats, and generated book data on the card.
 
 ## Development Device Simulator
@@ -120,6 +122,7 @@ See [Installation](./docs/installation.md) for step-by-step flashing and revert 
 - [Installation](./docs/installation.md)
 - [Font Build Variants](./docs/font-build-variants.md)
 - [Reader Features](./docs/reader-features.md)
+- [PDF Support](./docs/pdf-support.md)
 - [Controls](./docs/controls.md)
 - [Simulator](./docs/simulator.md)
 - [Data Cache](./docs/data-cache.md)

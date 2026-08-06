@@ -31,6 +31,11 @@ struct PdfTestReadObservation {
   size_t bytesRead = 0;
 };
 
+struct PdfTestOpenObservation {
+  std::string path;
+  PdfCacheOpenMode mode = PdfCacheOpenMode::Read;
+};
+
 class PdfTestCacheIo {
  public:
   PdfTestCacheIo();
@@ -43,6 +48,7 @@ class PdfTestCacheIo {
   void addFile(const std::string& path, const std::string& bytes);
   void truncateFile(const std::string& path, size_t length);
   void corruptByte(const std::string& path, size_t offset, uint8_t mask);
+  void mutateByteBeforeNextRead(const std::string& path, size_t offset, uint8_t mask);
   bool exists(const std::string& path) const;
   bool isDirectory(const std::string& path) const;
   const std::vector<uint8_t>& bytes(const std::string& path) const;
@@ -68,6 +74,7 @@ class PdfTestCacheIo {
   uint32_t listCalls() const;
   uint32_t capacityCalls() const;
   uint32_t metadataCalls() const;
+  uint32_t readMutationsApplied() const;
   uint32_t operationCalls() const;
   uint32_t openHandleCount() const;
   std::vector<std::string> openHandlePaths() const;
@@ -76,8 +83,14 @@ class PdfTestCacheIo {
   size_t maximumReadRequest() const;
   size_t maximumWriteRequest() const;
   uint32_t openCallsForPath(const std::string& path) const;
+  const std::vector<std::string>& syncObservations() const;
+  void clearSyncObservations();
   const std::vector<PdfTestReadObservation>& readObservations() const;
   void clearReadObservations();
+  const std::vector<PdfTestOpenObservation>& openObservations() const;
+  void clearOpenObservations();
+  const std::vector<std::string>& removeObservations() const;
+  void clearRemoveObservations();
   const std::vector<std::string>& events() const;
   void clearEvents();
 
@@ -93,6 +106,7 @@ class PdfTestCacheIo {
   struct OpenHandle {
     std::string path;
     size_t position = 0;
+    bool readable = false;
     bool writable = false;
     bool open = false;
   };
@@ -106,8 +120,7 @@ class PdfTestCacheIo {
   static PdfStatus syncThunk(void* context, PdfCacheHandle handle);
   static PdfStatus closeThunk(void* context, PdfCacheHandle* handle);
   static PdfStatus removeThunk(void* context, const char* path, bool recursive);
-  static PdfStatus renameThunk(void* context, const char* sourcePath,
-                               const char* destinationPath);
+  static PdfStatus renameThunk(void* context, const char* sourcePath, const char* destinationPath);
   static PdfStatus mkdirThunk(void* context, const char* path);
   static PdfStatus listThunk(void* context, const char* path, PdfCacheListVisitor visitor, void* visitorContext);
   static PdfStatus capacityThunk(void* context, PdfCacheCapacity* capacity);
@@ -126,6 +139,7 @@ class PdfTestCacheIo {
   PdfStatus list(const char* path, PdfCacheListVisitor visitor, void* visitorContext);
   PdfStatus capacity(PdfCacheCapacity* capacity);
   PdfStatus metadata(PdfCacheHandle handle, PdfCacheFileMetadata* metadata);
+  PdfStatus seek(PdfCacheHandle handle, uint64_t offset);
 
   std::map<std::string, Node> nodes_;
   OpenHandle handles_[8]{};
@@ -153,5 +167,13 @@ class PdfTestCacheIo {
   size_t maximumWriteRequest_ = 0;
   std::map<std::string, uint32_t> pathOpenCalls_;
   std::vector<PdfTestReadObservation> readObservations_;
+  std::vector<PdfTestOpenObservation> openObservations_;
+  std::vector<std::string> syncObservations_;
+  std::vector<std::string> removeObservations_;
   std::vector<std::string> events_;
+  std::string pendingReadMutationPath_;
+  size_t pendingReadMutationOffset_ = 0;
+  uint8_t pendingReadMutationMask_ = 0;
+  uint32_t readMutationsApplied_ = 0;
+  bool pendingReadMutation_ = false;
 };

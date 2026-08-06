@@ -1,4 +1,5 @@
 #include "EpubReaderActivity.h"
+#include "PdfReaderSessionAllocation.h"
 
 #include <Arduino.h>
 #include <Epub.h>
@@ -56,6 +57,60 @@
 #include "util/BookCacheUtils.h"
 #include "util/BookMoveUtils.h"
 #include "util/ScreenshotUtil.h"
+
+struct EpubReaderActivity::PdfReaderSessionState {
+  PdfReaderProgressState progress;
+  PdfPixelCacheRenderWorkspace pixelCacheRenderWorkspace;
+  PdfSavedItem savedItemStorage[PDF_SAVED_ITEMS_MAX_RECORDS] = {};
+  PdfSavedItemsBuffer savedItemsBuffer{savedItemStorage, PDF_SAVED_ITEMS_MAX_RECORDS, 0};
+  PdfSavedItemsSession savedItemsSession;
+  struct PdfBookmarkLegacyMutation {
+    uint16_t spineIndex = 0;
+    float progress = 0.0F;
+    const char* chapterTitle = nullptr;
+    const char* snippet = nullptr;
+  } bookmarkLegacyMutation;
+  struct PdfClippingLegacyMutation {
+    uint16_t spineIndex = 0;
+    uint16_t startPage = 0;
+    uint16_t endPage = 0;
+    uint16_t pageCount = 0;
+    uint16_t startWordIndex = 0;
+    uint16_t endWordIndex = 0;
+    uint16_t wordCount = 0;
+    const char* chapterTitle = nullptr;
+    const std::string* text = nullptr;
+  } clippingLegacyMutation;
+
+  void resetSavedItems() {
+    savedItemsSession = {};
+    std::memset(savedItemStorage, 0, sizeof(savedItemStorage));
+    savedItemsBuffer.count = 0;
+  }
+};
+
+EpubReaderActivity::EpubReaderActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
+                                       std::unique_ptr<ReflowDocument> document)
+    : Activity("EpubReader", renderer, mappedInput), document(std::move(document)) {
+#if UINTPTR_MAX == UINT32_MAX
+  struct LegacyPdfInlineStateLayout {
+    std::unique_ptr<PdfReaderProgressState> progressState;
+    std::unique_ptr<PdfSavedItem[]> savedItemStorage;
+    PdfSavedItemsBuffer savedItemsBuffer;
+    PdfSavedItemsSession savedItemsSession;
+    PdfReaderSessionState::PdfBookmarkLegacyMutation bookmarkLegacyMutation;
+    PdfReaderSessionState::PdfClippingLegacyMutation clippingLegacyMutation;
+  };
+  static_assert(sizeof(PdfReaderSessionState) == 11648,
+                "RV32 PDF reader state changed; review the single-allocation heap budget");
+  static_assert(sizeof(LegacyPdfInlineStateLayout) == 136,
+                "RV32 legacy inline PDF-state witness changed");
+  static_assert(sizeof(LegacyPdfInlineStateLayout) - sizeof(pdfReaderSession) == 132,
+                "RV32 EPUB activity must save 132 inline bytes");
+#endif
+}
+
+EpubReaderActivity::~EpubReaderActivity() = default;
 
 namespace {
 // pagesPerRefresh now comes from SETTINGS.getRefreshFrequency()
@@ -589,7 +644,8 @@ uint16_t resolveClippingJumpPage(Section& section, const Clipping& clipping, con
 
 bool runTiledGrayscalePass(GfxRenderer& renderer, const Page& page, const int fontId, const int marginLeft,
                            const int marginTop, const bool foregroundBlack, const bool needsTextGrayscale,
-                           const bool needsImageGrayscale, TiledGrayscaleTimings& timings) {
+                           const bool needsImageGrayscale, PdfPixelCacheRenderWorkspace* const pdfWorkspace,
+                           TiledGrayscaleTimings& timings) {
   if ((!needsTextGrayscale && !needsImageGrayscale) || !renderer.supportsStripGrayscale()) {
     return false;
   }
@@ -614,9 +670,9 @@ bool runTiledGrayscalePass(GfxRenderer& renderer, const Page& page, const int fo
       renderer.beginStripTarget(scratch.get(), y, rows);
       renderer.clearScreen(0x00);
       if (needsTextGrayscale) {
-        page.render(renderer, fontId, marginLeft, marginTop, foregroundBlack);
+        page.render(renderer, fontId, marginLeft, marginTop, foregroundBlack, pdfWorkspace);
       } else {
-        page.renderImages(renderer, fontId, marginLeft, marginTop);
+        page.renderImages(renderer, fontId, marginLeft, marginTop, pdfWorkspace);
       }
       renderer.endStripTarget();
       renderer.writeGrayscalePlaneStrip(lsbPlane, scratch.get(), y, rows);
@@ -1192,12 +1248,12 @@ float EpubReaderActivity::getCurrentBookProgressPercent() const {
     }
     uint32_t wordCursor = 0;
     bool hasWordCursor = false;
-    if (pdfProgressState && pdfProgressState->semanticRangeSectionIndex == currentSpineIndex &&
-        pdfProgressState->semanticRangePageNumber == section->currentPage) {
-      wordCursor = pdfProgressState->currentPageSemanticRange.wordCursor;
+    if (pdfReaderSession && pdfReaderSession->progress.semanticRangeSectionIndex == currentSpineIndex &&
+        pdfReaderSession->progress.semanticRangePageNumber == section->currentPage) {
+      wordCursor = pdfReaderSession->progress.currentPageSemanticRange.wordCursor;
       hasWordCursor = wordCursor <= totalWords;
-    } else if (pdfProgressState && pdfProgressState->hasLastKnownWordCursor) {
-      wordCursor = pdfProgressState->lastKnownWordCursor;
+    } else if (pdfReaderSession && pdfReaderSession->progress.hasLastKnownWordCursor) {
+      wordCursor = pdfReaderSession->progress.lastKnownWordCursor;
       hasWordCursor = wordCursor <= totalWords;
     }
     if (hasWordCursor) {
@@ -1809,10 +1865,10 @@ bool EpubReaderActivity::readPdfBookmarkId(void*, const uint16_t index, uint16_t
 
 PdfSavedItemsLegacyMutationResult EpubReaderActivity::addPdfBookmark(void* const context, const uint16_t itemId) {
   auto& self = *static_cast<EpubReaderActivity*>(context);
+  if (!self.pdfReaderSession) return PdfSavedItemsLegacyMutationResult::Rejected;
+  const auto& pending = self.pdfReaderSession->bookmarkLegacyMutation;
   const BookmarkStore::AddResult result =
-      BOOKMARKS.addPdfBookmark(self.pdfBookmarkLegacyMutation.spineIndex, self.pdfBookmarkLegacyMutation.progress,
-                               self.pdfBookmarkLegacyMutation.chapterTitle, itemId,
-                               self.pdfBookmarkLegacyMutation.snippet);
+      BOOKMARKS.addPdfBookmark(pending.spineIndex, pending.progress, pending.chapterTitle, itemId, pending.snippet);
   if (result == BookmarkStore::AddResult::Added) return PdfSavedItemsLegacyMutationResult::Applied;
   if (result == BookmarkStore::AddResult::LimitReached || result == BookmarkStore::AddResult::InvalidItemId) {
     return PdfSavedItemsLegacyMutationResult::Rejected;
@@ -1849,7 +1905,8 @@ bool EpubReaderActivity::readPdfClippingId(void*, const uint16_t index, uint16_t
 
 PdfSavedItemsLegacyMutationResult EpubReaderActivity::addPdfClipping(void* const context, const uint16_t itemId) {
   auto& self = *static_cast<EpubReaderActivity*>(context);
-  const auto& pending = self.pdfClippingLegacyMutation;
+  if (!self.pdfReaderSession) return PdfSavedItemsLegacyMutationResult::Rejected;
+  const auto& pending = self.pdfReaderSession->clippingLegacyMutation;
   if (pending.text == nullptr) return PdfSavedItemsLegacyMutationResult::Rejected;
   const ClippingStore::AddResult result =
       CLIPPINGS.addPdfClipping(pending.spineIndex, pending.startPage, pending.endPage, pending.pageCount,
@@ -1877,58 +1934,54 @@ PdfSavedItemsLegacyMutationResult EpubReaderActivity::clearPdfClippings(void*) {
 
 bool EpubReaderActivity::removePdfBookmarkFromList(void* const context, const uint16_t itemId) {
   auto& self = *static_cast<EpubReaderActivity*>(context);
-  const PdfSavedItemsSessionResult result = self.pdfSavedItemsSession.remove(PdfSavedItemKind::Bookmark, itemId);
+  if (!self.pdfReaderSession) return false;
+  const PdfSavedItemsSessionResult result =
+      self.pdfReaderSession->savedItemsSession.remove(PdfSavedItemKind::Bookmark, itemId);
   self.reloadPdfSavedItemsAfterMutation(result);
   return result == PdfSavedItemsSessionResult::Applied;
 }
 
 bool EpubReaderActivity::removePdfClippingFromList(void* const context, const uint16_t itemId) {
   auto& self = *static_cast<EpubReaderActivity*>(context);
-  const PdfSavedItemsSessionResult result = self.pdfSavedItemsSession.remove(PdfSavedItemKind::Clipping, itemId);
+  if (!self.pdfReaderSession) return false;
+  const PdfSavedItemsSessionResult result =
+      self.pdfReaderSession->savedItemsSession.remove(PdfSavedItemKind::Clipping, itemId);
   self.reloadPdfSavedItemsAfterMutation(result);
   return result == PdfSavedItemsSessionResult::Applied;
 }
 
 const ReflowPageSemanticRange* EpubReaderActivity::currentPdfPageSemanticRange() const {
-  if (!document || document->getFormat() != ReflowDocumentFormat::Pdf || !section || !pdfProgressState ||
-      pdfProgressState->semanticRangeSectionIndex != currentSpineIndex ||
-      pdfProgressState->semanticRangePageNumber != section->currentPage ||
-      !pdfProgressState->currentPageSemanticRange.valid) {
+  if (!document || document->getFormat() != ReflowDocumentFormat::Pdf || !section || !pdfReaderSession ||
+      pdfReaderSession->progress.semanticRangeSectionIndex != currentSpineIndex ||
+      pdfReaderSession->progress.semanticRangePageNumber != section->currentPage ||
+      !pdfReaderSession->progress.currentPageSemanticRange.valid) {
     return nullptr;
   }
-  return &pdfProgressState->currentPageSemanticRange;
+  return &pdfReaderSession->progress.currentPageSemanticRange;
 }
 
 const PdfSavedItem* EpubReaderActivity::currentPdfPageBookmark() const {
   const ReflowPageSemanticRange* const range = currentPdfPageSemanticRange();
   if (range == nullptr || currentSpineIndex < 0 || currentSpineIndex > UINT16_MAX) return nullptr;
-  return pdfSavedItemsSession.findBookmarkInPage(static_cast<uint16_t>(currentSpineIndex),
-                                                 range->firstGlobalWordOrdinal, range->lastGlobalWordOrdinal);
+  if (!pdfReaderSession) return nullptr;
+  return pdfReaderSession->savedItemsSession.findBookmarkInPage(
+      static_cast<uint16_t>(currentSpineIndex), range->firstGlobalWordOrdinal, range->lastGlobalWordOrdinal);
 }
 
 bool EpubReaderActivity::supportsSavedItems() const {
   if (!document || !reflowSupportsSavedItems(document->getCapabilities())) return false;
   if (document->getFormat() != ReflowDocumentFormat::Pdf) return true;
-  return pdfSavedItemStorage && pdfSavedItemsSession.supports(PdfSavedItemKind::Bookmark) &&
-         pdfSavedItemsSession.supports(PdfSavedItemKind::Clipping);
+  return pdfReaderSession && pdfReaderSession->savedItemsSession.supports(PdfSavedItemKind::Bookmark) &&
+         pdfReaderSession->savedItemsSession.supports(PdfSavedItemKind::Clipping);
 }
 
 bool EpubReaderActivity::initializePdfSavedItems() {
   if (!document || document->getFormat() != ReflowDocumentFormat::Pdf ||
-      !reflowSupportsSavedItems(document->getCapabilities())) {
+      !reflowSupportsSavedItems(document->getCapabilities()) || !pdfReaderSession) {
     return false;
   }
-  pdfSavedItemStorage = makeUniqueNoThrow<PdfSavedItem[]>(PDF_SAVED_ITEMS_MAX_RECORDS);
-  if (!pdfSavedItemStorage) {
-    LOG_ERR("ERS", "Failed to allocate PDF saved-item records (%u bytes)",
-            static_cast<unsigned>(PDF_SAVED_ITEMS_MAX_RECORDS * sizeof(PdfSavedItem)));
-    return false;
-  }
-  pdfSavedItemsBuffer = {
-      pdfSavedItemStorage.get(),
-      PDF_SAVED_ITEMS_MAX_RECORDS,
-      0,
-  };
+  auto& pdfState = *pdfReaderSession;
+  pdfState.resetSavedItems();
   auto* const pdf = static_cast<PdfReflowDocument*>(document.get());
   const PdfSavedItemsPersistence persistence{
       pdf,
@@ -1952,14 +2005,13 @@ bool EpubReaderActivity::initializePdfSavedItems() {
       removePdfClipping,
       clearPdfClippings,
   };
-  const PdfStatus status = pdfSavedItemsSession.begin(&pdfSavedItemsBuffer, persistence, bookmarks, clippings);
-  if (!status || !pdfSavedItemsSession.supports(PdfSavedItemKind::Bookmark) ||
-      !pdfSavedItemsSession.supports(PdfSavedItemKind::Clipping) ||
-      (pdfSavedItemsSession.dirty() && !pdfSavedItemsSession.flush())) {
+  const PdfStatus status =
+      pdfState.savedItemsSession.begin(&pdfState.savedItemsBuffer, persistence, bookmarks, clippings);
+  if (!status || !pdfState.savedItemsSession.supports(PdfSavedItemKind::Bookmark) ||
+      !pdfState.savedItemsSession.supports(PdfSavedItemKind::Clipping) ||
+      (pdfState.savedItemsSession.dirty() && !pdfState.savedItemsSession.flush())) {
     LOG_ERR("ERS", "PDF saved items unavailable (%u)", static_cast<unsigned>(status.error));
-    pdfSavedItemsSession = {};
-    pdfSavedItemsBuffer = {};
-    pdfSavedItemStorage.reset();
+    pdfState.resetSavedItems();
     return false;
   }
   return true;
@@ -1968,9 +2020,8 @@ bool EpubReaderActivity::initializePdfSavedItems() {
 bool EpubReaderActivity::reloadPdfSavedItemsAfterMutation(const PdfSavedItemsSessionResult result) {
   if (result != PdfSavedItemsSessionResult::ReloadRequired) return false;
   LOG_ERR("ERS", "Reloading PDF saved items after an ambiguous durable mutation");
-  pdfSavedItemsSession = {};
-  pdfSavedItemsBuffer = {};
-  pdfSavedItemStorage.reset();
+  if (!pdfReaderSession) return true;
+  pdfReaderSession->resetSavedItems();
   const bool bookmarksReloaded = BOOKMARKS.reloadPdfFromDisk();
   const bool clippingsReloaded = CLIPPINGS.reloadPdfFromDisk();
   if (!bookmarksReloaded || !clippingsReloaded) {
@@ -1988,21 +2039,22 @@ bool EpubReaderActivity::reloadPdfSavedItemsAfterMutation(const PdfSavedItemsSes
 }
 
 bool EpubReaderActivity::applyPendingPdfSavedItemJump() {
-  if (!section || !document || document->getFormat() != ReflowDocumentFormat::Pdf) return false;
+  if (!section || !document || document->getFormat() != ReflowDocumentFormat::Pdf || !pdfReaderSession) return false;
   PdfSavedItem item;
-  if (!pdfSavedItemsSession.pendingJump(&item) || item.sectionIndex != static_cast<uint16_t>(currentSpineIndex)) {
+  if (!pdfReaderSession->savedItemsSession.pendingJump(&item) ||
+      item.sectionIndex != static_cast<uint16_t>(currentSpineIndex)) {
     return false;
   }
   auto& pdfDocument = *static_cast<PdfReflowDocument*>(document.get());
   uint32_t fingerprint = 0;
   if (!pdfSavedItemsLayoutFingerprint(pdfDocument, section->getCacheFilePath(), fingerprint)) {
-    pdfSavedItemsSession.resolvePendingJump(false);
+    pdfReaderSession->savedItemsSession.resolvePendingJump(false);
     return false;
   }
   PdfSavedItemPageRange pages;
   const PdfStatus status = pdfDocument.mapPdfSavedItem(section->getCacheFilePath(), fingerprint, item, &pages);
   if (!status) {
-    pdfSavedItemsSession.resolvePendingJump(false);
+    pdfReaderSession->savedItemsSession.resolvePendingJump(false);
     LOG_ERR("ERS", "PDF saved-item map pending retry (%u)", static_cast<unsigned>(status.error));
     return false;
   }
@@ -2012,7 +2064,7 @@ bool EpubReaderActivity::applyPendingPdfSavedItemJump() {
   pendingParagraphIndex = UINT16_MAX;
   pendingClippingIndex = UINT16_MAX;
   pendingPercentJump = false;
-  pdfSavedItemsSession.resolvePendingJump(true);
+  pdfReaderSession->savedItemsSession.resolvePendingJump(true);
   if (APP_STATE.pendingBookmarkParagraphIndex == item.itemId &&
       APP_STATE.pendingBookmarkSpine == item.sectionIndex) {
     APP_STATE.pendingBookmarkSpine = UINT16_MAX;
@@ -2032,11 +2084,21 @@ void EpubReaderActivity::onEnter() {
     return;
   }
 
-  if (document->getFormat() == ReflowDocumentFormat::Pdf) {
-    pdfProgressState = makeUniqueNoThrow<PdfReaderProgressState>();
-    if (!pdfProgressState) {
-      LOG_ERR("ERS", "Failed to allocate bounded PDF progress state");
-    }
+  const ReflowDocumentFormat documentFormat = document->getFormat();
+  // This state is over 11 KiB because it owns the fixed saved-item records and
+  // the reusable PDF pixel-cache render workspace, so
+  // it cannot live on the 4 KiB reader stack. Allocate it once for PDF and
+  // reuse it until onExit(); the format gate guarantees EPUB allocates nothing.
+  pdfReaderSession = allocatePdfReaderSessionState<PdfReaderSessionState>(documentFormat);
+  if (documentFormat == ReflowDocumentFormat::Pdf && !pdfReaderSession) {
+    LOG_ERR("ERS", "Insufficient memory for mandatory PDF reader session (%u bytes)",
+            static_cast<unsigned>(sizeof(PdfReaderSessionState)));
+    snprintf(APP_STATE.pendingAlertTitle, sizeof(APP_STATE.pendingAlertTitle), "%s", tr(STR_MEMORY_ERROR));
+    snprintf(APP_STATE.pendingAlertBody, sizeof(APP_STATE.pendingAlertBody), "%s", tr(STR_PDF_INSUFFICIENT_MEMORY));
+    APP_STATE.pendingAlertGoHomeOnBack.store(true, std::memory_order_relaxed);
+    APP_STATE.hasPendingAlert.store(true, std::memory_order_release);
+    finish();
+    return;
   }
 
   captureGlobalReaderSettings();
@@ -2086,7 +2148,7 @@ void EpubReaderActivity::onEnter() {
       const PdfSavedItemKind kind =
           APP_STATE.pendingClippingIndex == UINT16_MAX ? PdfSavedItemKind::Bookmark : PdfSavedItemKind::Clipping;
       const PdfSavedItemsSessionResult queued =
-          pdfSavedItemsSession.queueJump(kind, APP_STATE.pendingBookmarkParagraphIndex);
+          pdfReaderSession->savedItemsSession.queueJump(kind, APP_STATE.pendingBookmarkParagraphIndex);
       if (queued != PdfSavedItemsSessionResult::Applied) {
         LOG_ERR("ERS", "Cannot queue persisted PDF saved-item jump (%u)", static_cast<unsigned>(queued));
         pendingPercentJump = false;
@@ -2111,12 +2173,12 @@ void EpubReaderActivity::onEnter() {
         cachedChapterPageNumber = progress.pageNumber;
         cachedChapterTotalPageCount = progress.pageCount;
       }
-      if (pdfProgressState) {
-        pdfProgressState->seedPersistedPosition(progress.sectionIndex, progress.pageNumber);
+      if (pdfReaderSession) {
+        pdfReaderSession->progress.seedPersistedPosition(progress.sectionIndex, progress.pageNumber);
         if (progress.hasSemanticPosition || progress.hasWordCursor) {
-          if (pdfProgressState->cacheExactPosition(progress)) {
-            pdfProgressState->hasLastKnownWordCursor = true;
-            pdfProgressState->lastKnownWordCursor = progress.wordCursor;
+          if (pdfReaderSession->progress.cacheExactPosition(progress)) {
+            pdfReaderSession->progress.hasLastKnownWordCursor = true;
+            pdfReaderSession->progress.lastKnownWordCursor = progress.wordCursor;
             pendingRelayoutReposition = true;
           } else {
             LOG_ERR("ERS", "Ignoring invalid persisted PDF exact position");
@@ -2167,6 +2229,14 @@ void EpubReaderActivity::onEnter() {
 
 void EpubReaderActivity::onExit() {
   Activity::onExit();
+
+  // onEnter() cannot safely continue without the mandatory PDF session. It
+  // queues a recoverable alert and exits before changing reader settings or
+  // starting stats, so this matching partial-entry cleanup must do neither.
+  if (document && document->getFormat() == ReflowDocumentFormat::Pdf && !pdfReaderSession) {
+    document.reset();
+    return;
+  }
 
   // Deactivate reader-specific front button mapping.
   mappedInput.setReaderMode(false);
@@ -2225,15 +2295,15 @@ void EpubReaderActivity::onExit() {
     }
   }
 
-  if (pdfSavedItemStorage && !pdfSavedItemsSession.flush()) {
+  if (pdfReaderSession && pdfReaderSession->savedItemsSession.supports(PdfSavedItemKind::Bookmark) &&
+      pdfReaderSession->savedItemsSession.supports(PdfSavedItemKind::Clipping) &&
+      !pdfReaderSession->savedItemsSession.flush()) {
     LOG_ERR("ERS", "Failed to flush PDF saved items on reader exit");
   }
-  pdfSavedItemsSession = {};
-  pdfSavedItemsBuffer = {};
   BOOKMARKS.unload();
   CLIPPINGS.unload();
-  pdfSavedItemStorage.reset();
   section.reset();
+  pdfReaderSession.reset();
 
   if (pendingReadFolderMove && document) {
     const bool isPdf =
@@ -2873,10 +2943,15 @@ void EpubReaderActivity::handleClippingJump(const ClippingJumpResult& clipping) 
   RenderLock lock(*this);
   clearFootnotePreviewState();
   if (document && document->getFormat() == ReflowDocumentFormat::Pdf) {
+    if (!pdfReaderSession) {
+      requestUpdate();
+      return;
+    }
     const PdfSavedItemsSessionResult queued =
-        pdfSavedItemsSession.queueJump(PdfSavedItemKind::Clipping, clipping.paragraphIndex);
+        pdfReaderSession->savedItemsSession.queueJump(PdfSavedItemKind::Clipping, clipping.paragraphIndex);
     PdfSavedItem item;
-    if (queued != PdfSavedItemsSessionResult::Applied || !pdfSavedItemsSession.pendingJump(&item)) {
+    if (queued != PdfSavedItemsSessionResult::Applied ||
+        !pdfReaderSession->savedItemsSession.pendingJump(&item)) {
       LOG_ERR("ERS", "Cannot queue PDF clipping jump (%u)", static_cast<unsigned>(queued));
       requestUpdate();
       return;
@@ -3271,10 +3346,10 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
           break;
         }
 
-        const PdfSavedItem* const existing = currentPdfPageBookmark();
-        if (existing != nullptr) {
-          const PdfSavedItemsSessionResult result =
-              pdfSavedItemsSession.remove(PdfSavedItemKind::Bookmark, existing->itemId);
+          const PdfSavedItem* const existing = currentPdfPageBookmark();
+          if (existing != nullptr) {
+            const PdfSavedItemsSessionResult result =
+                pdfReaderSession->savedItemsSession.remove(PdfSavedItemKind::Bookmark, existing->itemId);
           if (result != PdfSavedItemsSessionResult::Applied) {
             reloadPdfSavedItemsAfterMutation(result);
             LOG_ERR("ERS", "Failed to remove PDF bookmark (%u)", static_cast<unsigned>(result));
@@ -3313,14 +3388,14 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
           }
           std::memcpy(item.startBlockAnchor, semantic->blockAnchor, sizeof(item.startBlockAnchor));
 
-          pdfBookmarkLegacyMutation = {
+          pdfReaderSession->bookmarkLegacyMutation = {
               spine,
               progress,
               chapterTitle,
               snippet,
           };
-          const PdfSavedItemsSessionResult result = pdfSavedItemsSession.add(item, nullptr);
-          pdfBookmarkLegacyMutation = {};
+          const PdfSavedItemsSessionResult result = pdfReaderSession->savedItemsSession.add(item, nullptr);
+          pdfReaderSession->bookmarkLegacyMutation = {};
           if (result == PdfSavedItemsSessionResult::LimitReached) {
             bookmarkFeedbackType = BookmarkFeedbackType::LimitReached;
           } else if (result == PdfSavedItemsSessionResult::Applied) {
@@ -3385,9 +3460,10 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
               if (document && document->getFormat() == ReflowDocumentFormat::Pdf) {
                 const uint16_t itemId = bm.paragraphIndex;
                 const PdfSavedItemsSessionResult queued =
-                    pdfSavedItemsSession.queueJump(PdfSavedItemKind::Bookmark, itemId);
+                    pdfReaderSession->savedItemsSession.queueJump(PdfSavedItemKind::Bookmark, itemId);
                 PdfSavedItem item;
-                if (queued != PdfSavedItemsSessionResult::Applied || !pdfSavedItemsSession.pendingJump(&item)) {
+                if (queued != PdfSavedItemsSessionResult::Applied ||
+                    !pdfReaderSession->savedItemsSession.pendingJump(&item)) {
                   LOG_ERR("ERS", "Cannot queue PDF bookmark jump (%u)", static_cast<unsigned>(queued));
                   requestUpdate();
                   return;
@@ -3481,7 +3557,7 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
             if (!result.isCancelled) {
               if (document && document->getFormat() == ReflowDocumentFormat::Pdf) {
                 const PdfSavedItemsSessionResult clearResult =
-                    pdfSavedItemsSession.clear(PdfSavedItemKind::Bookmark);
+                    pdfReaderSession->savedItemsSession.clear(PdfSavedItemKind::Bookmark);
                 if (clearResult != PdfSavedItemsSessionResult::Applied) {
                   reloadPdfSavedItemsAfterMutation(clearResult);
                   LOG_ERR("ERS", "Failed to clear PDF bookmarks (%u)", static_cast<unsigned>(clearResult));
@@ -3566,6 +3642,7 @@ void EpubReaderActivity::startClipSelection() {
   std::string bookTitle;
   std::string author;
   std::string chapterTitle;
+  PdfPixelCacheRenderWorkspace* pdfRenderWorkspace = nullptr;
 
   {
     RenderLock lock(*this);
@@ -3598,6 +3675,13 @@ void EpubReaderActivity::startClipSelection() {
     words.reserve(maxSelectableWords);
     const bool pdfSelection = document->getFormat() == ReflowDocumentFormat::Pdf;
     if (pdfSelection) {
+      if (!pdfReaderSession) {
+        LOG_ERR("CLIP", "PDF clipping requires the mandatory reader session");
+        section->currentPage = startPage;
+        requestUpdate();
+        return;
+      }
+      pdfRenderWorkspace = &pdfReaderSession->pixelCacheRenderWorkspace;
       pdfSemanticWords.reserve(maxSelectableWords);
     }
     bool wordLimitLogged = false;
@@ -3770,7 +3854,7 @@ void EpubReaderActivity::startClipSelection() {
   pauseReadingPaceTimer("clip_selection");
   startActivityForResult(
       std::make_unique<ClipSelectionActivity>(renderer, mappedInput, std::move(words), readerFontId, *section,
-                                              startPage, layout.marginTop, layout.marginLeft),
+                                              startPage, layout.marginTop, layout.marginLeft, pdfRenderWorkspace),
       [this, bookTitle = std::move(bookTitle), author = std::move(author),
        pdfSemanticWords = std::move(pdfSemanticWords),
        chapterTitle = std::move(chapterTitle)](const ActivityResult& result) {
@@ -3821,7 +3905,7 @@ void EpubReaderActivity::startClipSelection() {
               std::memcpy(item.startBlockAnchor, start->blockAnchor, sizeof(item.startBlockAnchor));
               std::memcpy(item.endBlockAnchor, end->blockAnchor, sizeof(item.endBlockAnchor));
 
-              pdfClippingLegacyMutation = {
+              pdfReaderSession->clippingLegacyMutation = {
                   static_cast<uint16_t>(currentSpineIndex),
                   clip.sectionPage,
                   clip.endSectionPage,
@@ -3833,15 +3917,16 @@ void EpubReaderActivity::startClipSelection() {
                   &clip.text,
               };
               uint16_t assignedItemId = 0;
-              const PdfSavedItemsSessionResult addResult = pdfSavedItemsSession.add(item, &assignedItemId);
-              pdfClippingLegacyMutation = {};
+              const PdfSavedItemsSessionResult addResult =
+                  pdfReaderSession->savedItemsSession.add(item, &assignedItemId);
+              pdfReaderSession->clippingLegacyMutation = {};
               bool exported = false;
               if (addResult == PdfSavedItemsSessionResult::Applied) {
                 exported = ClippingsManager::saveClipping(bookTitle, author, chapterTitle,
                                                           static_cast<int>(clip.sectionPage) + 1, clip.text);
                 if (!exported) {
                   const PdfSavedItemsSessionResult rollback =
-                      pdfSavedItemsSession.remove(PdfSavedItemKind::Clipping, assignedItemId);
+                      pdfReaderSession->savedItemsSession.remove(PdfSavedItemKind::Clipping, assignedItemId);
                   if (rollback != PdfSavedItemsSessionResult::Applied) {
                     reloadPdfSavedItemsAfterMutation(rollback);
                     LOG_ERR("CLIP", "Failed to roll back PDF clipping after export failure");
@@ -4442,6 +4527,7 @@ void EpubReaderActivity::setAutoPageTurnIntervalSeconds(uint16_t seconds) {
 }
 
 void EpubReaderActivity::pageTurn(bool isForwardTurn, const char* source) {
+  PdfReaderProgressState* const pdfProgressState = pdfReaderSession ? &pdfReaderSession->progress : nullptr;
   pageLoadRetryCount = 0;
   if (activeFootnotePreview) {
     if (isForwardTurn) {
@@ -4761,7 +4847,8 @@ void EpubReaderActivity::render(RenderLock&& lock) {
 
     PdfSavedItem pendingPdfItem;
     const bool hasPendingPdfSavedItem =
-        document->getFormat() == ReflowDocumentFormat::Pdf && pdfSavedItemsSession.pendingJump(&pendingPdfItem);
+        document->getFormat() == ReflowDocumentFormat::Pdf && pdfReaderSession &&
+        pdfReaderSession->savedItemsSession.pendingJump(&pendingPdfItem);
     if (hasPendingPdfSavedItem) {
       if (!applyPendingPdfSavedItemJump()) {
         // Keep both the stable ID and session request for the next render. A
@@ -4927,6 +5014,7 @@ void EpubReaderActivity::render(RenderLock&& lock) {
 }
 
 bool EpubReaderActivity::applyDeferredReposition() {
+  PdfReaderProgressState* const pdfProgressState = pdfReaderSession ? &pdfReaderSession->progress : nullptr;
   const bool hasPdfPosition =
       pdfProgressState && (pdfProgressState->cachedHasSemanticPosition || pdfProgressState->cachedHasWordCursor);
   if ((!hasPdfPosition && cachedChapterTotalPageCount == 0) || !section) {
@@ -5066,6 +5154,7 @@ bool EpubReaderActivity::applyDeferredReposition() {
 
 bool EpubReaderActivity::saveProgress(const int spineIndex, const int currentPage, const int pageCount,
                                       const bool force) {
+  PdfReaderProgressState* const pdfProgressState = pdfReaderSession ? &pdfReaderSession->progress : nullptr;
   if (activeFootnotePreview) {
     return true;
   }
@@ -5130,6 +5219,7 @@ bool EpubReaderActivity::saveProgress(const int spineIndex, const int currentPag
 }
 
 void EpubReaderActivity::acceptPdfNavigation() {
+  PdfReaderProgressState* const pdfProgressState = pdfReaderSession ? &pdfReaderSession->progress : nullptr;
   if (!pdfProgressState || !document || document->getFormat() != ReflowDocumentFormat::Pdf) {
     return;
   }
@@ -5143,6 +5233,7 @@ void EpubReaderActivity::acceptPdfNavigation() {
 }
 
 void EpubReaderActivity::refreshCurrentPageSemanticRange() {
+  PdfReaderProgressState* const pdfProgressState = pdfReaderSession ? &pdfReaderSession->progress : nullptr;
   if (!pdfProgressState) {
     return;
   }
@@ -5169,6 +5260,7 @@ void EpubReaderActivity::refreshCurrentPageSemanticRange() {
 }
 
 bool EpubReaderActivity::cacheCurrentSectionPosition() {
+  PdfReaderProgressState* const pdfProgressState = pdfReaderSession ? &pdfReaderSession->progress : nullptr;
   if (activeFootnotePreview) {
     return true;
   }
@@ -5261,6 +5353,8 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
                                         const int orientedMarginRight, const int orientedMarginBottom,
                                         const int orientedMarginLeft) {
   const auto t0 = millis();
+  PdfPixelCacheRenderWorkspace* const pdfWorkspace =
+      pdfReaderSession ? &pdfReaderSession->pixelCacheRenderWorkspace : nullptr;
 
   // Font prewarm: scan pass accumulates text, then prewarm, then real render
   auto* fcm = renderer.getFontCacheManager();
@@ -5294,15 +5388,15 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
   };
 
   const auto composePageBuffer = [&]() {
-    page->render(renderer, fontId, orientedMarginLeft, orientedMarginTop, foregroundBlack);
+    page->render(renderer, fontId, orientedMarginLeft, orientedMarginTop, foregroundBlack, pdfWorkspace);
     finalizeBufferComposition();
   };
 
   const auto composeGrayscaleBuffer = [&]() {
     if (needsTextGrayscale) {
-      page->render(renderer, fontId, orientedMarginLeft, orientedMarginTop, foregroundBlack);
+      page->render(renderer, fontId, orientedMarginLeft, orientedMarginTop, foregroundBlack, pdfWorkspace);
     } else {
-      page->renderImages(renderer, fontId, orientedMarginLeft, orientedMarginTop);
+      page->renderImages(renderer, fontId, orientedMarginLeft, orientedMarginTop, pdfWorkspace);
     }
     finalizeBufferComposition();
   };
@@ -5399,7 +5493,7 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
 
   TiledGrayscaleTimings tiledTimings;
   if (runTiledGrayscalePass(renderer, *page, fontId, orientedMarginLeft, orientedMarginTop, foregroundBlack,
-                            needsTextGrayscale, needsImageGrayscale, tiledTimings)) {
+                            needsTextGrayscale, needsImageGrayscale, pdfWorkspace, tiledTimings)) {
     const auto tEnd = millis();
     LOG_DBG("ERS",
             "Page render (tiled): prewarm=%lums bw_render=%lums display=%lums "
@@ -5496,13 +5590,13 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
   const bool pdfDocument = document->getFormat() == ReflowDocumentFormat::Pdf;
   const ReflowPageSemanticRange* pdfPageSemanticRange = nullptr;
   if (pdfDocument) {
-    if (!canUseStoredRanges || !pdfProgressState ||
-        pdfProgressState->semanticRangeSectionIndex != currentSpineIndex ||
-        pdfProgressState->semanticRangePageNumber != section->currentPage ||
-        !pdfProgressState->currentPageSemanticRange.valid) {
+    if (!canUseStoredRanges || !pdfReaderSession ||
+        pdfReaderSession->progress.semanticRangeSectionIndex != currentSpineIndex ||
+        pdfReaderSession->progress.semanticRangePageNumber != section->currentPage ||
+        !pdfReaderSession->progress.currentPageSemanticRange.valid) {
       return;
     }
-    pdfPageSemanticRange = &pdfProgressState->currentPageSemanticRange;
+    pdfPageSemanticRange = &pdfReaderSession->progress.currentPageSemanticRange;
   }
   for (const Clipping& clipping : CLIPPINGS.getClippings()) {
     if (clipping.spineIndex != static_cast<uint16_t>(currentSpineIndex)) {
@@ -5511,7 +5605,7 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
     ClippingPageMatch match;
     if (pdfDocument) {
       const PdfSavedItem* const saved =
-          pdfSavedItemsSession.find(PdfSavedItemKind::Clipping, clipping.paragraphIndex);
+          pdfReaderSession->savedItemsSession.find(PdfSavedItemKind::Clipping, clipping.paragraphIndex);
       if (saved == nullptr || !canUseStoredRanges) {
         continue;
       }
@@ -5694,6 +5788,7 @@ void EpubReaderActivity::clearFootnotePreviewState() {
 }
 
 bool EpubReaderActivity::captureSavedPosition(SavedPosition& savedPosition) {
+  PdfReaderProgressState* const pdfProgressState = pdfReaderSession ? &pdfReaderSession->progress : nullptr;
   if (!section) {
     return false;
   }
@@ -5758,6 +5853,7 @@ bool EpubReaderActivity::captureSavedPosition(SavedPosition& savedPosition) {
 }
 
 void EpubReaderActivity::applySavedNavigationPosition(const SavedPosition& savedPosition) {
+  PdfReaderProgressState* const pdfProgressState = pdfReaderSession ? &pdfReaderSession->progress : nullptr;
   acceptPdfNavigation();
   currentSpineIndex = savedPosition.spineIndex;
   nextPageNumber = savedPosition.pageNumber;

@@ -13,6 +13,41 @@ SOURCE = ROOT / "src/activities/home/BookActions.cpp"
 
 MUTATIONS = (
     (
+        "ordinary EPUB metadata cleanup stopped constructing the baseline adapter",
+        '    Epub(fullPath, "/.crosspoint").clearCache();\n',
+        "",
+        "ordinary single-file EPUB cleanup must retain the baseline EPUB adapter",
+    ),
+    (
+        "directory EPUB cache cleanup was skipped",
+        '    const bool cacheDeleted =\n'
+        '        Epub::clearCacheForFilePathNoPathAlloc(fullPath, "/.crosspoint");\n',
+        '    const bool cacheDeleted = true;\n',
+        "EPUB metadata cleanup must preserve the exact string_view path",
+    ),
+    (
+        "directory EPUB cleanup short-circuited after cache failure",
+        '    const bool bookmarksDeleted =\n'
+        '        BookmarkStore::deleteLegacyForFilePathNoPathAlloc(fullPath, "epub");\n',
+        '    const bool bookmarksDeleted =\n'
+        '        cacheDeleted && BookmarkStore::deleteLegacyForFilePathNoPathAlloc(fullPath, "epub");\n',
+        "directory EPUB cleanup must continue after every cold API failure position",
+    ),
+    (
+        "directory EPUB cleanup result was discarded",
+        '    success = cacheDeleted && bookmarksDeleted && clippingsDeleted;\n',
+        '    success = (static_cast<void>(cacheDeleted),\n'
+        '               static_cast<void>(bookmarksDeleted),\n'
+        '               static_cast<void>(clippingsDeleted), true);\n',
+        "directory EPUB cleanup must report first, middle, and last cold API failures",
+    ),
+    (
+        "directory XTC metadata used the EPUB store key",
+        '        BookmarkStore::deleteLegacyForFilePathNoPathAlloc(fullPath, "xtc");\n',
+        '        BookmarkStore::deleteLegacyForFilePathNoPathAlloc(fullPath, "epub");\n',
+        "directory cleanup must preserve legacy XTC/TXT type mapping and exact views",
+    ),
+    (
         "missing PDF Delete Stats menu entry",
         "    items.push_back({FileBrowserAction::DeleteStats, StrId::STR_DELETE_BOOK_STATS});\n",
         "",

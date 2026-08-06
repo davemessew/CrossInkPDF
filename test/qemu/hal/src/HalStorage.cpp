@@ -7,9 +7,11 @@
 #include <climits>
 #include <cstdio>
 #include <cstring>
+#include <unistd.h>
 #include <utility>
 
 #include "QemuHalControl.h"
+#include "QemuStorageCapacityCache.h"
 
 HalStorage HalStorage::instance;
 
@@ -20,21 +22,23 @@ constexpr uint64_t LITTLEFS_CAPACITY_BYTES = 0x360000ULL;
 constexpr int MAX_LISTED_FILES = 200;
 constexpr uint8_t MAX_REMOVE_DIRECTORY_DEPTH = 8;
 constexpr size_t MAX_STORAGE_PATH_BYTES = 192;
+constexpr size_t MAX_STORAGE_NATIVE_PATH_BYTES = MAX_STORAGE_PATH_BYTES + 32U;
 
 uint32_t qemuStorageOpenCount = 0;
 uint32_t qemuStorageCloseCount = 0;
 uint64_t qemuStorageQuota = UINT64_MAX;
 uint64_t qemuVirtualBytesWritten = 0;
+QemuStorageCapacityCache qemuPhysicalCapacity;
 
 bool canWrite(size_t count) {
   if (static_cast<uint64_t>(count) > qemuStorageQuota) {
     return false;
   }
-  const uint64_t used = LittleFS.usedBytes();
-  return used <= LITTLEFS_CAPACITY_BYTES && static_cast<uint64_t>(count) <= LITTLEFS_CAPACITY_BYTES - used;
+  return qemuPhysicalCapacity.canWrite(count);
 }
 
 void accountWrite(size_t count) {
+  qemuPhysicalCapacity.charge(count);
   if (qemuStorageQuota != UINT64_MAX) {
     qemuStorageQuota -= std::min<uint64_t>(qemuStorageQuota, count);
   }
@@ -42,20 +46,45 @@ void accountWrite(size_t count) {
       std::min<uint64_t>(VIRTUAL_INITIAL_FREE_BYTES, qemuVirtualBytesWritten + static_cast<uint64_t>(count));
 }
 
-const char* modeForFlags(const oflag_t flags, const bool exists) {
-  if ((flags & O_RDWR) != 0) {
-    if ((flags & (O_APPEND | O_AT_END)) != 0) {
-      return "a+";
-    }
-    if ((flags & O_TRUNC) != 0 || ((flags & O_CREAT) != 0 && !exists)) {
-      return "w+";
-    }
-    return "r+";
+fs::File openWithFlags(const char* const path, const oflag_t flags) {
+  const bool readWrite = (flags & O_RDWR) != 0;
+  const bool writeOnly = (flags & O_WRONLY) != 0;
+  const bool create = (flags & O_CREAT) != 0;
+  const bool truncate = (flags & O_TRUNC) != 0;
+  const bool append = (flags & (O_APPEND | O_AT_END)) != 0;
+  if (!readWrite && !writeOnly) {
+    return LittleFS.open(path, FILE_READ, false);
   }
-  if ((flags & O_WRONLY) == 0) {
-    return FILE_READ;
+
+  if (truncate) {
+    const char* const mode = readWrite ? "w+" : FILE_WRITE;
+    if (create) {
+      return LittleFS.open(path, mode, false);
+    }
+    fs::File existing = LittleFS.open(path, "r+", false);
+    if (!existing) {
+      return {};
+    }
+    existing.close();
+    return LittleFS.open(path, mode, false);
   }
-  return (flags & (O_APPEND | O_AT_END)) != 0 ? FILE_APPEND : FILE_WRITE;
+
+  if (append) {
+    if (!create) {
+      fs::File existing = LittleFS.open(path, "r+", false);
+      if (!existing) {
+        return {};
+      }
+      existing.close();
+    }
+    return LittleFS.open(path, readWrite ? "a+" : FILE_APPEND, false);
+  }
+
+  fs::File opened = LittleFS.open(path, "r+", false);
+  if (!opened && create) {
+    opened = LittleFS.open(path, readWrite ? "w+" : FILE_WRITE, false);
+  }
+  return opened;
 }
 
 bool removeDirectoryTree(const char* path, const uint8_t depth) {
@@ -93,6 +122,13 @@ HalStorage::HalStorage() = default;
 
 bool HalStorage::begin() {
   initialized = LittleFS.begin(true, "/littlefs", 10, "spiffs");
+  uint64_t physicalCapacity = 0;
+  uint64_t physicalUsed = 0;
+  if (initialized) {
+    physicalCapacity = std::min<uint64_t>(LITTLEFS_CAPACITY_BYTES, LittleFS.totalBytes());
+    physicalUsed = LittleFS.usedBytes();
+  }
+  qemuPhysicalCapacity.refresh(physicalCapacity, physicalUsed);
   qemuStorageOpenCount = 0;
   qemuStorageCloseCount = 0;
   qemuStorageQuota = UINT64_MAX;
@@ -201,11 +237,12 @@ HalFile HalStorage::open(const char* path, const oflag_t oflag) {
   if (!initialized || path == nullptr) {
     return {};
   }
-  fs::File opened = LittleFS.open(path, modeForFlags(oflag, LittleFS.exists(path)), (oflag & O_CREAT) != 0);
+  fs::File opened = openWithFlags(path, oflag);
   if (opened && (oflag & O_AT_END) != 0) {
     opened.seek(static_cast<uint32_t>(opened.size()));
   }
-  return HalFile(std::move(opened));
+  const bool writable = (oflag & (O_WRONLY | O_RDWR)) != 0;
+  return HalFile(std::move(opened), writable);
 }
 
 bool HalStorage::mkdir(const char* path, const bool pFlag) {
@@ -259,7 +296,8 @@ HalStorageCapacityInfo HalStorage::capacityInfo() {
 
 HalFile::HalFile() = default;
 
-HalFile::HalFile(fs::File openedFile) : file(std::move(openedFile)), countedOpen(static_cast<bool>(file)) {
+HalFile::HalFile(fs::File openedFile, const bool isWritable)
+    : file(std::move(openedFile)), countedOpen(static_cast<bool>(file)), writable(isWritable) {
   if (countedOpen) {
     ++qemuStorageOpenCount;
   }
@@ -267,8 +305,10 @@ HalFile::HalFile(fs::File openedFile) : file(std::move(openedFile)), countedOpen
 
 HalFile::~HalFile() { close(); }
 
-HalFile::HalFile(HalFile&& other) : file(std::move(other.file)), countedOpen(other.countedOpen) {
+HalFile::HalFile(HalFile&& other)
+    : file(std::move(other.file)), countedOpen(other.countedOpen), writable(other.writable) {
   other.countedOpen = false;
+  other.writable = false;
 }
 
 HalFile& HalFile::operator=(HalFile&& other) {
@@ -276,7 +316,9 @@ HalFile& HalFile::operator=(HalFile&& other) {
     close();
     file = std::move(other.file);
     countedOpen = other.countedOpen;
+    writable = other.writable;
     other.countedOpen = false;
+    other.writable = false;
   }
   return *this;
 }
@@ -306,6 +348,40 @@ bool HalFile::seek(size_t pos) { return seek64(pos); }
 
 bool HalFile::seek64(uint64_t pos) {
   return file && pos <= UINT32_MAX && file.seek(static_cast<uint32_t>(pos), fs::SeekSet);
+}
+
+bool HalFile::truncate64(const uint64_t length) {
+  if (!file || !writable || length > UINT32_MAX || length > file.size()) {
+    return false;
+  }
+  const char* const mountpoint = LittleFS.mountpoint();
+  const char* const logicalPath = file.path();
+  if (mountpoint == nullptr || logicalPath == nullptr) {
+    return false;
+  }
+  const size_t mountpointLength = std::strlen(mountpoint);
+  char nativePath[MAX_STORAGE_NATIVE_PATH_BYTES]{};
+  const int nativeLength = std::snprintf(nativePath, sizeof(nativePath), "%s%s%s", mountpoint,
+                                         logicalPath[0] == '/' ? "" : "/", logicalPath);
+  if (nativeLength <= 0 || static_cast<size_t>(nativeLength) >= sizeof(nativePath) ||
+      static_cast<size_t>(nativeLength) <= mountpointLength) {
+    return false;
+  }
+  const char* const reopenPath = nativePath + mountpointLength;
+  const uint32_t originalPosition = file.position();
+  file.flush();
+  close();
+  const bool truncated = ::truncate(nativePath, static_cast<off_t>(length)) == 0;
+  file = openWithFlags(reopenPath, O_RDWR);
+  if (!file) {
+    return false;
+  }
+  countedOpen = true;
+  writable = true;
+  ++qemuStorageOpenCount;
+  const uint32_t targetPosition = truncated ? static_cast<uint32_t>(length) : originalPosition;
+  const bool positioned = file.seek(targetPosition, fs::SeekSet);
+  return truncated && positioned;
 }
 
 bool HalFile::seekCur(int64_t offset) {
@@ -381,6 +457,7 @@ bool HalFile::close() {
     ++qemuStorageCloseCount;
     countedOpen = false;
   }
+  writable = false;
   return wasOpen;
 }
 

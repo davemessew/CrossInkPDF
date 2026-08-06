@@ -282,8 +282,40 @@ void clearFileMetadata(const std::string& fullPath) {
   }
   LOG_DBG("BookActions", "Cleared metadata for: %s", fullPath.c_str());
 }
+// PDF_BOOK_ACTIONS_PARITY_BEGIN: directory metadata
+bool clearDirectoryLegacyMetadataNoPathAlloc(const std::string_view fullPath) {
+  bool success = true;
+  if (FsHelpers::hasEpubExtension(fullPath)) {
+    const bool cacheDeleted =
+        Epub::clearCacheForFilePathNoPathAlloc(fullPath, "/.crosspoint");
+    const bool bookmarksDeleted =
+        BookmarkStore::deleteLegacyForFilePathNoPathAlloc(fullPath, "epub");
+    const bool clippingsDeleted =
+        ClippingStore::deleteLegacyForFilePathNoPathAlloc(fullPath, "epub");
+    success = cacheDeleted && bookmarksDeleted && clippingsDeleted;
+  } else if (FsHelpers::hasXtcExtension(fullPath)) {
+    success =
+        BookmarkStore::deleteLegacyForFilePathNoPathAlloc(fullPath, "xtc");
+  } else if (FsHelpers::hasTxtExtension(fullPath) ||
+             FsHelpers::hasMarkdownExtension(fullPath)) {
+    success =
+        BookmarkStore::deleteLegacyForFilePathNoPathAlloc(fullPath, "txt");
+  }
+  LOG_DBG("BookActions", "Cleared directory metadata for: %.*s",
+          static_cast<int>(fullPath.size()), fullPath.data());
+  return success;
+}
+// PDF_BOOK_ACTIONS_PARITY_END: directory metadata
 
 // PDF_BOOK_ACTIONS_PARITY_BEGIN: delete
+bool deleteDirectoryPdfBookNoPathAlloc(
+    PdfDeleteUtils::DirectoryDeleteSession& session,
+    const std::string_view fullPath) {
+  if (!FsHelpers::hasPdfExtension(fullPath)) return false;
+  return PdfDeleteUtils::deletePdfBookNoPathAlloc(session, fullPath) ==
+         PdfDeleteUtils::Result::Complete;
+}
+
 bool deletePdfBook(const std::string& fullPath) {
   if (!FsHelpers::hasPdfExtension(fullPath)) return false;
   return PdfDeleteUtils::deletePdfBook(fullPath) == PdfDeleteUtils::Result::Complete;

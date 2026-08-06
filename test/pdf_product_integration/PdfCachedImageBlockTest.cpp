@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "Epub/blocks/ImageBlock.h"
+#include "Epub/Page.h"
 #include "Epub/converters/ImageDecoderFactory.h"
 #include "GfxRenderer.h"
 #include "HalStorage.h"
@@ -19,6 +20,7 @@ size_t nothrowArrayNewCalls = 0;
 size_t arrayDeleteCalls = 0;
 ImageBlock* nestedBlock = nullptr;
 GfxRenderer* nestedRenderer = nullptr;
+PdfPixelCacheRenderWorkspace* nestedWorkspace = nullptr;
 int nestedHookCalls = 0;
 
 class AllocationScope {
@@ -50,8 +52,8 @@ void renderNestedImage() {
     return;
   }
   Storage.setReadHook(nullptr);
-  if (nestedBlock != nullptr && nestedRenderer != nullptr) {
-    nestedBlock->render(*nestedRenderer, 0, 0);
+  if (nestedBlock != nullptr && nestedRenderer != nullptr && nestedWorkspace != nullptr) {
+    nestedBlock->render(*nestedRenderer, 0, 0, nestedWorkspace);
   }
 }
 
@@ -76,9 +78,10 @@ TEST(PdfCachedImageBlock, ScalesPreparedPixelCacheWithoutDecoding) {
   Storage.reset();
   Storage.addFile(kPdfPixelPath, pixels());
   GfxRenderer renderer;
+  PdfPixelCacheRenderWorkspace workspace;
   ImageBlock block(kPdfPixelPath, 2, 2);
 
-  block.render(renderer, 0, 0);
+  block.render(renderer, 0, 0, &workspace);
 
   EXPECT_EQ(renderer.framebuffer()[0], 0x3fU);
   EXPECT_EQ(renderer.framebuffer()[1], 0xbfU);
@@ -86,23 +89,25 @@ TEST(PdfCachedImageBlock, ScalesPreparedPixelCacheWithoutDecoding) {
   EXPECT_EQ(Storage.opens(), 1U);
 }
 
-TEST(PdfCachedImageBlock, ReusesStaticReadBufferAcrossPdfRenderPasses) {
+TEST(PdfCachedImageBlock, ReusesCallerWorkspaceAcrossPdfRenderPasses) {
   Storage.reset();
   Storage.addFile(kPdfPixelPath, pixels());
   GfxRenderer renderer;
+  PdfPixelCacheRenderWorkspace workspace;
   ImageBlock block(kPdfPixelPath, 4, 2);
 
   {
     AllocationScope allocations;
     for (int pass = 0; pass < 8; ++pass) {
       renderer.clear();
-      block.render(renderer, 0, 0);
+      block.render(renderer, 0, 0, &workspace);
       EXPECT_EQ(framebufferHash(renderer), 0xa5ff812bfb471921ULL);
     }
     EXPECT_EQ(allocations.mallocs(), 0U);
     EXPECT_EQ(allocations.frees(), 0U);
     EXPECT_EQ(allocations.arrayNews(), 0U);
     EXPECT_EQ(allocations.arrayDeletes(), 0U);
+    EXPECT_FALSE(workspace.inUse);
   }
 
   AllocationScope positiveControl;
@@ -118,10 +123,11 @@ TEST(PdfCachedImageBlock, KeepsLegacyEpubCacheAllocationPath) {
   Storage.addFile(kEpubImagePath, {'j', 'p', 'e', 'g'});
   Storage.addFile(kEpubPixelPath, pixels());
   GfxRenderer renderer;
+  PdfPixelCacheRenderWorkspace workspace;
   ImageBlock block(kEpubImagePath, 4, 2);
 
   AllocationScope allocations;
-  block.render(renderer, 0, 0);
+  block.render(renderer, 0, 0, &workspace);
 
   EXPECT_EQ(allocations.mallocs(), 1U);
   EXPECT_EQ(allocations.frees(), 1U);
@@ -160,10 +166,11 @@ TEST(PdfCachedImageBlock, RejectsPdfCacheLookalikesAndKeepsThemOnTheLegacyPath) 
     Storage.reset();
     Storage.addFile(lookalike.pixelCache, pixels());
     GfxRenderer renderer;
+    PdfPixelCacheRenderWorkspace workspace;
     ImageBlock block(lookalike.image, 4, 2);
 
     AllocationScope allocations;
-    block.render(renderer, 0, 0);
+    block.render(renderer, 0, 0, &workspace);
 
     EXPECT_EQ(allocations.mallocs(), 1U) << lookalike.image;
     EXPECT_EQ(allocations.frees(), 1U) << lookalike.image;
@@ -173,21 +180,24 @@ TEST(PdfCachedImageBlock, RejectsPdfCacheLookalikesAndKeepsThemOnTheLegacyPath) 
   }
 }
 
-TEST(PdfCachedImageBlock, GuardsTheSharedPdfBufferAgainstNestedRendering) {
+TEST(PdfCachedImageBlock, GuardsTheCallerWorkspaceAgainstNestedRendering) {
   Storage.reset();
   Storage.addFile(kPdfPixelPath, pixels());
   GfxRenderer renderer;
+  PdfPixelCacheRenderWorkspace workspace;
   ImageBlock block(kPdfPixelPath, 4, 2);
   nestedBlock = &block;
   nestedRenderer = &renderer;
+  nestedWorkspace = &workspace;
   nestedHookCalls = 0;
   Storage.setReadHook(renderNestedImage);
 
   AllocationScope allocations;
-  block.render(renderer, 0, 0);
+  block.render(renderer, 0, 0, &workspace);
   Storage.setReadHook(nullptr);
   nestedBlock = nullptr;
   nestedRenderer = nullptr;
+  nestedWorkspace = nullptr;
 
   EXPECT_EQ(allocations.mallocs(), 0U);
   EXPECT_EQ(allocations.frees(), 0U);
@@ -195,6 +205,53 @@ TEST(PdfCachedImageBlock, GuardsTheSharedPdfBufferAgainstNestedRendering) {
   EXPECT_EQ(allocations.arrayDeletes(), 1U);
   EXPECT_EQ(framebufferHash(renderer), 0xa5ff812bfb471921ULL);
   EXPECT_EQ(Storage.opens(), 2U);
+  EXPECT_FALSE(workspace.inUse);
+}
+
+TEST(PdfCachedImageBlock, PagePropagationReusesTheSameWorkspaceWithoutAllocating) {
+  Storage.reset();
+  Storage.addFile(kPdfPixelPath, pixels());
+  GfxRenderer renderer;
+  PdfPixelCacheRenderWorkspace workspace;
+  Page page;
+  page.elements.push_back(
+      std::make_shared<PageImage>(std::make_shared<ImageBlock>(kPdfPixelPath, 4, 2), 0, 0));
+
+  AllocationScope allocations;
+  page.render(renderer, 0, 0, 0, true, &workspace);
+
+  EXPECT_EQ(allocations.mallocs(), 0U);
+  EXPECT_EQ(allocations.frees(), 0U);
+  EXPECT_EQ(allocations.arrayNews(), 0U);
+  EXPECT_EQ(allocations.arrayDeletes(), 0U);
+  EXPECT_EQ(framebufferHash(renderer), 0xa5ff812bfb471921ULL);
+  EXPECT_EQ(Storage.opens(), 1U);
+  EXPECT_FALSE(workspace.inUse);
+}
+
+TEST(PdfCachedImageBlock, ClipPageSwitchRenderingReusesTheParentWorkspaceWithoutAllocating) {
+  Storage.reset();
+  Storage.addFile(kPdfPixelPath, pixels());
+  GfxRenderer renderer;
+  PdfPixelCacheRenderWorkspace parentWorkspace;
+  Page page;
+  page.elements.push_back(
+      std::make_shared<PageImage>(std::make_shared<ImageBlock>(kPdfPixelPath, 4, 2), 0, 0));
+
+  AllocationScope allocations;
+  for (int pageSwitch = 0; pageSwitch < 3; ++pageSwitch) {
+    renderer.clear();
+    page.renderText(renderer, 0, 0, 0, true);
+    page.render(renderer, 0, 0, 0, true, &parentWorkspace);
+    EXPECT_EQ(framebufferHash(renderer), 0xa5ff812bfb471921ULL);
+  }
+
+  EXPECT_EQ(allocations.mallocs(), 0U);
+  EXPECT_EQ(allocations.frees(), 0U);
+  EXPECT_EQ(allocations.arrayNews(), 0U);
+  EXPECT_EQ(allocations.arrayDeletes(), 0U);
+  EXPECT_EQ(Storage.opens(), 3U);
+  EXPECT_FALSE(parentWorkspace.inUse);
 }
 
 }  // namespace

@@ -104,8 +104,12 @@ class ChapterHtmlSlimParser {
   CssParser* cssParser;
   bool embeddedStyle;
   uint8_t imageRendering;
+  bool preserveImagePathRoot_ = false;
   std::string contentBase;
   std::string imageBasePath;
+  bool shouldPreserveImagePathRoot() const {
+    return preserveImagePathRoot_ && !contentBase.empty() && contentBase.front() == '/';
+  }
   int imageCounter = 0;
   bool lowMemoryImageFallback = false;
   bool lowMemoryAbort = false;
@@ -286,7 +290,7 @@ class ChapterHtmlSlimParser {
       std::vector<std::string> tocAnchors = {}, const std::function<void()>& popupFn = nullptr,
       CssParser* cssParser = nullptr, const EpubRenderMode renderMode = EpubRenderMode::CrossInkDefault,
       std::string previewAnchor = {}, const uint16_t previewMaxPages = 0,
-      const ChapterHtmlPaginationHooks paginationHooks = {})
+      const ChapterHtmlPaginationHooks paginationHooks = {}, const bool preserveImagePathRoot = false)
 
       : sectionSource(sectionSource),
         sectionIndex(sectionIndex),
@@ -308,6 +312,7 @@ class ChapterHtmlSlimParser {
         cssParser(cssParser),
         embeddedStyle(embeddedStyle),
         imageRendering(imageRendering),
+        preserveImagePathRoot_(preserveImagePathRoot),
         renderMode(renderMode),
         previewAnchor(std::move(previewAnchor)),
         previewMaxPages(previewMaxPages),

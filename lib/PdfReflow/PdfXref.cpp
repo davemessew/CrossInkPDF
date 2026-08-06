@@ -9,6 +9,8 @@
 
 namespace {
 
+constexpr size_t kNewestObjectFilterBytes = (PdfLimits::MaxIndirectObjects + 1U + 7U) / 8U;
+
 bool tokenEquals(const PdfToken& token, const char* expected) {
   const size_t length = std::strlen(expected);
   return token.length == length && std::memcmp(token.bytes, expected, length) == 0;
@@ -82,6 +84,34 @@ void stableSortXrefRun(PdfXrefEntry* entries, const uint32_t count) {
 
 }  // namespace
 
+PdfStatus PdfXrefTable::configureNewestObjectFilter(uint8_t* const first, const size_t firstBytes,
+                                                    uint8_t* const second, const size_t secondBytes) {
+  if (entryCount_ != 0 || finalized_ || first == nullptr) {
+    return PdfStatus::failure(PdfError::InvalidArgument, firstBytes);
+  }
+  const size_t usedFirstBytes = std::min(firstBytes, kNewestObjectFilterBytes);
+  const size_t usedSecondBytes = kNewestObjectFilterBytes - usedFirstBytes;
+  if (usedSecondBytes != 0 && (second == nullptr || secondBytes < usedSecondBytes)) {
+    return PdfStatus::failure(PdfError::InvalidArgument, firstBytes + secondBytes);
+  }
+  seenObjectsFirst_ = first;
+  seenObjectsFirstBytes_ = usedFirstBytes;
+  seenObjectsSecond_ = usedSecondBytes == 0 ? nullptr : second;
+  seenObjectsSecondBytes_ = usedSecondBytes;
+  std::memset(seenObjectsFirst_, 0, seenObjectsFirstBytes_);
+  if (seenObjectsSecond_ != nullptr) {
+    std::memset(seenObjectsSecond_, 0, seenObjectsSecondBytes_);
+  }
+  return PdfStatus::success();
+}
+
+void PdfXrefTable::detachNewestObjectFilter() {
+  seenObjectsFirst_ = nullptr;
+  seenObjectsSecond_ = nullptr;
+  seenObjectsFirstBytes_ = 0;
+  seenObjectsSecondBytes_ = 0;
+}
+
 void PdfXrefTable::reset() {
   entryCount_ = 0;
   root_ = {};
@@ -89,20 +119,57 @@ void PdfXrefTable::reset() {
   hasRoot_ = false;
   hasInfo_ = false;
   finalized_ = false;
+  appendOrderStrict_ = true;
+  lastAppendedObject_ = 0;
+  if (seenObjectsFirst_ != nullptr) {
+    std::memset(seenObjectsFirst_, 0, seenObjectsFirstBytes_);
+  }
+  if (seenObjectsSecond_ != nullptr) {
+    std::memset(seenObjectsSecond_, 0, seenObjectsSecondBytes_);
+  }
 }
 
 PdfStatus PdfXrefTable::appendNewest(const PdfXrefEntry& entry) {
-  if (finalized_ || !records_.valid() || records_.recordSize != sizeof(PdfXrefEntry)) {
+  if (finalized_ || !records_.valid() || records_.recordSize != sizeof(PdfXrefEntry) ||
+      entry.objectNumber > PdfLimits::MaxIndirectObjects) {
     return PdfStatus::failure(PdfError::InvalidArgument, entry.objectNumber);
+  }
+  const size_t seenByte = entry.objectNumber / 8U;
+  const uint8_t seenMask = static_cast<uint8_t>(1U << (entry.objectNumber % 8U));
+  uint8_t* seen = nullptr;
+  if (seenObjectsFirst_ != nullptr) {
+    seen = seenByte < seenObjectsFirstBytes_ ? seenObjectsFirst_ + seenByte
+                                             : seenObjectsSecond_ + (seenByte - seenObjectsFirstBytes_);
+  }
+  if (seen != nullptr && (*seen & seenMask) != 0) {
+    return PdfStatus::success();
   }
   if (entryCount_ >= records_.capacity) {
     return PdfStatus::failure(PdfError::LimitExceeded, entry.objectNumber);
   }
   const PdfStatus status = pdfWriteRecord(records_, entryCount_, &entry);
   if (status.ok()) {
+    if (entryCount_ != 0 && entry.objectNumber <= lastAppendedObject_) {
+      appendOrderStrict_ = false;
+    }
+    lastAppendedObject_ = entry.objectNumber;
+    if (seen != nullptr) {
+      *seen |= seenMask;
+    }
     ++entryCount_;
   }
   return status;
+}
+
+PdfStatus PdfXrefTable::adoptSortedRecords(const uint32_t count) {
+  if (finalized_ || entryCount_ != 0 || count == 0 || !records_.valid() ||
+      records_.recordSize != sizeof(PdfXrefEntry) || count > records_.capacity) {
+    return PdfStatus::failure(PdfError::InvalidArgument, count);
+  }
+  entryCount_ = count;
+  finalized_ = true;
+  appendOrderStrict_ = true;
+  return PdfStatus::success();
 }
 
 PdfStatus PdfXrefTable::finalize(const PdfFixedRecordStore scratch, PdfXrefEntry* mergeBuffer,
@@ -216,51 +283,127 @@ PdfStatus PdfXrefTable::finalize(const PdfFixedRecordStore scratch, PdfXrefEntry
   return PdfStatus::success();
 }
 
-PdfStatus PdfXrefTable::find(const uint32_t objectNumber, PdfXrefEntry* entry) const {
-  if (entry == nullptr || !records_.valid() || records_.recordSize != sizeof(PdfXrefEntry)) {
+PdfStatus PdfXrefTable::beginFind(const uint32_t objectNumber, PdfXrefLookupState* const state) const {
+  if (state == nullptr || !records_.valid() || records_.recordSize != sizeof(PdfXrefEntry) ||
+      objectNumber > PdfLimits::MaxIndirectObjects) {
     return PdfStatus::failure(PdfError::InvalidArgument, objectNumber);
   }
-  if (finalized_) {
-    uint32_t first = 0;
-    uint32_t last = entryCount_;
-    while (first < last) {
-      const uint32_t middle = first + (last - first) / 2;
-      PdfXrefEntry candidate;
-      const PdfStatus status = pdfReadRecord(records_, middle, &candidate);
-      if (!status.ok()) {
-        return status;
+  *state = {};
+  state->objectNumber = objectNumber;
+  state->last = entryCount_;
+  state->phase = finalized_ ? PdfXrefLookupPhase::Binary : PdfXrefLookupPhase::Linear;
+  return PdfStatus::success();
+}
+
+PdfStepResult PdfXrefTable::stepFind(PdfXrefLookupState& state, PdfXrefEntry* const entry,
+                                     PdfWorkBudget& budget) const {
+  if (entry == nullptr || state.phase == PdfXrefLookupPhase::Idle || !records_.valid() ||
+      records_.recordSize != sizeof(PdfXrefEntry)) {
+    return PdfStepResult::failure(PdfStatus::failure(PdfError::InvalidArgument, state.objectNumber));
+  }
+  if (state.phase == PdfXrefLookupPhase::Done) {
+    *entry = state.entry;
+    return PdfStepResult::completed();
+  }
+  if (state.phase == PdfXrefLookupPhase::Failed) {
+    return PdfStepResult::failure(state.status);
+  }
+
+  auto readRecord = [&](const uint32_t ordinal) -> PdfStepResult {
+    if (budget.cancelRequested()) {
+      return PdfStepResult::failure(PdfStatus::failure(PdfError::Cancelled, state.objectNumber));
+    }
+    if (budget.stopRequested() || budget.operationsRemaining == 0 || budget.bytesRemaining < sizeof(PdfXrefEntry)) {
+      return PdfStepResult::paused();
+    }
+    --budget.operationsRemaining;
+    budget.bytesRemaining -= sizeof(PdfXrefEntry);
+    const PdfStatus status = pdfReadRecord(records_, ordinal, &state.entry);
+    if (!status) {
+      state.status = status;
+      state.phase = PdfXrefLookupPhase::Failed;
+      return PdfStepResult::failure(status);
+    }
+    return PdfStepResult::completed();
+  };
+
+  while (true) {
+    if (state.phase == PdfXrefLookupPhase::Linear) {
+      if (state.cursor >= entryCount_) {
+        state.status = PdfStatus::failure(PdfError::InvalidOffset, state.objectNumber);
+        state.phase = PdfXrefLookupPhase::Failed;
+        return PdfStepResult::failure(state.status);
       }
-      if (candidate.objectNumber < objectNumber) {
-        first = middle + 1;
+      const PdfStepResult read = readRecord(state.cursor);
+      if (!read.complete()) {
+        return read;
+      }
+      ++state.cursor;
+      if (state.entry.objectNumber == state.objectNumber) {
+        state.phase = PdfXrefLookupPhase::Done;
+        *entry = state.entry;
+        return PdfStepResult::completed();
+      }
+      continue;
+    }
+
+    if (state.phase == PdfXrefLookupPhase::Binary) {
+      if (state.first >= state.last) {
+        state.phase = PdfXrefLookupPhase::Verify;
+        continue;
+      }
+      const uint32_t middle = state.first + (state.last - state.first) / 2U;
+      const PdfStepResult read = readRecord(middle);
+      if (!read.complete()) {
+        return read;
+      }
+      if (state.entry.objectNumber < state.objectNumber) {
+        state.first = middle + 1U;
       } else {
-        last = middle;
+        state.last = middle;
       }
+      continue;
     }
-    if (first < entryCount_) {
-      PdfXrefEntry candidate;
-      const PdfStatus status = pdfReadRecord(records_, first, &candidate);
-      if (!status.ok()) {
-        return status;
+
+    if (state.phase == PdfXrefLookupPhase::Verify) {
+      if (state.first >= entryCount_) {
+        state.status = PdfStatus::failure(PdfError::InvalidOffset, state.objectNumber);
+        state.phase = PdfXrefLookupPhase::Failed;
+        return PdfStepResult::failure(state.status);
       }
-      if (candidate.objectNumber == objectNumber) {
-        *entry = candidate;
-        return PdfStatus::success();
+      const PdfStepResult read = readRecord(state.first);
+      if (!read.complete()) {
+        return read;
       }
+      if (state.entry.objectNumber != state.objectNumber) {
+        state.status = PdfStatus::failure(PdfError::InvalidOffset, state.objectNumber);
+        state.phase = PdfXrefLookupPhase::Failed;
+        return PdfStepResult::failure(state.status);
+      }
+      state.phase = PdfXrefLookupPhase::Done;
+      *entry = state.entry;
+      return PdfStepResult::completed();
     }
-    return PdfStatus::failure(PdfError::InvalidOffset, objectNumber);
+
+    state.status = PdfStatus::failure(PdfError::InvalidArgument, state.objectNumber);
+    state.phase = PdfXrefLookupPhase::Failed;
+    return PdfStepResult::failure(state.status);
   }
-  for (uint32_t ordinal = 0; ordinal < entryCount_; ++ordinal) {
-    PdfXrefEntry candidate;
-    const PdfStatus status = pdfReadRecord(records_, ordinal, &candidate);
-    if (!status.ok()) {
-      return status;
-    }
-    if (candidate.objectNumber == objectNumber) {
-      *entry = candidate;
-      return PdfStatus::success();
+}
+
+PdfStatus PdfXrefTable::find(const uint32_t objectNumber, PdfXrefEntry* const entry) const {
+  PdfXrefLookupState state{};
+  PdfStatus status = beginFind(objectNumber, &state);
+  if (!status) {
+    return status;
+  }
+  while (true) {
+    PdfWorkBudget budget{UINT32_MAX, SIZE_MAX};
+    const PdfStepResult result = stepFind(state, entry, budget);
+    if (result.complete() || result.failed()) {
+      return result.status;
     }
   }
-  return PdfStatus::failure(PdfError::InvalidOffset, objectNumber);
 }
 
 bool PdfXrefTable::root(PdfObjectReference* root) const {
@@ -280,7 +423,8 @@ bool PdfXrefTable::info(PdfObjectReference* info) const {
 }
 
 PdfXrefParser::PdfXrefParser(const PdfByteSource& source, uint8_t* sourceBuffer, const size_t sourceBufferSize,
-                             PdfObjectArena& trailerArena, PdfXrefTable& table, PdfStreamDecoder* const streamDecoder)
+                             PdfObjectArena& trailerArena, PdfXrefTable& table, PdfStreamDecoder* const streamDecoder,
+                             const PdfStreamDecodeLimits decodeLimits)
     : source_(source),
       sourceBuffer_(sourceBuffer),
       sourceBufferSize_(sourceBufferSize),
@@ -288,7 +432,19 @@ PdfXrefParser::PdfXrefParser(const PdfByteSource& source, uint8_t* sourceBuffer,
       trailerArena_(trailerArena),
       trailerParser_(lexer_, trailerArena),
       table_(table),
-      streamDecoder_(streamDecoder) {}
+      streamDecoder_(streamDecoder),
+      decodeLimits_(decodeLimits) {
+  decodeLimits_.maxExpandedBytes =
+      std::min<uint64_t>(decodeLimits_.maxExpandedBytes, PdfLimits::MaxExpandedRequiredStreamBytes);
+  decodeLimits_.maxExpansionRatio = std::min<uint16_t>(decodeLimits_.maxExpansionRatio, PdfLimits::MaxExpansionRatio);
+}
+
+uint64_t PdfXrefParser::currentDecodedBytes() const {
+  if (phase_ == Phase::DecodeXrefStream && streamDecoder_ != nullptr) {
+    return decodedBytes_ + streamDecoder_->outputBytes();
+  }
+  return decodedBytes_;
+}
 
 void PdfXrefParser::begin() {
   table_.reset();
@@ -303,6 +459,7 @@ void PdfXrefParser::begin() {
   streamLength_ = 0;
   eolOffset_ = 0;
   pendingPrev_ = 0;
+  decodedBytes_ = 0;
   xrefExpectedEntries_ = 0;
   xrefDecodedEntries_ = 0;
   xrefCurrentObject_ = 0;
@@ -316,6 +473,8 @@ void PdfXrefParser::begin() {
   xrefIndexPairsRemaining_ = 0;
   streamFilterCount_ = 0;
   hasPendingPrev_ = false;
+  hasPendingEntry_ = false;
+  pendingEntryFromStream_ = false;
   xrefUsesDefaultIndex_ = false;
   std::memset(xrefFieldValues_, 0, sizeof(xrefFieldValues_));
   std::memset(xrefWidths_, 0, sizeof(xrefWidths_));
@@ -342,6 +501,57 @@ PdfStepResult PdfXrefParser::step(PdfWorkBudget& budget) {
   };
 
   while (true) {
+    if (hasPendingEntry_) {
+      PdfXrefEntry entry{};
+      if (pendingEntryFromStream_) {
+        entry.objectNumber = xrefCurrentObject_;
+        entry.type = static_cast<PdfXrefEntryType>(xrefFieldValues_[0]);
+        entry.offset = xrefFieldValues_[1];
+        if (entry.type == PdfXrefEntryType::Compressed) {
+          entry.objectStreamIndex = static_cast<uint32_t>(xrefFieldValues_[2]);
+        } else {
+          entry.generation = static_cast<uint16_t>(xrefFieldValues_[2]);
+        }
+      } else {
+        entry.objectNumber = subsectionStart_ + subsectionIndex_;
+        entry.generation = entryGeneration_;
+        entry.type = static_cast<PdfXrefEntryType>(xrefFieldValues_[0]);
+        entry.offset = entryOffset_;
+      }
+      if (budget.cancelRequested()) {
+        return fail(PdfStatus::failure(PdfError::Cancelled, entry.objectNumber));
+      }
+      if (budget.stopRequested() || budget.operationsRemaining == 0 || budget.bytesRemaining < sizeof(PdfXrefEntry)) {
+        return PdfStepResult::paused();
+      }
+      --budget.operationsRemaining;
+      budget.bytesRemaining -= sizeof(PdfXrefEntry);
+      const PdfStatus appendStatus = table_.appendNewest(entry);
+      if (!appendStatus) {
+        return fail(appendStatus);
+      }
+      hasPendingEntry_ = false;
+      if (pendingEntryFromStream_) {
+        ++xrefDecodedEntries_;
+        --xrefRangeRemaining_;
+        ++xrefCurrentObject_;
+        if (xrefRangeRemaining_ == 0 && xrefIndexPairsRemaining_ != 0) {
+          const PdfStatus rangeStatus = advanceXrefRange();
+          if (!rangeStatus) {
+            return fail(rangeStatus);
+          }
+        }
+        xrefFieldIndex_ = 0;
+        xrefFieldByteIndex_ = 0;
+        std::memset(xrefFieldValues_, 0, sizeof(xrefFieldValues_));
+      } else {
+        ++subsectionIndex_;
+        phase_ = subsectionIndex_ == subsectionCount_ ? Phase::SectionStartOrTrailer : Phase::EntryOffset;
+      }
+      pendingEntryFromStream_ = false;
+      continue;
+    }
+
     if (phase_ == Phase::FindStartXref) {
       const PdfStepResult readResult = pdfStepReadExact(source_, tailRead_, budget);
       if (!readResult.complete()) {
@@ -418,31 +628,140 @@ PdfStepResult PdfXrefParser::step(PdfWorkBudget& budget) {
         }
         streamOffset = eolOffset_ + 2;
       }
+      if (!pdfCheckedRange(streamOffset, streamLength_, source_.size)) {
+        return fail(PdfStatus::failure(PdfError::InvalidOffset, streamOffset));
+      }
+      const uint64_t streamEnd = streamOffset + streamLength_;
+      if (source_.size - streamEnd < PdfMinimumStreamBoundaryBytes) {
+        return fail(PdfStatus::failure(PdfError::Malformed, streamEnd));
+      }
       const PdfStatus rangeStatus = pdfInitializeByteRange(source_, streamOffset, streamLength_, &xrefStreamRange_);
       if (!rangeStatus.ok()) {
         return fail(rangeStatus);
       }
-      const PdfByteSource streamSource = pdfByteRangeSource(xrefStreamRange_);
-      const PdfByteSink streamSink{this, writeDecodedXref};
-      if (streamDecoder_ == nullptr) {
-        return fail(PdfStatus::failure(PdfError::UnsupportedFilter, sectionOffset_));
+      // These classic-xref counters are phase-disjoint while validating an
+      // xref-stream boundary. Reuse them so the parser remains RV32-size
+      // neutral and callers with even a one-byte lexer buffer stay safe.
+      subsectionStart_ = 0;  // bounded lookahead bytes consumed
+      subsectionCount_ = 0;  // boundary matcher state
+      subsectionIndex_ = 0;  // keyword byte index
+      eolOffset_ = streamEnd;
+      eolRead_ = {eolOffset_, &eolByte_, 1, 0};
+      phase_ = Phase::ValidateStreamBoundary;
+      continue;
+    }
+
+    if (phase_ == Phase::ValidateStreamBoundary) {
+      const PdfStepResult readResult = pdfStepReadExact(source_, eolRead_, budget);
+      if (!readResult.complete()) {
+        return readResult.failed() ? fail(readResult.status) : readResult;
       }
-      const PdfStatus decoderStatus =
-          streamDecoder_->begin(streamSource, streamSink, streamFilters_, streamFilterCount_);
-      if (!decoderStatus.ok()) {
-        return fail(decoderStatus);
+      ++subsectionStart_;
+      ++eolOffset_;
+      bool boundaryComplete = false;
+      switch (subsectionCount_) {
+        case 0:
+          if (eolByte_ == '\n') {
+            subsectionCount_ = 2;
+          } else if (eolByte_ == '\r') {
+            subsectionCount_ = 1;
+          } else {
+            return fail(PdfStatus::failure(PdfError::Malformed, eolOffset_ - 1));
+          }
+          break;
+        case 1:
+          if (eolByte_ != '\n') {
+            return fail(PdfStatus::failure(PdfError::Malformed, eolOffset_ - 1));
+          }
+          subsectionCount_ = 2;
+          break;
+        case 2: {
+          static constexpr char keyword[] = "endstream";
+          if (subsectionIndex_ >= sizeof(keyword) - 1 || eolByte_ != keyword[subsectionIndex_]) {
+            return fail(PdfStatus::failure(PdfError::Malformed, eolOffset_ - 1));
+          }
+          if (++subsectionIndex_ == sizeof(keyword) - 1) {
+            subsectionCount_ = 3;
+            subsectionIndex_ = 0;
+          }
+          break;
+        }
+        case 3:
+          if (!pdfIsStreamBoundaryWhitespace(eolByte_)) {
+            return fail(PdfStatus::failure(PdfError::Malformed, eolOffset_ - 1));
+          }
+          subsectionCount_ = 4;
+          break;
+        case 4:
+          if (!pdfIsStreamBoundaryWhitespace(eolByte_)) {
+            if (eolByte_ != 'e') {
+              return fail(PdfStatus::failure(PdfError::Malformed, eolOffset_ - 1));
+            }
+            subsectionCount_ = 5;
+            subsectionIndex_ = 1;
+          }
+          break;
+        case 5: {
+          static constexpr char keyword[] = "endobj";
+          if (subsectionIndex_ >= sizeof(keyword) - 1 || eolByte_ != keyword[subsectionIndex_]) {
+            return fail(PdfStatus::failure(PdfError::Malformed, eolOffset_ - 1));
+          }
+          if (++subsectionIndex_ == sizeof(keyword) - 1) {
+            if (eolOffset_ == source_.size) {
+              boundaryComplete = true;
+            } else {
+              subsectionCount_ = 6;
+            }
+          }
+          break;
+        }
+        case 6:
+          if (!pdfIsStreamBoundaryWhitespace(eolByte_)) {
+            return fail(PdfStatus::failure(PdfError::Malformed, eolOffset_ - 1));
+          }
+          boundaryComplete = true;
+          break;
+        default:
+          return fail(PdfStatus::failure(PdfError::Malformed, eolOffset_ - 1));
       }
-      phase_ = Phase::DecodeXrefStream;
+      if (boundaryComplete) {
+        const PdfStatus decoderStatus = beginXrefStreamDecode();
+        if (!decoderStatus.ok()) {
+          return fail(decoderStatus);
+        }
+        continue;
+      }
+      if (subsectionStart_ >= PdfStreamBoundaryLookaheadBytes || eolOffset_ >= source_.size) {
+        return fail(PdfStatus::failure(PdfError::Malformed, eolOffset_));
+      }
+      eolRead_ = {eolOffset_, &eolByte_, 1, 0};
       continue;
     }
 
     if (phase_ == Phase::DecodeXrefStream) {
+      // Each decoder sink operation may complete at most one xref record. Cap
+      // this call to one decoder operation so a completed pending record is
+      // charged by the parser before more decoded bytes are accepted.
+      const uint32_t callerOperations = budget.operationsRemaining;
+      const uint32_t decoderOperations = std::min<uint32_t>(callerOperations, 1U);
+      budget.operationsRemaining = decoderOperations;
       const PdfStepResult decodeResult = streamDecoder_->step(budget);
+      const uint32_t usedOperations = decoderOperations - budget.operationsRemaining;
+      budget.operationsRemaining = callerOperations - usedOperations;
       if (!decodeResult.complete()) {
         if (decodeResult.failed()) {
           phase_ = Phase::Failed;
+          return decodeResult;
+        }
+        // A short sink accept completed one xref record. Charge and append it
+        // before letting the decoder retry the retained output suffix.
+        if (hasPendingEntry_) {
+          continue;
         }
         return decodeResult;
+      }
+      if (hasPendingEntry_) {
+        continue;
       }
       const PdfStatus finishStatus = finishXrefStream();
       if (!finishStatus.ok()) {
@@ -556,12 +875,9 @@ PdfStepResult PdfXrefParser::step(PdfWorkBudget& budget) {
         if (entry.type == PdfXrefEntryType::Uncompressed && entry.offset >= source_.size) {
           return fail(PdfStatus::failure(PdfError::InvalidOffset, entry.offset));
         }
-        const PdfStatus appendStatus = table_.appendNewest(entry);
-        if (!appendStatus.ok()) {
-          return fail(appendStatus);
-        }
-        ++subsectionIndex_;
-        phase_ = subsectionIndex_ == subsectionCount_ ? Phase::SectionStartOrTrailer : Phase::EntryOffset;
+        xrefFieldValues_[0] = static_cast<uint64_t>(entry.type);
+        hasPendingEntry_ = true;
+        pendingEntryFromStream_ = false;
         break;
       }
 
@@ -768,6 +1084,25 @@ PdfStatus PdfXrefParser::configureXrefStream(const uint16_t rootIndex) {
                                         &streamFilterCount_);
 }
 
+PdfStatus PdfXrefParser::beginXrefStreamDecode() {
+  const PdfByteSource streamSource = pdfByteRangeSource(xrefStreamRange_);
+  const PdfByteSink streamSink{this, writeDecodedXref};
+  if (streamDecoder_ == nullptr) {
+    return PdfStatus::failure(PdfError::UnsupportedFilter, sectionOffset_);
+  }
+  if (decodeLimits_.maxExpandedBytes <= decodedBytes_) {
+    return PdfStatus::failure(PdfError::ExpansionLimit, decodedBytes_);
+  }
+  PdfStreamDecodeLimits streamLimits = decodeLimits_;
+  streamLimits.maxExpandedBytes -= decodedBytes_;
+  const PdfStatus status =
+      streamDecoder_->begin(streamSource, streamSink, streamFilters_, streamFilterCount_, streamLimits);
+  if (status.ok()) {
+    phase_ = Phase::DecodeXrefStream;
+  }
+  return status;
+}
+
 PdfStatus PdfXrefParser::advanceXrefRange() {
   if (xrefUsesDefaultIndex_ || xrefIndexPairsRemaining_ == 0) {
     xrefRangeRemaining_ = 0;
@@ -795,7 +1130,7 @@ PdfStatus PdfXrefParser::advanceXrefRange() {
 }
 
 PdfStatus PdfXrefParser::consumeXrefByte(const uint8_t byte) {
-  if (xrefDecodedEntries_ >= xrefExpectedEntries_ || xrefRangeRemaining_ == 0) {
+  if (hasPendingEntry_ || xrefDecodedEntries_ >= xrefExpectedEntries_ || xrefRangeRemaining_ == 0) {
     return PdfStatus::failure(PdfError::Malformed, sectionOffset_);
   }
   while (xrefFieldIndex_ < 3 && xrefWidths_[xrefFieldIndex_] == 0) {
@@ -845,23 +1180,8 @@ PdfStatus PdfXrefParser::consumeXrefByte(const uint8_t byte) {
     entry.offset = xrefFieldValues_[1];
     entry.objectStreamIndex = static_cast<uint32_t>(xrefFieldValues_[2]);
   }
-  const PdfStatus appendStatus = table_.appendNewest(entry);
-  if (!appendStatus.ok()) {
-    return appendStatus;
-  }
-
-  ++xrefDecodedEntries_;
-  --xrefRangeRemaining_;
-  ++xrefCurrentObject_;
-  if (xrefRangeRemaining_ == 0 && xrefIndexPairsRemaining_ != 0) {
-    const PdfStatus rangeStatus = advanceXrefRange();
-    if (!rangeStatus.ok()) {
-      return rangeStatus;
-    }
-  }
-  xrefFieldIndex_ = 0;
-  xrefFieldByteIndex_ = 0;
-  std::memset(xrefFieldValues_, 0, sizeof(xrefFieldValues_));
+  hasPendingEntry_ = true;
+  pendingEntryFromStream_ = true;
   return PdfStatus::success();
 }
 
@@ -878,15 +1198,24 @@ PdfStatus PdfXrefParser::writeDecodedXref(void* context, const uint8_t* source, 
       return status;
     }
     ++*bytesWritten;
+    if (parser.hasPendingEntry_) {
+      break;
+    }
   }
   return PdfStatus::success();
 }
 
 PdfStatus PdfXrefParser::finishXrefStream() {
-  if (xrefDecodedEntries_ != xrefExpectedEntries_ || xrefFieldIndex_ != 0 || xrefFieldByteIndex_ != 0 ||
-      xrefRangeRemaining_ != 0 || xrefIndexPairsRemaining_ != 0) {
+  if (hasPendingEntry_ || xrefDecodedEntries_ != xrefExpectedEntries_ || xrefFieldIndex_ != 0 ||
+      xrefFieldByteIndex_ != 0 || xrefRangeRemaining_ != 0 || xrefIndexPairsRemaining_ != 0) {
     return PdfStatus::failure(PdfError::UnexpectedEof, sectionOffset_);
   }
+  uint64_t completedBytes = 0;
+  if (streamDecoder_ == nullptr || !pdfCheckedAdd(decodedBytes_, streamDecoder_->outputBytes(), &completedBytes) ||
+      completedBytes > decodeLimits_.maxExpandedBytes) {
+    return PdfStatus::failure(PdfError::ExpansionLimit, decodedBytes_);
+  }
+  decodedBytes_ = completedBytes;
   PdfObjectReference existingRoot;
   if (hasPendingPrev_) {
     return enterSection(pendingPrev_);

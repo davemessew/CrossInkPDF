@@ -427,9 +427,6 @@ PdfStatus pdfDecodePdfTextString(const uint8_t* const source, const size_t sourc
 }
 
 PdfStatus PdfSimpleEncoding::setSourceAccess(const bool required) {
-  if (sourceAccessRequired_ == required) {
-    return PdfStatus::success();
-  }
   if (workspace_.setSourceAccess != nullptr) {
     const PdfStatus status = workspace_.setSourceAccess(workspace_.sourceAccessContext, required);
     if (!status.ok()) {

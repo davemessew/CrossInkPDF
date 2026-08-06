@@ -5,8 +5,12 @@
 #include <limits>
 
 #include "PdfCheckedMath.h"
+#include "PdfStreamBoundary.h"
 
 namespace {
+
+constexpr uint64_t kResolvingIndirectLength = std::numeric_limits<uint64_t>::max();
+constexpr uint64_t kResolvedIndirectLength = std::numeric_limits<uint64_t>::max() - 1U;
 
 bool tokenEquals(const PdfToken& token, const char* expected) {
   const size_t length = std::strlen(expected);
@@ -47,6 +51,33 @@ bool dictionaryUnsigned(const PdfObjectArena& arena, const uint16_t dictionaryIn
   return true;
 }
 
+PdfStatus uniqueDictionaryValue(const PdfObjectArena& arena, const uint16_t dictionaryIndex, const char* key,
+                                uint16_t* const valueIndex) {
+  if (key == nullptr || valueIndex == nullptr || dictionaryIndex >= arena.valueCount ||
+      arena.values[dictionaryIndex].kind != PdfValueKind::Dictionary) {
+    return PdfStatus::failure(PdfError::Malformed, dictionaryIndex);
+  }
+  const size_t keyLength = std::strlen(key);
+  const PdfValue& dictionary = arena.values[dictionaryIndex];
+  uint16_t entryIndex = dictionary.firstLink;
+  uint8_t matches = 0;
+  for (uint16_t ordinal = 0; ordinal < dictionary.count; ++ordinal) {
+    if (entryIndex >= arena.dictionaryCount) {
+      return PdfStatus::failure(PdfError::Malformed, dictionaryIndex);
+    }
+    const PdfDictionaryEntry& entry = arena.dictionaryEntries[entryIndex];
+    if (entry.keyLength == keyLength && static_cast<uint32_t>(entry.keyOffset) + entry.keyLength <= arena.textLength &&
+        std::memcmp(arena.text + entry.keyOffset, key, keyLength) == 0) {
+      if (++matches > 1 || entry.valueIndex >= arena.valueCount) {
+        return PdfStatus::failure(PdfError::Malformed, dictionaryIndex);
+      }
+      *valueIndex = entry.valueIndex;
+    }
+    entryIndex = entry.next;
+  }
+  return matches == 1 ? PdfStatus::success() : PdfStatus::failure(PdfError::Malformed, dictionaryIndex);
+}
+
 }  // namespace
 
 PdfObjectResolver::PdfObjectResolver(const PdfByteSource& source, const PdfXrefTable& xref, uint8_t* sourceBuffer,
@@ -58,87 +89,46 @@ PdfObjectResolver::PdfObjectResolver(const PdfByteSource& source, const PdfXrefT
       arena_(arena),
       parser_(lexer_, arena),
       workspace_(workspace),
-      streamDecoder_(workspace.streamDecoder) {}
+      streamDecoder_(workspace.streamDecoder) {
+  workspace_.decodeLimits.maxExpandedBytes =
+      std::min<uint64_t>(workspace_.decodeLimits.maxExpandedBytes, PdfLimits::MaxExpandedRequiredStreamBytes);
+  workspace_.decodeLimits.maxExpansionRatio =
+      std::min<uint16_t>(workspace_.decodeLimits.maxExpansionRatio, PdfLimits::MaxExpansionRatio);
+}
+
+uint64_t PdfObjectResolver::currentStreamBytes() const {
+  if (phase_ == Phase::DecodeObjectStream && streamDecoder_ != nullptr) {
+    return streamDecoder_->outputBytes();
+  }
+  return objectStreamDecodedSize_;
+}
+
+uint64_t PdfObjectResolver::takeCompletedStreamBytes() {
+  const uint64_t completed = completedStreamBytes_;
+  completedStreamBytes_ = 0;
+  return completed;
+}
 
 PdfStatus PdfObjectResolver::begin(const PdfObjectReference reference) {
+  if (resolvingIndirectLength() || hasResolvedIndirectLength()) {
+    cachedObjectStreamNumber_ = 0;
+    cachedObjectStreamCount_ = 0;
+    cachedObjectStreamFirst_ = 0;
+    cachedObjectStreamSize_ = 0;
+    cachedObjectStreamUsesStore_ = false;
+  }
   result_ = {};
   result_.reference = reference;
   activeReference_ = reference;
   resolvingObjectStream_ = false;
   objectStreamTargetFound_ = false;
+  objectStreamDecodedSize_ = 0;
+  objectStreamUsesStore_ = false;
+  publishObjectStream_ = false;
   streamFilterCount_ = 0;
-
-  PdfXrefEntry entry;
-  PdfStatus status = xref_.find(reference.objectNumber, &entry);
-  if (!status.ok()) {
-    phase_ = Phase::Failed;
-    return status;
-  }
-  if (entry.type == PdfXrefEntryType::Free) {
-    phase_ = Phase::Failed;
-    return PdfStatus::failure(PdfError::InvalidOffset, reference.objectNumber);
-  }
-
-  if (entry.type != PdfXrefEntryType::Compressed) {
-    if (entry.generation != reference.generation) {
-      phase_ = Phase::Failed;
-      return PdfStatus::failure(PdfError::InvalidOffset, reference.objectNumber);
-    }
-    status = setSourceAccess(true);
-    if (!status.ok()) {
-      phase_ = Phase::Failed;
-      return status;
-    }
-    return beginUncompressed(reference, entry);
-  }
-
-  if (reference.generation != 0 || !workspace_.objectStreamStore.valid() ||
-      entry.offset > PdfLimits::MaxIndirectObjects || entry.objectStreamIndex >= PdfLimits::MaxIndirectObjects) {
-    phase_ = Phase::Failed;
-    return PdfStatus::failure(workspace_.objectStreamStore.valid() ? PdfError::Malformed : PdfError::Unsupported,
-                              reference.objectNumber);
-  }
-  objectStreamNumber_ = static_cast<uint32_t>(entry.offset);
-  objectStreamTargetIndex_ = entry.objectStreamIndex;
-  if (objectStreamNumber_ == reference.objectNumber) {
-    phase_ = Phase::Failed;
-    return PdfStatus::failure(PdfError::Malformed, reference.objectNumber);
-  }
-
-  if (cachedObjectStreamNumber_ == objectStreamNumber_ && cachedObjectStreamSize_ != 0) {
-    objectStreamObjectCount_ = cachedObjectStreamCount_;
-    objectStreamFirst_ = cachedObjectStreamFirst_;
-    objectStreamDecodedSize_ = cachedObjectStreamSize_;
-    objectStoreSource_ = pdfByteStoreSource(workspace_.objectStreamStore);
-    status = setSourceAccess(false);
-    if (!status.ok() || !objectStoreSource_.valid()) {
-      phase_ = Phase::Failed;
-      return status.ok() ? PdfStatus::failure(PdfError::IoFailure, objectStreamNumber_) : status;
-    }
-    status = beginObjectStreamIndex();
-    if (!status.ok()) {
-      phase_ = Phase::Failed;
-    }
-    return status;
-  }
-
-  status = setSourceAccess(true);
-  if (!status.ok()) {
-    phase_ = Phase::Failed;
-    return status;
-  }
-  PdfXrefEntry objectStreamEntry;
-  status = xref_.find(objectStreamNumber_, &objectStreamEntry);
-  if (!status.ok()) {
-    phase_ = Phase::Failed;
-    return status;
-  }
-  if (objectStreamEntry.type != PdfXrefEntryType::Uncompressed) {
-    phase_ = Phase::Failed;
-    return PdfStatus::failure(PdfError::Malformed, objectStreamNumber_);
-  }
-  resolvingObjectStream_ = true;
-  return beginUncompressed({objectStreamNumber_, objectStreamEntry.generation}, objectStreamEntry);
+  const PdfStatus status = xref_.beginFind(reference.objectNumber, &xrefLookup_);
+  phase_ = status ? Phase::SelectXref : Phase::Failed;
+  return status;
 }
 
 PdfStatus PdfObjectResolver::beginUncompressed(const PdfObjectReference reference, const PdfXrefEntry& entry) {
@@ -166,6 +156,162 @@ PdfStepResult PdfObjectResolver::step(PdfWorkBudget& budget) {
   };
 
   while (true) {
+    if (budget.cancelRequested()) {
+      return fail(PdfStatus::failure(PdfError::Cancelled, activeReference_.objectNumber));
+    }
+    if (budget.stopRequested()) {
+      return PdfStepResult::paused();
+    }
+
+    if (phase_ == Phase::SelectXref) {
+      const PdfStepResult access = stepSourceAccess(PdfObjectResolverReader::Xref, budget);
+      if (!access.complete()) {
+        return access.failed() ? fail(access.status) : access;
+      }
+      phase_ = Phase::LookupReference;
+      return PdfStepResult::paused();
+    }
+
+    if (phase_ == Phase::LookupReference) {
+      const PdfStepResult lookup = xref_.stepFind(xrefLookup_, &xrefLookup_.entry, budget);
+      if (!lookup.complete()) {
+        return lookup.failed() ? fail(lookup.status) : lookup;
+      }
+      if (xrefLookup_.entry.type == PdfXrefEntryType::Free) {
+        return fail(PdfStatus::failure(PdfError::InvalidOffset, lookupTargetReference().objectNumber));
+      }
+      if (xrefLookup_.entry.type != PdfXrefEntryType::Compressed) {
+        if (xrefLookup_.entry.generation != lookupTargetReference().generation) {
+          return fail(PdfStatus::failure(PdfError::InvalidOffset, lookupTargetReference().objectNumber));
+        }
+        phase_ = Phase::SelectUncompressedSource;
+        return PdfStepResult::paused();
+      }
+
+      if (lookupTargetReference().generation != 0 || xrefLookup_.entry.offset > PdfLimits::MaxIndirectObjects ||
+          xrefLookup_.entry.objectStreamIndex >= PdfLimits::MaxIndirectObjects) {
+        return fail(PdfStatus::failure(PdfError::Malformed, lookupTargetReference().objectNumber));
+      }
+      objectStreamNumber_ = static_cast<uint32_t>(xrefLookup_.entry.offset);
+      objectStreamTargetIndex_ = xrefLookup_.entry.objectStreamIndex;
+      if (objectStreamNumber_ == lookupTargetReference().objectNumber) {
+        return fail(PdfStatus::failure(PdfError::Malformed, lookupTargetReference().objectNumber));
+      }
+
+      if (!resolvingIndirectLength() && !hasResolvedIndirectLength() &&
+          cachedObjectStreamNumber_ == objectStreamNumber_ && cachedObjectStreamSize_ != 0) {
+        objectStreamObjectCount_ = cachedObjectStreamCount_;
+        objectStreamFirst_ = cachedObjectStreamFirst_;
+        objectStreamDecodedSize_ = cachedObjectStreamSize_;
+        objectStreamUsesStore_ = cachedObjectStreamUsesStore_;
+        publishObjectStream_ = false;
+        phase_ = objectStreamUsesStore_ ? Phase::SelectObjectStore : Phase::SelectDirectObjectStream;
+        return PdfStepResult::paused();
+      }
+
+      const PdfStatus status = xref_.beginFind(objectStreamNumber_, &xrefLookup_);
+      if (!status) {
+        return fail(status);
+      }
+      phase_ = Phase::LookupObjectStream;
+      return PdfStepResult::paused();
+    }
+
+    if (phase_ == Phase::LookupObjectStream) {
+      const PdfStepResult lookup = xref_.stepFind(xrefLookup_, &xrefLookup_.entry, budget);
+      if (!lookup.complete()) {
+        return lookup.failed() ? fail(lookup.status) : lookup;
+      }
+      if (xrefLookup_.entry.type != PdfXrefEntryType::Uncompressed) {
+        return fail(PdfStatus::failure(PdfError::Malformed, objectStreamNumber_));
+      }
+      phase_ = Phase::SelectObjectStreamSource;
+      return PdfStepResult::paused();
+    }
+
+    if (phase_ == Phase::SelectUncompressedSource || phase_ == Phase::SelectObjectStreamSource) {
+      const bool objectStream = phase_ == Phase::SelectObjectStreamSource;
+      const PdfStepResult access = stepSourceAccess(PdfObjectResolverReader::Source, budget);
+      if (!access.complete()) {
+        return access.failed() ? fail(access.status) : access;
+      }
+      resolvingObjectStream_ = objectStream;
+      const PdfObjectReference reference =
+          objectStream ? PdfObjectReference{objectStreamNumber_, xrefLookup_.entry.generation}
+                       : lookupTargetReference();
+      const PdfStatus status = beginUncompressed(reference, xrefLookup_.entry);
+      if (!status) {
+        return fail(status);
+      }
+      return PdfStepResult::paused();
+    }
+
+    if (phase_ == Phase::ConfigureObjectStream) {
+      if (!budget.consumeOperation()) {
+        return PdfStepResult::paused();
+      }
+      const PdfStatus status = configureObjectStream(pendingObjectStreamOffset_);
+      if (!status) {
+        return fail(status);
+      }
+      return PdfStepResult::paused();
+    }
+
+    if (phase_ == Phase::SelectObjectStoreWriter) {
+      const PdfStepResult access = stepSourceAccess(PdfObjectResolverReader::ObjectStoreWriter, budget);
+      if (!access.complete()) {
+        return access.failed() ? fail(access.status) : access;
+      }
+      phase_ = Phase::ResetObjectStreamStore;
+      return PdfStepResult::paused();
+    }
+
+    if (phase_ == Phase::ResetObjectStreamStore) {
+      if (!budget.consumeOperation()) {
+        return PdfStepResult::paused();
+      }
+      clearObjectStreamCache();
+      const PdfStatus status = workspace_.objectStreamStore.reset(workspace_.objectStreamStore.context);
+      if (!status) {
+        return fail(status);
+      }
+      phase_ = Phase::BeginObjectStreamDecode;
+      return PdfStepResult::paused();
+    }
+
+    if (phase_ == Phase::BeginObjectStreamDecode) {
+      if (!budget.consumeOperation()) {
+        return PdfStepResult::paused();
+      }
+      const PdfStatus status = beginObjectStreamDecode();
+      if (!status) {
+        return fail(status);
+      }
+      return PdfStepResult::paused();
+    }
+
+    if (phase_ == Phase::SelectObjectStore || phase_ == Phase::SelectDirectObjectStream) {
+      const bool stored = phase_ == Phase::SelectObjectStore;
+      const PdfStepResult access =
+          stepSourceAccess(stored ? PdfObjectResolverReader::ObjectStore : PdfObjectResolverReader::Source, budget);
+      if (!access.complete()) {
+        return access.failed() ? fail(access.status) : access;
+      }
+      phase_ = Phase::ActivateObjectStream;
+      return PdfStepResult::paused();
+    }
+
+    if (phase_ == Phase::ActivateObjectStream) {
+      if (!budget.consumeOperation()) {
+        return PdfStepResult::paused();
+      }
+      const PdfStatus status = activateObjectStream();
+      if (!status) {
+        return fail(status);
+      }
+      return PdfStepResult::paused();
+    }
+
     if (phase_ == Phase::ParseValue || phase_ == Phase::ParseEmbeddedValue) {
       const bool embedded = phase_ == Phase::ParseEmbeddedValue;
       const PdfStepResult parseResult = parser_.step(budget);
@@ -177,6 +323,13 @@ PdfStepResult PdfObjectResolver::step(PdfWorkBudget& budget) {
       }
       result_.rootIndex = parser_.rootIndex();
       if (embedded) {
+        if (resolvingIndirectLength()) {
+          const PdfStatus status = finishIndirectLength();
+          if (!status.ok()) {
+            return fail(status);
+          }
+          return PdfStepResult::paused();
+        }
         result_.streamOffset = 0;
         result_.streamLength = 0;
         result_.hasStream = false;
@@ -195,27 +348,9 @@ PdfStepResult PdfObjectResolver::step(PdfWorkBudget& budget) {
         }
         return decodeResult;
       }
-      PdfStatus status = setSourceAccess(false);
-      if (!status.ok()) {
-        return fail(status);
-      }
-      objectStoreSource_ = pdfByteStoreSource(workspace_.objectStreamStore);
-      if (!objectStoreSource_.valid()) {
-        return fail(PdfStatus::failure(PdfError::IoFailure, objectStreamNumber_));
-      }
-      objectStreamDecodedSize_ = objectStoreSource_.size;
-      if (objectStreamFirst_ > objectStreamDecodedSize_) {
-        return fail(PdfStatus::failure(PdfError::Malformed, objectStreamNumber_));
-      }
-      cachedObjectStreamNumber_ = objectStreamNumber_;
-      cachedObjectStreamCount_ = objectStreamObjectCount_;
-      cachedObjectStreamFirst_ = objectStreamFirst_;
-      cachedObjectStreamSize_ = objectStreamDecodedSize_;
-      status = beginObjectStreamIndex();
-      if (!status.ok()) {
-        return fail(status);
-      }
-      continue;
+      objectStreamDecodedSize_ = streamDecoder_->outputBytes();
+      phase_ = Phase::SelectObjectStore;
+      return PdfStepResult::paused();
     }
 
     if (phase_ == Phase::StreamFirstEol || phase_ == Phase::StreamSecondEol) {
@@ -246,14 +381,32 @@ PdfStepResult PdfObjectResolver::step(PdfWorkBudget& budget) {
       if (!pdfCheckedRange(streamOffset, result_.streamLength, source_.size)) {
         return fail(PdfStatus::failure(PdfError::InvalidOffset, streamOffset));
       }
-      if (resolvingObjectStream_) {
-        const PdfStatus status = prepareObjectStream(streamOffset);
-        if (!status.ok()) {
-          return fail(status);
-        }
-        continue;
+      const uint64_t streamEnd = streamOffset + result_.streamLength;
+      const uint64_t available = source_.size - streamEnd;
+      static_assert(sizeof(objectStreamSourceRange_) >= PdfStreamBoundaryLookaheadBytes);
+      const size_t boundaryLength = static_cast<size_t>(std::min<uint64_t>(available, PdfStreamBoundaryLookaheadBytes));
+      if (boundaryLength < PdfMinimumStreamBoundaryBytes) {
+        return fail(PdfStatus::failure(PdfError::Malformed, streamEnd));
       }
       result_.streamOffset = streamOffset;
+      eolRead_ = {streamEnd, reinterpret_cast<uint8_t*>(&objectStreamSourceRange_), boundaryLength, 0};
+      phase_ = Phase::ValidateStreamBoundary;
+      continue;
+    }
+
+    if (phase_ == Phase::ValidateStreamBoundary) {
+      const PdfStepResult readResult = pdfStepReadExact(source_, eolRead_, budget);
+      if (!readResult.complete()) {
+        return readResult.failed() ? fail(readResult.status) : readResult;
+      }
+      if (!pdfValidateStreamBoundary(reinterpret_cast<const uint8_t*>(&objectStreamSourceRange_), eolRead_.length)) {
+        return fail(PdfStatus::failure(PdfError::Malformed, result_.streamOffset + result_.streamLength));
+      }
+      if (resolvingObjectStream_) {
+        pendingObjectStreamOffset_ = result_.streamOffset;
+        phase_ = Phase::ConfigureObjectStream;
+        continue;
+      }
       result_.hasStream = true;
       phase_ = Phase::Done;
       return PdfStepResult::completed();
@@ -296,6 +449,16 @@ PdfStepResult PdfObjectResolver::step(PdfWorkBudget& budget) {
         if (token.kind != PdfTokenKind::Keyword) {
           return fail(PdfStatus::failure(PdfError::Malformed, lexer_.tokenOffset()));
         }
+        if (resolvingIndirectLength() && activeReference_ == lookupTargetReference()) {
+          if (!tokenEquals(token, "endobj")) {
+            return fail(PdfStatus::failure(PdfError::Malformed, lexer_.tokenOffset()));
+          }
+          const PdfStatus status = finishIndirectLength();
+          if (!status.ok()) {
+            return fail(status);
+          }
+          return PdfStepResult::paused();
+        }
         if (tokenEquals(token, "endobj")) {
           if (resolvingObjectStream_) {
             return fail(PdfStatus::failure(PdfError::Malformed, activeReference_.objectNumber));
@@ -309,18 +472,32 @@ PdfStepResult PdfObjectResolver::step(PdfWorkBudget& budget) {
         }
         {
           uint16_t lengthIndex = PDF_INVALID_INDEX;
-          if (!pdfDictionaryFind(arena_, result_.rootIndex, "Length", &lengthIndex) ||
-              lengthIndex >= arena_.valueCount) {
-            return fail(PdfStatus::failure(PdfError::Malformed, lexer_.tokenOffset()));
+          const PdfStatus lengthStatus = uniqueDictionaryValue(arena_, result_.rootIndex, "Length", &lengthIndex);
+          if (!lengthStatus.ok()) {
+            return fail(lengthStatus);
           }
           const PdfValue& length = arena_.values[lengthIndex];
           if (length.kind == PdfValueKind::Reference) {
-            return fail(PdfStatus::failure(PdfError::Unsupported, lexer_.tokenOffset()));
+            const PdfObjectReference reference{length.objectNumber, length.generation};
+            if (hasResolvedIndirectLength()) {
+              if (cachedObjectStreamNumber_ != reference.objectNumber ||
+                  cachedObjectStreamCount_ != reference.generation) {
+                return fail(PdfStatus::failure(PdfError::Malformed, lexer_.tokenOffset()));
+              }
+              result_.streamLength = cachedObjectStreamFirst_;
+            } else {
+              const PdfStatus status = beginIndirectLength(reference);
+              if (!status.ok()) {
+                return fail(status);
+              }
+              return PdfStepResult::paused();
+            }
+          } else {
+            if (length.kind != PdfValueKind::Integer || length.integerValue < 0) {
+              return fail(PdfStatus::failure(PdfError::Malformed, lexer_.tokenOffset()));
+            }
+            result_.streamLength = static_cast<uint64_t>(length.integerValue);
           }
-          if (length.kind != PdfValueKind::Integer || length.integerValue < 0) {
-            return fail(PdfStatus::failure(PdfError::Malformed, lexer_.tokenOffset()));
-          }
-          result_.streamLength = static_cast<uint64_t>(length.integerValue);
           eolOffset_ = lexer_.position();
           eolRead_ = {eolOffset_, &eolByte_, 1, 0};
           phase_ = Phase::StreamFirstEol;
@@ -343,8 +520,8 @@ PdfStepResult PdfObjectResolver::step(PdfWorkBudget& budget) {
         }
         objectStreamCurrentOffset_ = value;
         if (objectStreamIndexOrdinal_ == objectStreamTargetIndex_) {
-          if (objectStreamIndexObjectNumber_ != result_.reference.objectNumber) {
-            return fail(PdfStatus::failure(PdfError::Malformed, result_.reference.objectNumber));
+          if (objectStreamIndexObjectNumber_ != lookupTargetReference().objectNumber) {
+            return fail(PdfStatus::failure(PdfError::Malformed, lookupTargetReference().objectNumber));
           }
           objectStreamTargetStart_ = value;
           objectStreamTargetFound_ = true;
@@ -355,7 +532,7 @@ PdfStepResult PdfObjectResolver::step(PdfWorkBudget& budget) {
         ++objectStreamIndexOrdinal_;
         if (objectStreamIndexOrdinal_ == objectStreamObjectCount_) {
           if (!objectStreamTargetFound_) {
-            return fail(PdfStatus::failure(PdfError::Malformed, result_.reference.objectNumber));
+            return fail(PdfStatus::failure(PdfError::Malformed, lookupTargetReference().objectNumber));
           }
           if (objectStreamTargetIndex_ + 1 >= objectStreamObjectCount_) {
             objectStreamTargetEnd_ = bodyLength;
@@ -376,11 +553,61 @@ PdfStepResult PdfObjectResolver::step(PdfWorkBudget& budget) {
   }
 }
 
-PdfStatus PdfObjectResolver::prepareObjectStream(const uint64_t streamOffset) {
-  if (!workspace_.objectStreamStore.valid() || workspace_.objectStreamStore.capacity == 0 ||
-      streamDecoder_ == nullptr || result_.rootIndex >= arena_.valueCount ||
-      arena_.values[result_.rootIndex].kind != PdfValueKind::Dictionary) {
-    return PdfStatus::failure(PdfError::Unsupported, objectStreamNumber_);
+bool PdfObjectResolver::resolvingIndirectLength() const { return cachedObjectStreamSize_ == kResolvingIndirectLength; }
+
+bool PdfObjectResolver::hasResolvedIndirectLength() const { return cachedObjectStreamSize_ == kResolvedIndirectLength; }
+
+PdfObjectReference PdfObjectResolver::lookupTargetReference() const {
+  return resolvingIndirectLength()
+             ? PdfObjectReference{cachedObjectStreamNumber_, static_cast<uint16_t>(cachedObjectStreamCount_)}
+             : result_.reference;
+}
+
+PdfStatus PdfObjectResolver::beginIndirectLength(const PdfObjectReference reference) {
+  if (resolvingIndirectLength() || hasResolvedIndirectLength() || reference == result_.reference ||
+      reference == activeReference_) {
+    return PdfStatus::failure(PdfError::Malformed, reference.objectNumber);
+  }
+  cachedObjectStreamNumber_ = reference.objectNumber;
+  cachedObjectStreamCount_ = reference.generation;
+  cachedObjectStreamFirst_ = 0;
+  cachedObjectStreamSize_ = kResolvingIndirectLength;
+  activeReference_ = reference;
+  resolvingObjectStream_ = false;
+  objectStreamTargetFound_ = false;
+  streamFilterCount_ = 0;
+  const PdfStatus status = xref_.beginFind(reference.objectNumber, &xrefLookup_);
+  phase_ = status.ok() ? Phase::SelectXref : Phase::Failed;
+  return status;
+}
+
+PdfStatus PdfObjectResolver::finishIndirectLength() {
+  if (!resolvingIndirectLength() || result_.rootIndex >= arena_.valueCount) {
+    return PdfStatus::failure(PdfError::Malformed, lookupTargetReference().objectNumber);
+  }
+  const PdfValue& value = arena_.values[result_.rootIndex];
+  if (value.kind != PdfValueKind::Integer || value.integerValue < 0) {
+    return PdfStatus::failure(PdfError::Malformed, lookupTargetReference().objectNumber);
+  }
+  cachedObjectStreamFirst_ = static_cast<uint64_t>(value.integerValue);
+  cachedObjectStreamSize_ = kResolvedIndirectLength;
+
+  result_.rootIndex = PDF_INVALID_INDEX;
+  result_.streamOffset = 0;
+  result_.streamLength = 0;
+  result_.hasStream = false;
+  activeReference_ = result_.reference;
+  resolvingObjectStream_ = false;
+  objectStreamTargetFound_ = false;
+  streamFilterCount_ = 0;
+  const PdfStatus status = xref_.beginFind(result_.reference.objectNumber, &xrefLookup_);
+  phase_ = status.ok() ? Phase::SelectXref : Phase::Failed;
+  return status;
+}
+
+PdfStatus PdfObjectResolver::configureObjectStream(const uint64_t streamOffset) {
+  if (result_.rootIndex >= arena_.valueCount || arena_.values[result_.rootIndex].kind != PdfValueKind::Dictionary) {
+    return PdfStatus::failure(PdfError::Malformed, objectStreamNumber_);
   }
   uint16_t typeIndex = PDF_INVALID_INDEX;
   if (!pdfDictionaryFind(arena_, result_.rootIndex, "Type", &typeIndex) || typeIndex >= arena_.valueCount ||
@@ -403,29 +630,85 @@ PdfStatus PdfObjectResolver::prepareObjectStream(const uint64_t streamOffset) {
   if (!filterStatus.ok()) {
     return filterStatus;
   }
+  if (workspace_.decodeLimits.maxExpandedBytes == 0 || workspace_.decodeLimits.maxExpansionRatio == 0) {
+    return PdfStatus::failure(PdfError::ExpansionLimit, objectStreamNumber_);
+  }
+  if (!resolvingIndirectLength() && !hasResolvedIndirectLength() && cachedObjectStreamNumber_ != 0 &&
+      cachedObjectStreamNumber_ != objectStreamNumber_) {
+    clearObjectStreamCache();
+  }
 
-  PdfStatus status = pdfInitializeByteRange(source_, streamOffset, result_.streamLength, &objectStreamSourceRange_);
+  const PdfStatus status =
+      pdfInitializeByteRange(source_, streamOffset, result_.streamLength, &objectStreamSourceRange_);
   if (!status.ok()) {
     return status;
   }
-  status = workspace_.objectStreamStore.reset(workspace_.objectStreamStore.context);
-  if (!status.ok()) {
-    return status;
-  }
-  const PdfByteSource streamSource = pdfByteRangeSource(objectStreamSourceRange_);
-  const PdfByteSink streamSink = pdfByteStoreSink(workspace_.objectStreamStore);
-  PdfStreamDecodeLimits limits;
-  limits.maxExpandedBytes =
-      std::min<uint64_t>(PdfLimits::MaxExpandedRequiredStreamBytes, workspace_.objectStreamStore.capacity);
-  status = streamDecoder_->begin(streamSource, streamSink, streamFilters_, streamFilterCount_, limits);
-  if (!status.ok()) {
-    return status;
-  }
+  objectStreamUsesStore_ = streamFilterCount_ != 0;
+  publishObjectStream_ = true;
+  objectStreamDecodedSize_ = 0;
   result_.streamOffset = 0;
   result_.streamLength = 0;
   result_.hasStream = false;
+
+  if (!objectStreamUsesStore_) {
+    objectStreamDecodedSize_ = objectStreamSourceRange_.length;
+    if (objectStreamDecodedSize_ > workspace_.decodeLimits.maxExpandedBytes) {
+      return PdfStatus::failure(PdfError::ExpansionLimit, objectStreamDecodedSize_);
+    }
+    phase_ = Phase::SelectDirectObjectStream;
+    return PdfStatus::success();
+  }
+
+  if (!workspace_.objectStreamStore.valid() || workspace_.objectStreamStore.capacity == 0 ||
+      streamDecoder_ == nullptr) {
+    return PdfStatus::failure(PdfError::Unsupported, objectStreamNumber_);
+  }
+  phase_ = Phase::SelectObjectStoreWriter;
+  return PdfStatus::success();
+}
+
+PdfStatus PdfObjectResolver::beginObjectStreamDecode() {
+  const PdfByteSource streamSource = pdfByteRangeSource(objectStreamSourceRange_);
+  const PdfByteSink streamSink = pdfByteStoreSink(workspace_.objectStreamStore);
+  PdfStreamDecodeLimits limits = workspace_.decodeLimits;
+  limits.maxExpandedBytes = std::min(limits.maxExpandedBytes, workspace_.objectStreamStore.capacity);
+  if (limits.maxExpandedBytes == 0) {
+    return PdfStatus::failure(PdfError::ExpansionLimit, objectStreamNumber_);
+  }
+  const PdfStatus status = streamDecoder_->begin(streamSource, streamSink, streamFilters_, streamFilterCount_, limits);
+  if (!status.ok()) {
+    return status;
+  }
   phase_ = Phase::DecodeObjectStream;
   return PdfStatus::success();
+}
+
+PdfStatus PdfObjectResolver::activateObjectStream() {
+  objectStoreSource_ = objectStreamUsesStore_ ? pdfByteStoreSource(workspace_.objectStreamStore)
+                                              : pdfByteRangeSource(objectStreamSourceRange_);
+  if (!objectStoreSource_.valid() || objectStoreSource_.size != objectStreamDecodedSize_) {
+    return PdfStatus::failure(PdfError::IoFailure, objectStreamNumber_);
+  }
+  if (objectStreamFirst_ > objectStreamDecodedSize_) {
+    return PdfStatus::failure(PdfError::Malformed, objectStreamNumber_);
+  }
+  if (publishObjectStream_) {
+    if (objectStreamDecodedSize_ > workspace_.decodeLimits.maxExpandedBytes ||
+        completedStreamBytes_ > std::numeric_limits<uint64_t>::max() - objectStreamDecodedSize_) {
+      return PdfStatus::failure(PdfError::ExpansionLimit, objectStreamDecodedSize_);
+    }
+    workspace_.decodeLimits.maxExpandedBytes -= objectStreamDecodedSize_;
+    completedStreamBytes_ += objectStreamDecodedSize_;
+    if (!resolvingIndirectLength() && !hasResolvedIndirectLength()) {
+      cachedObjectStreamNumber_ = objectStreamNumber_;
+      cachedObjectStreamCount_ = objectStreamObjectCount_;
+      cachedObjectStreamFirst_ = objectStreamFirst_;
+      cachedObjectStreamSize_ = objectStreamDecodedSize_;
+      cachedObjectStreamUsesStore_ = objectStreamUsesStore_;
+    }
+    publishObjectStream_ = false;
+  }
+  return beginObjectStreamIndex();
 }
 
 PdfStatus PdfObjectResolver::beginObjectStreamIndex() {
@@ -434,11 +717,11 @@ PdfStatus PdfObjectResolver::beginObjectStreamIndex() {
     return PdfStatus::failure(PdfError::Malformed, objectStreamNumber_);
   }
   const PdfStatus rangeStatus =
-      pdfInitializeByteRange(objectStoreSource_, 0, objectStreamFirst_, &objectStreamIndexRange_);
+      pdfInitializeByteRange(objectStoreSource_, 0, objectStreamFirst_, &objectStreamSliceRange_);
   if (!rangeStatus.ok()) {
     return rangeStatus;
   }
-  const PdfByteSource indexSource = pdfByteRangeSource(objectStreamIndexRange_);
+  const PdfByteSource indexSource = pdfByteRangeSource(objectStreamSliceRange_);
   lexer_.setSource(indexSource);
   objectStreamIndexOrdinal_ = 0;
   objectStreamIndexObjectNumber_ = 0;
@@ -453,7 +736,7 @@ PdfStatus PdfObjectResolver::beginObjectStreamIndex() {
 
 PdfStatus PdfObjectResolver::beginEmbeddedObject() {
   if (objectStreamTargetEnd_ < objectStreamTargetStart_) {
-    return PdfStatus::failure(PdfError::Malformed, result_.reference.objectNumber);
+    return PdfStatus::failure(PdfError::Malformed, lookupTargetReference().objectNumber);
   }
   uint64_t bodyOffset = 0;
   if (!pdfCheckedAdd(objectStreamFirst_, objectStreamTargetStart_, &bodyOffset) ||
@@ -461,27 +744,47 @@ PdfStatus PdfObjectResolver::beginEmbeddedObject() {
     return PdfStatus::failure(PdfError::InvalidOffset, bodyOffset);
   }
   const PdfStatus rangeStatus = pdfInitializeByteRange(
-      objectStoreSource_, bodyOffset, objectStreamTargetEnd_ - objectStreamTargetStart_, &objectStreamBodyRange_);
+      objectStoreSource_, bodyOffset, objectStreamTargetEnd_ - objectStreamTargetStart_, &objectStreamSliceRange_);
   if (!rangeStatus.ok()) {
     return rangeStatus;
   }
-  const PdfByteSource bodySource = pdfByteRangeSource(objectStreamBodyRange_);
+  const PdfByteSource bodySource = pdfByteRangeSource(objectStreamSliceRange_);
   lexer_.setSource(bodySource);
   parser_.begin();
   phase_ = Phase::ParseEmbeddedValue;
   return PdfStatus::success();
 }
 
-PdfStatus PdfObjectResolver::setSourceAccess(const bool sourceRequired) {
-  if (sourceAccessRequired_ == sourceRequired) {
-    return PdfStatus::success();
+void PdfObjectResolver::clearObjectStreamCache() {
+  if (resolvingIndirectLength() || hasResolvedIndirectLength()) {
+    return;
   }
-  if (workspace_.setSourceAccess != nullptr) {
-    const PdfStatus status = workspace_.setSourceAccess(workspace_.sourceAccessContext, sourceRequired);
-    if (!status.ok()) {
-      return status;
-    }
+  cachedObjectStreamNumber_ = 0;
+  cachedObjectStreamCount_ = 0;
+  cachedObjectStreamFirst_ = 0;
+  cachedObjectStreamSize_ = 0;
+  cachedObjectStreamUsesStore_ = false;
+}
+
+PdfStepResult PdfObjectResolver::stepSourceAccess(const PdfObjectResolverReader reader, PdfWorkBudget& budget) {
+  if (sourceAccessKnown_ && sourceAccess_ == reader) {
+    return PdfStepResult::completed();
   }
-  sourceAccessRequired_ = sourceRequired;
-  return PdfStatus::success();
+  if (workspace_.setSourceAccess == nullptr) {
+    sourceAccess_ = reader;
+    sourceAccessKnown_ = true;
+    return PdfStepResult::completed();
+  }
+  if (budget.cancelRequested()) {
+    return PdfStepResult::failure(PdfStatus::failure(PdfError::Cancelled, activeReference_.objectNumber));
+  }
+  if (budget.stopRequested()) {
+    return PdfStepResult::paused();
+  }
+  const PdfStepResult result = workspace_.setSourceAccess(workspace_.sourceAccessContext, reader, budget);
+  if (result.complete()) {
+    sourceAccess_ = reader;
+    sourceAccessKnown_ = true;
+  }
+  return result;
 }

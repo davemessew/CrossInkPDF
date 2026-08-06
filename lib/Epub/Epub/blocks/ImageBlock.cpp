@@ -38,41 +38,31 @@ bool ImageBlock::imageExists() const { return Storage.exists(imagePath.c_str());
 namespace {
 
 #if defined(CROSSINK_ENABLE_PDF) && CROSSINK_ENABLE_PDF
-constexpr size_t PDF_PIXEL_CACHE_READ_BUFFER_BYTES = 4096;
-constexpr size_t PDF_PIXEL_CACHE_PATH_BYTES = 160;
-
-// PDF reflow owns immutable prepared image files and renders on the single
-// reader task. Reusing one fixed DRAM buffer avoids a malloc/free pair on every
-// BW/grayscale pass without adding per-ImageBlock memory to EPUB pages.
-alignas(uint32_t) uint8_t pdfPixelCacheReadBuffer[PDF_PIXEL_CACHE_READ_BUFFER_BYTES]{};
-char pdfPixelCachePath[PDF_PIXEL_CACHE_PATH_BYTES]{};
-bool pdfPixelCacheWorkspaceInUse = false;
-
 class PdfPixelCacheWorkspaceLease {
  public:
-  explicit PdfPixelCacheWorkspaceLease(const bool requested) {
-    if (requested && !pdfPixelCacheWorkspaceInUse) {
-      pdfPixelCacheWorkspaceInUse = true;
-      acquired_ = true;
+  PdfPixelCacheWorkspaceLease(const bool requested, PdfPixelCacheRenderWorkspace* const workspace) {
+    if (requested && workspace != nullptr && !workspace->inUse) {
+      workspace->inUse = true;
+      workspace_ = workspace;
     }
   }
 
   ~PdfPixelCacheWorkspaceLease() {
-    if (acquired_) {
-      pdfPixelCacheWorkspaceInUse = false;
+    if (workspace_ != nullptr) {
+      workspace_->inUse = false;
     }
   }
 
-  uint8_t* data() const { return acquired_ ? pdfPixelCacheReadBuffer : nullptr; }
-  size_t size() const { return acquired_ ? sizeof(pdfPixelCacheReadBuffer) : 0; }
-  char* path() const { return acquired_ ? pdfPixelCachePath : nullptr; }
-  size_t pathSize() const { return acquired_ ? sizeof(pdfPixelCachePath) : 0; }
+  uint8_t* data() const { return workspace_ == nullptr ? nullptr : workspace_->readBuffer; }
+  size_t size() const { return workspace_ == nullptr ? 0 : sizeof(workspace_->readBuffer); }
+  char* path() const { return workspace_ == nullptr ? nullptr : workspace_->path; }
+  size_t pathSize() const { return workspace_ == nullptr ? 0 : sizeof(workspace_->path); }
 
   PdfPixelCacheWorkspaceLease(const PdfPixelCacheWorkspaceLease&) = delete;
   PdfPixelCacheWorkspaceLease& operator=(const PdfPixelCacheWorkspaceLease&) = delete;
 
  private:
-  bool acquired_ = false;
+  PdfPixelCacheRenderWorkspace* workspace_ = nullptr;
 };
 #endif
 
@@ -309,9 +299,9 @@ PDF_IMAGE_BLOCK_NOINLINE bool renderPdfFromCache(GfxRenderer& renderer, const ch
     uint8_t* scaledBuffer = pdfWorkspace.data();
     size_t scaledBufferBytes = pdfWorkspace.size();
     if (scaledBuffer == nullptr) {
-      ownedScaledBuffer = makeUniqueNoThrow<uint8_t[]>(PDF_PIXEL_CACHE_READ_BUFFER_BYTES);
+      ownedScaledBuffer = makeUniqueNoThrow<uint8_t[]>(PdfPixelCacheRenderWorkspace::READ_BUFFER_BYTES);
       scaledBuffer = ownedScaledBuffer.get();
-      scaledBufferBytes = scaledBuffer == nullptr ? 0 : PDF_PIXEL_CACHE_READ_BUFFER_BYTES;
+      scaledBufferBytes = scaledBuffer == nullptr ? 0 : PdfPixelCacheRenderWorkspace::READ_BUFFER_BYTES;
     }
     const bool rendered = renderScaledPdfCache(renderer, cacheFile, cachedWidth, cachedHeight, x, y, expectedWidth,
                                                expectedHeight, scaledBuffer, scaledBufferBytes);
@@ -563,7 +553,10 @@ PDF_IMAGE_BLOCK_NOINLINE bool renderFromCache(GfxRenderer& renderer, const std::
 
 }  // namespace
 
-void ImageBlock::render(GfxRenderer& renderer, const int x, const int y) {
+void ImageBlock::render(GfxRenderer& renderer, const int x, const int y) { render(renderer, x, y, nullptr); }
+
+void ImageBlock::render(GfxRenderer& renderer, const int x, const int y,
+                        PdfPixelCacheRenderWorkspace* const pdfWorkspace) {
   // The font-prewarm scan pass only accumulates glyphs; an image contributes
   // none, and its DirectPixelWriter output bypasses the renderer's scan-mode
   // suppression, so it would otherwise do a full (discarded) cache render every
@@ -606,12 +599,12 @@ void ImageBlock::render(GfxRenderer& renderer, const int x, const int y) {
   const bool pdfCachedImage = isCanonicalPdfCachedImagePath(imagePath);
   // The lease spans path derivation, cache reads, and first-time JPEG decode so
   // a nested render cannot overwrite either shared scratch region.
-  PdfPixelCacheWorkspaceLease pdfWorkspace(pdfCachedImage);
+  PdfPixelCacheWorkspaceLease workspaceLease(pdfCachedImage, pdfWorkspace);
   std::string legacyCachePath;
   const char* cachePath = nullptr;
   if (pdfCachedImage) {
-    cachePath = getPdfPixelCachePath(imagePath, pdfWorkspace, legacyCachePath);
-    if (renderPdfFromCache(renderer, cachePath, x, y, width, height, pdfWorkspace)) {
+    cachePath = getPdfPixelCachePath(imagePath, workspaceLease, legacyCachePath);
+    if (renderPdfFromCache(renderer, cachePath, x, y, width, height, workspaceLease)) {
       return;  // Successfully rendered from the immutable PDF cache
     }
   } else {

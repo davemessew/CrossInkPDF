@@ -33,8 +33,7 @@ constexpr size_t SECTION_HEADER_BYTES = 44;
 constexpr size_t PAGE_LUT_ENTRY_BYTES = sizeof(uint32_t);
 constexpr uint16_t MAX_TEXT_BLOCK_WORDS = 512;
 constexpr size_t TEXT_BLOCK_HEADER_BYTES = sizeof(uint16_t) + sizeof(uint8_t) * 3 + sizeof(uint16_t);
-constexpr size_t TEXT_BLOCK_STYLE_BYTES =
-    sizeof(uint8_t) + sizeof(bool) + sizeof(int16_t) * 9 + sizeof(bool) * 3;
+constexpr size_t TEXT_BLOCK_STYLE_BYTES = sizeof(uint8_t) + sizeof(bool) + sizeof(int16_t) * 9 + sizeof(bool) * 3;
 constexpr size_t FOOTNOTE_BYTES = 32 + 96;
 constexpr size_t PUBLISHER_MARKER_BYTES = sizeof(int16_t) + 16;
 constexpr uint8_t TAG_PAGE_LINE = 1;
@@ -224,17 +223,13 @@ struct TextBlockView {
   const char* text = nullptr;
 
   uint16_t textOffset(const uint16_t index) const { return readLe16(textOffsets + static_cast<size_t>(index) * 2U); }
-  int16_t xPosition(const uint16_t index) const {
-    return readLeI16(xPositions + static_cast<size_t>(index) * 2U);
-  }
+  int16_t xPosition(const uint16_t index) const { return readLeI16(xPositions + static_cast<size_t>(index) * 2U); }
   uint16_t wordLength(const uint16_t index) const {
     const uint16_t end = index + 1U < wordCount ? textOffset(index + 1U) : textBytes;
     return static_cast<uint16_t>(end - textOffset(index) - 1U);
   }
   const char* word(const uint16_t index) const { return text + textOffset(index); }
-  EpdFontFamily::Style style(const uint16_t index) const {
-    return static_cast<EpdFontFamily::Style>(styles[index]);
-  }
+  EpdFontFamily::Style style(const uint16_t index) const { return static_cast<EpdFontFamily::Style>(styles[index]); }
   uint8_t boundary(const uint16_t index) const { return hasBionic ? bionicBoundaries[index] : 0; }
   uint16_t suffixX(const uint16_t index) const {
     return hasBionic ? readLe16(bionicSuffixX + static_cast<size_t>(index) * 2U) : 0;
@@ -332,8 +327,7 @@ bool parseTextBlock(MemoryPageCursor& cursor, DecodeBudget* const budget, TextBl
   }
 
   const uint8_t* style = nullptr;
-  if (!cursor.take(TEXT_BLOCK_STYLE_BYTES, &style) || style[1] > 1 || style[20] > 1 || style[21] > 1 ||
-      style[22] > 1) {
+  if (!cursor.take(TEXT_BLOCK_STYLE_BYTES, &style) || style[1] > 1 || style[20] > 1 || style[21] > 1 || style[22] > 1) {
     return false;
   }
   view.isRtl = style[21] != 0;
@@ -351,12 +345,10 @@ bool isWhitespaceOnlyBackgroundToken(const char* const word) {
     const uint8_t current = static_cast<uint8_t>(word[index]);
     if (current == ' ' || current == '\r' || current == '\n' || current == '\t') {
       ++index;
-    } else if (current == 0xc2 && word[index + 1U] != '\0' &&
-               static_cast<uint8_t>(word[index + 1U]) == 0xa0) {
+    } else if (current == 0xc2 && word[index + 1U] != '\0' && static_cast<uint8_t>(word[index + 1U]) == 0xa0) {
       index += 2;
     } else if (current == 0xe2 && word[index + 1U] != '\0' && word[index + 2U] != '\0' &&
-               static_cast<uint8_t>(word[index + 1U]) == 0x80 &&
-               static_cast<uint8_t>(word[index + 2U]) == 0xaf) {
+               static_cast<uint8_t>(word[index + 1U]) == 0x80 && static_cast<uint8_t>(word[index + 2U]) == 0xaf) {
       index += 3;
     } else {
       return false;
@@ -366,8 +358,8 @@ bool isWhitespaceOnlyBackgroundToken(const char* const word) {
 }
 
 bool hasSyntheticIndentPrefix(const char* const word, const uint16_t length) {
-  return length >= 3 && static_cast<uint8_t>(word[0]) == 0xe2 &&
-         static_cast<uint8_t>(word[1]) == 0x80 && static_cast<uint8_t>(word[2]) == 0x83;
+  return length >= 3 && static_cast<uint8_t>(word[0]) == 0xe2 && static_cast<uint8_t>(word[1]) == 0x80 &&
+         static_cast<uint8_t>(word[2]) == 0x83;
 }
 
 uint16_t measureBackgroundWidth(const GfxRenderer& renderer, const int fontId, const char* const word,
@@ -388,8 +380,8 @@ void renderTextBlock(const TextBlockView& block, GfxRenderer& renderer, const in
     const int wordX = x + block.xPosition(index);
     const EpdFontFamily::Style style = block.style(index);
     const uint8_t boundary = block.boundary(index);
-    const auto baseDirection = static_cast<BidiUtils::BidiBaseDir>(
-        BidiUtils::detectParagraphLevel(word, block.isRtl ? 1 : 0));
+    const auto baseDirection =
+        static_cast<BidiUtils::BidiBaseDir>(BidiUtils::detectParagraphLevel(word, block.isRtl ? 1 : 0));
 
     if ((block.flags(index) & WORD_FLAG_BACKGROUND_BLACK) != 0 && isWhitespaceOnlyBackgroundToken(word)) {
       const uint16_t backgroundWidth = measureBackgroundWidth(renderer, fontId, word, style);
@@ -408,8 +400,7 @@ void renderTextBlock(const TextBlockView& block, GfxRenderer& renderer, const in
     if (boundary > 0) {
       const auto boldStyle = static_cast<EpdFontFamily::Style>(style | EpdFontFamily::BOLD);
       char boldBuffer[40]{};
-      const size_t boldLength =
-          std::min<size_t>({boundary, wordLength, sizeof(boldBuffer) - 1U});
+      const size_t boldLength = std::min<size_t>({boundary, wordLength, sizeof(boldBuffer) - 1U});
       std::memcpy(boldBuffer, word, boldLength);
       renderer.drawText(fontId, wordX, wordY, boldBuffer, foregroundBlack, boldStyle, baseDirection);
       renderer.drawText(fontId, wordX + block.suffixX(index), wordY, word + boldLength, foregroundBlack, style,
@@ -462,10 +453,10 @@ bool preflightTableFragment(MemoryPageCursor& cursor, DecodeBudget& budget) {
   uint8_t unusedPadding = 0;
   uint16_t lineHeight = 0;
   uint8_t rows = 0;
-  if (!cursor.readI16(&unusedX) || !cursor.readI16(&unusedY) || !cursor.readU16(&width) ||
-      !cursor.readU8(&columns) || !cursor.readU8(&unusedPadding) || !cursor.readU16(&lineHeight) ||
-      !cursor.readU8(&rows) || rows == 0 || rows > MAX_TABLE_ROWS || columns == 0 ||
-      columns > MAX_TABLE_CELLS || width < 2 || lineHeight == 0 || !budget.consumeTable(rows)) {
+  if (!cursor.readI16(&unusedX) || !cursor.readI16(&unusedY) || !cursor.readU16(&width) || !cursor.readU8(&columns) ||
+      !cursor.readU8(&unusedPadding) || !cursor.readU16(&lineHeight) || !cursor.readU8(&rows) || rows == 0 ||
+      rows > MAX_TABLE_ROWS || columns == 0 || columns > MAX_TABLE_CELLS || width < 2 || lineHeight == 0 ||
+      !budget.consumeTable(rows)) {
     return false;
   }
   uint32_t totalHeight = 1;
@@ -541,8 +532,8 @@ bool preflightSerializedPage(const uint8_t* const bytes, const size_t size) {
         int16_t y = 0;
         uint16_t width = 0;
         uint8_t thickness = 0;
-        if (!cursor.readI16(&x) || !cursor.readI16(&y) || !cursor.readU16(&width) ||
-            !cursor.readU8(&thickness) || width == 0 || thickness == 0) {
+        if (!cursor.readI16(&x) || !cursor.readI16(&y) || !cursor.readU16(&width) || !cursor.readU8(&thickness) ||
+            width == 0 || thickness == 0) {
           return false;
         }
         break;
@@ -618,8 +609,7 @@ bool renderTableFragment(MemoryPageCursor& cursor, DecodeBudget& budget, GfxRend
   const int drawY = yOffset + y;
   int16_t columnStarts[MAX_TABLE_CELLS + 1]{};
   for (uint8_t column = 0; column < columns; ++column) {
-    columnStarts[column] =
-        static_cast<int16_t>((static_cast<uint32_t>(width) * column) / columns);
+    columnStarts[column] = static_cast<int16_t>((static_cast<uint32_t>(width) * column) / columns);
   }
   columnStarts[columns] = static_cast<int16_t>(width - 1U);
   renderer.drawRect(drawX, drawY, width, totalHeight, foregroundBlack);
@@ -657,8 +647,8 @@ bool renderTableFragment(MemoryPageCursor& cursor, DecodeBudget& budget, GfxRend
     }
     currentY += rowHeight;
     if (row + 1U < rows) {
-      renderer.drawLine(drawX, drawY + currentY, drawX + width - 1, drawY + currentY,
-                        headerSeparator ? 2 : 1, foregroundBlack);
+      renderer.drawLine(drawX, drawY + currentY, drawX + width - 1, drawY + currentY, headerSeparator ? 2 : 1,
+                        foregroundBlack);
     }
   }
   return cursor.position() == measurement.position();
@@ -705,12 +695,11 @@ bool renderSerializedTextPage(const uint8_t* const bytes, const size_t size, Gfx
       int16_t y = 0;
       uint16_t width = 0;
       uint8_t thickness = 0;
-      if (!cursor.readI16(&x) || !cursor.readI16(&y) || !cursor.readU16(&width) ||
-          !cursor.readU8(&thickness) || width == 0 || thickness == 0) {
+      if (!cursor.readI16(&x) || !cursor.readI16(&y) || !cursor.readU16(&width) || !cursor.readU8(&thickness) ||
+          width == 0 || thickness == 0) {
         return false;
       }
-      renderer.drawLine(xOffset + x, yOffset + y, xOffset + x + width - 1, yOffset + y, thickness,
-                        foregroundBlack);
+      renderer.drawLine(xOffset + x, yOffset + y, xOffset + x + width - 1, yOffset + y, thickness, foregroundBlack);
     } else {
       return false;
     }
@@ -729,13 +718,14 @@ struct WordIndexSource {
   PdfCacheHandle handle{};
   uint64_t size = 0;
 
-  static PdfStatus read(void* const context, const uint64_t offset, uint8_t* const destination,
-                        const size_t requested, size_t* const bytesRead) {
+  static PdfStatus read(void* const context, const uint64_t offset, uint8_t* const destination, const size_t requested,
+                        size_t* const bytesRead) {
     if (context == nullptr) {
       return PdfStatus::failure(PdfError::InvalidArgument, offset);
     }
-    auto& source = *static_cast<WordIndexSource*>(context);
-    return source.io->read(source.io->context, source.handle, offset, destination, requested, bytesRead);
+    auto& wordIndexSource = *static_cast<WordIndexSource*>(context);
+    return wordIndexSource.io->read(wordIndexSource.io->context, wordIndexSource.handle, offset, destination, requested,
+                                    bytesRead);
   }
 
   PdfByteSource source() { return {this, size, read}; }
@@ -771,8 +761,7 @@ bool formatSectionPaths(const char* const cacheRoot, const uint16_t section, cha
   if (cacheRoot == nullptr || cacheRoot[0] == '\0') {
     return false;
   }
-  const int sectionLength =
-      std::snprintf(sectionPath, sectionCapacity, "%s/sections/%u_light.bin", cacheRoot, section);
+  const int sectionLength = std::snprintf(sectionPath, sectionCapacity, "%s/sections/%u_light.bin", cacheRoot, section);
   if (sectionLength <= 0 || static_cast<size_t>(sectionLength) >= sectionCapacity) {
     return false;
   }
@@ -806,8 +795,7 @@ struct PdfSleepPageCache::Impl {
     pageRecordBytes = 0;
   }
 
-  bool selectPage(const PdfSleepProductCache& product, uint16_t* const pageNumber,
-                  uint16_t* const sidecarPageCount) {
+  bool selectPage(const PdfSleepProductCache& product, uint16_t* const pageNumber, uint16_t* const sidecarPageCount) {
     if (pageNumber == nullptr || sidecarPageCount == nullptr ||
         !formatSectionPaths(product.cacheRoot(), product.currentSection(), sectionPath, sizeof(sectionPath),
                             wordIndexPath, sizeof(wordIndexPath))) {
@@ -826,6 +814,19 @@ struct PdfSleepPageCache::Impl {
       LOG_ERR("SLP", "PDF sleep sidecar I/O is unavailable");
       return false;
     }
+    WordIndexSource sectionSource;
+    PdfLayoutCacheBinding sectionBinding{};
+    if (!openWordIndex(io, sectionPath, sectionSource)) {
+      LOG_DBG("SLP", "PDF sleep section layout is unavailable for binding validation");
+      return false;
+    }
+    PdfStatus status = pdfComputeLayoutCacheBinding(sectionSource.source(), &sectionBinding);
+    const bool sectionClosed = closeWordIndex(io, sectionSource);
+    if (!status || !sectionClosed) {
+      LOG_DBG("SLP", "PDF sleep section layout fingerprint is unavailable");
+      return false;
+    }
+
     WordIndexSource source;
     if (!openWordIndex(io, wordIndexPath, source)) {
       LOG_DBG("SLP", "PDF sleep word index is unavailable");
@@ -833,11 +834,11 @@ struct PdfSleepPageCache::Impl {
     }
 
     PdfLayoutWordIndexInfo info{};
-    PdfStatus status = pdfInspectLayoutWordIndex(source.source(), &info);
+    status = pdfInspectLayoutWordIndex(source.source(), &info);
     if (status && (info.sectionIndex != product.currentSection() ||
                    info.firstGlobalWordOrdinal != product.currentSectionFirstWordOrdinal() ||
                    info.sectionWordCount != product.currentSectionWordCount() || info.pageCount == 0 ||
-                   info.pageCount > MAX_LAYOUT_PAGES)) {
+                   info.pageCount > MAX_LAYOUT_PAGES || !pdfLayoutWordIndexMatchesSectionCache(info, sectionBinding))) {
       status = PdfStatus::failure(PdfError::Malformed);
     }
     if (status) {
@@ -871,8 +872,7 @@ struct PdfSleepPageCache::Impl {
     const uint32_t paragraphLutOffset = valid ? readLe32(header + 36) : 0;
     const uint32_t liLutOffset = valid ? readLe32(header + 40) : 0;
     const int fileFontId = valid ? static_cast<int32_t>(readLe32(header + 5)) : 0;
-    const uint64_t lutEnd =
-        static_cast<uint64_t>(lutOffset) + static_cast<uint64_t>(pageCount) * PAGE_LUT_ENTRY_BYTES;
+    const uint64_t lutEnd = static_cast<uint64_t>(lutOffset) + static_cast<uint64_t>(pageCount) * PAGE_LUT_ENTRY_BYTES;
 
     valid = valid && readLe32(header) == SECTION_CACHE_MAGIC && header[4] == SECTION_FILE_VERSION &&
             readLe16(header + 16) == layout.viewportWidth && readLe16(header + 18) == layout.viewportHeight &&
@@ -886,20 +886,19 @@ struct PdfSleepPageCache::Impl {
       valid = readU32At(file, lutOffset + static_cast<uint32_t>(pageNumber) * PAGE_LUT_ENTRY_BYTES, &pagePosition);
     }
     if (valid && pageNumber + 1U < pageCount) {
-      valid = readU32At(file, lutOffset + static_cast<uint32_t>(pageNumber + 1U) * PAGE_LUT_ENTRY_BYTES,
-                        &nextPagePosition);
+      valid =
+          readU32At(file, lutOffset + static_cast<uint32_t>(pageNumber + 1U) * PAGE_LUT_ENTRY_BYTES, &nextPagePosition);
     }
-    const size_t serializedBytes =
-        nextPagePosition >= pagePosition ? static_cast<size_t>(nextPagePosition - pagePosition)
-                                         : std::numeric_limits<size_t>::max();
+    const size_t serializedBytes = nextPagePosition >= pagePosition
+                                       ? static_cast<size_t>(nextPagePosition - pagePosition)
+                                       : std::numeric_limits<size_t>::max();
     valid = valid && pagePosition >= SECTION_HEADER_BYTES && pagePosition < nextPagePosition &&
             nextPagePosition <= lutOffset && serializedBytes <= MAX_SERIALIZED_PAGE_BYTES &&
             serializedBytes <= static_cast<size_t>(std::numeric_limits<int>::max());
 
     if (valid) {
       pageRecord = makeUniqueNoThrow<uint8_t[]>(serializedBytes);
-      valid = pageRecord != nullptr && file.seek(pagePosition) &&
-              readExact(file, pageRecord.get(), serializedBytes);
+      valid = pageRecord != nullptr && file.seek(pagePosition) && readExact(file, pageRecord.get(), serializedBytes);
     }
     const bool closed = file.close();
     valid = valid && closed && preflightSerializedPage(pageRecord.get(), serializedBytes);
@@ -967,9 +966,8 @@ bool PdfSleepProductCache::load(const std::string& sourcePath) {
   }
 
   const uint64_t* const cacheHashOverride = resolvedCacheHash == normalCacheHash ? nullptr : &resolvedCacheHash;
-  impl_->result =
-      pdfLoadCachedProductStateForSleep(pdfHalCacheIo(impl_->ioContext), sourcePath.c_str(), PDF_CACHE_DIRECTORY,
-                                        &impl_->state, cacheHashOverride);
+  impl_->result = pdfLoadCachedProductStateForSleep(pdfHalCacheIo(impl_->ioContext), sourcePath.c_str(),
+                                                    PDF_CACHE_DIRECTORY, &impl_->state, cacheHashOverride);
   return impl_->result.available();
 }
 
@@ -1010,16 +1008,6 @@ float PdfSleepProductCache::progressPercent() const {
   const float percent =
       static_cast<float>(impl_->state.currentWord) / static_cast<float>(impl_->state.totalWords) * 100.0f;
   return std::clamp(percent, 0.0f, 100.0f);
-}
-
-bool pdfSnapshotBeforeFallback(GfxRenderer& renderer, const PdfSleepFallback fallback) {
-  if (renderer.storeBwBuffer()) {
-    return true;
-  }
-  if (fallback.load != nullptr) {
-    fallback.load(fallback.context);
-  }
-  return false;
 }
 
 bool PdfSleepPageCache::load(const PdfSleepProductCache& product, const PdfSleepPageLayout& layout) {

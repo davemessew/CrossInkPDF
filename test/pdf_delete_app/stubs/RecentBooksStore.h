@@ -1,8 +1,11 @@
 #pragma once
 
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <vector>
+
+#include <Memory.h>
 
 class RecentBooksStore {
  public:
@@ -14,6 +17,7 @@ class RecentBooksStore {
   inline static bool failNextCanonicalRead = false;
   inline static bool failNextCanonicalParse = false;
   inline static std::string canonicalBytes;
+  inline static bool exerciseCheckedScratchAllocation = false;
 
   static RecentBooksStore& getInstance() {
     static RecentBooksStore store;
@@ -45,6 +49,15 @@ class RecentBooksStore {
     persistedPaths = paths;
     canonicalBytes = "persisted-after-delete";
     return true;
+  }
+
+  bool removeByPathDurablyNoPathAlloc(const std::string_view path) {
+    if (exerciseCheckedScratchAllocation) {
+      exerciseCheckedScratchAllocation = false;
+      auto scratch = makeUniqueNoThrow<uint8_t>();
+      if (!scratch) return false;
+    }
+    return removeByPathDurably(std::string(path));
   }
 };
 

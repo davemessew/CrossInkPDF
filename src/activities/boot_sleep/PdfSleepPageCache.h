@@ -33,15 +33,6 @@ struct PdfSleepPageLayout {
 PdfSleepPageLayout capturePdfSleepPageLayoutForSleep(GfxRenderer& renderer, bool canSnapshotOverlayBackground,
                                                      const std::string& currentBookPath);
 
-struct PdfSleepFallback {
-  void* context = nullptr;
-  void (*load)(void* context) = nullptr;
-};
-
-// Snapshot is always attempted before fallback.load. A successful snapshot
-// returns true without invoking the fallback.
-bool pdfSnapshotBeforeFallback(GfxRenderer& renderer, PdfSleepFallback fallback);
-
 // Sleep-only, read-only view of completed PDF products. Cache identity is
 // derived from the path/move alias; loading never opens the PDF source.
 class PdfSleepProductCache final {

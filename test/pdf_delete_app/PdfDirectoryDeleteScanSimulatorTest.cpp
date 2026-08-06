@@ -7,6 +7,7 @@
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <string_view>
 
 namespace {
 
@@ -29,7 +30,7 @@ void setSimulatorRoot(const std::filesystem::path& root) {
 
 bool deletePdf(void*, const char*) { return false; }
 
-void clearLegacy(void*, const std::string&) {}
+bool clearLegacy(void*, std::string_view) { return true; }
 
 void testHiddenTombstoneSkippedByPinnedHalStillBlocksDelete() {
   const std::filesystem::path root =
@@ -45,11 +46,22 @@ void testHiddenTombstoneSkippedByPinnedHalStillBlocksDelete() {
   const PdfDirectoryDeleteScan::DeleteCallbacks callbacks{
       nullptr, &deletePdf, &clearLegacy};
   const auto status =
-      PdfDirectoryDeleteScan::deleteDirectoryNoThrow("/Books", callbacks);
+      PdfDirectoryDeleteScan::deletePdfDirectoryNoThrow("/Books", callbacks);
   expect(status == PdfDirectoryDeleteScan::Status::ReservedTombstone,
          "actual SIMULATOR branch must detect a dot-prefixed tombstone hidden by its HAL iterator");
   expect(std::filesystem::exists(root / "Books" / ".prepared.pdf.crossink-delete"),
          "SIMULATOR preflight must not mutate the hidden tombstone");
+
+  Storage.reset();
+  Storage.mkdir("/Books");
+  const auto publicStatus =
+      PdfDirectoryDeleteScan::deleteDirectoryNoThrow("/Books", callbacks);
+  expect(publicStatus == PdfDirectoryDeleteScan::Status::ReservedTombstone,
+         "public directory routing must classify a HAL-hidden SIMULATOR tombstone as strict");
+  expect(Storage.exists("/Books") &&
+             std::filesystem::exists(
+                 root / "Books" / ".prepared.pdf.crossink-delete"),
+         "public routing must never fall through to legacy removeDir for a hidden tombstone");
 
   std::filesystem::remove_all(root, error);
 }

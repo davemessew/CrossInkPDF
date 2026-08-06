@@ -41,6 +41,9 @@ class PdfReflowDocument : public ReflowDocument {
                        const uint64_t* cacheHashOverride = nullptr);
   PdfStatus loadCompletedCache();
   PdfStatus lastStatus() const { return status_; }
+  bool optionalContentWasSkipped() const {
+    return (manifest_.warningFlags & PDF_CACHE_WARNING_OPTIONAL_CONTENT_OMITTED) != 0;
+  }
 
   ReflowDocumentFormat getFormat() const override { return ReflowDocumentFormat::Pdf; }
   const char* getStoreFormatKey() const override { return "pdf"; }
@@ -145,9 +148,86 @@ class PdfReflowDocument : public ReflowDocument {
 
   static constexpr uint8_t MaxCachedResources = 64;
 
+  struct ManifestSectionValidationRecord {
+    uint32_t size = 0;
+    uint32_t crc32 = 0;
+  };
+
+  struct ValidationStorageLayout {
+    size_t sectionRecordsOffset = 0;
+    size_t sectionSeenOffset = 0;
+    size_t resourcesOffset = 0;
+    size_t bytes = 0;
+  };
+
+  struct ManifestRecordCursor {
+    uint32_t generation = 0;
+    uint32_t filesSeen = 0;
+    uint16_t sectionCount = 0;
+    uint8_t resourceCount = 0;
+    uint8_t metadataFiles = 0;
+    uint8_t outlineFiles = 0;
+    ManifestFileStage stage = ManifestFileStage::Sections;
+  };
+
+  enum class ManifestRecordKind : uint8_t {
+    Section,
+    Resource,
+    Cover,
+    Thumbnail,
+    Metadata,
+    Outline,
+  };
+
+  struct ManifestRecordClassification {
+    ManifestRecordKind kind = ManifestRecordKind::Section;
+    uint16_t sectionIndex = 0;
+    PdfCachedResourceRecord resource{};
+  };
+
+  struct ManifestCountContext {
+    const PdfCacheManifest* manifest = nullptr;
+    ManifestRecordCursor cursor{};
+    PdfStatus status{};
+    bool initialized = false;
+  };
+
+  static constexpr size_t MaxValidationStorageBytes =
+      PdfMetadataLimits::MaxSections * sizeof(ManifestSectionValidationRecord) +
+      (PdfMetadataLimits::MaxSections + 7U) / 8U + MaxCachedResources * sizeof(PdfCachedResourceRecord);
+  static_assert(MaxValidationStorageBytes == 4640,
+                "maximum exact PDF validation storage must not exceed the former fixed capacities");
+
   static PdfStatus captureRequiredFile(void* context, const PdfRequiredFileRecord& record);
+  static PdfStatus countRequiredFile(void* context, const PdfRequiredFileRecord& record);
   static PdfStatus captureMetadataSection(void* context, uint16_t index, const PdfMetadataSection& record);
   static PdfStatus validateOutlineEntry(void* context, uint16_t index, const PdfOutlineEntry& record);
+  static PdfStatus classifyManifestRecord(ManifestRecordCursor* cursor, const PdfRequiredFileRecord& record,
+                                          ManifestRecordClassification* classification);
+  static PdfStatus computeValidationStorageLayout(size_t sectionCount, size_t resourceCount,
+                                                  ValidationStorageLayout* layout);
+  PdfStatus allocateValidationStorage(uint16_t sectionCount, uint8_t resourceCount);
+#ifdef CROSSINK_PDF_REFLOW_DOCUMENT_TEST
+ public:
+  static PdfStatus validationStorageLayoutForTest(size_t sectionCount, size_t resourceCount, size_t* bytes) {
+    if (bytes == nullptr) {
+      return PdfStatus::failure(PdfError::InvalidArgument);
+    }
+    ValidationStorageLayout layout;
+    const PdfStatus status = computeValidationStorageLayout(sectionCount, resourceCount, &layout);
+    *bytes = status ? layout.bytes : 0;
+    return status;
+  }
+  size_t validationStorageBytesForTest() const { return validationStorageLayout_.bytes; }
+
+ private:
+#endif
+  ManifestSectionValidationRecord* manifestSectionRecords();
+  const ManifestSectionValidationRecord* manifestSectionRecords() const;
+  uint8_t* manifestSectionSeen();
+  const uint8_t* manifestSectionSeen() const;
+  PdfCachedResourceRecord* cachedResources();
+  const PdfCachedResourceRecord* cachedResources() const;
   PdfStatus captureFile(const PdfRequiredFileRecord& record);
   PdfStatus validateCapturedFiles();
   PdfStatus validateCachedFile(const char* path, uint64_t expectedSize, uint32_t expectedCrc32,
@@ -191,10 +271,10 @@ class PdfReflowDocument : public ReflowDocument {
   PdfSavedItemsStore savedItemsStore_{};
   std::unique_ptr<PdfMetadataSection[]> sections_;
   std::unique_ptr<uint8_t[]> ioWorkspace_;
-  std::array<uint32_t, PdfMetadataLimits::MaxSections> manifestSectionSizes_{};
-  std::array<uint32_t, PdfMetadataLimits::MaxSections> manifestSectionCrcs_{};
-  std::array<uint8_t, (PdfMetadataLimits::MaxSections + 7) / 8> manifestSectionSeen_{};
-  std::array<PdfCachedResourceRecord, MaxCachedResources> resources_{};
+  std::unique_ptr<uint8_t[]> validationStorage_;
+  ValidationStorageLayout validationStorageLayout_{};
+  uint16_t validationSectionCount_ = 0;
+  uint8_t validationResourceCount_ = 0;
   std::array<char, PDF_CACHE_PATH_CAPACITY> validationPath_{};
   mutable PdfOutlineEntry cachedOutlineEntry_{};
   mutable int cachedOutlineIndex_ = -1;
@@ -205,14 +285,11 @@ class PdfReflowDocument : public ReflowDocument {
   mutable uint16_t layoutWordWindowStart_ = 0;
   mutable uint8_t layoutWordWindowCount_ = 0;
   mutable bool layoutWordIndexAvailable_ = false;
-  uint32_t validationGeneration_ = 0;
-  uint32_t requiredFilesSeen_ = 0;
-  uint32_t xhtmlFilesSeen_ = 0;
-  uint8_t resourceCount_ = 0;
-  uint16_t metadataFilesSeen_ = 0;
-  uint16_t outlineFilesSeen_ = 0;
-  ManifestFileStage manifestFileStage_ = ManifestFileStage::Sections;
+  ManifestRecordCursor manifestCursor_{};
   bool loaded_ = false;
   bool savedItemsReady_ = false;
   PdfStatus status_{};
 };
+
+static_assert(sizeof(PdfReflowDocument) <= 2560,
+              "PdfReflowDocument must not embed maximum-capacity validation tables");

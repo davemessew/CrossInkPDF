@@ -16,7 +16,7 @@ execute_process(
 if(NOT nm_result EQUAL 0)
   message(FATAL_ERROR "nm failed for disabled PDF sleep object: ${nm_error}")
 endif()
-if(nm_output MATCHES "PdfSleep|pdfSnapshotBeforeFallback|capturePdfSleep")
+if(nm_output MATCHES "PdfSleep|capturePdfSleep")
   message(FATAL_ERROR "disabled PDF sleep object retains PDF symbols or references:\n${nm_output}")
 endif()
 

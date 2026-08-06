@@ -3,15 +3,24 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "PdfStreamBoundary.h"
 #include "PdfXref.h"
 
+enum class PdfObjectResolverReader : uint8_t {
+  Source,
+  Xref,
+  ObjectStoreWriter,
+  ObjectStore,
+};
+
 struct PdfObjectResolverWorkspace {
-  using SourceAccessFn = PdfStatus (*)(void* context, bool sourceRequired);
+  using SourceAccessFn = PdfStepResult (*)(void* context, PdfObjectResolverReader reader, PdfWorkBudget& budget);
 
   PdfStreamDecoder* streamDecoder = nullptr;
   PdfByteStore objectStreamStore{};
   void* sourceAccessContext = nullptr;
   SourceAccessFn setSourceAccess = nullptr;
+  PdfStreamDecodeLimits decodeLimits{};
 };
 
 struct PdfResolvedObject {
@@ -30,10 +39,29 @@ class PdfObjectResolver {
   PdfStatus begin(PdfObjectReference reference);
   PdfStepResult step(PdfWorkBudget& budget);
   const PdfResolvedObject& result() const { return result_; }
+  uint64_t currentStreamBytes() const;
+  uint64_t takeCompletedStreamBytes();
+  // External users of the single SD reader (for example the page-tree spool)
+  // invalidate the cached source/xref selection. The next resolver step then
+  // reasserts the required reader through the access callback.
+  void invalidateSourceAccess() { sourceAccessKnown_ = false; }
 
  private:
   enum class Phase : uint8_t {
     Idle,
+    SelectXref,
+    LookupReference,
+    LookupObjectStream,
+    SelectUncompressedSource,
+    SelectObjectStreamSource,
+    ConfigureObjectStream,
+    SelectObjectStoreWriter,
+    ResetObjectStreamStore,
+    BeginObjectStreamDecode,
+    DecodeObjectStream,
+    SelectObjectStore,
+    SelectDirectObjectStream,
+    ActivateObjectStream,
     ObjectNumber,
     Generation,
     ObjKeyword,
@@ -41,7 +69,7 @@ class PdfObjectResolver {
     AfterValue,
     StreamFirstEol,
     StreamSecondEol,
-    DecodeObjectStream,
+    ValidateStreamBoundary,
     ObjectStreamIndexNumber,
     ObjectStreamIndexOffset,
     ParseEmbeddedValue,
@@ -50,10 +78,18 @@ class PdfObjectResolver {
   };
 
   PdfStatus beginUncompressed(PdfObjectReference reference, const PdfXrefEntry& entry);
-  PdfStatus prepareObjectStream(uint64_t streamOffset);
+  PdfStepResult stepSourceAccess(PdfObjectResolverReader reader, PdfWorkBudget& budget);
+  PdfStatus configureObjectStream(uint64_t streamOffset);
+  PdfStatus beginObjectStreamDecode();
+  PdfStatus activateObjectStream();
   PdfStatus beginObjectStreamIndex();
   PdfStatus beginEmbeddedObject();
-  PdfStatus setSourceAccess(bool sourceRequired);
+  PdfStatus beginIndirectLength(PdfObjectReference reference);
+  PdfStatus finishIndirectLength();
+  PdfObjectReference lookupTargetReference() const;
+  bool resolvingIndirectLength() const;
+  bool hasResolvedIndirectLength() const;
+  void clearObjectStreamCache();
 
   PdfByteSource source_{};
   const PdfXrefTable& xref_;
@@ -63,19 +99,21 @@ class PdfObjectResolver {
   PdfObjectResolverWorkspace workspace_{};
   PdfStreamDecoder* streamDecoder_ = nullptr;
   PdfByteRange objectStreamSourceRange_{};
-  PdfByteRange objectStreamIndexRange_{};
-  PdfByteRange objectStreamBodyRange_{};
+  PdfByteRange objectStreamSliceRange_{};
   PdfByteSource objectStoreSource_{};
   PdfResolvedObject result_{};
   PdfObjectReference activeReference_{};
+  PdfXrefLookupState xrefLookup_{};
   Phase phase_ = Phase::Idle;
   uint64_t eolOffset_ = 0;
+  uint64_t pendingObjectStreamOffset_ = 0;
   uint64_t objectStreamFirst_ = 0;
   uint64_t objectStreamDecodedSize_ = 0;
   uint64_t objectStreamCurrentOffset_ = 0;
   uint64_t objectStreamPreviousOffset_ = 0;
   uint64_t objectStreamTargetStart_ = 0;
   uint64_t objectStreamTargetEnd_ = 0;
+  uint64_t completedStreamBytes_ = 0;
   uint32_t objectStreamNumber_ = 0;
   uint32_t objectStreamTargetIndex_ = 0;
   uint32_t objectStreamObjectCount_ = 0;
@@ -90,6 +128,10 @@ class PdfObjectResolver {
   uint8_t eolByte_ = 0;
   bool resolvingObjectStream_ = false;
   bool objectStreamTargetFound_ = false;
-  bool sourceAccessRequired_ = true;
+  bool objectStreamUsesStore_ = false;
+  bool cachedObjectStreamUsesStore_ = false;
+  bool publishObjectStream_ = false;
+  PdfObjectResolverReader sourceAccess_ = PdfObjectResolverReader::Source;
+  bool sourceAccessKnown_ = true;
   PdfReadExactState eolRead_{};
 };

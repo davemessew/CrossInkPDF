@@ -49,3 +49,15 @@ target_compile_options(AtomicBookUploadTest PRIVATE
 )
 
 gtest_discover_tests(AtomicBookUploadTest TEST_PREFIX "WebUpload")
+
+find_program(NODE_EXECUTABLE NAMES node nodejs)
+if(NODE_EXECUTABLE)
+  add_test(
+    NAME WebUploadSourceContract
+    COMMAND ${NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/source_contract_test.js
+  )
+  add_test(
+    NAME WebUploadLegacyBehavior
+    COMMAND ${NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/legacy_transport_trace_test.js
+  )
+endif()

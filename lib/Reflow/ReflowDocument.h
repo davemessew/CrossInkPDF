@@ -185,6 +185,11 @@ class ReflowDocument : public ReflowSectionSource {
                                         int readerFontId = 0) const = 0;
 
   virtual int getSectionCount() const = 0;
+  virtual bool getSectionHref(const int sectionIndex, std::string& href) const {
+    ReflowSectionInfo info = getSectionInfo(sectionIndex);
+    href = std::move(info.href);
+    return !href.empty();
+  }
   virtual ReflowSectionInfo getSectionInfo(int sectionIndex) const = 0;
   virtual bool getSectionSize(int sectionIndex, size_t* size) const = 0;
   virtual size_t getCumulativeSectionSize(int sectionIndex) const = 0;

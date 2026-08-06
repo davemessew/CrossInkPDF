@@ -27,6 +27,12 @@ struct PdfCMapLookup {
   PdfUtf8Value unicode{};
 };
 
+struct PdfCMapCodeSpace {
+  uint32_t first = 0;
+  uint32_t last = 0;
+  uint8_t length = 0;
+};
+
 struct PdfCMapWorkspace {
   using SourceAccessFn = PdfStatus (*)(void* context, bool sourceRequired);
 
@@ -44,9 +50,12 @@ class PdfCMap {
   PdfStatus begin(const PdfByteSource& source);
   PdfStepResult step(PdfWorkBudget& budget);
   PdfStatus lookup(const uint8_t* source, size_t sourceLength, PdfCMapLookup* result);
+  PdfStatus copyCodeSpaces(PdfCMapCodeSpace* destination, size_t capacity, uint8_t* count) const;
+  PdfStatus applyRecord(const PdfCMapRecord& record, uint32_t code, uint8_t codeLength, PdfCMapLookup* result);
 
   uint32_t mappingCount() const { return mappingCount_; }
   uint8_t codeSpaceCount() const { return codeSpaceCount_; }
+  bool fullyResident() const { return spillCount_ == 0; }
 
  private:
   struct CodeSpace {
@@ -77,9 +86,10 @@ class PdfCMap {
   PdfStatus addSequential(uint32_t first, uint32_t last, uint8_t sourceLength, const uint8_t* destination,
                           size_t destinationLength);
   PdfStatus readRecord(uint32_t ordinal, PdfCMapRecord* record);
-  PdfStatus applyRecord(const PdfCMapRecord& record, uint32_t code, uint8_t codeLength, PdfCMapLookup* result);
   PdfStatus decodeCode(const uint8_t* source, size_t sourceLength, uint32_t* code, uint8_t* codeLength) const;
   PdfStepResult fail(PdfStatus status);
+  bool observingRecords() const;
+  bool codeSpaceOnly() const;
 
   PdfCMapWorkspace workspace_{};
   PdfLexer lexer_;

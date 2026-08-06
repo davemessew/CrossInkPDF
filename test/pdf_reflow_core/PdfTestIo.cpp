@@ -52,6 +52,9 @@ PdfStatus PdfTestRecordStore::read(void* context, const uint32_t ordinal, void* 
   if (store.readForbiddenFlag_ != nullptr && *store.readForbiddenFlag_) {
     return PdfStatus::failure(PdfError::IoFailure, ordinal);
   }
+  if (store.activeOwner_ != nullptr && *store.activeOwner_ != store.requiredOwner_) {
+    return PdfStatus::failure(PdfError::IoFailure, ordinal);
+  }
   if (ordinal == store.readFailureOrdinal_) {
     return PdfStatus::failure(PdfError::IoFailure, ordinal);
   }

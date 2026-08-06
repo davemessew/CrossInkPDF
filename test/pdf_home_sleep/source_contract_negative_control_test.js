@@ -63,14 +63,25 @@ expectRejected(
 );
 
 expectRejected(
-  "PDF snapshot-first removal",
+  "PDF framebuffer clone insertion",
   (sources) => {
     sources.sleep = sources.sleep.replace(
-      "pdfSnapshotBeforeFallback(",
-      "pdfFallbackBeforeSnapshot(",
+      "loadPdfSleepProducts(activeBookPath);",
+      "renderer.storeBwBuffer(); loadPdfSleepProducts(activeBookPath);",
     );
   },
-  "Sleep onEnter must use the executable snapshot-first seam",
+  "PDF overlay path must not snapshot or restore framebuffer clones",
+);
+
+expectRejected(
+  "PDF snapshot-based grayscale insertion",
+  (sources) => {
+    sources.sleep = sources.sleep.replace(
+      "const bool backgroundSupportsGrayscale =",
+      "const bool backgroundSupportsGrayscale = FsHelpers::hasPdfExtension(path) ||",
+    );
+  },
+  "PDF overlay must remain excluded from the snapshot-based grayscale pass",
 );
 
 expectRejected(

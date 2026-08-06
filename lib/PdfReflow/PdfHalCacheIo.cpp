@@ -33,7 +33,10 @@ PdfStatus openFile(void* rawContext, const char* const path, const PdfCacheOpenM
   if (mode == PdfCacheOpenMode::Read && !Storage.exists(path)) {
     return PdfStatus::failure(PdfError::InvalidOffset);
   }
-  const oflag_t flags = mode == PdfCacheOpenMode::Read ? O_RDONLY : static_cast<oflag_t>(O_WRONLY | O_CREAT | O_TRUNC);
+  const oflag_t flags = mode == PdfCacheOpenMode::Read          ? O_RDONLY
+                        : mode == PdfCacheOpenMode::ReadWrite   ? static_cast<oflag_t>(O_RDWR | O_CREAT)
+                        : mode == PdfCacheOpenMode::Write       ? static_cast<oflag_t>(O_WRONLY | O_CREAT)
+                                                                : static_cast<oflag_t>(O_WRONLY | O_CREAT | O_TRUNC);
   HalFile opened = Storage.open(path, flags);
   if (!opened) {
     return PdfStatus::failure(PdfError::IoFailure);
@@ -132,10 +135,8 @@ PdfStatus removePath(void* rawContext, const char* const path, const bool recurs
   return removed ? PdfStatus::success() : PdfStatus::failure(PdfError::IoFailure);
 }
 
-PdfStatus renamePath(void* rawContext, const char* const sourcePath,
-                     const char* const destinationPath) {
-  if (rawContext == nullptr || sourcePath == nullptr ||
-      destinationPath == nullptr) {
+PdfStatus renamePath(void* rawContext, const char* const sourcePath, const char* const destinationPath) {
+  if (rawContext == nullptr || sourcePath == nullptr || destinationPath == nullptr) {
     return PdfStatus::failure(PdfError::InvalidArgument);
   }
   if (!Storage.exists(sourcePath)) {
@@ -144,9 +145,7 @@ PdfStatus renamePath(void* rawContext, const char* const sourcePath,
   if (Storage.exists(destinationPath)) {
     return PdfStatus::failure(PdfError::IoFailure);
   }
-  return Storage.rename(sourcePath, destinationPath)
-             ? PdfStatus::success()
-             : PdfStatus::failure(PdfError::IoFailure);
+  return Storage.rename(sourcePath, destinationPath) ? PdfStatus::success() : PdfStatus::failure(PdfError::IoFailure);
 }
 
 PdfStatus makeDirectory(void* rawContext, const char* const path) {
@@ -216,6 +215,20 @@ PdfStatus fileMetadata(void* rawContext, const PdfCacheHandle handle, PdfCacheFi
     return invalidHandle();
   }
   HalFile& file = context.files[handle.value];
+  if (metadata->operation == PdfCacheMetadataOperation::Seek) {
+    const uint64_t offset = metadata->size;
+    return file.seek64(offset) ? PdfStatus::success() : PdfStatus::failure(PdfError::IoFailure, offset);
+  }
+  if (metadata->operation == PdfCacheMetadataOperation::Truncate) {
+    const uint64_t length = metadata->size;
+#ifdef SIMULATOR
+    // The external native-simulator HalFile contract does not expose its POSIX
+    // descriptor. Keep this build explicit until that dependency adds truncate64.
+    return PdfStatus::failure(PdfError::Unsupported, length);
+#else
+    return file.truncate64(length) ? PdfStatus::success() : PdfStatus::failure(PdfError::IoFailure, length);
+#endif
+  }
   *metadata = {};
   metadata->size = file.fileSize64();
   metadata->directory = file.isDirectory();
@@ -231,8 +244,7 @@ PdfStatus fileMetadata(void* rawContext, const PdfCacheHandle handle, PdfCacheFi
 
 }  // namespace
 
-PdfStatus pdfHalCacheRename(void* context, const char* sourcePath,
-                            const char* destinationPath) {
+PdfStatus pdfHalCacheRename(void* context, const char* sourcePath, const char* destinationPath) {
   return renamePath(context, sourcePath, destinationPath);
 }
 

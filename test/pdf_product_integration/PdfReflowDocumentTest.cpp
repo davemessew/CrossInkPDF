@@ -3,7 +3,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -14,6 +16,7 @@
 #include "PdfReflowDocument.h"
 #include "PdfTestCacheIo.h"
 #include "PdfTestIo.h"
+#include <Memory.h>
 
 namespace {
 
@@ -47,14 +50,18 @@ struct RequiredRecords {
   PdfRequiredFileTableSource source() { return {this, static_cast<uint32_t>(values.size()), read}; }
 };
 
-struct OneMetadataSection {
-  PdfMetadataSection value{};
+struct MetadataSections {
+  std::vector<PdfMetadataSection> values;
 
   static PdfStatus read(void* context, const uint16_t index, PdfMetadataSection* output) {
-    if (context == nullptr || output == nullptr || index != 0) {
+    if (context == nullptr || output == nullptr) {
       return PdfStatus::failure(PdfError::InvalidArgument);
     }
-    *output = static_cast<OneMetadataSection*>(context)->value;
+    const auto& self = *static_cast<MetadataSections*>(context);
+    if (index >= self.values.size()) {
+      return PdfStatus::failure(PdfError::InvalidOffset, index);
+    }
+    *output = self.values[index];
     return PdfStatus::success();
   }
 };
@@ -75,9 +82,14 @@ struct CacheFixture {
   PdfTestCacheIo storage;
   PdfSourceIdentity identity{};
   std::string cacheRoot;
+  std::string selectedManifestPath;
+  std::string otherManifestPath;
   std::string sectionPath;
 
-  void build(const char* const sourcePath = kSourcePath, const uint64_t* const cacheHashOverride = nullptr) {
+  void build(const char* const sourcePath = kSourcePath, const uint64_t* const cacheHashOverride = nullptr,
+             const uint16_t sectionCount = 1) {
+    ASSERT_GT(sectionCount, 0);
+    ASSERT_LE(sectionCount, PdfMetadataLimits::MaxSections);
     const std::string source = "%PDF-host-fixture-with-enough-identity-bytes";
     storage.addFile(sourcePath, std::vector<uint8_t>(source.begin(), source.end()), 42, true);
     std::array<uint8_t, PDF_SOURCE_FINGERPRINT_BYTES> workspace{};
@@ -90,21 +102,27 @@ struct CacheFixture {
             : pdfFormatCacheRootForHash(kCacheDirectory, *cacheHashOverride, root.data(), root.size());
     ASSERT_TRUE(rootStatus.ok());
     cacheRoot = root.data();
-    sectionPath = cacheRoot + "/gen_7/sections/000000.xhtml";
-
     PdfCacheStore cache;
     ASSERT_TRUE(cache.initialize(storage.io(), cacheRoot.c_str()).ok());
     ASSERT_TRUE(cache.ensureGeneration(7).ok());
-    PdfCacheTrackedWriter writer;
-    ASSERT_TRUE(pdfOpenTrackedCacheWriter(storage.io(), sectionPath.c_str(), "gen_7/sections/000000.xhtml",
-                                          PdfCacheFileKind::Required, sizeof(kSection), &writer)
-                    .ok());
-    ASSERT_TRUE(
-        pdfWriteTrackedCacheFile(&writer, reinterpret_cast<const uint8_t*>(kSection), sizeof(kSection) - 1).ok());
     RequiredRecords records;
-    PdfRequiredFileRecord sectionRecord{};
-    ASSERT_TRUE(pdfCloseTrackedCacheFile(&writer, &sectionRecord).ok());
-    records.values.push_back(sectionRecord);
+    for (uint16_t index = 0; index < sectionCount; ++index) {
+      char relative[48]{};
+      ASSERT_GT(std::snprintf(relative, sizeof(relative), "gen_7/sections/%06u.xhtml", index), 0);
+      const std::string fullPath = cacheRoot + "/" + relative;
+      if (index == 0) {
+        sectionPath = fullPath;
+      }
+      PdfCacheTrackedWriter writer;
+      ASSERT_TRUE(pdfOpenTrackedCacheWriter(storage.io(), fullPath.c_str(), relative, PdfCacheFileKind::Required,
+                                            sizeof(kSection), &writer)
+                      .ok());
+      ASSERT_TRUE(
+          pdfWriteTrackedCacheFile(&writer, reinterpret_cast<const uint8_t*>(kSection), sizeof(kSection) - 1).ok());
+      PdfRequiredFileRecord sectionRecord{};
+      ASSERT_TRUE(pdfCloseTrackedCacheFile(&writer, &sectionRecord).ok());
+      records.values.push_back(sectionRecord);
+    }
 
     const auto addArtifact = [&](const std::string& relative, const std::string& bytes) {
       const std::string path = cacheRoot + "/" + relative;
@@ -123,20 +141,28 @@ struct CacheFixture {
     PdfMetadataBuilder metadataBuilder;
     ASSERT_TRUE(metadataBuilder.begin(reinterpret_cast<const uint8_t*>("minimal"), 7).ok());
     PdfMetadata metadata = metadataBuilder.metadata();
-    metadata.sectionCount = 1;
+    metadata.sectionCount = sectionCount;
     metadata.outlineCount = 1;
-    metadata.totalWords = 2;
-    OneMetadataSection metadataSection{{
-        .byteSize = static_cast<uint32_t>(sectionRecord.size),
-        .cumulativeSize = static_cast<uint32_t>(sectionRecord.size),
-        .firstWordOrdinal = 0,
-        .wordCount = 2,
-        .firstAnchorOrdinal = 0,
-        .tocIndex = 0,
-    }};
+    metadata.totalWords = static_cast<uint32_t>(sectionCount) * 2U;
+    MetadataSections metadataSections;
+    metadataSections.values.reserve(sectionCount);
+    uint32_t cumulativeSize = 0;
+    for (uint16_t index = 0; index < sectionCount; ++index) {
+      const uint32_t byteSize = static_cast<uint32_t>(records.values[index].size);
+      cumulativeSize += byteSize;
+      metadataSections.values.push_back({
+          .byteSize = byteSize,
+          .cumulativeSize = cumulativeSize,
+          .firstWordOrdinal = static_cast<uint32_t>(index) * 2U,
+          .wordCount = 2,
+          .firstAnchorOrdinal = index,
+          .tocIndex = static_cast<int16_t>(index == 0 ? 0 : -1),
+      });
+    }
     PdfTestByteSink metadataBytes;
-    ASSERT_TRUE(
-        pdfEncodeMetadata(metadata, {&metadataSection, 1, OneMetadataSection::read}, metadataBytes.sink()).ok());
+    ASSERT_TRUE(pdfEncodeMetadata(metadata, {&metadataSections, sectionCount, MetadataSections::read},
+                                  metadataBytes.sink())
+                    .ok());
     const std::string metadataRelative = "gen_7/metadata.bin";
     const std::string metadataPath = cacheRoot + "/" + metadataRelative;
     storage.addFile(metadataPath, metadataBytes.bytes());
@@ -169,7 +195,7 @@ struct CacheFixture {
     manifest.completed = true;
     manifest.source = identity;
     manifest.generation = 7;
-    manifest.totalWords = 2;
+    manifest.totalWords = metadata.totalWords;
     manifest.requiredFileCount = static_cast<uint32_t>(records.values.size());
     manifest.requiredFileLedger = PDF_CACHE_FNV64_OFFSET;
     for (const auto& record : records.values) {
@@ -186,6 +212,8 @@ struct CacheFixture {
     const PdfCacheManifestSelection prior{};
     ASSERT_TRUE(cache.commitManifest(manifest, records.source(), evidence, prior, &committed).ok());
     ASSERT_TRUE(committed.selected);
+    selectedManifestPath = cacheRoot + (committed.selectedSlot == PdfCacheSlot::A ? "/manifest.a" : "/manifest.b");
+    otherManifestPath = cacheRoot + (committed.selectedSlot == PdfCacheSlot::A ? "/manifest.b" : "/manifest.a");
     storage.clearEvents();
   }
 };
@@ -213,7 +241,22 @@ PdfLayoutWordRange layoutRange(const uint32_t first, const uint32_t last, const 
   return result;
 }
 
-std::vector<uint8_t> layoutWordIndex(const std::vector<PdfLayoutWordRange>& ranges, const uint32_t totalWords) {
+PdfStatus patchVector(void* const context, const uint64_t offset, const uint8_t* const source,
+                      const size_t requested, size_t* const bytesWritten) {
+  if (context == nullptr || source == nullptr || bytesWritten == nullptr) {
+    return PdfStatus::failure(PdfError::InvalidArgument, offset);
+  }
+  auto& bytes = *static_cast<std::vector<uint8_t>*>(context);
+  if (offset > bytes.size() || requested > bytes.size() - static_cast<size_t>(offset)) {
+    return PdfStatus::failure(PdfError::InvalidOffset, offset);
+  }
+  std::copy_n(source, requested, bytes.begin() + static_cast<std::ptrdiff_t>(offset));
+  *bytesWritten = requested;
+  return PdfStatus::success();
+}
+
+std::vector<uint8_t> layoutWordIndex(const std::vector<PdfLayoutWordRange>& ranges, const uint32_t totalWords,
+                                      uint32_t* const pairToken = nullptr) {
   PdfTestByteSink sink;
   PdfLayoutWordIndexWriter writer;
   EXPECT_TRUE(writer.begin(sink.sink(), 0, 0, totalWords));
@@ -221,7 +264,112 @@ std::vector<uint8_t> layoutWordIndex(const std::vector<PdfLayoutWordRange>& rang
     EXPECT_TRUE(writer.append(range));
   }
   EXPECT_TRUE(writer.finish());
+  if (pairToken != nullptr) {
+    *pairToken = writer.pairToken();
+  }
   return sink.bytes();
+}
+
+void addLayoutPair(CacheFixture& fixture, const std::string& sectionCachePath,
+                    const std::vector<PdfLayoutWordRange>& ranges, const uint32_t totalWords,
+                    std::vector<uint8_t> sectionBytes = {44, 1, 2, 3, 4, 5, 6, 7}) {
+  uint32_t pairToken = 0;
+  std::vector<uint8_t> sidecar = layoutWordIndex(ranges, totalWords, &pairToken);
+  const PdfLayoutCacheBinding binding{static_cast<uint32_t>(sectionBytes.size()), pairToken};
+  uint8_t trailer[PDF_LAYOUT_CACHE_BINDING_TRAILER_BYTES];
+  ASSERT_TRUE(pdfEncodeLayoutCacheBindingTrailer(binding, trailer));
+  sectionBytes.insert(sectionBytes.end(), trailer, trailer + sizeof(trailer));
+
+  PdfTestByteSource source(sidecar);
+  ASSERT_TRUE(pdfBindLayoutWordIndex(source.source(), {&sidecar, patchVector}, binding));
+  fixture.storage.addFile(sectionCachePath, sectionBytes);
+  fixture.storage.addFile(sectionCachePath + ".pwi", sidecar);
+}
+
+class ArrayAllocationProbe {
+ public:
+  explicit ArrayAllocationProbe(const size_t failBytes = 0) {
+    TestMemory::resetArrayProbe();
+    TestMemory::observeArrays = true;
+    TestMemory::failArrayBytes = failBytes;
+  }
+  ~ArrayAllocationProbe() { TestMemory::resetArrayProbe(); }
+};
+
+TEST(PdfReflowDocumentStorage, AllocatesExactTwoSectionZeroResourceValidationBytesOnce) {
+  CacheFixture fixture;
+  fixture.build(kSourcePath, nullptr, 2);
+
+  ArrayAllocationProbe allocations;
+  const uint32_t selectedManifestOpens = fixture.storage.openCallsForPath(fixture.selectedManifestPath);
+  const uint32_t otherManifestOpens = fixture.storage.openCallsForPath(fixture.otherManifestPath);
+  PdfReflowDocument document;
+  ASSERT_TRUE(document.initialize(fixture.storage.io(), kSourcePath, kCacheDirectory).ok());
+  ASSERT_TRUE(document.loadCompletedCache().ok());
+
+  EXPECT_EQ(document.validationStorageBytesForTest(), 17U);
+  EXPECT_EQ(std::count(TestMemory::arraySizes, TestMemory::arraySizes + TestMemory::arrayCount, 17U), 1);
+  EXPECT_EQ(document.getSectionCount(), 2);
+  EXPECT_EQ(document.getTotalWordCount(), 4U);
+  EXPECT_EQ(fixture.storage.openCallsForPath(fixture.selectedManifestPath), selectedManifestOpens + 2U);
+  EXPECT_EQ(fixture.storage.openCallsForPath(fixture.otherManifestPath), otherManifestOpens + 1U);
+  EXPECT_EQ(fixture.storage.openHandleCount(), 0U);
+}
+
+TEST(PdfReflowDocumentStorage, FailsClosedWhenExactValidationAllocationFails) {
+  CacheFixture fixture;
+  fixture.build(kSourcePath, nullptr, 2);
+
+  ArrayAllocationProbe allocations(17);
+  PdfReflowDocument document;
+  ASSERT_TRUE(document.initialize(fixture.storage.io(), kSourcePath, kCacheDirectory).ok());
+  const PdfStatus status = document.loadCompletedCache();
+
+  EXPECT_EQ(status.error, PdfError::InsufficientMemory);
+  EXPECT_TRUE(TestMemory::sawArrayBytes(17));
+  EXPECT_EQ(document.validationStorageBytesForTest(), 0U);
+  EXPECT_EQ(document.getSectionCount(), 0);
+  EXPECT_EQ(document.getCapabilities(), 0U);
+  EXPECT_EQ(fixture.storage.openHandleCount(), 0U);
+}
+
+TEST(PdfReflowDocumentStorage, ReleasesExactValidationStorageAfterRequiredFileCorruption) {
+  CacheFixture fixture;
+  fixture.build(kSourcePath, nullptr, 2);
+  fixture.storage.corruptByte(fixture.sectionPath, 12, 0x40);
+
+  ArrayAllocationProbe allocations;
+  PdfReflowDocument document;
+  ASSERT_TRUE(document.initialize(fixture.storage.io(), kSourcePath, kCacheDirectory).ok());
+  const PdfStatus status = document.loadCompletedCache();
+
+  EXPECT_EQ(status.error, PdfError::Malformed);
+  EXPECT_TRUE(TestMemory::sawArrayBytes(17));
+  EXPECT_EQ(document.validationStorageBytesForTest(), 0U);
+  EXPECT_EQ(document.getSectionCount(), 0);
+  EXPECT_EQ(document.getCapabilities(), 0U);
+  EXPECT_EQ(fixture.storage.openHandleCount(), 0U);
+}
+
+TEST(PdfReflowDocumentStorage, BoundsZeroMaximumAndOverflowLayouts) {
+  size_t bytes = 99;
+  EXPECT_TRUE(PdfReflowDocument::validationStorageLayoutForTest(0, 0, &bytes).ok());
+  EXPECT_EQ(bytes, 0U);
+  EXPECT_TRUE(PdfReflowDocument::validationStorageLayoutForTest(2, 0, &bytes).ok());
+  EXPECT_EQ(bytes, 17U);
+  EXPECT_TRUE(PdfReflowDocument::validationStorageLayoutForTest(PdfMetadataLimits::MaxSections, 64, &bytes).ok());
+  EXPECT_EQ(bytes, 4640U);
+  EXPECT_EQ(PdfReflowDocument::validationStorageLayoutForTest(PdfMetadataLimits::MaxSections + 1U, 0, &bytes).error,
+            PdfError::LimitExceeded);
+  EXPECT_EQ(bytes, 0U);
+  EXPECT_EQ(PdfReflowDocument::validationStorageLayoutForTest(1, 65, &bytes).error, PdfError::LimitExceeded);
+  EXPECT_EQ(bytes, 0U);
+  EXPECT_EQ(PdfReflowDocument::validationStorageLayoutForTest(std::numeric_limits<size_t>::max(), 1, &bytes).error,
+            PdfError::LimitExceeded);
+  EXPECT_EQ(bytes, 0U);
+  EXPECT_EQ(PdfReflowDocument::validationStorageLayoutForTest(1, std::numeric_limits<size_t>::max(), &bytes).error,
+            PdfError::LimitExceeded);
+  EXPECT_EQ(bytes, 0U);
 }
 
 TEST(PdfReflowDocument, ClosesSourceBeforeValidatingCacheAndNeverReopensItForReading) {
@@ -275,9 +423,9 @@ TEST(PdfReflowDocument, ClosesSourceBeforeValidatingCacheAndNeverReopensItForRea
   ReflowReadingPosition loadedPosition;
   ASSERT_TRUE(document.loadReadingPosition(loadedPosition));
   EXPECT_EQ(loadedPosition.sectionIndex, 0);
-  EXPECT_EQ(loadedPosition.pageNumber, 2);
-  EXPECT_EQ(loadedPosition.pageCount, 4);
-  EXPECT_TRUE(loadedPosition.hasPageCount);
+  EXPECT_EQ(loadedPosition.pageNumber, 0);
+  EXPECT_EQ(loadedPosition.pageCount, 0);
+  EXPECT_FALSE(loadedPosition.hasPageCount);
   EXPECT_TRUE(loadedPosition.hasSemanticPosition);
   EXPECT_EQ(loadedPosition.globalWordOrdinal, 1U);
   EXPECT_EQ(loadedPosition.blockWordOffset, 1U);
@@ -400,6 +548,204 @@ TEST(PdfReflowDocument, ReloadsSemanticProgressAfterDocumentRestart) {
   EXPECT_EQ(fixture.storage.openHandleCount(), 0U);
 }
 
+TEST(PdfReflowDocument, RemapsStalePerPageProgressAtARegroupedSectionBoundaryWithoutAllocating) {
+  CacheFixture fixture;
+  fixture.storage.setMaximumReadHandles(1);
+  fixture.build(kSourcePath, nullptr, 2);
+
+  PdfReflowDocument document;
+  ASSERT_TRUE(document.initialize(fixture.storage.io(), kSourcePath, kCacheDirectory).ok());
+  ASSERT_TRUE(document.loadCompletedCache().ok());
+
+  ReflowReadingPosition stale;
+  stale.sectionIndex = 2;
+  stale.pageNumber = 5;
+  stale.pageCount = 9;
+  stale.hasPageCount = true;
+  stale.hasSemanticPosition = true;
+  stale.hasWordCursor = true;
+  stale.globalWordOrdinal = 2;
+  stale.blockWordOffset = 7;
+  stale.wordCursor = 1;
+  setAnchor(stale, "b00000002");
+  ASSERT_TRUE(document.saveReadingPosition(stale));
+
+  ArrayAllocationProbe allocations;
+  const size_t allocationsBefore = TestMemory::arrayCount;
+  ReflowReadingPosition loaded;
+  ASSERT_TRUE(document.loadReadingPosition(loaded));
+
+  EXPECT_EQ(loaded.sectionIndex, 1);
+  EXPECT_EQ(loaded.pageNumber, 0);
+  EXPECT_EQ(loaded.pageCount, 0);
+  EXPECT_FALSE(loaded.hasPageCount);
+  EXPECT_TRUE(loaded.hasSemanticPosition);
+  EXPECT_TRUE(loaded.hasWordCursor);
+  EXPECT_EQ(loaded.globalWordOrdinal, 2U);
+  EXPECT_EQ(loaded.blockWordOffset, 7U);
+  EXPECT_EQ(loaded.wordCursor, 1U);
+  EXPECT_STREQ(loaded.blockAnchor, "b00000002");
+  EXPECT_EQ(TestMemory::arrayCount, allocationsBefore);
+  EXPECT_EQ(fixture.storage.openHandleCount(), 0U);
+}
+
+TEST(PdfReflowDocument, RemapsCursorOnlyProgressAtDocumentEndToTheFinalLogicalSection) {
+  CacheFixture fixture;
+  fixture.storage.setMaximumReadHandles(1);
+  fixture.build(kSourcePath, nullptr, 2);
+
+  PdfReflowDocument document;
+  ASSERT_TRUE(document.initialize(fixture.storage.io(), kSourcePath, kCacheDirectory).ok());
+  ASSERT_TRUE(document.loadCompletedCache().ok());
+
+  ReflowReadingPosition stale;
+  stale.sectionIndex = 3;
+  stale.pageNumber = 4;
+  stale.pageCount = 8;
+  stale.hasPageCount = true;
+  stale.hasWordCursor = true;
+  stale.wordCursor = 4;
+  ASSERT_TRUE(document.saveReadingPosition(stale));
+
+  ReflowReadingPosition loaded;
+  ASSERT_TRUE(document.loadReadingPosition(loaded));
+  EXPECT_EQ(loaded.sectionIndex, 1);
+  EXPECT_EQ(loaded.pageNumber, 0);
+  EXPECT_EQ(loaded.pageCount, 0);
+  EXPECT_FALSE(loaded.hasPageCount);
+  EXPECT_FALSE(loaded.hasSemanticPosition);
+  EXPECT_TRUE(loaded.hasWordCursor);
+  EXPECT_EQ(loaded.wordCursor, 4U);
+  EXPECT_EQ(fixture.storage.openHandleCount(), 0U);
+}
+
+TEST(PdfReflowDocument, PreservesLegacyPageTupleWhenNoSemanticCoordinateExists) {
+  CacheFixture fixture;
+  fixture.storage.setMaximumReadHandles(1);
+  fixture.build(kSourcePath, nullptr, 2);
+
+  PdfReflowDocument document;
+  ASSERT_TRUE(document.initialize(fixture.storage.io(), kSourcePath, kCacheDirectory).ok());
+  ASSERT_TRUE(document.loadCompletedCache().ok());
+
+  ReflowReadingPosition legacy;
+  legacy.sectionIndex = 1;
+  legacy.pageNumber = 3;
+  legacy.pageCount = 8;
+  legacy.hasPageCount = true;
+  ASSERT_TRUE(document.saveReadingPosition(legacy));
+
+  ReflowReadingPosition loaded;
+  ASSERT_TRUE(document.loadReadingPosition(loaded));
+  EXPECT_EQ(loaded.sectionIndex, 1);
+  EXPECT_EQ(loaded.pageNumber, 3);
+  EXPECT_EQ(loaded.pageCount, 8);
+  EXPECT_TRUE(loaded.hasPageCount);
+  EXPECT_FALSE(loaded.hasSemanticPosition);
+  EXPECT_FALSE(loaded.hasWordCursor);
+  EXPECT_EQ(fixture.storage.openHandleCount(), 0U);
+}
+
+TEST(PdfReflowDocument, FailsClosedForOutOfRangeProgressWithoutASemanticCoordinate) {
+  CacheFixture fixture;
+  fixture.storage.setMaximumReadHandles(1);
+  fixture.build(kSourcePath, nullptr, 2);
+
+  PdfReflowDocument document;
+  ASSERT_TRUE(document.initialize(fixture.storage.io(), kSourcePath, kCacheDirectory).ok());
+  ASSERT_TRUE(document.loadCompletedCache().ok());
+
+  ReflowReadingPosition stale;
+  stale.sectionIndex = 2;
+  stale.pageNumber = 1;
+  ASSERT_TRUE(document.saveReadingPosition(stale));
+
+  ReflowReadingPosition loaded;
+  EXPECT_FALSE(document.loadReadingPosition(loaded));
+  EXPECT_EQ(fixture.storage.openHandleCount(), 0U);
+}
+
+TEST(PdfReflowDocument, RemapsSavedItemsBySemanticWordAndDropsStaleFallbackPagesWithoutAllocating) {
+  CacheFixture fixture;
+  fixture.storage.setMaximumReadHandles(1);
+  fixture.build(kSourcePath, nullptr, 2);
+
+  PdfReflowDocument document;
+  ASSERT_TRUE(document.initialize(fixture.storage.io(), kSourcePath, kCacheDirectory).ok());
+  ASSERT_TRUE(document.loadCompletedCache().ok());
+
+  PdfSavedItem bookmark{};
+  bookmark.itemId = 7;
+  bookmark.kind = PdfSavedItemKind::Bookmark;
+  bookmark.flags = PDF_SAVED_ITEM_HAS_START_SEMANTIC | PDF_SAVED_ITEM_HAS_FALLBACK_PAGES;
+  bookmark.startGlobalWordOrdinal = 2;
+  bookmark.startBlockWordOffset = 6;
+  bookmark.sectionIndex = 2;
+  bookmark.fallbackStartPage = 4;
+  bookmark.fallbackEndPage = 4;
+  bookmark.fallbackPageCount = 7;
+  bookmark.fallbackLayoutFingerprint = 0x12345678U;
+  std::memcpy(bookmark.startBlockAnchor, "b00000002", 9);
+  ASSERT_TRUE(document.savePdfSavedItems(&bookmark, 1).ok());
+
+  std::array<PdfSavedItem, PDF_SAVED_ITEMS_MAX_RECORDS> items{};
+  PdfSavedItemsBuffer buffer{items.data(), static_cast<uint16_t>(items.size()), 0};
+  ArrayAllocationProbe allocations;
+  const size_t allocationsBefore = TestMemory::arrayCount;
+  ASSERT_TRUE(document.loadPdfSavedItems(&buffer).ok());
+
+  ASSERT_EQ(buffer.count, 1);
+  EXPECT_EQ(buffer.items[0].sectionIndex, 1U);
+  EXPECT_EQ(buffer.items[0].startGlobalWordOrdinal, 2U);
+  EXPECT_EQ(buffer.items[0].startBlockWordOffset, 6U);
+  EXPECT_STREQ(buffer.items[0].startBlockAnchor, "b00000002");
+  EXPECT_EQ(buffer.items[0].flags & PDF_SAVED_ITEM_HAS_FALLBACK_PAGES, 0U);
+  EXPECT_EQ(buffer.items[0].fallbackStartPage, 0U);
+  EXPECT_EQ(buffer.items[0].fallbackEndPage, 0U);
+  EXPECT_EQ(buffer.items[0].fallbackPageCount, 0U);
+  EXPECT_EQ(buffer.items[0].fallbackLayoutFingerprint, 0U);
+  EXPECT_EQ(TestMemory::arrayCount, allocationsBefore);
+  EXPECT_EQ(fixture.storage.openHandleCount(), 0U);
+}
+
+TEST(PdfReflowDocument, PreservesSavedItemFallbackPagesWhenTheSemanticSectionIsUnchanged) {
+  CacheFixture fixture;
+  fixture.storage.setMaximumReadHandles(1);
+  fixture.build(kSourcePath, nullptr, 2);
+
+  PdfReflowDocument document;
+  ASSERT_TRUE(document.initialize(fixture.storage.io(), kSourcePath, kCacheDirectory).ok());
+  ASSERT_TRUE(document.loadCompletedCache().ok());
+
+  PdfSavedItem bookmark{};
+  bookmark.itemId = 8;
+  bookmark.kind = PdfSavedItemKind::Bookmark;
+  bookmark.flags = PDF_SAVED_ITEM_HAS_START_SEMANTIC | PDF_SAVED_ITEM_HAS_FALLBACK_PAGES;
+  bookmark.startGlobalWordOrdinal = 2;
+  bookmark.startBlockWordOffset = 6;
+  bookmark.sectionIndex = 1;
+  bookmark.fallbackStartPage = 4;
+  bookmark.fallbackEndPage = 4;
+  bookmark.fallbackPageCount = 7;
+  bookmark.fallbackLayoutFingerprint = 0x12345678U;
+  std::memcpy(bookmark.startBlockAnchor, "b00000002", 9);
+  ASSERT_TRUE(document.savePdfSavedItems(&bookmark, 1).ok());
+
+  std::array<PdfSavedItem, PDF_SAVED_ITEMS_MAX_RECORDS> items{};
+  PdfSavedItemsBuffer buffer{items.data(), static_cast<uint16_t>(items.size()), 0};
+  ASSERT_TRUE(document.loadPdfSavedItems(&buffer).ok());
+
+  ASSERT_EQ(buffer.count, 1);
+  EXPECT_EQ(buffer.items[0].sectionIndex, 1U);
+  EXPECT_EQ(buffer.items[0].flags,
+            PDF_SAVED_ITEM_HAS_START_SEMANTIC | PDF_SAVED_ITEM_HAS_FALLBACK_PAGES);
+  EXPECT_EQ(buffer.items[0].fallbackStartPage, 4U);
+  EXPECT_EQ(buffer.items[0].fallbackEndPage, 4U);
+  EXPECT_EQ(buffer.items[0].fallbackPageCount, 7U);
+  EXPECT_EQ(buffer.items[0].fallbackLayoutFingerprint, 0x12345678U);
+  EXPECT_EQ(fixture.storage.openHandleCount(), 0U);
+}
+
 TEST(PdfReflowDocument, RejectsCorruptRequiredFileBeforeExposingSections) {
   CacheFixture fixture;
   fixture.build();
@@ -418,12 +764,8 @@ TEST(PdfReflowDocument, FallsBackToGlobalOrdinalWhenEarliestAnchorContinuationDo
   CacheFixture fixture;
   fixture.build();
   const std::string sectionCachePath = fixture.cacheRoot + "/sections/0.bin";
-  fixture.storage.addFile(sectionCachePath + ".pwi", layoutWordIndex(
-                                                         {
-                                                             layoutRange(0, 0, 0, "b00000000"),
-                                                             layoutRange(1, 1, 0, "b00000000"),
-                                                         },
-                                                         2));
+  addLayoutPair(fixture, sectionCachePath,
+                {layoutRange(0, 0, 0, "b00000000"), layoutRange(1, 1, 0, "b00000000")}, 2);
 
   PdfReflowDocument document;
   ASSERT_TRUE(document.initialize(fixture.storage.io(), kSourcePath, kCacheDirectory).ok());
@@ -435,16 +777,35 @@ TEST(PdfReflowDocument, FallsBackToGlobalOrdinalWhenEarliestAnchorContinuationDo
   EXPECT_EQ(page, 1U);
 }
 
+TEST(PdfReflowDocument, RejectsSameLengthSectionCacheFromAnotherBoundSidecarPair) {
+  CacheFixture fixture;
+  fixture.build();
+  const std::string sectionCachePath = fixture.cacheRoot + "/sections/0.bin";
+  const std::vector<uint8_t> oldSection = {44, 1, 2, 3, 4, 5, 6, 7};
+  const std::vector<uint8_t> newSection = {44, 1, 2, 3, 4, 5, 6, 8};
+  addLayoutPair(fixture, sectionCachePath,
+                {layoutRange(0, 0, 0, "b00000000"), layoutRange(1, 1, 1, "b00000000")}, 2,
+                oldSection);
+
+  PdfReflowDocument document;
+  ASSERT_TRUE(document.initialize(fixture.storage.io(), kSourcePath, kCacheDirectory).ok());
+  ASSERT_TRUE(document.loadCompletedCache().ok());
+  ASSERT_TRUE(document.validateLayoutWordIndex(sectionCachePath, 0, 2));
+
+  const std::vector<uint8_t> oldSidecar = fixture.storage.bytes(sectionCachePath + ".pwi");
+  addLayoutPair(fixture, sectionCachePath,
+                {layoutRange(0, 0, 0, "b00000000"), layoutRange(1, 1, 0, "b00000000")}, 2,
+                newSection);
+  fixture.storage.addFile(sectionCachePath + ".pwi", oldSidecar);
+  EXPECT_FALSE(document.validateLayoutWordIndex(sectionCachePath, 0, 2));
+}
+
 TEST(PdfReflowDocument, RetriesValidatedSidecarAfterTransientOpenFailure) {
   CacheFixture fixture;
   fixture.build();
   const std::string sectionCachePath = fixture.cacheRoot + "/sections/0.bin";
-  fixture.storage.addFile(sectionCachePath + ".pwi", layoutWordIndex(
-                                                         {
-                                                             layoutRange(0, 0, 0, "b00000000"),
-                                                             layoutRange(1, 1, 1, "b00000000"),
-                                                         },
-                                                         2));
+  addLayoutPair(fixture, sectionCachePath,
+                {layoutRange(0, 0, 0, "b00000000"), layoutRange(1, 1, 1, "b00000000")}, 2);
 
   PdfReflowDocument document;
   ASSERT_TRUE(document.initialize(fixture.storage.io(), kSourcePath, kCacheDirectory).ok());
@@ -475,7 +836,7 @@ TEST(PdfReflowDocument, InvalidatesCachedWindowBeforeAPartialRefillCanOverwriteI
       PdfLayoutWordRange{},
       layoutRange(1, 1, 0, "b00000001"),
   };
-  fixture.storage.addFile(sidecarPath, layoutWordIndex(ranges, 2));
+  addLayoutPair(fixture, sectionCachePath, ranges, 2);
 
   PdfReflowDocument document;
   ASSERT_TRUE(document.initialize(fixture.storage.io(), kSourcePath, kCacheDirectory).ok());
@@ -508,19 +869,18 @@ TEST(PdfReflowDocument, PublishesARefilledWindowOnlyAfterCloseSucceeds) {
   fixture.build();
   const std::string sectionCachePath = fixture.cacheRoot + "/sections/0.bin";
   const std::string sidecarPath = sectionCachePath + ".pwi";
-  fixture.storage.addFile(sidecarPath,
-                          layoutWordIndex(
-                              {
-                                  layoutRange(0, 0, 0, "b00000000"),
-                                  PdfLayoutWordRange{},
-                                  PdfLayoutWordRange{},
-                                  PdfLayoutWordRange{},
-                                  PdfLayoutWordRange{},
-                                  PdfLayoutWordRange{},
-                                  PdfLayoutWordRange{},
-                                  layoutRange(1, 1, 0, "b00000001"),
-                              },
-                              2));
+  addLayoutPair(fixture, sectionCachePath,
+                {
+                    layoutRange(0, 0, 0, "b00000000"),
+                    PdfLayoutWordRange{},
+                    PdfLayoutWordRange{},
+                    PdfLayoutWordRange{},
+                    PdfLayoutWordRange{},
+                    PdfLayoutWordRange{},
+                    PdfLayoutWordRange{},
+                    layoutRange(1, 1, 0, "b00000001"),
+                },
+                2);
 
   PdfReflowDocument document;
   ASSERT_TRUE(document.initialize(fixture.storage.io(), kSourcePath, kCacheDirectory).ok());
@@ -544,7 +904,7 @@ TEST(PdfReflowDocument, RemovesSidecarDirectlyAndKeepsItUsableWhenRemoveFails) {
   fixture.build();
   const std::string sectionCachePath = fixture.cacheRoot + "/sections/0.bin";
   const std::string sidecarPath = sectionCachePath + ".pwi";
-  fixture.storage.addFile(sidecarPath, layoutWordIndex({layoutRange(0, 1, 0, "b00000000")}, 2));
+  addLayoutPair(fixture, sectionCachePath, {layoutRange(0, 1, 0, "b00000000")}, 2);
 
   PdfReflowDocument document;
   ASSERT_TRUE(document.initialize(fixture.storage.io(), kSourcePath, kCacheDirectory).ok());
@@ -570,10 +930,8 @@ TEST(PdfReflowDocument, MapsSavedItemsThroughTheCurrentSectionSidecar) {
   CacheFixture fixture;
   fixture.build();
   const std::string sectionCachePath = fixture.cacheRoot + "/sections/0.bin";
-  fixture.storage.addFile(sectionCachePath + ".pwi",
-                          layoutWordIndex({layoutRange(0, 0, 0, "b00000000"),
-                                           layoutRange(1, 1, 1, "b00000000")},
-                                          2));
+  addLayoutPair(fixture, sectionCachePath,
+                {layoutRange(0, 0, 0, "b00000000"), layoutRange(1, 1, 1, "b00000000")}, 2);
 
   PdfReflowDocument document;
   ASSERT_TRUE(document.initialize(fixture.storage.io(), kSourcePath, kCacheDirectory).ok());
@@ -601,6 +959,7 @@ TEST(PdfReflowDocument, MapsLongSavedItemWithOneOpenAndOneLinearPassBeyondValida
   CacheFixture fixture;
   fixture.build();
   const std::string sectionCachePath = fixture.cacheRoot + "/sections/0.bin";
+  fixture.storage.addFile(sectionCachePath, std::vector<uint8_t>{44, 1, 2, 3, 4, 5, 6, 7});
   const std::string sidecarPath = sectionCachePath + ".pwi";
   const std::vector<uint8_t> sidecar =
       layoutWordIndex(

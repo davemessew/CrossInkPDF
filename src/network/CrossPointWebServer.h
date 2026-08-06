@@ -39,10 +39,15 @@ class CrossPointWebServer {
       Http,
       WebSocket,
     };
+    enum class HttpPostStatus : uint8_t {
+      UploadResult,
+      Busy,
+    };
 
     HalFile file;
     BookUpload::AtomicUploadState transaction;
     Owner owner = Owner::None;
+    HttpPostStatus httpPostStatus = HttpPostStatus::UploadResult;
     String fileName;
     String path = "/";
     size_t size = 0;

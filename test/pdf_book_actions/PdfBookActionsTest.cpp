@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <iostream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "BookActions.h"
@@ -92,6 +93,34 @@ void testPdfDeleteUsesJournaledAdapterOnlyForPdf() {
   expect(TEST_STATE.pdfDeleteCalls == 0, "legacy formats must never enter the PDF delete adapter");
 }
 
+void testDirectoryPdfDeleteUsesExactNonOwningSlice() {
+  resetBookActionTestState();
+  PdfDeleteUtils::DirectoryDeleteSession session;
+  constexpr char paddedPath[] = "/Books/action.pdf.trailing";
+  const std::string_view exactPath(paddedPath,
+                                   sizeof("/Books/action.pdf") - 1U);
+
+  expect(BookActions::deleteDirectoryPdfBookNoPathAlloc(session, exactPath),
+         "directory PDF delete must report a complete adapter result");
+  expect(TEST_STATE.pdfDirectoryDeleteCalls == 1 &&
+             TEST_STATE.pdfDeleteCalls == 0 &&
+             TEST_STATE.pdfDeletePath == "/Books/action.pdf",
+         "directory PDF delete must preserve the exact view without entering the owning adapter");
+
+  resetBookActionTestState();
+  TEST_STATE.pdfDeleteResult =
+      static_cast<uint8_t>(PdfDeleteUtils::Result::Pending);
+  expect(!BookActions::deleteDirectoryPdfBookNoPathAlloc(session, exactPath) &&
+             TEST_STATE.pdfDirectoryDeleteCalls == 1,
+         "pending directory PDF deletion must remain fail-closed");
+
+  resetBookActionTestState();
+  expect(!BookActions::deleteDirectoryPdfBookNoPathAlloc(
+             session, std::string_view("/Books/legacy.epub")) &&
+             TEST_STATE.pdfDirectoryDeleteCalls == 0,
+         "directory-only seam must reject non-PDF paths before the adapter");
+}
+
 void testLegacyMenusRemainExactlyOrdered() {
   resetBookActionTestState();
   expect(actionsFor("/Books/legacy.epub", true) ==
@@ -120,6 +149,92 @@ void testLegacyMenusRemainExactlyOrdered() {
                  FileBrowserAction::RemoveFromRecents,
              }),
          "TXT menu order must remain unchanged");
+}
+
+void testSingleFileLegacyMetadataKeepsBaselineOwningPath() {
+  resetBookActionTestState();
+  const std::string exactPath = "/Books/legacy.epub";
+
+  BookActions::clearFileMetadata(exactPath);
+
+  expect(TEST_STATE.epubConstructs == 1,
+         "ordinary single-file EPUB cleanup must retain the baseline EPUB adapter");
+  expect(TEST_STATE.owningMetadataPathCalls == 2,
+         "ordinary single-file cleanup must retain the baseline owning store APIs");
+  expect(TEST_STATE.metadataDeletes ==
+             std::vector<std::string>({
+                 "epub-cache",
+                 "bookmark:epub:/Books/legacy.epub",
+                 "clipping:epub:/Books/legacy.epub",
+             }),
+         "ordinary single-file EPUB cleanup must remain behavior-compatible");
+}
+
+void testDirectoryLegacyMetadataViewPreservesExactEpubPath() {
+  resetBookActionTestState();
+  constexpr char paddedPath[] = "/Books/legacy.epub.trailing";
+  const std::string_view exactPath(paddedPath,
+                                   sizeof("/Books/legacy.epub") - 1U);
+
+  const bool cleaned =
+      BookActions::clearDirectoryLegacyMetadataNoPathAlloc(exactPath);
+
+  expect(cleaned && TEST_STATE.epubConstructs == 0,
+         "post-commit EPUB metadata cleanup must not construct an owning EPUB adapter");
+  expect(TEST_STATE.owningMetadataPathCalls == 0,
+         "post-commit metadata cleanup must not enter owning path APIs");
+  expect(TEST_STATE.metadataDeletes ==
+             std::vector<std::string>({
+                 "epub-cache:/Books/legacy.epub",
+                 "bookmark:epub:/Books/legacy.epub",
+                 "clipping:epub:/Books/legacy.epub",
+             }),
+         "EPUB metadata cleanup must preserve the exact string_view path");
+}
+
+void testDirectoryLegacyMetadataUsesNoAllocApisForEveryLegacyType() {
+  resetBookActionTestState();
+  constexpr char paddedXtc[] = "/Books/legacy.xtch.trailing";
+  constexpr char paddedMarkdown[] = "/Books/legacy.md.trailing";
+
+  const bool xtcCleaned = BookActions::clearDirectoryLegacyMetadataNoPathAlloc(
+      std::string_view(paddedXtc, sizeof("/Books/legacy.xtch") - 1U));
+  const bool markdownCleaned =
+      BookActions::clearDirectoryLegacyMetadataNoPathAlloc(
+          std::string_view(paddedMarkdown,
+                           sizeof("/Books/legacy.md") - 1U));
+
+  expect(xtcCleaned && markdownCleaned && TEST_STATE.epubConstructs == 0 &&
+             TEST_STATE.owningMetadataPathCalls == 0,
+         "directory XTC/TXT metadata cleanup must not enter owning APIs");
+  expect(TEST_STATE.metadataDeletes ==
+             std::vector<std::string>({
+                 "bookmark:xtc:/Books/legacy.xtch",
+                 "bookmark:txt:/Books/legacy.md",
+             }),
+         "directory cleanup must preserve legacy XTC/TXT type mapping and exact views");
+}
+
+void testDirectoryEpubCleanupContinuesAfterColdApiFailure() {
+  for (size_t failedCleanup = 0; failedCleanup < 3U; ++failedCleanup) {
+    resetBookActionTestState();
+    TEST_STATE.epubNoPathAllocResult = failedCleanup != 0U;
+    TEST_STATE.bookmarkNoPathAllocResult = failedCleanup != 1U;
+    TEST_STATE.clippingNoPathAllocResult = failedCleanup != 2U;
+
+    const bool cleaned = BookActions::clearDirectoryLegacyMetadataNoPathAlloc(
+        "/Books/legacy.epub");
+
+    expect(!cleaned,
+           "directory EPUB cleanup must report first, middle, and last cold API failures");
+    expect(TEST_STATE.metadataDeletes ==
+               std::vector<std::string>({
+                   "epub-cache:/Books/legacy.epub",
+                   "bookmark:epub:/Books/legacy.epub",
+                   "clipping:epub:/Books/legacy.epub",
+               }),
+           "directory EPUB cleanup must continue after every cold API failure position");
+  }
 }
 
 void testPdfCacheAndStatsUseWritableMoveAwareIdentity() {
@@ -355,7 +470,12 @@ void testLegacyCompletionControlFlowStillUsesLegacyRoutes() {
 int main() {
   testPdfMenuHasParityWithoutEpubOnlyActions();
   testPdfDeleteUsesJournaledAdapterOnlyForPdf();
+  testDirectoryPdfDeleteUsesExactNonOwningSlice();
   testLegacyMenusRemainExactlyOrdered();
+  testSingleFileLegacyMetadataKeepsBaselineOwningPath();
+  testDirectoryLegacyMetadataViewPreservesExactEpubPath();
+  testDirectoryLegacyMetadataUsesNoAllocApisForEveryLegacyType();
+  testDirectoryEpubCleanupContinuesAfterColdApiFailure();
   testPdfCacheAndStatsUseWritableMoveAwareIdentity();
   testUnsafePdfStatsIdentityFailsBeforeMutation();
   testPdfCompletionUsesCommonStatsAndRemovesRecentWithoutProductLoad();

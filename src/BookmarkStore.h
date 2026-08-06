@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 // chapterTitle is always NUL-terminated within BOOKMARK_CHAPTER_TITLE_MAX bytes.
@@ -73,6 +74,11 @@ class BookmarkStore {
   // Delete the bookmark file for a given file path and book type without loading the book.
   // bookType must be "epub", "pdf", "xtc", or "txt".
   static bool deleteForFilePath(const std::string& filePath, const std::string& bookType);
+  // Cold directory-delete replay path: filename generation uses bounded stack
+  // buffers and never materializes either input view as an owning string.
+  static bool deleteLegacyForFilePathNoPathAlloc(std::string_view filePath,
+                                                 std::string_view bookType);
+  static bool deletePdfForFilePathNoPathAlloc(std::string_view filePath);
 
   // Crash-safe PDF moves copy and read back the destination before deleting
   // the old path-keyed store in a later journal phase. bookType must be "pdf".

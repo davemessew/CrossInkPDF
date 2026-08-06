@@ -52,6 +52,8 @@ class PageImage final : public PageElement {
   PageImage(std::shared_ptr<ImageBlock> block, const int16_t xPos, const int16_t yPos)
       : PageElement(xPos, yPos), imageBlock(std::move(block)) {}
   void render(GfxRenderer& renderer, int fontId, int xOffset, int yOffset, bool foregroundBlack = true) override;
+  void render(GfxRenderer& renderer, int fontId, int xOffset, int yOffset, bool foregroundBlack,
+              PdfPixelCacheRenderWorkspace* pdfWorkspace);
   bool serialize(FsFile& file) override;
   PageElementTag getTag() const override { return TAG_PageImage; }
   static std::unique_ptr<PageImage> deserialize(FsFile& file);
@@ -161,8 +163,12 @@ class Page {
   }
 
   void render(GfxRenderer& renderer, int fontId, int xOffset, int yOffset, bool foregroundBlack = true) const;
+  void render(GfxRenderer& renderer, int fontId, int xOffset, int yOffset, bool foregroundBlack,
+              PdfPixelCacheRenderWorkspace* pdfWorkspace) const;
   void renderText(GfxRenderer& renderer, int fontId, int xOffset, int yOffset, bool foregroundBlack = true) const;
   void renderImages(GfxRenderer& renderer, int fontId, int xOffset, int yOffset) const;
+  void renderImages(GfxRenderer& renderer, int fontId, int xOffset, int yOffset,
+                    PdfPixelCacheRenderWorkspace* pdfWorkspace) const;
   bool serialize(FsFile& file) const;
   static std::unique_ptr<Page> deserialize(FsFile& file);
 

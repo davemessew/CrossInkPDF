@@ -1,5 +1,6 @@
 #include "PdfFontMap.h"
 
+#include <cstring>
 #include <limits>
 
 namespace {
@@ -32,12 +33,26 @@ bool valueAsCode(const PdfValue& value, uint32_t* code) {
   return true;
 }
 
+uint64_t glyphKey(const uint32_t sourceCode, const uint8_t sourceLength) {
+  return static_cast<uint64_t>(sourceLength) << 32U | sourceCode;
+}
+
+bool sourceCodeFitsLength(const uint32_t sourceCode, const uint8_t sourceLength) {
+  return sourceLength >= 1U && sourceLength <= 4U &&
+         (sourceLength == 4U || sourceCode < (uint32_t{1} << (sourceLength * 8U)));
+}
+
+bool sourceCodeIsPrefix(const uint32_t prefixCode, const uint8_t prefixLength, const uint32_t code,
+                        const uint8_t codeLength) {
+  if (prefixLength >= codeLength) {
+    return false;
+  }
+  return code >> ((codeLength - prefixLength) * 8U) == prefixCode;
+}
+
 }  // namespace
 
 PdfStatus PdfFontMap::setSourceAccess(const bool required) {
-  if (sourceAccessRequired_ == required) {
-    return PdfStatus::success();
-  }
   if (workspace_.setSourceAccess != nullptr) {
     const PdfStatus status = workspace_.setSourceAccess(workspace_.sourceAccessContext, required);
     if (!status.ok()) {
@@ -70,14 +85,116 @@ PdfStatus PdfFontMap::begin(const uint16_t fontId, const bool cid, PdfCMap* cons
   return setSourceAccess(true);
 }
 
+PdfStatus PdfFontMap::beginMaterialized(const uint16_t fontId, const bool cid) {
+  if (workspace_.materializedGlyphs == nullptr || workspace_.materializedGlyphCapacity == 0) {
+    return PdfStatus::failure(PdfError::InvalidArgument);
+  }
+  if (workspace_.materializedGlyphCapacity > PdfLimits::MaxPageUniqueGlyphs) {
+    return PdfStatus::failure(PdfError::LimitExceeded, workspace_.materializedGlyphCapacity);
+  }
+  const PdfStatus accessStatus = setSourceAccess(false);
+  if (!accessStatus.ok()) {
+    return accessStatus;
+  }
+  fontId_ = fontId;
+  cid_ = cid;
+  toUnicode_ = nullptr;
+  encoding_ = nullptr;
+  defaultWidth_ = -1;
+  widthCount_ = 0;
+  spillCount_ = 0;
+  previousWidthLast_ = 0;
+  widthsSorted_ = true;
+  hasPreviousWidth_ = false;
+  hasCachedWidth_ = false;
+  return PdfStatus::success();
+}
+
+PdfStatus PdfFontMap::addMaterializedGlyph(const PdfDecodedGlyph& glyph) {
+  if (!materialized() || !sourceCodeFitsLength(glyph.sourceCode, glyph.sourceLength) || glyph.unicode.length == 0 ||
+      glyph.unicode.length > sizeof(glyph.unicode.bytes) || glyph.width < 0) {
+    return PdfStatus::failure(PdfError::Malformed, glyph.sourceCode);
+  }
+
+  const uint64_t key = glyphKey(glyph.sourceCode, glyph.sourceLength);
+  uint16_t first = 0;
+  uint16_t last = widthCount_;
+  while (first < last) {
+    const uint16_t middle = static_cast<uint16_t>(first + (last - first) / 2U);
+    const PdfDecodedGlyph& candidate = workspace_.materializedGlyphs[middle];
+    if (glyphKey(candidate.sourceCode, candidate.sourceLength) < key) {
+      first = static_cast<uint16_t>(middle + 1U);
+    } else {
+      last = middle;
+    }
+  }
+  if (first < widthCount_) {
+    const PdfDecodedGlyph& existing = workspace_.materializedGlyphs[first];
+    if (glyphKey(existing.sourceCode, existing.sourceLength) == key) {
+      const bool identical = existing.width == glyph.width && existing.unicode.length == glyph.unicode.length &&
+                             std::memcmp(existing.unicode.bytes, glyph.unicode.bytes, glyph.unicode.length) == 0;
+      return identical ? PdfStatus::success() : PdfStatus::failure(PdfError::Malformed, glyph.sourceCode);
+    }
+  }
+
+  for (uint16_t index = 0; index < widthCount_; ++index) {
+    const PdfDecodedGlyph& existing = workspace_.materializedGlyphs[index];
+    if (sourceCodeIsPrefix(existing.sourceCode, existing.sourceLength, glyph.sourceCode, glyph.sourceLength) ||
+        sourceCodeIsPrefix(glyph.sourceCode, glyph.sourceLength, existing.sourceCode, existing.sourceLength)) {
+      return PdfStatus::failure(PdfError::UnsupportedEncoding, glyph.sourceCode);
+    }
+  }
+  if (widthCount_ >= workspace_.materializedGlyphCapacity) {
+    return PdfStatus::failure(PdfError::LimitExceeded, widthCount_);
+  }
+
+  if (first < widthCount_) {
+    std::memmove(workspace_.materializedGlyphs + first + 1U, workspace_.materializedGlyphs + first,
+                 static_cast<size_t>(widthCount_ - first) * sizeof(PdfDecodedGlyph));
+  }
+  workspace_.materializedGlyphs[first] = glyph;
+  ++widthCount_;
+  return PdfStatus::success();
+}
+
+PdfStatus PdfFontMap::materializeString(PdfFontMap& sourceFont, const uint8_t* const source,
+                                        const size_t sourceLength) {
+  if (!materialized() || &sourceFont == this || sourceFont.fontId() != fontId_ || sourceFont.cid() != cid_ ||
+      (source == nullptr && sourceLength != 0)) {
+    return PdfStatus::failure(PdfError::InvalidArgument);
+  }
+  size_t offset = 0;
+  while (offset < sourceLength) {
+    PdfDecodedGlyph glyph;
+    const PdfStatus decodeStatus = sourceFont.decodeNext(source + offset, sourceLength - offset, &glyph);
+    if (!decodeStatus.ok()) {
+      return decodeStatus;
+    }
+    if (glyph.sourceLength == 0 || glyph.sourceLength > sourceLength - offset) {
+      return PdfStatus::failure(PdfError::Malformed, offset);
+    }
+    const PdfStatus addStatus = addMaterializedGlyph(glyph);
+    if (!addStatus.ok()) {
+      return addStatus;
+    }
+    offset += glyph.sourceLength;
+  }
+  return PdfStatus::success();
+}
+
 PdfStatus PdfFontMap::addWidth(const uint32_t firstCode, const uint32_t lastCode, const int32_t width) {
-  if (lastCode < firstCode || width < 0) {
+  if (materialized() || lastCode < firstCode || width < 0) {
     return PdfStatus::failure(PdfError::Malformed, firstCode);
   }
   if (widthCount_ >= PdfLimits::MaxCMapRanges) {
     return PdfStatus::failure(PdfError::LimitExceeded, widthCount_);
   }
-  if (hasPreviousWidth_ && firstCode <= previousWidthLast_) {
+  const bool ordered = !hasPreviousWidth_ || firstCode > previousWidthLast_;
+  if ((!ordered || !widthsSorted_) && widthCount_ >= workspace_.widthCapacity) {
+    // Keep an unsorted map in bounded RAM; never turn it into a per-glyph linear SD scan.
+    return PdfStatus::failure(PdfError::LimitExceeded, widthCount_);
+  }
+  if (!ordered) {
     widthsSorted_ = false;
   }
   PdfFontWidthRecord record{firstCode, lastCode, width};
@@ -192,7 +309,7 @@ PdfStatus PdfFontMap::readWidth(const uint16_t ordinal, PdfFontWidthRecord* cons
 }
 
 PdfStatus PdfFontMap::widthFor(const uint32_t sourceCode, int32_t* const width) {
-  if (width == nullptr) {
+  if (width == nullptr || materialized()) {
     return PdfStatus::failure(PdfError::InvalidArgument);
   }
   if (hasCachedWidth_ && sourceCode >= cachedWidth_.firstCode && sourceCode <= cachedWidth_.lastCode) {
@@ -248,9 +365,45 @@ PdfStatus PdfFontMap::widthFor(const uint32_t sourceCode, int32_t* const width) 
   return PdfStatus::success();
 }
 
+PdfStatus PdfFontMap::findMaterializedGlyph(const uint8_t* const source, const size_t sourceLength,
+                                            PdfDecodedGlyph* const glyph) const {
+  if (!materialized() || source == nullptr || sourceLength == 0 || glyph == nullptr) {
+    return PdfStatus::failure(PdfError::InvalidArgument);
+  }
+  uint32_t sourceCode = 0;
+  const uint8_t maximumLength = static_cast<uint8_t>(sourceLength < 4U ? sourceLength : 4U);
+  for (uint8_t sourceCodeLength = 1; sourceCodeLength <= maximumLength; ++sourceCodeLength) {
+    sourceCode = sourceCode << 8U | source[sourceCodeLength - 1U];
+    const uint64_t key = glyphKey(sourceCode, sourceCodeLength);
+    uint16_t first = 0;
+    uint16_t last = widthCount_;
+    while (first < last) {
+      const uint16_t middle = static_cast<uint16_t>(first + (last - first) / 2U);
+      const PdfDecodedGlyph& candidate = workspace_.materializedGlyphs[middle];
+      const uint64_t candidateKey = glyphKey(candidate.sourceCode, candidate.sourceLength);
+      if (candidateKey < key) {
+        first = static_cast<uint16_t>(middle + 1U);
+      } else {
+        last = middle;
+      }
+    }
+    if (first < widthCount_) {
+      const PdfDecodedGlyph& candidate = workspace_.materializedGlyphs[first];
+      if (glyphKey(candidate.sourceCode, candidate.sourceLength) == key) {
+        *glyph = candidate;
+        return PdfStatus::success();
+      }
+    }
+  }
+  return PdfStatus::failure(PdfError::UnsupportedEncoding, sourceCode);
+}
+
 PdfStatus PdfFontMap::decodeNext(const uint8_t* const source, const size_t sourceLength, PdfDecodedGlyph* const glyph) {
   if (source == nullptr || sourceLength == 0 || glyph == nullptr) {
     return PdfStatus::failure(PdfError::InvalidArgument);
+  }
+  if (materialized()) {
+    return findMaterializedGlyph(source, sourceLength, glyph);
   }
   *glyph = {};
   if (toUnicode_ != nullptr) {

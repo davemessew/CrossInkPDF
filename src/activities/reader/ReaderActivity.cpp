@@ -7,6 +7,10 @@
 #include <PdfHalReflowDocument.h>
 #include <PdfSourceIdentity.h>
 
+#ifdef SIMULATOR
+#include <cstdlib>
+#endif
+
 #include "CrossPointSettings.h"
 #include "Epub.h"
 #include "EpubReaderActivity.h"
@@ -199,6 +203,13 @@ bool ReaderActivity::openPdfRoute() {
   PdfStatus status{};
   auto document =
       loadPdfHalReflowDocumentNoThrow(initialBookPath.c_str(), "/.crosspoint", &status, cacheHashOverride);
+#ifdef SIMULATOR
+  const char* const injectedCacheErrorBook = std::getenv("CROSSINK_SIMULATOR_PDF_CACHE_ERROR_BOOK");
+  if (injectedCacheErrorBook != nullptr && initialBookPath == injectedCacheErrorBook) {
+    document.reset();
+    status = PdfStatus::failure(PdfError::IoFailure);
+  }
+#endif
   if (document) {
     onGoToReflowReader(std::move(document));
     return true;
@@ -206,8 +217,15 @@ bool ReaderActivity::openPdfRoute() {
   if (status.error == PdfError::InsufficientMemory || status.error == PdfError::IoFailure ||
       status.error == PdfError::InvalidArgument) {
     LOG_ERR("READER", "PDF cache check failed before preparation: error=%u", static_cast<unsigned>(status.error));
-    onGoBack();
-    return false;
+    auto errorActivity =
+        makeUniqueNoThrow<PdfPrepareActivity>(renderer, mappedInput, initialBookPath, status);
+    if (!errorActivity) {
+      LOG_ERR("READER", "Failed to allocate PDF error activity");
+      onGoBack();
+      return false;
+    }
+    activityManager.replaceActivity(std::move(errorActivity));
+    return true;
   }
   auto preparation = makeUniqueNoThrow<PdfPrepareActivity>(renderer, mappedInput, initialBookPath);
   if (!preparation) {

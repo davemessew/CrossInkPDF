@@ -1700,7 +1700,8 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
 
       if (!src.empty() && self->imageRendering != 1) {
         LOG_DBG("EHP", "Found image: src=%s", src.c_str());
-        const std::string resolvedPath = FsHelpers::normalisePath(FsHelpers::decodeUriEscapes(self->contentBase + src));
+        const std::string resolvedPath = FsHelpers::normalisePath(
+            FsHelpers::decodeUriEscapes(self->contentBase + src), self->shouldPreserveImagePathRoot());
         if (isSvgImagePath(resolvedPath)) {
           LOG_DBG("EHP", "Skipping unsupported SVG image: %s", resolvedPath.c_str());
           self->skipCurrentElement();

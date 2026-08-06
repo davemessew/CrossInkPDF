@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <string_view>
 
 namespace PdfDirectoryDeleteScan {
 
@@ -15,6 +16,7 @@ constexpr char kSpoolSealedPath[] =
 
 enum class Status : uint8_t {
   Complete,
+  CommittedWithCleanupWarning,
   InvalidRoot,
   AllocationFailure,
   OpenFailure,
@@ -28,16 +30,26 @@ enum class Status : uint8_t {
   SpoolSyncFailure,
   SpoolReadFailure,
   SpoolCorrupt,
+  PdfRecoveryFailure,
   PdfDeleteFailure,
   DirectoryDeleteFailure,
+  MetadataCleanupFailure,
 };
 
 struct DeleteCallbacks {
   void* context = nullptr;
   bool (*deletePdf)(void* context, const char* path) = nullptr;
-  void (*clearLegacyMetadata)(void* context, const std::string& path) = nullptr;
+  bool (*clearLegacyMetadata)(void* context, std::string_view path) = nullptr;
+  bool (*preparePdfDelete)(void* context) = nullptr;
 };
 
+// Read-only, spool-free classification used to keep PDF-free directories on
+// the original FileBrowser deletion path.
+Status containsPdfNoThrow(const std::string& rootPath, bool* containsPdf);
+Status deleteLegacyDirectoryNoThrow(const std::string& rootPath,
+                                    const DeleteCallbacks& callbacks);
+Status deletePdfDirectoryNoThrow(const std::string& rootPath,
+                                 const DeleteCallbacks& callbacks);
 Status deleteDirectoryNoThrow(const std::string& rootPath,
                               const DeleteCallbacks& callbacks);
 

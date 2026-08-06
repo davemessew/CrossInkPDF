@@ -26,6 +26,7 @@ add_executable(PdfProductIntegrationTest
 )
 
 target_include_directories(PdfProductIntegrationTest BEFORE PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/allocation_stubs
   ${CMAKE_CURRENT_SOURCE_DIR}/stubs
 )
 
@@ -45,9 +46,14 @@ target_link_libraries(PdfProductIntegrationTest PRIVATE
   GTest::gtest_main
 )
 
+target_compile_definitions(PdfProductIntegrationTest PRIVATE
+  CROSSINK_PDF_REFLOW_DOCUMENT_TEST=1
+)
+
 gtest_discover_tests(PdfProductIntegrationTest TEST_PREFIX "PdfProduct")
 
 add_executable(PdfCachedImageBlockTest
+  ${REPO_ROOT}/lib/Epub/Epub/Page.cpp
   ${REPO_ROOT}/lib/Epub/Epub/blocks/ImageBlock.cpp
   PdfCachedImageBlockTest.cpp
 )
@@ -61,6 +67,7 @@ target_include_directories(PdfCachedImageBlockTest PRIVATE
   ${REPO_ROOT}/lib/Epub/Epub
   ${REPO_ROOT}/lib/Epub/Epub/blocks
   ${REPO_ROOT}/lib/Epub/Epub/converters
+  ${REPO_ROOT}/lib/EpdFont
   ${REPO_ROOT}/lib/Memory
 )
 
@@ -70,6 +77,9 @@ target_link_libraries(PdfCachedImageBlockTest PRIVATE
   crosspoint_test_common
   GTest::gtest_main
 )
+
+target_compile_options(PdfCachedImageBlockTest PRIVATE -ffunction-sections -fdata-sections)
+target_link_options(PdfCachedImageBlockTest PRIVATE -Wl,--gc-sections)
 
 if(UNIX AND NOT APPLE AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   target_link_options(PdfCachedImageBlockTest PRIVATE
@@ -85,6 +95,7 @@ add_executable(PdfPreparedCacheRenderingTest
   ${REPO_ROOT}/lib/PdfReflow/PdfBuildCheckpoint.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfCacheManifest.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfCacheStore.cpp
+  ${REPO_ROOT}/lib/PdfReflow/PdfFixedRecordSpool.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfIo.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfImageBuildSpool.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfImageCache.cpp

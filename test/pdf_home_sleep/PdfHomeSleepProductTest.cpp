@@ -34,18 +34,6 @@ namespace {
 constexpr char kSourcePath[] = "/books/integration.pdf";
 constexpr char kCacheDirectory[] = "/.crosspoint";
 
-struct PdfSleepFallbackProbe {
-  uint32_t* operationCounter = nullptr;
-  uint32_t calls = 0;
-  uint32_t order = 0;
-
-  static void load(void* const context) {
-    auto& probe = *static_cast<PdfSleepFallbackProbe*>(context);
-    ++probe.calls;
-    probe.order = ++*probe.operationCounter;
-  }
-};
-
 struct RequiredRecords {
   std::vector<PdfRequiredFileRecord> values;
 
@@ -329,7 +317,23 @@ std::vector<uint8_t> pdfSleepTooManyWordsPage() {
   return page;
 }
 
-std::vector<uint8_t> pdfSleepWordIndex(const uint32_t firstWordOrdinal = 4, const uint32_t wordCount = 6) {
+PdfStatus patchVector(void* const context, const uint64_t offset, const uint8_t* const source,
+                      const size_t requested, size_t* const bytesWritten) {
+  if (context == nullptr || source == nullptr || bytesWritten == nullptr) {
+    return PdfStatus::failure(PdfError::InvalidArgument, offset);
+  }
+  auto& bytes = *static_cast<std::vector<uint8_t>*>(context);
+  if (offset > bytes.size() || requested > bytes.size() - static_cast<size_t>(offset)) {
+    return PdfStatus::failure(PdfError::InvalidOffset, offset);
+  }
+  std::copy_n(source, requested, bytes.begin() + static_cast<std::ptrdiff_t>(offset));
+  *bytesWritten = requested;
+  return PdfStatus::success();
+}
+
+std::vector<uint8_t> pdfSleepWordIndex(std::vector<uint8_t>& sectionBytes,
+                                       const uint32_t firstWordOrdinal = 4, const uint32_t wordCount = 6,
+                                       const bool bindSection = true) {
   PdfTestByteSink bytes;
   PdfLayoutWordIndexWriter writer;
   EXPECT_TRUE(writer.begin(bytes.sink(), 1, firstWordOrdinal, wordCount).ok());
@@ -343,7 +347,18 @@ std::vector<uint8_t> pdfSleepWordIndex(const uint32_t firstWordOrdinal = 4, cons
     EXPECT_TRUE(writer.append(range).ok());
   }
   EXPECT_TRUE(writer.finish().ok());
-  return bytes.bytes();
+
+  const PdfLayoutCacheBinding binding{static_cast<uint32_t>(sectionBytes.size()), writer.pairToken()};
+  uint8_t trailer[PDF_LAYOUT_CACHE_BINDING_TRAILER_BYTES];
+  EXPECT_TRUE(pdfEncodeLayoutCacheBindingTrailer(binding, trailer).ok());
+  sectionBytes.insert(sectionBytes.end(), trailer, trailer + sizeof(trailer));
+
+  std::vector<uint8_t> sidecar = bytes.bytes();
+  if (bindSection) {
+    PdfTestByteSource source(sidecar);
+    EXPECT_TRUE(pdfBindLayoutWordIndex(source.source(), {&sidecar, patchVector}, binding).ok());
+  }
+  return sidecar;
 }
 
 PdfOutlineEntry outlineEntry(const char* title, uint16_t section) {
@@ -912,10 +927,15 @@ TEST(PdfSleepProduct, LoadsOneValidatedTextPageWithoutSourceXhtmlOrImageIoAndRel
 
   const std::string sectionPath = fixture.cacheRoot + "/sections/1_light.bin";
   const std::string wordIndexPath = sectionPath + ".pwi";
-  fixture.storage.addFile(wordIndexPath, pdfSleepWordIndex());
-  Storage.reset();
   auto persistedLayout = pdfSleepLayout(layout, {0xa0, 0xb1, 0xc2});
   putU32(persistedLayout, 5, 31);  // Actual bounded fallback font retained in the section header.
+  const std::vector<uint8_t> wordIndex = pdfSleepWordIndex(persistedLayout);
+  fixture.storage.addFile(sectionPath, persistedLayout);
+  fixture.storage.addFile(wordIndexPath, wordIndex);
+  fixture.storage.setMaximumReadHandles(1);
+  fixture.storage.clearEvents();
+  Storage.reset();
+  Storage.setMaximumReadHandles(1);
   Storage.addFile(sectionPath, persistedLayout);
   const uint32_t sourceOpensBefore = fixture.budget.sourceOpens;
   const uint32_t cacheOpensBefore = fixture.storage.openCalls();
@@ -927,13 +947,19 @@ TEST(PdfSleepProduct, LoadsOneValidatedTextPageWithoutSourceXhtmlOrImageIoAndRel
   EXPECT_EQ(Storage.closeCalls(), 1U);
   EXPECT_EQ(Storage.activeReaders(), 0U);
   EXPECT_EQ(Storage.maximumActiveReaders(), 1U);
+  EXPECT_EQ(fixture.storage.openHandleCount(), 0U);
+  EXPECT_EQ(fixture.storage.events(),
+            (std::vector<std::string>{"open:" + sectionPath, "close:" + sectionPath,
+                                      "open:" + wordIndexPath, "close:" + wordIndexPath}));
+  EXPECT_EQ(Storage.events(),
+            (std::vector<std::string>{"open:" + sectionPath, "close:" + sectionPath}));
   EXPECT_EQ(fixture.budget.sourceOpens, sourceOpensBefore);
   EXPECT_EQ(fixture.budget.sourceOpens, 0U);
   EXPECT_EQ(fixture.budget.sourceReads, 0U);
   EXPECT_EQ(fixture.budget.sourceCloses, 0U);
   EXPECT_EQ(fixture.storage.openCallsForPath(fixture.fullPath("sections/000000.xhtml")), 0U);
   EXPECT_EQ(fixture.storage.openCallsForPath(fixture.fullPath("images/0123456789abcdef-89abcdef.pxc")), 0U);
-  EXPECT_EQ(fixture.storage.openCalls(), cacheOpensBefore + 1U);
+  EXPECT_EQ(fixture.storage.openCalls(), cacheOpensBefore + 2U);
 
   GfxRenderer renderer;
   ASSERT_TRUE(page.renderTextAndRelease(renderer));
@@ -969,16 +995,28 @@ TEST(PdfSleepProduct, RendersProductionTextTableAndRuleBytesAndSkipsSerializedIm
   layout.valid = true;
 
   const std::string sectionPath = fixture.cacheRoot + "/sections/1_light.bin";
-  fixture.storage.addFile(sectionPath + ".pwi", pdfSleepWordIndex());
   const auto pageBytes = pdfSleepTextTableImageRulePage();
   auto persistedLayout =
       pdfSleepLayoutWithPages(layout, std::array<std::vector<uint8_t>, 3>{pageBytes, pageBytes, pageBytes});
   putU32(persistedLayout, 5, 31);
+  const std::vector<uint8_t> wordIndex = pdfSleepWordIndex(persistedLayout);
+  fixture.storage.addFile(sectionPath, persistedLayout);
+  fixture.storage.addFile(sectionPath + ".pwi", wordIndex);
+  fixture.storage.setMaximumReadHandles(1);
+  fixture.storage.clearEvents();
   Storage.reset();
+  Storage.setMaximumReadHandles(1);
   Storage.addFile(sectionPath, persistedLayout);
 
   PdfSleepPageCache page;
   ASSERT_TRUE(page.load(product, layout));
+  EXPECT_EQ(fixture.storage.openHandleCount(), 0U);
+  EXPECT_EQ(Storage.activeReaders(), 0U);
+  EXPECT_EQ(fixture.storage.events(),
+            (std::vector<std::string>{"open:" + sectionPath, "close:" + sectionPath,
+                                      "open:" + sectionPath + ".pwi", "close:" + sectionPath + ".pwi"}));
+  EXPECT_EQ(Storage.events(),
+            (std::vector<std::string>{"open:" + sectionPath, "close:" + sectionPath}));
   EXPECT_EQ(Storage.activeReaders(), 0U);
 
   GfxRenderer renderer;
@@ -998,32 +1036,63 @@ TEST(PdfSleepProduct, RendersProductionTextTableAndRuleBytesAndSkipsSerializedIm
   EXPECT_EQ(Storage.openCallsForPath("/never.jpg"), 0U);
 }
 
-TEST(PdfSleepProduct, SnapshotsBeforeFallbackAndSkipsEveryFallbackReadOnSuccess) {
-  uint32_t operationCounter = 0;
-  GfxRenderer renderer;
-  renderer.operationCounter = &operationCounter;
-  renderer.storeBwBufferResult = true;
-  PdfSleepFallbackProbe fallback{&operationCounter};
+void expectSectionAndWordIndexCloseFailuresReleaseReadHandles() {
+  for (const uint32_t closeOccurrence : {1U, 2U}) {
+    SCOPED_TRACE(closeOccurrence);
+    ProductFixture fixture;
+    fixture.initialize();
+    PdfSleepProductCache product;
+    ASSERT_TRUE(product.load(kSourcePath));
 
-  EXPECT_TRUE(pdfSnapshotBeforeFallback(renderer, {&fallback, PdfSleepFallbackProbe::load}));
-  EXPECT_EQ(renderer.storeBwBufferCalls, 1U);
-  EXPECT_EQ(renderer.storeBwBufferOrder, 1U);
-  EXPECT_EQ(fallback.calls, 0U);
+    PdfSleepPageLayout layout{};
+    layout.fontId = 23;
+    layout.marginLeft = 19;
+    layout.marginTop = 27;
+    layout.viewportWidth = 442;
+    layout.viewportHeight = 731;
+    layout.orientation = static_cast<uint8_t>(GfxRenderer::Portrait);
+    layout.backgroundColor = 0xff;
+    layout.foregroundBlack = true;
+    layout.valid = true;
 
-  operationCounter = 0;
-  renderer.storeBwBufferOrder = 0;
-  renderer.storeBwBufferResult = false;
-  EXPECT_FALSE(pdfSnapshotBeforeFallback(renderer, {&fallback, PdfSleepFallbackProbe::load}));
-  EXPECT_EQ(renderer.storeBwBufferCalls, 2U);
-  EXPECT_EQ(renderer.storeBwBufferOrder, 1U);
-  EXPECT_EQ(fallback.calls, 1U);
-  EXPECT_EQ(fallback.order, 2U);
+    const std::string sectionPath = fixture.cacheRoot + "/sections/1_light.bin";
+    const std::string wordIndexPath = sectionPath + ".pwi";
+    auto section = pdfSleepLayout(layout, {0xa0, 0xb1, 0xc2});
+    const std::vector<uint8_t> wordIndex = pdfSleepWordIndex(section);
+    fixture.storage.addFile(sectionPath, section);
+    fixture.storage.addFile(wordIndexPath, wordIndex);
+    fixture.storage.setMaximumReadHandles(1);
+    fixture.storage.clearEvents();
+    fixture.storage.fail(PdfTestFaultPoint::Close, closeOccurrence);
+    Storage.reset();
+    Storage.setMaximumReadHandles(1);
+    Storage.addFile(sectionPath, section);
+
+    PdfSleepPageCache page;
+    EXPECT_FALSE(page.load(product, layout));
+    EXPECT_FALSE(page.available());
+    EXPECT_EQ(fixture.storage.openHandleCount(), 0U);
+    EXPECT_EQ(Storage.activeReaders(), 0U);
+    EXPECT_EQ(Storage.maximumActiveReaders(), 0U);
+    if (closeOccurrence == 1U) {
+      EXPECT_EQ(fixture.storage.events(),
+                (std::vector<std::string>{"open:" + sectionPath, "close:" + sectionPath}));
+    } else {
+      EXPECT_EQ(fixture.storage.events(),
+                (std::vector<std::string>{"open:" + sectionPath, "close:" + sectionPath,
+                                          "open:" + wordIndexPath, "close:" + wordIndexPath}));
+    }
+  }
 }
 
 TEST(PdfSleepProduct, RejectsMissingCorruptMismatchedCrossingOversizedAndOomLayoutState) {
+  expectSectionAndWordIndexCloseFailuresReleaseReadHandles();
   enum class Scenario : uint8_t {
     MissingIndex,
+    MissingSection,
     CorruptIndex,
+    UnboundIndex,
+    SameLengthDifferentSection,
     MismatchedWordRange,
     StaleViewport,
     CrossingDeclaredImagePath,
@@ -1033,7 +1102,8 @@ TEST(PdfSleepProduct, RejectsMissingCorruptMismatchedCrossingOversizedAndOomLayo
     GlobalWordBudget
   };
   for (const Scenario scenario :
-       {Scenario::MissingIndex, Scenario::CorruptIndex, Scenario::StaleViewport, Scenario::MismatchedWordRange,
+       {Scenario::MissingIndex, Scenario::MissingSection, Scenario::CorruptIndex, Scenario::UnboundIndex,
+        Scenario::SameLengthDifferentSection, Scenario::StaleViewport, Scenario::MismatchedWordRange,
         Scenario::CrossingDeclaredImagePath, Scenario::OversizedPage, Scenario::AllocatorFailure,
         Scenario::CorruptTextOffsets, Scenario::GlobalWordBudget}) {
     SCOPED_TRACE(static_cast<unsigned>(scenario));
@@ -1054,14 +1124,6 @@ TEST(PdfSleepProduct, RejectsMissingCorruptMismatchedCrossingOversizedAndOomLayo
     layout.valid = true;
     const std::string sectionPath = fixture.cacheRoot + "/sections/1_light.bin";
     const std::string wordIndexPath = sectionPath + ".pwi";
-    if (scenario != Scenario::MissingIndex) {
-      auto index = scenario == Scenario::MismatchedWordRange ? pdfSleepWordIndex(3, 6) : pdfSleepWordIndex();
-      if (scenario == Scenario::CorruptIndex) {
-        index[PDF_LAYOUT_WORD_INDEX_HEADER_BYTES + 3] ^= 0x80;
-      }
-      fixture.storage.addFile(wordIndexPath, index);
-    }
-
     auto section = pdfSleepLayout(layout, {0xa0, 0xb1, 0xc2});
     if (scenario == Scenario::CorruptTextOffsets) {
       const auto complexPage = pdfSleepTextTableImageRulePage();
@@ -1104,7 +1166,30 @@ TEST(PdfSleepProduct, RejectsMissingCorruptMismatchedCrossingOversizedAndOomLayo
       putU32(section, shiftedLut + sizeof(uint32_t), page1);
       putU32(section, shiftedLut + 2 * sizeof(uint32_t), page2 + oversizedBytes);
     }
+    std::vector<uint8_t> index;
+    if (scenario == Scenario::SameLengthDifferentSection) {
+      std::vector<uint8_t> bindingBytes = section;
+      bindingBytes[0] ^= 0x01;
+      index = pdfSleepWordIndex(bindingBytes, 5, 6);
+      (void)pdfSleepWordIndex(section, 4, 6);
+    } else {
+      index = scenario == Scenario::MismatchedWordRange
+                  ? pdfSleepWordIndex(section, 3, 6)
+                  : pdfSleepWordIndex(section, 4, 6, scenario != Scenario::UnboundIndex);
+    }
+    if (scenario == Scenario::CorruptIndex) {
+      index[PDF_LAYOUT_WORD_INDEX_HEADER_BYTES + 3] ^= 0x80;
+    }
+    if (scenario != Scenario::MissingSection) {
+      fixture.storage.addFile(sectionPath, section);
+    }
+    if (scenario != Scenario::MissingIndex) {
+      fixture.storage.addFile(wordIndexPath, index);
+    }
+    fixture.storage.setMaximumReadHandles(1);
+    fixture.storage.clearEvents();
     Storage.reset();
+    Storage.setMaximumReadHandles(1);
     Storage.addFile(sectionPath, section);
     MemoryTestHooks::reset();
     if (scenario == Scenario::AllocatorFailure) {
@@ -1115,7 +1200,27 @@ TEST(PdfSleepProduct, RejectsMissingCorruptMismatchedCrossingOversizedAndOomLayo
     PdfSleepPageCache page;
     EXPECT_FALSE(page.load(product, layout));
     EXPECT_FALSE(page.available());
+    EXPECT_EQ(fixture.storage.openHandleCount(), 0U);
     EXPECT_EQ(Storage.activeReaders(), 0U);
+    EXPECT_LE(Storage.maximumActiveReaders(), 1U);
+    if (scenario == Scenario::MissingSection) {
+      EXPECT_EQ(fixture.storage.events(), (std::vector<std::string>{"open:" + sectionPath}));
+    } else if (scenario == Scenario::MissingIndex) {
+      EXPECT_EQ(fixture.storage.events(),
+                (std::vector<std::string>{"open:" + sectionPath, "close:" + sectionPath,
+                                          "open:" + wordIndexPath}));
+    } else {
+      EXPECT_EQ(fixture.storage.events(),
+                (std::vector<std::string>{"open:" + sectionPath, "close:" + sectionPath,
+                                          "open:" + wordIndexPath, "close:" + wordIndexPath}));
+    }
+    const bool reachedSectionLoad =
+        scenario == Scenario::StaleViewport || scenario == Scenario::CrossingDeclaredImagePath ||
+        scenario == Scenario::OversizedPage || scenario == Scenario::AllocatorFailure ||
+        scenario == Scenario::CorruptTextOffsets || scenario == Scenario::GlobalWordBudget;
+    EXPECT_EQ(Storage.events(), reachedSectionLoad
+                                    ? (std::vector<std::string>{"open:" + sectionPath, "close:" + sectionPath})
+                                    : std::vector<std::string>{});
     EXPECT_EQ(fixture.budget.sourceOpens, sourceOpensBefore);
     EXPECT_EQ(fixture.storage.openCallsForPath(fixture.fullPath("sections/000000.xhtml")), 0U);
     EXPECT_EQ(fixture.storage.openCallsForPath(fixture.fullPath("images/0123456789abcdef-89abcdef.pxc")), 0U);

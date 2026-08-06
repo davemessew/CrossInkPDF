@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <iostream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -33,9 +34,10 @@ bool deletePdf(void* const context, const char* const path) {
   return Storage.remove(exactPath.c_str());
 }
 
-void clearLegacy(void* const context, const std::string& path) {
+bool clearLegacy(void* const context, const std::string_view path) {
   auto& log = *static_cast<CallbackLog*>(context);
   log.clearedLegacy.emplace_back(path);
+  return true;
 }
 
 PdfDirectoryDeleteScan::DeleteCallbacks callbacksFor(CallbackLog& log) {
@@ -63,12 +65,12 @@ void testInvalidRootsAndCallbacksFailClosed() {
   CallbackLog log;
   for (const std::string root :
        {"", "/", "Books", "/Books/", "/Books/../Other"}) {
-    expect(PdfDirectoryDeleteScan::deleteDirectoryNoThrow(root,
+    expect(PdfDirectoryDeleteScan::deletePdfDirectoryNoThrow(root,
                                                           callbacksFor(log)) ==
                Status::InvalidRoot,
            "non-canonical directory root must fail closed: " + root);
   }
-  expect(PdfDirectoryDeleteScan::deleteDirectoryNoThrow(
+  expect(PdfDirectoryDeleteScan::deletePdfDirectoryNoThrow(
              "/Books", PdfDirectoryDeleteScan::DeleteCallbacks{}) ==
              Status::InvalidRoot,
          "missing mutation callbacks must fail closed");
@@ -82,7 +84,7 @@ void testRootNestedIterationAndCloseFailuresAbortBeforeMutation() {
   Storage.putFile("/Books/keep.epub", {1});
   Storage.failNextOpenOf("/Books");
   CallbackLog log;
-  expect(PdfDirectoryDeleteScan::deleteDirectoryNoThrow(
+  expect(PdfDirectoryDeleteScan::deletePdfDirectoryNoThrow(
              "/Books", callbacksFor(log)) == Status::OpenFailure,
          "root open failure must be result-bearing");
   expect(Storage.exists("/Books/keep.epub") && !hasTreeMutationEvent(),
@@ -91,7 +93,7 @@ void testRootNestedIterationAndCloseFailuresAbortBeforeMutation() {
   reset();
   Storage.putFile("/Books/nested/keep.epub", {1});
   Storage.failNextOpenOf("/Books/nested");
-  expect(PdfDirectoryDeleteScan::deleteDirectoryNoThrow(
+  expect(PdfDirectoryDeleteScan::deletePdfDirectoryNoThrow(
              "/Books", callbacksFor(log)) == Status::OpenFailure,
          "nested open failure must abort the complete preflight");
   expect(Storage.exists("/Books/nested/keep.epub") && !hasTreeMutationEvent(),
@@ -100,7 +102,7 @@ void testRootNestedIterationAndCloseFailuresAbortBeforeMutation() {
   reset();
   Storage.putFile("/Books/keep.epub", {1});
   Storage.failNextDirectoryIterationOf("/Books");
-  expect(PdfDirectoryDeleteScan::deleteDirectoryNoThrow(
+  expect(PdfDirectoryDeleteScan::deletePdfDirectoryNoThrow(
              "/Books", callbacksFor(log)) == Status::IterationFailure,
          "directory iteration failure must abort the complete preflight");
   expect(Storage.exists("/Books/keep.epub") && !hasTreeMutationEvent(),
@@ -108,7 +110,7 @@ void testRootNestedIterationAndCloseFailuresAbortBeforeMutation() {
 
   reset();
   Storage.failCloseOnCall(1);
-  expect(PdfDirectoryDeleteScan::deleteDirectoryNoThrow(
+  expect(PdfDirectoryDeleteScan::deletePdfDirectoryNoThrow(
              "/Books", callbacksFor(log)) == Status::CloseFailure,
          "directory close failure must abort the complete preflight");
   expect(Storage.exists("/Books") && !hasTreeMutationEvent(),
@@ -119,7 +121,7 @@ void testCheckedWorkspaceAllocationAndReservedTombstone() {
   reset();
   TestMemory::failNextAllocation = true;
   CallbackLog log;
-  expect(PdfDirectoryDeleteScan::deleteDirectoryNoThrow(
+  expect(PdfDirectoryDeleteScan::deletePdfDirectoryNoThrow(
              "/Books", callbacksFor(log)) == Status::AllocationFailure,
          "checked walker allocation failure must return without scanning");
   expect(Storage.exists("/Books") && !hasTreeMutationEvent(),
@@ -127,7 +129,7 @@ void testCheckedWorkspaceAllocationAndReservedTombstone() {
 
   reset();
   Storage.putFile("/Books/.held.pdf.crossink-delete", {7});
-  expect(PdfDirectoryDeleteScan::deleteDirectoryNoThrow(
+  expect(PdfDirectoryDeleteScan::deletePdfDirectoryNoThrow(
              "/Books", callbacksFor(log)) == Status::ReservedTombstone,
          "prepared PDF tombstone must block recursive directory deletion");
   expect(Storage.exists("/Books/.held.pdf.crossink-delete") &&

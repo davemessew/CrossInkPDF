@@ -4,9 +4,18 @@
 #include <cstring>
 #include <limits>
 
+#include "PdfCacheFormat.h"
+
 namespace {
 
 constexpr uint8_t kInvalidHandle = 0xff;
+
+void writeLe32(uint8_t* const destination, const uint32_t value) {
+  destination[0] = static_cast<uint8_t>(value);
+  destination[1] = static_cast<uint8_t>(value >> 8U);
+  destination[2] = static_cast<uint8_t>(value >> 16U);
+  destination[3] = static_cast<uint8_t>(value >> 24U);
+}
 
 bool isDirectChild(const std::string& parent, const std::string& candidate, std::string* name) {
   std::string prefix = parent;
@@ -70,6 +79,13 @@ void PdfTestCacheIo::corruptByte(const std::string& path, const size_t offset, c
   }
 }
 
+void PdfTestCacheIo::mutateByteBeforeNextRead(const std::string& path, const size_t offset, const uint8_t mask) {
+  pendingReadMutationPath_ = path;
+  pendingReadMutationOffset_ = offset;
+  pendingReadMutationMask_ = mask;
+  pendingReadMutation_ = true;
+}
+
 bool PdfTestCacheIo::exists(const std::string& path) const { return nodes_.find(path) != nodes_.end(); }
 
 bool PdfTestCacheIo::isDirectory(const std::string& path) const {
@@ -110,9 +126,7 @@ void PdfTestCacheIo::setWriteAllowance(const uint64_t bytes) { writeAllowance_ =
 
 void PdfTestCacheIo::clearWriteAllowance() { writeAllowance_ = UINT64_MAX; }
 
-void PdfTestCacheIo::setMaximumReadHandles(const uint8_t maximum) {
-  maximumReadHandles_ = maximum;
-}
+void PdfTestCacheIo::setMaximumReadHandles(const uint8_t maximum) { maximumReadHandles_ = maximum; }
 
 uint32_t PdfTestCacheIo::openCalls() const { return openCalls_; }
 uint32_t PdfTestCacheIo::readCalls() const { return readCalls_; }
@@ -126,10 +140,10 @@ uint32_t PdfTestCacheIo::mkdirCalls() const { return mkdirCalls_; }
 uint32_t PdfTestCacheIo::listCalls() const { return listCalls_; }
 uint32_t PdfTestCacheIo::capacityCalls() const { return capacityCalls_; }
 uint32_t PdfTestCacheIo::metadataCalls() const { return metadataCalls_; }
+uint32_t PdfTestCacheIo::readMutationsApplied() const { return readMutationsApplied_; }
 uint32_t PdfTestCacheIo::operationCalls() const {
-  return openCalls_ + readCalls_ + writeCalls_ + flushCalls_ + syncCalls_ +
-         closeCalls_ + removeCalls_ + mkdirCalls_ + listCalls_ +
-         capacityCalls_ + metadataCalls_ + renameCalls_;
+  return openCalls_ + readCalls_ + writeCalls_ + flushCalls_ + syncCalls_ + closeCalls_ + removeCalls_ + mkdirCalls_ +
+         listCalls_ + capacityCalls_ + metadataCalls_ + renameCalls_;
 }
 uint64_t PdfTestCacheIo::bytesReadTotal() const { return bytesReadTotal_; }
 uint64_t PdfTestCacheIo::bytesWrittenTotal() const { return bytesWrittenTotal_; }
@@ -139,10 +153,14 @@ uint32_t PdfTestCacheIo::openCallsForPath(const std::string& path) const {
   const auto found = pathOpenCalls_.find(path);
   return found == pathOpenCalls_.end() ? 0 : found->second;
 }
-const std::vector<PdfTestReadObservation>& PdfTestCacheIo::readObservations() const {
-  return readObservations_;
-}
+const std::vector<std::string>& PdfTestCacheIo::syncObservations() const { return syncObservations_; }
+void PdfTestCacheIo::clearSyncObservations() { syncObservations_.clear(); }
+const std::vector<PdfTestReadObservation>& PdfTestCacheIo::readObservations() const { return readObservations_; }
 void PdfTestCacheIo::clearReadObservations() { readObservations_.clear(); }
+const std::vector<PdfTestOpenObservation>& PdfTestCacheIo::openObservations() const { return openObservations_; }
+void PdfTestCacheIo::clearOpenObservations() { openObservations_.clear(); }
+const std::vector<std::string>& PdfTestCacheIo::removeObservations() const { return removeObservations_; }
+void PdfTestCacheIo::clearRemoveObservations() { removeObservations_.clear(); }
 const std::vector<std::string>& PdfTestCacheIo::events() const { return events_; }
 void PdfTestCacheIo::clearEvents() { events_.clear(); }
 
@@ -197,11 +215,8 @@ PdfStatus PdfTestCacheIo::removeThunk(void* context, const char* path, const boo
   return static_cast<PdfTestCacheIo*>(context)->remove(path, recursive);
 }
 
-PdfStatus PdfTestCacheIo::renameThunk(void* context,
-                                      const char* sourcePath,
-                                      const char* destinationPath) {
-  return static_cast<PdfTestCacheIo*>(context)->rename(sourcePath,
-                                                       destinationPath);
+PdfStatus PdfTestCacheIo::renameThunk(void* context, const char* sourcePath, const char* destinationPath) {
+  return static_cast<PdfTestCacheIo*>(context)->rename(sourcePath, destinationPath);
 }
 
 PdfStatus PdfTestCacheIo::mkdirThunk(void* context, const char* path) {
@@ -240,30 +255,49 @@ PdfStatus PdfTestCacheIo::open(const char* path, const PdfCacheOpenMode mode, Pd
   }
   const std::string key(path);
   ++pathOpenCalls_[key];
+  openObservations_.push_back({key, mode});
   events_.push_back("open:" + key);
   auto found = nodes_.find(key);
-  if (mode == PdfCacheOpenMode::Read) {
+  const bool readCapable = mode == PdfCacheOpenMode::Read || mode == PdfCacheOpenMode::ReadWrite;
+  if (readCapable) {
+    if (pendingReadMutation_ && key == pendingReadMutationPath_ && found != nodes_.end() &&
+        found->second.bytes.size() >= sizeof(uint32_t) &&
+        pendingReadMutationOffset_ < found->second.bytes.size() - sizeof(uint32_t)) {
+      auto& bytes = found->second.bytes;
+      bytes[pendingReadMutationOffset_] ^= pendingReadMutationMask_;
+      writeLe32(bytes.data() + bytes.size() - sizeof(uint32_t),
+                pdfCacheCrc32(bytes.data(), bytes.size() - sizeof(uint32_t)));
+      pendingReadMutation_ = false;
+      ++readMutationsApplied_;
+    }
     if (found == nodes_.end() || found->second.directory) {
       return PdfStatus::failure(PdfError::InvalidOffset);
     }
     uint8_t readHandles = 0;
     for (const OpenHandle& candidate : handles_) {
-      if (candidate.open && !candidate.writable) {
+      if (candidate.open && candidate.readable) {
         ++readHandles;
       }
     }
     if (readHandles >= maximumReadHandles_) {
       return PdfStatus::failure(PdfError::LimitExceeded);
     }
-  } else {
+  } else if (mode == PdfCacheOpenMode::WriteTruncate) {
     Node& node = nodes_[key];
     node.bytes.clear();
+    node.directory = false;
+    node.symlinkLike = false;
+  } else {
+    Node& node = nodes_[key];
+    if (node.directory) {
+      return PdfStatus::failure(PdfError::InvalidOffset);
+    }
     node.directory = false;
     node.symlinkLike = false;
   }
   for (uint8_t index = 0; index < 8; ++index) {
     if (!handles_[index].open) {
-      handles_[index] = {key, 0, mode == PdfCacheOpenMode::WriteTruncate, true};
+      handles_[index] = {key, 0, readCapable, mode != PdfCacheOpenMode::Read, true};
       handle->value = index;
       return PdfStatus::success();
     }
@@ -275,7 +309,8 @@ PdfStatus PdfTestCacheIo::read(const PdfCacheHandle handle, const uint64_t offse
                                const size_t requested, size_t* bytesRead) {
   ++readCalls_;
   maximumReadRequest_ = std::max(maximumReadRequest_, requested);
-  if (!handle.valid() || handle.value >= 8 || !handles_[handle.value].open || destination == nullptr ||
+  if (!handle.valid() || handle.value >= 8 || !handles_[handle.value].open ||
+      !handles_[handle.value].readable || destination == nullptr ||
       bytesRead == nullptr) {
     return PdfStatus::failure(PdfError::InvalidArgument, offset);
   }
@@ -341,6 +376,7 @@ PdfStatus PdfTestCacheIo::sync(const PdfCacheHandle handle) {
   if (!handle.valid() || handle.value >= 8 || !handles_[handle.value].open) {
     return PdfStatus::failure(PdfError::InvalidArgument);
   }
+  syncObservations_.push_back(handles_[handle.value].path);
   return shouldFail(PdfTestFaultPoint::Sync) ? PdfStatus::failure(PdfError::IoFailure) : PdfStatus::success();
 }
 
@@ -361,6 +397,7 @@ PdfStatus PdfTestCacheIo::remove(const char* path, const bool recursive) {
   if (path == nullptr) {
     return PdfStatus::failure(PdfError::InvalidArgument);
   }
+  removeObservations_.emplace_back(path);
   if (shouldFail(PdfTestFaultPoint::Remove)) {
     return PdfStatus::failure(PdfError::IoFailure);
   }
@@ -387,8 +424,7 @@ PdfStatus PdfTestCacheIo::remove(const char* path, const bool recursive) {
   return PdfStatus::success();
 }
 
-PdfStatus PdfTestCacheIo::rename(const char* sourcePath,
-                                 const char* destinationPath) {
+PdfStatus PdfTestCacheIo::rename(const char* sourcePath, const char* destinationPath) {
   ++renameCalls_;
   if (sourcePath == nullptr || destinationPath == nullptr) {
     return PdfStatus::failure(PdfError::InvalidArgument);
@@ -406,8 +442,7 @@ PdfStatus PdfTestCacheIo::rename(const char* sourcePath,
     return PdfStatus::failure(PdfError::IoFailure);
   }
   for (const OpenHandle& handle : handles_) {
-    if (handle.open &&
-        (handle.path == source || handle.path == destination)) {
+    if (handle.open && (handle.path == source || handle.path == destination)) {
       return PdfStatus::failure(PdfError::IoFailure);
     }
   }
@@ -483,10 +518,36 @@ PdfStatus PdfTestCacheIo::metadata(const PdfCacheHandle handle, PdfCacheFileMeta
   if (shouldFail(PdfTestFaultPoint::Metadata)) {
     return PdfStatus::failure(PdfError::IoFailure);
   }
+  if (metadata->operation == PdfCacheMetadataOperation::Seek) {
+    return seek(handle, metadata->size);
+  }
+  if (metadata->operation == PdfCacheMetadataOperation::Truncate) {
+    OpenHandle& opened = handles_[handle.value];
+    auto found = nodes_.find(opened.path);
+    if (!opened.writable || metadata->size > SIZE_MAX || found == nodes_.end() || found->second.directory ||
+        metadata->size > found->second.bytes.size()) {
+      return PdfStatus::failure(PdfError::IoFailure, metadata->size);
+    }
+    found->second.bytes.resize(static_cast<size_t>(metadata->size));
+    opened.position = static_cast<size_t>(metadata->size);
+    return PdfStatus::success();
+  }
   const Node& node = nodes_.at(handles_[handle.value].path);
   metadata->size = node.bytes.size();
   metadata->modificationTime = {node.modificationTimeKnown, node.modificationTime};
   metadata->directory = node.directory;
   metadata->symlinkLike = node.symlinkLike;
+  return PdfStatus::success();
+}
+
+PdfStatus PdfTestCacheIo::seek(const PdfCacheHandle handle, const uint64_t offset) {
+  if (!handle.valid() || handle.value >= 8 || !handles_[handle.value].open || offset > SIZE_MAX) {
+    return PdfStatus::failure(PdfError::InvalidArgument, offset);
+  }
+  const auto found = nodes_.find(handles_[handle.value].path);
+  if (found == nodes_.end() || found->second.directory || offset > found->second.bytes.size()) {
+    return PdfStatus::failure(PdfError::InvalidOffset, offset);
+  }
+  handles_[handle.value].position = static_cast<size_t>(offset);
   return PdfStatus::success();
 }

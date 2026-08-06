@@ -7,7 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "src/activities/home/BookActions.cpp"
 BASELINE_SHA256 = "c4d9f19f8f96ae9e09170ae51539bcf949e35f71efd7e716bc13a32443003db7"
-EXPECTED_BLOCKS = 9
+EXPECTED_BLOCKS = 10
 
 
 def strip_pdf_parity_blocks(source: str) -> str:

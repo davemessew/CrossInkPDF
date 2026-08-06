@@ -8,6 +8,7 @@
 #include "PdfSourceIdentity.h"
 
 constexpr size_t PDF_CACHE_REQUIRED_PATH_CAPACITY = 96;
+inline constexpr uint32_t PDF_CACHE_WARNING_OPTIONAL_CONTENT_OMITTED = 1U << 0U;
 
 struct PdfRequiredFileRecord {
   char path[PDF_CACHE_REQUIRED_PATH_CAPACITY]{};

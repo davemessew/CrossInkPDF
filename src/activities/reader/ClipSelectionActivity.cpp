@@ -28,11 +28,13 @@ bool hasEmSpace(const std::string& text) {
 
 ClipSelectionActivity::ClipSelectionActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
                                              std::vector<WordRef> words, const int fontId, Section& section,
-                                             const int startPageInSection, const int marginTop, const int marginLeft)
+                                             const int startPageInSection, const int marginTop, const int marginLeft,
+                                             PdfPixelCacheRenderWorkspace* const pdfRenderWorkspace)
     : Activity("ClipSelection", renderer, mappedInput),
       words(std::move(words)),
       renderFontId(fontId),
       section(section),
+      pdfRenderWorkspace(pdfRenderWorkspace),
       startPageInSection(startPageInSection),
       marginTop(marginTop),
       marginLeft(marginLeft) {}
@@ -260,7 +262,8 @@ bool ClipSelectionActivity::switchToPage(const int pageIdx) {
         renderWithFallback = true;
       } else {
         renderer.clearScreen(ReaderUtils::readerBackgroundColor());
-        page->render(renderer, renderFontId, marginLeft, marginTop, ReaderUtils::readerForegroundBlack());
+        page->render(renderer, renderFontId, marginLeft, marginTop, ReaderUtils::readerForegroundBlack(),
+                     pdfRenderWorkspace);
       }
     }
     if (renderWithFallback) {
@@ -268,11 +271,13 @@ bool ClipSelectionActivity::switchToPage(const int pageIdx) {
       page->renderText(renderer, renderFontId, marginLeft, marginTop, ReaderUtils::readerForegroundBlack());
       fallbackScope.endScanAndPrewarm();
       renderer.clearScreen(ReaderUtils::readerBackgroundColor());
-      page->render(renderer, renderFontId, marginLeft, marginTop, ReaderUtils::readerForegroundBlack());
+      page->render(renderer, renderFontId, marginLeft, marginTop, ReaderUtils::readerForegroundBlack(),
+                   pdfRenderWorkspace);
     }
   } else {
     renderer.clearScreen(ReaderUtils::readerBackgroundColor());
-    page->render(renderer, renderFontId, marginLeft, marginTop, ReaderUtils::readerForegroundBlack());
+    page->render(renderer, renderFontId, marginLeft, marginTop, ReaderUtils::readerForegroundBlack(),
+                 pdfRenderWorkspace);
   }
 
   storeCurrentBuffer();

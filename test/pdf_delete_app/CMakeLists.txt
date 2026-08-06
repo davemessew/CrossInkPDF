@@ -68,6 +68,7 @@ add_executable(PdfDirectoryDeleteScanTest
 )
 target_include_directories(PdfDirectoryDeleteScanTest BEFORE PRIVATE
   "${CMAKE_CURRENT_BINARY_DIR}"
+  "${CMAKE_CURRENT_SOURCE_DIR}/directory_stubs"
   "${REPO_ROOT}/test/book_move_integration/stubs"
 )
 target_include_directories(PdfDirectoryDeleteScanTest PRIVATE
@@ -84,7 +85,10 @@ target_compile_options(PdfDirectoryDeleteScanTest PRIVATE
   -fstack-usage
   -Os
 )
-target_compile_definitions(PdfDirectoryDeleteScanTest PRIVATE CROSSINK_ENABLE_PDF=1)
+target_compile_definitions(PdfDirectoryDeleteScanTest PRIVATE
+  CROSSINK_ENABLE_PDF=1
+  PDF_DIRECTORY_DELETE_TRUNCATING_GET_NAME=1
+)
 add_test(NAME PdfDirectoryDeleteScanTest COMMAND PdfDirectoryDeleteScanTest)
 
 add_executable(PdfDirectoryDeleteLegacyPathTest
@@ -93,6 +97,7 @@ add_executable(PdfDirectoryDeleteLegacyPathTest
 )
 target_include_directories(PdfDirectoryDeleteLegacyPathTest BEFORE PRIVATE
   "${CMAKE_CURRENT_BINARY_DIR}"
+  "${CMAKE_CURRENT_SOURCE_DIR}/directory_stubs"
   "${REPO_ROOT}/test/book_move_integration/stubs"
 )
 target_include_directories(PdfDirectoryDeleteLegacyPathTest PRIVATE
@@ -111,6 +116,7 @@ target_compile_options(PdfDirectoryDeleteLegacyPathTest PRIVATE
 )
 target_compile_definitions(PdfDirectoryDeleteLegacyPathTest PRIVATE
   CROSSINK_ENABLE_PDF=1
+  PDF_DIRECTORY_DELETE_TRUNCATING_GET_NAME=1
 )
 add_test(NAME PdfDirectoryDeleteLegacyPathTest COMMAND PdfDirectoryDeleteLegacyPathTest)
 
@@ -120,6 +126,7 @@ add_executable(PdfDirectoryDeleteSpoolTest
 )
 target_include_directories(PdfDirectoryDeleteSpoolTest BEFORE PRIVATE
   "${CMAKE_CURRENT_BINARY_DIR}"
+  "${CMAKE_CURRENT_SOURCE_DIR}/directory_stubs"
   "${REPO_ROOT}/test/book_move_integration/stubs"
 )
 target_include_directories(PdfDirectoryDeleteSpoolTest PRIVATE
@@ -138,6 +145,7 @@ target_compile_options(PdfDirectoryDeleteSpoolTest PRIVATE
 )
 target_compile_definitions(PdfDirectoryDeleteSpoolTest PRIVATE
   CROSSINK_ENABLE_PDF=1
+  PDF_DIRECTORY_DELETE_TRUNCATING_GET_NAME=1
 )
 add_test(NAME PdfDirectoryDeleteSpoolTest COMMAND PdfDirectoryDeleteSpoolTest)
 
@@ -147,6 +155,7 @@ add_executable(PdfDirectoryDeleteScanSimulatorTest
 )
 target_include_directories(PdfDirectoryDeleteScanSimulatorTest BEFORE PRIVATE
   "${CMAKE_CURRENT_BINARY_DIR}"
+  "${CMAKE_CURRENT_SOURCE_DIR}/directory_stubs"
   "${REPO_ROOT}/test/book_move_integration/stubs"
 )
 target_include_directories(PdfDirectoryDeleteScanSimulatorTest PRIVATE
@@ -155,6 +164,7 @@ target_include_directories(PdfDirectoryDeleteScanSimulatorTest PRIVATE
 )
 target_compile_definitions(PdfDirectoryDeleteScanSimulatorTest PRIVATE
   CROSSINK_ENABLE_PDF=1
+  PDF_DIRECTORY_DELETE_TRUNCATING_GET_NAME=1
   SIMULATOR=1
 )
 target_compile_options(PdfDirectoryDeleteScanSimulatorTest PRIVATE
@@ -219,4 +229,8 @@ add_test(
 add_test(
   NAME PdfDeleteAppSourceNegativeControls
   COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/source_contract_negative_control_test.py"
+)
+add_test(
+  NAME PdfDeleteAppLegacyFileBrowserRouting
+  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/legacy_file_browser_routing_test.py"
 )

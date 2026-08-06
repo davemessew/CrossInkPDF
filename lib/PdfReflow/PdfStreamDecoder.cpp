@@ -51,6 +51,104 @@ PdfStreamFilter filterFromName(const PdfObjectArena& arena, const PdfValue& valu
   return PdfStreamFilter::Unsupported;
 }
 
+bool dictionaryKeyEquals(const PdfObjectArena& arena, const PdfDictionaryEntry& entry, const char* expected) {
+  const size_t expectedLength = std::strlen(expected);
+  return expectedLength == entry.keyLength &&
+         static_cast<uint32_t>(entry.keyOffset) + entry.keyLength <= arena.textLength &&
+         std::memcmp(arena.text + entry.keyOffset, expected, expectedLength) == 0;
+}
+
+PdfStatus validateDefaultDecodeParameters(const PdfObjectArena& arena, const uint16_t dictionaryIndex,
+                                          const PdfStreamFilter filter) {
+  if (dictionaryIndex >= arena.valueCount || arena.values[dictionaryIndex].kind != PdfValueKind::Dictionary) {
+    return PdfStatus::failure(PdfError::Malformed, dictionaryIndex);
+  }
+  const PdfValue& dictionary = arena.values[dictionaryIndex];
+  if (dictionary.count == 0) {
+    return PdfStatus::success();
+  }
+  if (filter != PdfStreamFilter::Flate) {
+    return PdfStatus::failure(PdfError::UnsupportedFilter, dictionaryIndex);
+  }
+  uint16_t entryIndex = dictionary.firstLink;
+  uint8_t seenKeys = 0;
+  for (uint16_t ordinal = 0; ordinal < dictionary.count; ++ordinal) {
+    if (entryIndex >= arena.dictionaryCount) {
+      return PdfStatus::failure(PdfError::Malformed, dictionaryIndex);
+    }
+    const PdfDictionaryEntry& entry = arena.dictionaryEntries[entryIndex];
+    if (entry.valueIndex >= arena.valueCount) {
+      return PdfStatus::failure(PdfError::Malformed, dictionaryIndex);
+    }
+
+    uint8_t keyMask = 0;
+    if (dictionaryKeyEquals(arena, entry, "Predictor")) {
+      keyMask = 1U << 0;
+    } else if (dictionaryKeyEquals(arena, entry, "Colors")) {
+      keyMask = 1U << 1;
+    } else if (dictionaryKeyEquals(arena, entry, "BitsPerComponent")) {
+      keyMask = 1U << 2;
+    } else if (dictionaryKeyEquals(arena, entry, "Columns")) {
+      keyMask = 1U << 3;
+    } else {
+      return PdfStatus::failure(PdfError::UnsupportedFilter, dictionaryIndex);
+    }
+    if ((seenKeys & keyMask) != 0) {
+      return PdfStatus::failure(PdfError::Malformed, dictionaryIndex);
+    }
+    seenKeys = static_cast<uint8_t>(seenKeys | keyMask);
+
+    const PdfValue& parameter = arena.values[entry.valueIndex];
+    if (parameter.kind != PdfValueKind::Integer || parameter.integerValue <= 0) {
+      return PdfStatus::failure(PdfError::Malformed, entry.valueIndex);
+    }
+    if (keyMask == (1U << 0) && parameter.integerValue != 1) {
+      return PdfStatus::failure(PdfError::UnsupportedFilter, static_cast<uint64_t>(parameter.integerValue));
+    }
+    entryIndex = entry.next;
+  }
+  return PdfStatus::success();
+}
+
+PdfStatus validateDecodeParameters(const PdfObjectArena& arena, const uint16_t dictionaryIndex,
+                                   const PdfStreamFilter* filters, const uint8_t filterCount) {
+  uint16_t parametersIndex = PDF_INVALID_INDEX;
+  if (!pdfDictionaryFind(arena, dictionaryIndex, "DecodeParms", &parametersIndex)) {
+    return PdfStatus::success();
+  }
+  if (parametersIndex >= arena.valueCount) {
+    return PdfStatus::failure(PdfError::Malformed, dictionaryIndex);
+  }
+  const PdfValue& parameters = arena.values[parametersIndex];
+  if (parameters.kind == PdfValueKind::Null) {
+    return PdfStatus::success();
+  }
+  if (filterCount == 0) {
+    return PdfStatus::failure(PdfError::Malformed, parametersIndex);
+  }
+  if (parameters.kind == PdfValueKind::Dictionary) {
+    return filterCount == 1 ? validateDefaultDecodeParameters(arena, parametersIndex, filters[0])
+                            : PdfStatus::failure(PdfError::Malformed, parametersIndex);
+  }
+  if (parameters.kind != PdfValueKind::Array || parameters.count != filterCount) {
+    return PdfStatus::failure(PdfError::Malformed, parametersIndex);
+  }
+  for (uint8_t ordinal = 0; ordinal < filterCount; ++ordinal) {
+    uint16_t itemIndex = PDF_INVALID_INDEX;
+    if (!pdfArrayAt(arena, parametersIndex, ordinal, &itemIndex) || itemIndex >= arena.valueCount) {
+      return PdfStatus::failure(PdfError::Malformed, parametersIndex);
+    }
+    if (arena.values[itemIndex].kind == PdfValueKind::Null) {
+      continue;
+    }
+    const PdfStatus status = validateDefaultDecodeParameters(arena, itemIndex, filters[ordinal]);
+    if (!status.ok()) {
+      return status;
+    }
+  }
+  return PdfStatus::success();
+}
+
 }  // namespace
 
 PdfStreamDecoder::PdfStreamDecoder(const PdfStreamDecoderWorkspace workspace) : workspace_(workspace) {
@@ -565,6 +663,10 @@ PdfStreamDecoder::PullResult PdfStreamDecoder::flushPending(PdfWorkBudget& budge
     if (written == 0 || written > requested) {
       return {PullState::Failed, PdfStatus::failure(PdfError::IoFailure, outputBytes_)};
     }
+    // The sink may deliberately accept only a prefix (for example, one
+    // complete fixed-size record). Charge the bytes actually accepted and
+    // retain the unwritten suffix for the next flush operation.
+    budget.bytesRemaining += requested - written;
     pendingOutputWritten_ += written;
     outputBytes_ += written;
   }
@@ -608,13 +710,33 @@ int PdfStreamDecoder::refillInflateInput(uzlib_uncomp*) {
 
 PdfStatus pdfStreamFiltersFromDictionary(const PdfObjectArena& arena, const uint16_t dictionaryIndex,
                                          PdfStreamFilter* filters, const uint8_t filterCapacity, uint8_t* filterCount) {
-  if (filters == nullptr || filterCount == nullptr || dictionaryIndex >= arena.valueCount) {
+  if (filters == nullptr || filterCount == nullptr || dictionaryIndex >= arena.valueCount ||
+      arena.values[dictionaryIndex].kind != PdfValueKind::Dictionary) {
     return PdfStatus::failure(PdfError::InvalidArgument, dictionaryIndex);
   }
   *filterCount = 0;
+  const PdfValue& dictionary = arena.values[dictionaryIndex];
+  uint16_t entryIndex = dictionary.firstLink;
+  uint8_t filterKeys = 0;
+  uint8_t decodeParameterKeys = 0;
+  for (uint16_t ordinal = 0; ordinal < dictionary.count; ++ordinal) {
+    if (entryIndex >= arena.dictionaryCount) {
+      return PdfStatus::failure(PdfError::Malformed, dictionaryIndex);
+    }
+    const PdfDictionaryEntry& entry = arena.dictionaryEntries[entryIndex];
+    if (dictionaryKeyEquals(arena, entry, "Filter")) {
+      ++filterKeys;
+    } else if (dictionaryKeyEquals(arena, entry, "DecodeParms")) {
+      ++decodeParameterKeys;
+    }
+    if (filterKeys > 1 || decodeParameterKeys > 1) {
+      return PdfStatus::failure(PdfError::Malformed, dictionaryIndex);
+    }
+    entryIndex = entry.next;
+  }
   uint16_t valueIndex = PDF_INVALID_INDEX;
   if (!pdfDictionaryFind(arena, dictionaryIndex, "Filter", &valueIndex)) {
-    return PdfStatus::success();
+    return validateDecodeParameters(arena, dictionaryIndex, filters, 0);
   }
   if (valueIndex >= arena.valueCount) {
     return PdfStatus::failure(PdfError::Malformed, dictionaryIndex);
@@ -626,20 +748,20 @@ PdfStatus pdfStreamFiltersFromDictionary(const PdfObjectArena& arena, const uint
     }
     filters[0] = filterFromName(arena, value);
     *filterCount = 1;
-    return PdfStatus::success();
-  }
-  if (value.kind != PdfValueKind::Array || value.count > PdfLimits::MaxFiltersPerStream ||
-      value.count > filterCapacity) {
-    return PdfStatus::failure(PdfError::LimitExceeded, dictionaryIndex);
-  }
-  for (uint16_t ordinal = 0; ordinal < value.count; ++ordinal) {
-    uint16_t itemIndex = PDF_INVALID_INDEX;
-    if (!pdfArrayAt(arena, valueIndex, ordinal, &itemIndex) || itemIndex >= arena.valueCount ||
-        arena.values[itemIndex].kind != PdfValueKind::Name) {
-      return PdfStatus::failure(PdfError::Malformed, dictionaryIndex);
+  } else {
+    if (value.kind != PdfValueKind::Array || value.count > PdfLimits::MaxFiltersPerStream ||
+        value.count > filterCapacity) {
+      return PdfStatus::failure(PdfError::LimitExceeded, dictionaryIndex);
     }
-    filters[ordinal] = filterFromName(arena, arena.values[itemIndex]);
+    for (uint16_t ordinal = 0; ordinal < value.count; ++ordinal) {
+      uint16_t itemIndex = PDF_INVALID_INDEX;
+      if (!pdfArrayAt(arena, valueIndex, ordinal, &itemIndex) || itemIndex >= arena.valueCount ||
+          arena.values[itemIndex].kind != PdfValueKind::Name) {
+        return PdfStatus::failure(PdfError::Malformed, dictionaryIndex);
+      }
+      filters[ordinal] = filterFromName(arena, arena.values[itemIndex]);
+    }
+    *filterCount = static_cast<uint8_t>(value.count);
   }
-  *filterCount = static_cast<uint8_t>(value.count);
-  return PdfStatus::success();
+  return validateDecodeParameters(arena, dictionaryIndex, filters, *filterCount);
 }

@@ -17,10 +17,14 @@ static_assert(PageTableFragment::MAX_SERIALIZED_ROWS == MAX_TABLE_ROWS_PER_FRAGM
 template <typename Predicate>
 void renderFilteredPageElements(const std::vector<std::shared_ptr<PageElement>>& elements, GfxRenderer& renderer,
                                 const int fontId, const int xOffset, const int yOffset, const bool foregroundBlack,
-                                Predicate&& predicate) {
+                                PdfPixelCacheRenderWorkspace* const pdfWorkspace, Predicate&& predicate) {
   for (const auto& element : elements) {
     if (predicate(*element)) {
-      element->render(renderer, fontId, xOffset, yOffset, foregroundBlack);
+      if (pdfWorkspace != nullptr && element->getTag() == TAG_PageImage) {
+        static_cast<PageImage&>(*element).render(renderer, fontId, xOffset, yOffset, foregroundBlack, pdfWorkspace);
+      } else {
+        element->render(renderer, fontId, xOffset, yOffset, foregroundBlack);
+      }
     }
   }
 }
@@ -66,9 +70,15 @@ std::unique_ptr<PageLine> PageLine::deserialize(FsFile& file) {
 
 void PageImage::render(GfxRenderer& renderer, const int fontId, const int xOffset, const int yOffset,
                        const bool foregroundBlack) {
+  render(renderer, fontId, xOffset, yOffset, foregroundBlack, nullptr);
+}
+
+void PageImage::render(GfxRenderer& renderer, const int fontId, const int xOffset, const int yOffset,
+                       const bool foregroundBlack, PdfPixelCacheRenderWorkspace* const pdfWorkspace) {
+  (void)fontId;
   (void)foregroundBlack;
   // Images don't use fontId or text rendering
-  imageBlock->render(renderer, xPos + xOffset, yPos + yOffset);
+  imageBlock->render(renderer, xPos + xOffset, yPos + yOffset, pdfWorkspace);
 }
 
 bool PageImage::serialize(FsFile& file) {
@@ -349,18 +359,31 @@ std::unique_ptr<PageTableFragment> PageTableFragment::deserialize(FsFile& file) 
 
 void Page::render(GfxRenderer& renderer, const int fontId, const int xOffset, const int yOffset,
                   const bool foregroundBlack) const {
+  render(renderer, fontId, xOffset, yOffset, foregroundBlack, nullptr);
+}
+
+void Page::render(GfxRenderer& renderer, const int fontId, const int xOffset, const int yOffset,
+                  const bool foregroundBlack, PdfPixelCacheRenderWorkspace* const pdfWorkspace) const {
   renderFilteredPageElements(elements, renderer, fontId, xOffset, yOffset, foregroundBlack,
+                             pdfWorkspace,
                              [](const PageElement&) { return true; });
 }
 
 void Page::renderText(GfxRenderer& renderer, const int fontId, const int xOffset, const int yOffset,
                       const bool foregroundBlack) const {
   renderFilteredPageElements(elements, renderer, fontId, xOffset, yOffset, foregroundBlack,
+                             nullptr,
                              [](const PageElement& element) { return element.getTag() != TAG_PageImage; });
 }
 
 void Page::renderImages(GfxRenderer& renderer, const int fontId, const int xOffset, const int yOffset) const {
+  renderImages(renderer, fontId, xOffset, yOffset, nullptr);
+}
+
+void Page::renderImages(GfxRenderer& renderer, const int fontId, const int xOffset, const int yOffset,
+                        PdfPixelCacheRenderWorkspace* const pdfWorkspace) const {
   renderFilteredPageElements(elements, renderer, fontId, xOffset, yOffset, true,
+                             pdfWorkspace,
                              [](const PageElement& element) { return element.getTag() == TAG_PageImage; });
 }
 

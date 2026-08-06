@@ -62,7 +62,6 @@ struct DeleteWorkspace {
   char cache[CACHE_PATH_CAPACITY]{};
   char bookmarks[STORE_PATH_CAPACITY]{};
   char clippings[STORE_PATH_CAPACITY]{};
-  std::string sourcePath;
   Targets targets{};
 };
 
@@ -87,15 +86,13 @@ struct JournalReadSession {
   static Io makeJournalIo(JournalIoWorkspace& workspace);
 };
 
+static_assert(sizeof(JournalReadSession) <= 7 * 1024,
+              "PDF delete journal reader exceeded its RAM budget");
+
 bool sameView(const StringView view, const char* const expected) {
   if (view.data == nullptr || expected == nullptr) return false;
   const size_t length = std::strlen(expected);
   return view.length == length && std::memcmp(view.data, expected, length) == 0;
-}
-
-bool sameView(const StringView view, const std::string& expected) {
-  return view.data != nullptr && view.length == expected.size() &&
-         std::memcmp(view.data, expected.data(), view.length) == 0;
 }
 
 bool hasPdfExtension(const char* const path, const size_t length) {
@@ -243,7 +240,6 @@ bool initializeTargets(DeleteWorkspace& workspace, const StringView source) {
     return false;
   }
 
-  workspace.sourcePath.assign(workspace.source, source.length);
   workspace.targets = {
       {workspace.source, source.length},
       {workspace.tombstone, tombstoneLength},
@@ -256,7 +252,7 @@ bool initializeTargets(DeleteWorkspace& workspace, const StringView source) {
 }
 
 bool exactTargets(const DeleteWorkspace& workspace, const Targets& targets) {
-  return sameView(targets.source, workspace.sourcePath) && sameView(targets.tombstone, workspace.tombstone) &&
+  return sameView(targets.source, workspace.source) && sameView(targets.tombstone, workspace.tombstone) &&
          sameView(targets.cache, workspace.cache) && sameView(targets.bookmarks, workspace.bookmarks) &&
          sameView(targets.clippings, workspace.clippings) &&
          sameView(targets.recent, RecentBooksStore::getFilePath());
@@ -287,19 +283,28 @@ Status purgeFullCache(void* const context, const Targets& targets) {
 Status purgeBookmarks(void* const context, const Targets& targets) {
   const auto& workspace = *static_cast<const DeleteWorkspace*>(context);
   if (!exactTargets(workspace, targets)) return Status::InvalidArgument;
-  return BookmarkStore::deleteForFilePath(workspace.sourcePath, "pdf") ? Status::Ok : Status::OperationFailed;
+  return BookmarkStore::deletePdfForFilePathNoPathAlloc(
+             std::string_view(workspace.source, targets.source.length))
+             ? Status::Ok
+             : Status::OperationFailed;
 }
 
 Status purgeClippings(void* const context, const Targets& targets) {
   const auto& workspace = *static_cast<const DeleteWorkspace*>(context);
   if (!exactTargets(workspace, targets)) return Status::InvalidArgument;
-  return ClippingStore::deleteForFilePath(workspace.sourcePath, "pdf") ? Status::Ok : Status::OperationFailed;
+  return ClippingStore::deletePdfForFilePathNoPathAlloc(
+             std::string_view(workspace.source, targets.source.length))
+             ? Status::Ok
+             : Status::OperationFailed;
 }
 
 Status purgeRecents(void* const context, const Targets& targets) {
   const auto& workspace = *static_cast<const DeleteWorkspace*>(context);
   if (!exactTargets(workspace, targets)) return Status::InvalidArgument;
-  return RECENT_BOOKS.removeByPathDurably(workspace.sourcePath) ? Status::Ok : Status::OperationFailed;
+  return RECENT_BOOKS.removeByPathDurablyNoPathAlloc(
+             std::string_view(workspace.source, targets.source.length))
+             ? Status::Ok
+             : Status::OperationFailed;
 }
 
 Status removeHiddenSource(void* const context, const Targets& targets) {
@@ -328,7 +333,7 @@ PdfDeleteUtils::Result resultFor(const PdfDelete::RunResult& result) {
   return PdfDeleteUtils::Result::NoPendingDelete;
 }
 
-bool pathMatches(const StringView view, const std::string& path) {
+bool pathMatches(const StringView view, const std::string_view path) {
   return view.data != nullptr && view.length == path.size() &&
          std::memcmp(view.data, path.data(), view.length) == 0;
 }
@@ -358,8 +363,9 @@ void publishResult(const PdfDeleteUtils::Result result) {
                         std::memory_order_release);
 }
 
-PdfDeleteUtils::Result checkMoveFence(const std::string& sourcePath) {
-  const BookMutationFence fence = BookMoveUtils::mutationFenceForPath(sourcePath);
+PdfDeleteUtils::Result checkMoveFence(const std::string_view sourcePath) {
+  const BookMutationFence fence =
+      BookMoveUtils::mutationFenceForPathNoPathAlloc(sourcePath);
   if (fence == BookMutationFence::Clear) return PdfDeleteUtils::Result::NoPendingDelete;
   return fence == BookMutationFence::Indeterminate ? PdfDeleteUtils::Result::Pending
                                                    : PdfDeleteUtils::Result::Conflict;
@@ -370,15 +376,98 @@ PdfDeleteUtils::Result recoverSession(DeleteSession& session, Selection selectio
   if (!initializeTargets(session.workspace, selection.record.targets.source)) {
     return PdfDeleteUtils::Result::Pending;
   }
-  const PdfDeleteUtils::Result moveFence = checkMoveFence(session.workspace.sourcePath);
+  const std::string_view sourcePath(
+      session.workspace.source, selection.record.targets.source.length);
+  const PdfDeleteUtils::Result moveFence = checkMoveFence(sourcePath);
   if (moveFence != PdfDeleteUtils::Result::NoPendingDelete) return moveFence;
   Coordinator coordinator(session.journal, session.operations);
   return resultFor(coordinator.recover());
 }
 
+PdfDeleteUtils::Result deleteWithSession(DeleteSession& session,
+                                         const std::string_view sourcePath) {
+  if (!canonicalAbsolutePath(sourcePath.data(), sourcePath.size())) {
+    return PdfDeleteUtils::Result::Invalid;
+  }
+  if (!hasPdfExtension(sourcePath.data(), sourcePath.size())) {
+    return PdfDeleteUtils::Result::Unsupported;
+  }
+  if (!acquireStart()) return PdfDeleteUtils::Result::Pending;
+
+  Selection existing{};
+  const Status loaded = session.journal.load(&existing);
+  if (loaded != Status::Ok) {
+    publishResult(PdfDeleteUtils::Result::Pending);
+    return PdfDeleteUtils::Result::Pending;
+  }
+  if (existing.selected) {
+    const bool requestedExisting =
+        pathMatches(existing.record.targets.source, sourcePath);
+    const PdfDeleteUtils::Result recovered = recoverSession(session, existing);
+    if (recovered != PdfDeleteUtils::Result::Complete || requestedExisting) {
+      publishResult(recovered);
+      return recovered;
+    }
+  }
+
+  const PdfDeleteUtils::Result moveFence = checkMoveFence(sourcePath);
+  if (moveFence != PdfDeleteUtils::Result::NoPendingDelete) {
+    publishResult(moveFence);
+    return moveFence;
+  }
+  if (!initializeTargets(session.workspace,
+                         {sourcePath.data(), sourcePath.size()})) {
+    publishResult(PdfDeleteUtils::Result::Invalid);
+    return PdfDeleteUtils::Result::Invalid;
+  }
+  if (!Storage.exists(session.workspace.source) ||
+      Storage.exists(session.workspace.tombstone)) {
+    publishResult(PdfDeleteUtils::Result::Invalid);
+    return PdfDeleteUtils::Result::Invalid;
+  }
+
+  Coordinator coordinator(session.journal, session.operations);
+  const Request request{session.workspace.targets, BookFormat::Pdf};
+  const PdfDelete::BeginResult begun = coordinator.begin(request);
+  if (begun.disposition != BeginDisposition::Armed) {
+    PdfDeleteUtils::Result result = PdfDeleteUtils::Result::Pending;
+    if (begun.status == Status::Conflict) {
+      result = PdfDeleteUtils::Result::Conflict;
+    } else if (begun.status == Status::InvalidArgument ||
+               begun.status == Status::LimitExceeded) {
+      result = PdfDeleteUtils::Result::Invalid;
+    }
+    publishResult(result);
+    return result;
+  }
+
+  const PdfDeleteUtils::Result result = resultFor(coordinator.recover());
+  publishResult(result);
+  return result;
+}
+
 }  // namespace
 
 namespace PdfDeleteUtils {
+
+class DirectoryDeleteSession {
+ public:
+  DeleteSession session;
+};
+
+void DirectoryDeleteSessionDeleter::operator()(
+    DirectoryDeleteSession* const session) const {
+  delete session;
+}
+
+DirectoryDeleteSessionPtr makeDirectoryDeleteSessionNoThrow() {
+  auto session = makeUniqueNoThrow<DirectoryDeleteSession>();
+  if (!session) {
+    LOG_ERR("PdfDelete", "Out of memory allocating reusable PDF delete workspace");
+    return {};
+  }
+  return DirectoryDeleteSessionPtr(session.release());
+}
 
 BookMutationFence mutationFenceForPath(const std::string& sourcePath) {
   const JournalPresence presence = journalPresence.load(std::memory_order_acquire);
@@ -410,6 +499,27 @@ Result recoverPendingPdfDelete() {
   }
   if (!acquireStart()) return Result::Pending;
 
+  // The 6,182-byte journal codec scratch is too large for the task stack, but
+  // is still smaller than the full delete workspace. Decode first so an
+  // ordinary boot with no journal never allocates the full recovery session.
+  {
+    auto reader = makeUniqueNoThrow<JournalReadSession>();
+    if (!reader) {
+      LOG_ERR("PdfDelete", "Out of memory allocating PDF delete journal reader");
+      publishResult(Result::Pending);
+      return Result::Pending;
+    }
+    const Status loaded = reader->journal.load(&reader->selection);
+    if (loaded != Status::Ok) {
+      publishResult(Result::Pending);
+      return Result::Pending;
+    }
+    if (!reader->selection.selected) {
+      publishResult(Result::NoPendingDelete);
+      return Result::NoPendingDelete;
+    }
+  }
+
   auto session = makeUniqueNoThrow<DeleteSession>();
   if (!session) {
     LOG_ERR("PdfDelete", "Out of memory allocating PDF delete recovery workspace");
@@ -426,65 +536,24 @@ Result recoverPendingPdfDelete() {
 Result deletePdfBook(const std::string& sourcePath) {
   if (!canonicalAbsolutePath(sourcePath.data(), sourcePath.size())) return Result::Invalid;
   if (!hasPdfExtension(sourcePath.data(), sourcePath.size())) return Result::Unsupported;
-  if (!acquireStart()) return Result::Pending;
-
-  auto session = makeUniqueNoThrow<DeleteSession>();
+  auto session = makeDirectoryDeleteSessionNoThrow();
   if (!session) {
     LOG_ERR("PdfDelete", "Out of memory allocating PDF delete workspace");
-    publishResult(Result::Pending);
     return Result::Pending;
   }
+  return deleteWithSession(session->session, sourcePath);
+}
 
-  Selection existing{};
-  const Status loaded = session->journal.load(&existing);
-  if (loaded != Status::Ok) {
-    publishResult(Result::Pending);
-    return Result::Pending;
-  }
-  if (existing.selected) {
-    const bool requestedExisting = pathMatches(existing.record.targets.source, sourcePath);
-    const Result recovered = recoverSession(*session, existing);
-    if (recovered != Result::Complete || requestedExisting) {
-      publishResult(recovered);
-      return recovered;
-    }
-  }
-
-  const Result moveFence = checkMoveFence(sourcePath);
-  if (moveFence != Result::NoPendingDelete) {
-    publishResult(moveFence);
-    return moveFence;
-  }
-  if (!initializeTargets(session->workspace, {sourcePath.data(), sourcePath.size()})) {
-    publishResult(Result::Invalid);
-    return Result::Invalid;
-  }
-  if (!Storage.exists(session->workspace.source) || Storage.exists(session->workspace.tombstone)) {
-    publishResult(Result::Invalid);
-    return Result::Invalid;
-  }
-
-  Coordinator coordinator(session->journal, session->operations);
-  const Request request{session->workspace.targets, BookFormat::Pdf};
-  const PdfDelete::BeginResult begun = coordinator.begin(request);
-  if (begun.disposition != BeginDisposition::Armed) {
-    Result result = Result::Pending;
-    if (begun.status == Status::Conflict) {
-      result = Result::Conflict;
-    } else if (begun.status == Status::InvalidArgument || begun.status == Status::LimitExceeded) {
-      result = Result::Invalid;
-    }
-    publishResult(result);
-    return result;
-  }
-
-  const Result result = resultFor(coordinator.recover());
-  publishResult(result);
-  return result;
+Result deletePdfBookNoPathAlloc(DirectoryDeleteSession& session,
+                                const std::string_view sourcePath) {
+  return deleteWithSession(session.session, sourcePath);
 }
 
 #if defined(PDF_DELETE_TESTING)
 void resetPresenceForTest() { journalPresence.store(JournalPresence::LookupRequired, std::memory_order_release); }
+void markDeleteStartingForTest() {
+  journalPresence.store(JournalPresence::DeleteStarting, std::memory_order_release);
+}
 #endif
 
 }  // namespace PdfDeleteUtils

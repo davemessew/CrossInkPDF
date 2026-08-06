@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 inline constexpr size_t CLIPPING_CHAPTER_TITLE_MAX = 48;
@@ -66,6 +67,11 @@ class ClippingStore {
   static bool hasAnyClippings();
   static bool getAllClippedBooks(std::vector<ClippedBookEntry>& out);
   static bool deleteForFilePath(const std::string& filePath, const std::string& bookType);
+  // Cold directory-delete replay path: filename generation uses a bounded
+  // stack buffer and never materializes either input view as an owning string.
+  static bool deleteLegacyForFilePathNoPathAlloc(std::string_view filePath,
+                                                 std::string_view bookType);
+  static bool deletePdfForFilePathNoPathAlloc(std::string_view filePath);
   // Journaled copy/verification is PDF-only. Legacy formats keep using
   // migrateForFilePath after their source rename.
   static bool copyForFilePath(const std::string& oldFilePath, const std::string& newFilePath,

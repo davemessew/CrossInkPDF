@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <vector>
 
@@ -17,6 +18,17 @@ class ClippingStore {
       return false;
     }
     books.erase(path);
+    return true;
+  }
+
+
+  static bool deletePdfForFilePathNoPathAlloc(const std::string_view path) {
+    events.emplace_back("clippings:" + std::string(path) + ":pdf");
+    if (failNextDelete) {
+      failNextDelete = false;
+      return false;
+    }
+    books.erase(std::string(path));
     return true;
   }
 };

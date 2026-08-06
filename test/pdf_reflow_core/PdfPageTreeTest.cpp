@@ -18,6 +18,8 @@ std::vector<uint8_t> loadPageTreeFixture(const char* name) {
 }
 
 struct PageTreeHarness {
+  PageTreeHarness() { traversalStorage.forbidReadsWhile(&traversalReadForbidden); }
+
   std::array<uint8_t, 4096> sourceBuffer{};
   std::array<PdfValue, 128> values{};
   std::array<PdfDictionaryEntry, 128> dictionaries{};
@@ -34,6 +36,12 @@ struct PageTreeHarness {
   PdfTestRecordStore traversalStorage{sizeof(PdfPageTreeRecord), 256};
   PdfPageInfo pageScratch{};
   std::vector<PdfPageInfo> pages;
+  bool sourceOpen = true;
+  bool xrefBlocked = true;
+  bool traversalOpen = false;
+  bool traversalReadForbidden = true;
+  uint32_t traversalOpenCount = 0;
+  uint32_t traversalCloseCount = 0;
 };
 
 PdfStepResult runParser(PdfXrefParser& parser) {
@@ -58,6 +66,19 @@ PdfStepResult runResolver(PdfObjectResolver& resolver) {
 
 PdfStatus capturePage(void* context, const PdfPageInfo& page) {
   static_cast<PageTreeHarness*>(context)->pages.push_back(page);
+  return PdfStatus::success();
+}
+
+PdfStatus setTraversalAccess(void* context, const bool required) {
+  if (context == nullptr) {
+    return PdfStatus::failure(PdfError::InvalidArgument);
+  }
+  auto& harness = *static_cast<PageTreeHarness*>(context);
+  harness.traversalOpen = required;
+  harness.traversalReadForbidden = !required;
+  harness.sourceOpen = false;
+  harness.xrefBlocked = true;
+  required ? ++harness.traversalOpenCount : ++harness.traversalCloseCount;
   return PdfStatus::success();
 }
 
@@ -97,18 +118,20 @@ PdfStepResult walkFixture(const char* fixture, PageTreeHarness& harness,
 
   PdfPageTreeWalker walker(resolver, harness.arena,
                            harness.traversalStorage.store(), capturePage,
-                           &harness, &harness.pageScratch, maxPages);
+                           &harness, setTraversalAccess, &harness,
+                           &harness.pageScratch, maxPages);
   status = walker.begin({pages.objectNumber, pages.generation});
   if (!status.ok()) {
     return PdfStepResult::failure(status);
   }
-  while (true) {
-    PdfWorkBudget budget{1, 1};
+  for (uint16_t step = 0; step < 4096U; ++step) {
+    PdfWorkBudget budget{32, 4096};
     result = walker.step(budget);
     if (!result.yielded()) {
       return result;
     }
   }
+  return PdfStepResult::failure(PdfStatus::failure(PdfError::BudgetExhausted));
 }
 
 }  // namespace
@@ -120,6 +143,12 @@ TEST(PdfPageTreeTest, PreservesOrderInheritedResourcesAndSingleOrArrayContents) 
 
   ASSERT_TRUE(result.complete());
   ASSERT_EQ(harness.pages.size(), 2u);
+  EXPECT_GT(harness.traversalOpenCount, 0U);
+  EXPECT_EQ(harness.traversalOpenCount, harness.traversalCloseCount);
+  EXPECT_FALSE(harness.traversalOpen);
+  EXPECT_TRUE(harness.traversalReadForbidden);
+  EXPECT_FALSE(harness.sourceOpen);
+  EXPECT_TRUE(harness.xrefBlocked);
   EXPECT_EQ(harness.pages[0].pageReference, (PdfObjectReference{3, 0}));
   EXPECT_EQ(harness.pages[0].contentCount, 2u);
   EXPECT_EQ(harness.pages[0].contents[0], (PdfObjectReference{4, 0}));

@@ -36,7 +36,8 @@ std::string decodeUriEscapes(const std::string& path) {
   return decoded;
 }
 
-std::string normalisePath(const std::string& path) {
+std::string normalisePath(const std::string& path, const bool preserveRoot) {
+  const bool rooted = preserveRoot && !path.empty() && path.front() == '/';
   std::vector<std::string_view> components;
   components.reserve(8);  // Eight nested folders is more than we might expect
 
@@ -58,7 +59,7 @@ std::string normalisePath(const std::string& path) {
   }
 
   if (components.empty()) {
-    return "";
+    return rooted ? "/" : "";
   }
 
   size_t total_len = 0;
@@ -67,7 +68,10 @@ std::string normalisePath(const std::string& path) {
   }
 
   std::string result;
-  result.reserve(total_len - 1);
+  result.reserve(rooted ? total_len : total_len - 1);
+  if (rooted) {
+    result += '/';
+  }
 
   for (size_t i = 0; i < components.size(); ++i) {
     if (i > 0) {
