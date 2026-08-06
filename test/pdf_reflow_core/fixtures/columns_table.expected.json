@@ -1,0 +1,20 @@
+{
+  "error": null,
+  "fixture": "columns_table",
+  "geometry_order": [
+    "Left one.",
+    "Left two.",
+    "Right one.",
+    "Right two.",
+    "Name Value",
+    "Alpha 10"
+  ],
+  "image_hashes": {},
+  "outline_link_map": {
+    "links": [],
+    "outline": []
+  },
+  "transcript": "Left one. Left two. Right one. Right two. Name Value Alpha 10",
+  "warning": null,
+  "word_count": 12
+}

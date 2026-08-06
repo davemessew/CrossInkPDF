@@ -40,7 +40,15 @@ void EpubReaderBookmarkListActivity::onExit() { Activity::onExit(); }
 
 void EpubReaderBookmarkListActivity::deleteSelectedBookmark() {
   if (bookmarks.empty() || selectedIndex < 0 || selectedIndex >= static_cast<int>(bookmarks.size())) return;
-  if (!BOOKMARKS.removeBookmarkAt(static_cast<size_t>(selectedIndex))) return;
+
+  bool removed = false;
+  if (deleteCallback == nullptr) {
+    removed = BOOKMARKS.removeBookmarkAt(static_cast<size_t>(selectedIndex));
+  } else {
+    removed = deleteCallback(deleteContext, bookmarks[selectedIndex].paragraphIndex);
+  }
+  if (!removed) return;
+
   bookmarks = BOOKMARKS.getBookmarks();
   if (bookmarks.empty())
     selectedIndex = 0;
@@ -69,12 +77,33 @@ void EpubReaderBookmarkListActivity::selectBookmark() {
   finish();
 }
 
-void EpubReaderBookmarkListActivity::onRowEvent(const fui::ActionEvent& event, void* user) {
-  auto* self = static_cast<EpubReaderBookmarkListActivity*>(user);
-  if (event.value < 0 || event.value >= static_cast<int16_t>(self->bookmarks.size())) return;
-  self->selectedIndex = event.value;
-  self->app.clearTapFlash();
-  self->selectBookmark();
+  startActivityForResult(
+      std::make_unique<FileBrowserActionActivity>(renderer, mappedInput, chapter, std::move(items),
+                                                  ignoreInitialConfirmRelease),
+      [this, selectedBookmark](const ActivityResult& result) {
+        longPressConfirmHandled = false;
+        if (result.isCancelled) {
+          requestUpdate();
+          return;
+        }
+
+        const auto* actionResult = std::get_if<FileBrowserActionResult>(&result.data);
+        if (!actionResult || static_cast<FileBrowserAction>(actionResult->action) != FileBrowserAction::Delete) {
+          requestUpdate();
+          return;
+        }
+
+        const auto it = std::find_if(bookmarks.begin(), bookmarks.end(), [this, &selectedBookmark](const Bookmark& bm) {
+          return bm.spineIndex == selectedBookmark.spineIndex && bm.progress == selectedBookmark.progress &&
+                 (deleteCallback == nullptr || bm.paragraphIndex == selectedBookmark.paragraphIndex);
+        });
+        if (it != bookmarks.end()) {
+          selectedIndex = static_cast<int>(std::distance(bookmarks.begin(), it));
+          deleteSelectedBookmark();
+        } else {
+          requestUpdate();
+        }
+      });
 }
 
 void EpubReaderBookmarkListActivity::loop() {

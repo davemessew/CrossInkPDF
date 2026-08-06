@@ -27,22 +27,21 @@ EpubReaderChapterSelectionActivity::EpubReaderChapterSelectionActivity(GfxRender
       uiTarget(makeUiTarget(renderer)),
       app(uiTarget, uiTarget.deviceContext()) {}
 
-int EpubReaderChapterSelectionActivity::getTotalItems() const { return epub->getTocItemsCount(); }
+int EpubReaderChapterSelectionActivity::getTotalItems() const { return document ? document->getTocEntryCount() : 0; }
 
 void EpubReaderChapterSelectionActivity::onEnter() {
   Activity::onEnter();
-  mappedInput.setReaderTouchscreenOverride(true);
-  if (!epub) return;
 
-  selectorIndex = epub->getTocIndexForSpineIndex(currentSpineIndex);
-  if (selectorIndex < 0) selectorIndex = 0;
-  topIndex = 0;
-  visibleRows = 1;
-  initialViewportPending = true;
-  uiReady = false;
-  app.setTheme(uiThemeTokens(uiTarget));
-  app.on(ACTION_ROW, &EpubReaderChapterSelectionActivity::onRowEvent, this);
-  app.setScreen(&EpubReaderChapterSelectionActivity::chapterScreen, this);
+  if (!document) {
+    return;
+  }
+
+  selectorIndex = document->getTocIndexForSectionIndex(currentSpineIndex);
+  if (selectorIndex == -1) {
+    selectorIndex = 0;
+  }
+
+  // Trigger first update
   requestUpdate();
 }
 
@@ -73,12 +72,30 @@ void EpubReaderChapterSelectionActivity::onRowEvent(const fui::ActionEvent& even
 
 void EpubReaderChapterSelectionActivity::loop() {
   const int totalItems = getTotalItems();
-  const auto& metrics = UITheme::getInstance().getMetrics();
-  const Rect safe = UITheme::getInstance().getScreenSafeArea(renderer, true, false);
-  const Rect header{safe.x, safe.y + metrics.topPadding, safe.width,
-                    TouchHeaderBackButton::height(metrics, mappedInput)};
-  if (TouchHeaderBackButton::wasTapped(mappedInput, header) ||
-      mappedInput.wasReleased(MappedInputManager::Button::Back)) {
+
+  if (!document || totalItems <= 0) {
+    if (mappedInput.wasReleased(MappedInputManager::Button::Confirm) ||
+        mappedInput.wasReleased(MappedInputManager::Button::Back)) {
+      ActivityResult result;
+      result.isCancelled = true;
+      setResult(std::move(result));
+      finish();
+    }
+    return;
+  }
+
+  if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
+    const auto tocItem = document->getTocEntry(selectorIndex);
+    if (tocItem.sectionIndex == -1) {
+      ActivityResult result;
+      result.isCancelled = true;
+      setResult(std::move(result));
+      finish();
+    } else {
+      setResult(ChapterResult{tocItem.sectionIndex, tocItem.anchor});
+      finish();
+    }
+  } else if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
     ActivityResult result;
     result.isCancelled = true;
     setResult(std::move(result));
@@ -169,18 +186,25 @@ void EpubReaderChapterSelectionActivity::buildChapterScreen(UiApp::ScreenType& s
 
 void EpubReaderChapterSelectionActivity::render(RenderLock&&) {
   renderer.clearScreen();
-  const auto& metrics = UITheme::getInstance().getMetrics();
-  const Rect safe = UITheme::getInstance().getScreenSafeArea(renderer, true, false);
-  const Rect header{safe.x, safe.y + metrics.topPadding, safe.width,
-                    TouchHeaderBackButton::height(metrics, mappedInput)};
-  if (mappedInput.hasTouchHardware()) {
-    TouchHeaderBackButton::draw(renderer, uiTarget, header, tr(STR_SELECT_CHAPTER), true);
-  } else {
-    GUI.drawHeader(renderer, header, tr(STR_SELECT_CHAPTER), nullptr, true);
-  }
-  uiReady = false;
-  app.render();
-  uiReady = true;
+
+  auto metrics = UITheme::getInstance().getMetrics();
+  Rect screen = UITheme::getInstance().getScreenSafeArea(renderer, true, false);
+
+  GUI.drawHeader(renderer, Rect{screen.x, screen.y + metrics.topPadding, screen.width, metrics.headerHeight},
+                 tr(STR_SELECT_CHAPTER), nullptr, true);
+
+  const int contentTop = screen.y + metrics.topPadding + metrics.headerHeight + metrics.verticalSpacing;
+  const int contentHeight = screen.height - contentTop - metrics.verticalSpacing;
+
+  const int totalItems = getTotalItems();
+  GUI.drawList(renderer, Rect{screen.x, contentTop, screen.width, contentHeight}, totalItems, selectorIndex,
+               [this](int index) {
+                 auto item = document->getTocEntry(index);
+                 const int indentLevel = item.level > 0 ? static_cast<int>(item.level) - 1 : 0;
+                 std::string indent(static_cast<size_t>(indentLevel * 2), ' ');
+                 return indent + item.title;
+               });
+
   const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_SELECT), tr(STR_DIR_UP), tr(STR_DIR_DOWN));
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4, true);
   renderer.displayBuffer();

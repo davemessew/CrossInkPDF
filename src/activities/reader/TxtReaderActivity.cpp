@@ -116,7 +116,7 @@ void TxtReaderActivity::onEnter() {
   // Save current txt as last opened file and add to recent books
   auto filePath = txt->getPath();
   auto fileName = filePath.substr(filePath.rfind('/') + 1);
-  APP_STATE.openEpubPath = filePath;
+  APP_STATE.openBookPath() = filePath;
   APP_STATE.saveToFile();
   SleepCoverAssets::prepareTxt(*txt);
   const std::string coverBmpPath = Storage.exists(txt->getCoverBmpPath().c_str()) ? txt->getCoverBmpPath() : "";

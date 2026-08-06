@@ -1,0 +1,19 @@
+{
+  "error": null,
+  "fixture": "filter_matrix",
+  "geometry_order": [
+    "Unfiltered stream.",
+    "Flate stream.",
+    "ASCII hex stream.",
+    "ASCII eighty five stream.",
+    "Chained filter stream."
+  ],
+  "image_hashes": {},
+  "outline_link_map": {
+    "links": [],
+    "outline": []
+  },
+  "transcript": "Unfiltered stream. Flate stream. ASCII hex stream. ASCII eighty five stream. Chained filter stream.",
+  "warning": null,
+  "word_count": 14
+}

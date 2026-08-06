@@ -31,12 +31,11 @@ def patch_jpegdec(env):
     if not os.path.isdir(libdeps_dir):
         return
     patches = _patch_files()
-    for env_dir in os.listdir(libdeps_dir):
-        jpeg_dir = os.path.join(libdeps_dir, env_dir, "JPEGDEC")
-        if not os.path.isdir(os.path.join(jpeg_dir, ".git")):
-            continue
-        for patch in patches:
-            _apply_one(jpeg_dir, patch)
+    jpeg_dir = os.path.join(libdeps_dir, env["PIOENV"], "JPEGDEC")
+    if not os.path.isdir(os.path.join(jpeg_dir, ".git")):
+        return
+    for patch in patches:
+        _apply_one(jpeg_dir, patch)
 
 
 def _patch_files():
@@ -68,17 +67,26 @@ def _apply_one(jpeg_dir, patch_path):
         # Not applied, not appliable -- the libdep source has diverged from
         # what the patch expects. Don't write a half-patched file.
         result = subprocess.run(
-            ["git", "apply", "--check", patch_path],
+            ["git", "apply", "--check", "-"],
             cwd=jpeg_dir,
             capture_output=True,
-            text=True,
+            input=_read_patch(patch_path),
         )
         sys.stderr.write(
             "ERROR: JPEGDEC patch %s does not apply cleanly:\n%s%s\n"
-            % (name, result.stdout, result.stderr)
+            % (
+                name,
+                result.stdout.decode("utf-8", errors="replace"),
+                result.stderr.decode("utf-8", errors="replace"),
+            )
         )
         raise SystemExit(1)
-    subprocess.run(["git", "apply", patch_path], cwd=jpeg_dir, check=True)
+    subprocess.run(
+        ["git", "apply", "-"],
+        cwd=jpeg_dir,
+        check=True,
+        input=_read_patch(patch_path),
+    )
     print("Applied JPEGDEC patch: %s" % name)
 
 
@@ -88,17 +96,18 @@ def _patch_already_satisfied(jpeg_dir, patch_name):
         return False
     with open(jpeg_inl, "r", encoding="utf-8") as f:
         content = f.read()
+    normalized = " ".join(content.split())
 
     if patch_name.startswith("0001-"):
         return (
-            "signed short *pMCU = (iMCU < 0) ? pJPEG->sMCUs" in content
-            and ": &pJPEG->sMCUs[iMCU & 0xffffff];" in content
+            "signed short *pMCU = (iMCU < 0) ? pJPEG->sMCUs : &pJPEG->sMCUs[iMCU & 0xffffff];"
+            in normalized
         )
 
     if patch_name.startswith("0002-"):
         return (
-            "if (iMCU >= 0)\n                    pMCU[0] |= iPositive;" in content
-            and "if (iMCU >= 0)\n            pMCU[0] = (short)*iDCPredictor;" in content
+            "if (iMCU >= 0) pMCU[0] |= iPositive;" in normalized
+            and "if (iMCU >= 0) pMCU[0] = (short)*iDCPredictor;" in normalized
         )
 
     return False
@@ -108,10 +117,20 @@ def _git_apply_succeeds(jpeg_dir, patch_path, *, reverse):
     cmd = ["git", "apply", "--check"]
     if reverse:
         cmd.append("--reverse")
-    cmd.append(patch_path)
+    cmd.append("-")
     return subprocess.run(
-        cmd, cwd=jpeg_dir, capture_output=True, text=True
+        cmd,
+        cwd=jpeg_dir,
+        capture_output=True,
+        input=_read_patch(patch_path),
     ).returncode == 0
+
+
+def _read_patch(patch_path):
+    # Binary stdin prevents the Windows text layer from restoring CRLF after
+    # normalization, so git receives the LF context recorded in the repository.
+    with open(patch_path, "rb") as patch_file:
+        return patch_file.read().replace(b"\r\n", b"\n")
 
 
 patch_jpegdec(env)  # noqa: F821

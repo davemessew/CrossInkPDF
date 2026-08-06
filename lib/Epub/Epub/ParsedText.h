@@ -55,17 +55,26 @@ class ParsedText {
   int resolveFirstLineIndent(bool isFirstLine, const GfxRenderer& renderer, int fontId) const;
   bool calculateGapMetrics(ArenaVector<int16_t>& naturalGaps, ArenaVector<uint8_t>& gapSlots,
                            const GfxRenderer& renderer, int fontId);
+  template <bool SemanticWordTracking>
+  bool layoutAndExtractLinesImpl(const GfxRenderer& renderer, int fontId, uint16_t viewportWidth,
+                                 const std::function<void(std::shared_ptr<TextBlock>)>& processLine,
+                                 bool includeLastLine);
+  template <bool SemanticWordTracking>
   bool computeLineBreaks(Arena& scratchArena, const GfxRenderer& renderer, int fontId, int pageWidth,
                          ArenaVector<uint16_t>& wordWidths, std::vector<bool>& continuesVec,
                          std::vector<bool>& noSpaceBeforeVec, ArenaVector<int16_t>& naturalGaps,
                          ArenaVector<uint8_t>& gapSlots, ArenaVector<size_t>& lineBreakIndices);
+  template <bool SemanticWordTracking>
   bool computeHyphenatedLineBreaks(const GfxRenderer& renderer, int fontId, int pageWidth,
                                    ArenaVector<uint16_t>& wordWidths, std::vector<bool>& continuesVec,
                                    std::vector<bool>& noSpaceBeforeVec, ArenaVector<size_t>& lineBreakIndices);
+  template <bool SemanticWordTracking>
   bool hyphenateWordAtIndex(size_t wordIndex, int availableWidth, const GfxRenderer& renderer, int fontId,
                             ArenaVector<uint16_t>& wordWidths, bool allowFallbackBreaks);
+  template <bool SemanticWordTracking>
   bool splitPathologicalTokenAtIndex(size_t wordIndex, int availableWidth, const GfxRenderer& renderer, int fontId,
                                      ArenaVector<uint16_t>& wordWidths);
+  template <bool SemanticWordTracking>
   bool extractLine(Arena& scratchArena, size_t breakIndex, int pageWidth, const ArenaVector<uint16_t>& wordWidths,
                    const std::vector<bool>& continuesVec, const std::vector<bool>& noSpaceBeforeVec,
                    const ArenaVector<int16_t>& naturalGaps, const ArenaVector<uint8_t>& gapSlots,
@@ -105,7 +114,8 @@ class ParsedText {
   bool isContinuation() const { return isContinuation_; }
   bool layoutAndExtractLines(const GfxRenderer& renderer, int fontId, uint16_t viewportWidth,
                              const std::function<void(std::shared_ptr<TextBlock>)>& processLine,
-                             bool includeLastLine = true);
+                             bool includeLastLine = true, bool semanticWordTracking = false);
   bool layoutAndExtractLinesPreservingSource(const GfxRenderer& renderer, int fontId, uint16_t viewportWidth,
-                                             const std::function<void(std::shared_ptr<TextBlock>)>& processLine) const;
+                                             const std::function<void(std::shared_ptr<TextBlock>)>& processLine,
+                                             bool semanticWordTracking = false) const;
 };

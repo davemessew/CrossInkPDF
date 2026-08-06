@@ -25,8 +25,9 @@ struct ClipWordStyle {
 
 class ClipSelectionActivity final : public Activity {
  public:
-  ClipSelectionActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, ClipWordStore wordStore, int fontId,
-                        Section& section, int startPageInSection, int marginTop, int marginLeft);
+  ClipSelectionActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, std::vector<WordRef> words, int fontId,
+                        Section& section, int startPageInSection, int marginTop, int marginLeft,
+                        PdfPixelCacheRenderWorkspace* pdfRenderWorkspace);
 
   void onEnter() override;
   void onExit() override;
@@ -43,6 +44,9 @@ class ClipSelectionActivity final : public Activity {
   ClipWordStore wordStore;
   int renderFontId = 0;
   Section& section;
+  // Non-owning: the parent EpubReaderActivity remains on the activity stack
+  // while this child runs, just as it does for the borrowed Section reference.
+  PdfPixelCacheRenderWorkspace* pdfRenderWorkspace = nullptr;
   int startPageInSection = 0;
   int marginTop = 0;
   int marginLeft = 0;

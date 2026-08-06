@@ -1,0 +1,15 @@
+{
+  "error": null,
+  "fixture": "inline_ascii85_boundary",
+  "geometry_order": [
+    "Inline ascii85 boundary survives."
+  ],
+  "image_hashes": {},
+  "outline_link_map": {
+    "links": [],
+    "outline": []
+  },
+  "transcript": "Inline ascii85 boundary survives.",
+  "warning": null,
+  "word_count": 4
+}

@@ -1,0 +1,15 @@
+{
+  "error": null,
+  "fixture": "inline_indexed_decode_parms_caption",
+  "geometry_order": [
+    "Inline indexed predictor caption."
+  ],
+  "image_hashes": {},
+  "outline_link_map": {
+    "links": [],
+    "outline": []
+  },
+  "transcript": "Inline indexed predictor caption.",
+  "warning": null,
+  "word_count": 4
+}

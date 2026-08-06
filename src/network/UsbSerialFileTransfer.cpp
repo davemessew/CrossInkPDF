@@ -65,7 +65,18 @@ bool readExact(uint8_t* buffer, size_t length, uint32_t timeoutMs, size_t* recei
     const int available = logSerial.available();
     if (available > 0) {
       const size_t wanted = std::min(length - received, static_cast<size_t>(available));
-      const size_t bytesRead = logSerial.read(buffer + received, wanted);
+      size_t bytesRead = 0;
+#ifdef SIMULATOR
+      // The host serial shim exposes only the single-byte Stream read API.
+      while (bytesRead < wanted) {
+        const int byteValue = logSerial.read();
+        if (byteValue < 0) break;
+        buffer[received + bytesRead] = static_cast<uint8_t>(byteValue);
+        ++bytesRead;
+      }
+#else
+      bytesRead = logSerial.read(buffer + received, wanted);
+#endif
       if (bytesRead > 0 && bytesRead <= wanted) {
         received += bytesRead;
         nextBusyAt = millis() + 3000;

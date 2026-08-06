@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 inline constexpr size_t CLIPPING_CHAPTER_TITLE_MAX = 48;
@@ -45,11 +46,19 @@ class ClippingStore {
 
   bool loadForBook(const std::string& filePath, const std::string& title, const std::string& author,
                    const std::string& bookType);
+  // Cold ambiguity-recovery path. On failure the reader disables saved-item
+  // mutations instead of reconciling PSIT against an untrusted resident view.
+  bool reloadPdfFromDisk();
   void unload();
 
   AddResult addClipping(uint16_t spineIndex, uint16_t startPage, uint16_t endPage, uint16_t pageCount,
                         uint16_t startWordIndex, uint16_t endWordIndex, uint16_t wordCount, const char* chapterTitle,
                         uint16_t paragraphIndex, const std::string& text);
+  AddResult addPdfClipping(uint16_t spineIndex, uint16_t startPage, uint16_t endPage, uint16_t pageCount,
+                           uint16_t startWordIndex, uint16_t endWordIndex, uint16_t wordCount, const char* chapterTitle,
+                           uint16_t itemId, const std::string& text);
+  bool removePdfClipping(uint16_t itemId);
+  bool clearPdfClippings();
   bool removeClippingAt(size_t index);
   bool saveToFile();
   void clearAll();
@@ -64,7 +73,18 @@ class ClippingStore {
 
   static bool hasAnyClippings();
   static bool getAllClippedBooks(std::vector<ClippedBookEntry>& out);
-  static void deleteForFilePath(const std::string& filePath, const std::string& bookType);
+  static bool deleteForFilePath(const std::string& filePath, const std::string& bookType);
+  // Cold directory-delete replay path: filename generation uses a bounded
+  // stack buffer and never materializes either input view as an owning string.
+  static bool deleteLegacyForFilePathNoPathAlloc(std::string_view filePath,
+                                                 std::string_view bookType);
+  static bool deletePdfForFilePathNoPathAlloc(std::string_view filePath);
+  // Journaled copy/verification is PDF-only. Legacy formats keep using
+  // migrateForFilePath after their source rename.
+  static bool copyForFilePath(const std::string& oldFilePath, const std::string& newFilePath,
+                              const std::string& bookType);
+  static bool verifyCopyForFilePath(const std::string& oldFilePath, const std::string& newFilePath,
+                                    const std::string& bookType);
   static bool migrateForFilePath(const std::string& oldFilePath, const std::string& newFilePath,
                                  const std::string& title, const std::string& author, const std::string& bookType);
 
@@ -80,7 +100,16 @@ class ClippingStore {
 
   bool readFromFile();
   bool readFromFile(const std::string& path, std::vector<Clipping>& out) const;
-  bool writeToFile(const std::string* replacementText = nullptr, size_t replacementIndex = SIZE_MAX);
+  bool writeToFile() const;
+  bool writeMigrationPayload(void* fileContext) const;
+  bool writePdfTransaction(const Clipping* appended, size_t removeIndex, bool clear) const;
+  bool verifyPdfTransaction(const std::string& path, const Clipping* appended, size_t removeIndex, bool clear) const;
+  bool recoverPdfTransaction() const;
+  static bool migratePdfForFilePath(const std::string& oldFilePath, const std::string& newFilePath,
+                                    const std::string& title, const std::string& author);
+  static bool migrateLegacyForFilePath(const std::string& oldFilePath, const std::string& newFilePath,
+                                       const std::string& title, const std::string& author,
+                                       const std::string& bookType);
 };
 
 #define CLIPPINGS ClippingStore::getInstance()

@@ -28,8 +28,11 @@ serial transport and won't trigger deprecation warnings.
 #define LOG_LEVEL 0
 #endif
 
-static auto& logSerial = BoardConfig::serialTransport();
-#define LOG_SERIAL_HAS_TX_TIMEOUT FREEINK_SERIAL_HAS_TX_TIMEOUT
+#ifdef CROSSINK_QEMU
+static HardwareSerial& logSerial = Serial0;
+#else
+static HWCDC& logSerial = Serial;
+#endif
 
 void logPrintf(const char* level, const char* origin, const char* format, ...);
 

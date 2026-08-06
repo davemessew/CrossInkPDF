@@ -14,7 +14,7 @@
 #include <HalTiltSensor.h>
 #include <I18n.h>
 #include <Logging.h>
-#include <Memory.h>
+#include <PdfSourceIdentity.h>
 #include <SPI.h>
 #include <builtinFonts/all.h>
 #include <uzlib.h>
@@ -94,10 +94,13 @@ inline esp_sleep_wakeup_cause_t esp_sleep_get_wakeup_cause() { return ESP_SLEEP_
 #include "simulator/SimulatorHomeKeyInput.h"
 #include "simulator/SimulatorSmokeTest.h"
 #endif
+#ifdef CROSSINK_QEMU
+#include "qemu/QemuAcceptance.h"
+#endif
 #include "images/LoadingIcon.h"
 #include "util/ButtonNavigator.h"
-#include "util/Dictionary.h"
-#include "util/DictionaryRegistry.h"
+#include "util/BookMoveUtils.h"
+#include "util/PdfDeleteUtils.h"
 #include "util/ScreenshotUtil.h"
 
 GfxRenderer renderer(display);
@@ -414,7 +417,7 @@ bool startGlobalSyncProgress(const bool networkBootReady = false) {
     return true;
   }
 
-  std::string epubPath = APP_STATE.openEpubPath;
+  const std::string epubPath = APP_STATE.openBookPath();
   if (epubPath.empty() || !FsHelpers::hasEpubExtension(epubPath) || !Storage.exists(epubPath.c_str())) {
     if (networkBootReady) return false;
     LOG_DBG("MAIN", "No syncable EPUB open, opening KOReader settings instead");
@@ -695,6 +698,9 @@ void setup() {
   const esp_sleep_wakeup_cause_t rawWakeupCause = esp_sleep_get_wakeup_cause();
 
 #ifdef ENABLE_SERIAL_LOG
+#ifdef CROSSINK_QEMU
+  Serial.begin(115200);
+#else
   // Earliest possible Serial setup. The 250 ms stall before begin() lets the
   // USB Serial/JTAG peripheral finish power-on and lets the host complete USB
   // enumeration before we touch the CDC state — otherwise cold boot races
@@ -704,11 +710,14 @@ void setup() {
   // Web Serial sends file data in 256-byte chunks and waits for a 1-byte ACK.
   // HWCDC defaults to a 256-byte RX queue, which is fine for logs but too small
   // for chunked file transfer.
+#ifndef SIMULATOR
   logSerial.setRxBufferSize(1024);
   logSerial.setTxBufferSize(1024);
+#endif
   Serial.begin(115200);
 #if !defined(SIMULATOR) && LOG_SERIAL_HAS_TX_TIMEOUT
   logSerial.setTxTimeoutMs(1);  // This is a load-bearing 1. Do not modify.
+#endif
 #endif
 #endif
 
@@ -766,8 +775,41 @@ void setup() {
   HalSystem::checkPanic();
 
   SETTINGS.loadFromFile();
+#ifndef SIMULATOR
   Storage.installDateTimeCallback(&SETTINGS.clockUtcOffsetQ);
+#endif
   APP_STATE.loadFromFile();
+  RECENT_BOOKS.loadFromFile();
+  const PdfDeleteUtils::Result deleteRecovery = PdfDeleteUtils::recoverPendingPdfDelete();
+  const bool bookDeleteRecoveryBlocked = deleteRecovery == PdfDeleteUtils::Result::Pending ||
+                                         deleteRecovery == PdfDeleteUtils::Result::Conflict ||
+                                         deleteRecovery == PdfDeleteUtils::Result::Invalid;
+  if (bookDeleteRecoveryBlocked) {
+    LOG_ERR("MAIN", "PDF delete recovery remains pending (%u)", static_cast<unsigned>(deleteRecovery));
+  }
+  const BookMoveUtils::MoveResult moveRecovery =
+      bookDeleteRecoveryBlocked ? BookMoveUtils::MoveResult::Pending : BookMoveUtils::recoverPendingBookMove();
+  const bool bookMoveRecoveryBlocked = moveRecovery == BookMoveUtils::MoveResult::Pending ||
+                                       moveRecovery == BookMoveUtils::MoveResult::Conflict ||
+                                       moveRecovery == BookMoveUtils::MoveResult::Invalid;
+  if (bookMoveRecoveryBlocked) {
+    LOG_ERR("MAIN", "Book move recovery remains pending (%u)", static_cast<unsigned>(moveRecovery));
+  }
+  bool bookMoveResumeBlocked = false;
+  if (FsHelpers::hasPdfExtension(APP_STATE.openBookPath())) {
+    const std::string& openBookPath = APP_STATE.openBookPath();
+    const BookMutationFence deleteFence = PdfDeleteUtils::mutationFenceForPath(openBookPath);
+    bookMoveResumeBlocked = deleteFence == BookMutationFence::MatchingPending ||
+                            deleteFence == BookMutationFence::Indeterminate;
+    if (!bookMoveResumeBlocked && bookMoveRecoveryBlocked) {
+      const uint64_t normalCacheHash = pdfPathHash64(openBookPath.c_str(), openBookPath.size());
+      uint64_t resolvedCacheHash = normalCacheHash;
+      bool readOnlyFallback = true;
+      const bool cacheResolved =
+          BookMoveUtils::migrationCacheHash(openBookPath, normalCacheHash, &resolvedCacheHash, &readOnlyFallback);
+      bookMoveResumeBlocked = !cacheResolved || readOnlyFallback;
+    }
+  }
   I18N.setLanguage(static_cast<Language>(SETTINGS.language));
   if (!isNetworkResume) {
     RECENT_BOOKS.loadFromFile();
@@ -906,64 +948,27 @@ void setup() {
   } else if (HalSystem::isRebootFromPanic()) {
     // If we rebooted from a panic, go to crash report screen to show the panic info
     activityManager.goToCrashReport();
-  } else if (resume == BootResume::Network) {
-    bool launched = false;
-    switch (static_cast<NetworkBootTarget>(snapshotTarget)) {
-      case NetworkBootTarget::OTA: {
-        auto otaActivity = makeUniqueNoThrow<OtaUpdateActivity>(renderer, mappedInputManager);
-        if (otaActivity) {
-          activityManager.replaceActivity(std::move(otaActivity));
-          launched = true;
-        } else {
-          LOG_ERR("MAIN", "OOM: OTA activity after minimal boot (free=%u maxAlloc=%u)", ESP.getFreeHeap(),
-                  ESP.getMaxAllocHeap());
-        }
-        break;
-      }
-      case NetworkBootTarget::OPDS:
-        launched = activityManager.goToOpdsServer(snapshotPayload, true);
-        break;
-      case NetworkBootTarget::KOREADER_SYNC:
-        launched = startGlobalSyncProgress(true);
-        break;
-      case NetworkBootTarget::KOREADER_AUTH: {
-        const auto mode =
-            snapshotPayload == 1 ? KOReaderAuthActivity::Mode::SIGN_UP : KOReaderAuthActivity::Mode::AUTHENTICATE;
-        auto authActivity = makeUniqueNoThrow<KOReaderAuthActivity>(renderer, mappedInputManager, mode);
-        if (authActivity) {
-          activityManager.replaceActivity(std::move(authActivity));
-          launched = true;
-        } else {
-          LOG_ERR("MAIN", "OOM: KOReader auth activity after minimal boot (free=%u maxAlloc=%u)", ESP.getFreeHeap(),
-                  ESP.getMaxAllocHeap());
-        }
-        break;
-      }
-      case NetworkBootTarget::FILE_TRANSFER:
-        launched = activityManager.resumeFileTransferFromNetworkBoot(snapshotPayload);
-        break;
-    }
-    if (!launched) {
-      LOG_ERR("MAIN", "Minimal network boot target failed; returning home");
-      silentRestart();
-    }
+  } else if (bookMoveResumeBlocked) {
+    // Never resume the affected PDF while its path-keyed move is unresolved.
+    // Home can still render retained read-only products without preparing or saving.
+    activityManager.goHome();
   } else if (resume == BootResume::Silent && snapshotTarget == SILENT_REBOOT_TARGET_READER &&
-             !APP_STATE.openEpubPath.empty()) {
-    activityManager.goToReader(APP_STATE.openEpubPath);
+             !APP_STATE.openBookPath().empty()) {
+    activityManager.goToReader(APP_STATE.openBookPath());
   } else if (resume == BootResume::Silent) {
     // target == home (or reader with no open book): land on home — don't fall
     // through to the sleep-wake "resume reader" logic, which fires on stale
-    // openEpubPath + lastSleepFromReader from a prior session.
+    // open-book path + lastSleepFromReader from a prior session.
     activityManager.goHome();
-  } else if (APP_STATE.openEpubPath.empty() || !APP_STATE.lastSleepFromReader ||
+  } else if (APP_STATE.openBookPath().empty() || !APP_STATE.lastSleepFromReader ||
              mappedInputManager.isPressed(MappedInputManager::Button::Back) || APP_STATE.readerActivityLoadCount > 0) {
     // Boot to home screen if no book is open, last sleep was not from reader, back button is held, or reader activity
     // crashed (indicated by readerActivityLoadCount > 0)
     activityManager.goHome();
   } else {
-    // Clear app state to avoid getting into a boot loop if the epub doesn't load
-    const auto path = APP_STATE.openEpubPath;
-    APP_STATE.openEpubPath = "";
+    // Clear app state to avoid getting into a boot loop if the book doesn't load.
+    const auto path = APP_STATE.openBookPath();
+    APP_STATE.openBookPath().clear();
     APP_STATE.readerActivityLoadCount++;
     APP_STATE.saveToFile();
     activityManager.goToReader(path, false, allowFastInitialReaderRefresh);
@@ -989,6 +994,9 @@ void setup() {
   // Ensure we're not still holding the power button before leaving setup
   waitForPowerRelease();
   allowSleepAt = millis() + 2000;
+#ifdef CROSSINK_QEMU
+  qemuAcceptanceBegin(mappedInputManager, renderer);
+#endif
 }
 
 void loop() {
@@ -1125,4 +1133,7 @@ void loop() {
       delay(10);
     }
   }
+#ifdef CROSSINK_QEMU
+  qemuAcceptanceTick(mappedInputManager, renderer);
+#endif
 }

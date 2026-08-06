@@ -1,7 +1,7 @@
 #pragma once
-#include <Epub.h>
 #include <Epub/FootnoteEntry.h>
 #include <Epub/Section.h>
+#include <ReflowDocument.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
@@ -16,6 +16,8 @@
 #include "EndOfBookOptions.h"
 #include "EpubReaderMenuActivity.h"
 #include "GlobalReadingStats.h"
+#include "PdfReaderProgressState.h"
+#include "PdfSavedItemsSession.h"
 #include "activities/Activity.h"
 
 struct ToastRect {
@@ -53,7 +55,7 @@ class EpubReaderActivity final : public Activity {
   };
 
  private:
-  std::shared_ptr<Epub> epub;
+  std::shared_ptr<ReflowDocument> document;
   std::unique_ptr<Section> section = nullptr;
   int currentSpineIndex = 0;
   int nextPageNumber = 0;
@@ -88,9 +90,14 @@ class EpubReaderActivity final : public Activity {
   uint16_t cachedPageParagraphIndex = UINT16_MAX;
   uint16_t cachedPageParagraphOffset = 0;
   uint16_t cachedPageParagraphSpan = 0;
-  std::atomic<uint8_t> pendingHeapShapeReaderRedrawStages{0};
-  static constexpr uint8_t HEAP_SHAPE_REDRAW_CLIP = 1U << 0;
-  static constexpr uint8_t HEAP_SHAPE_REDRAW_DICT = 1U << 1;
+  struct PdfReaderSessionState;
+  // The complete PDF-only state, including its 128 fixed saved-item records,
+  // is allocated once on PDF entry. Ordinary EPUB readers carry only this
+  // pointer and perform no PDF-state allocation.
+  std::unique_ptr<PdfReaderSessionState> pdfReaderSession;
+#if UINTPTR_MAX == UINT32_MAX
+  static_assert(sizeof(pdfReaderSession) == 4, "RV32 PDF reader-state handle must remain one pointer");
+#endif
   unsigned long lastPageTurnTime = 0UL;
   unsigned long pageTurnDuration = 0UL;
   unsigned long pageShownAtMs = 0UL;
@@ -183,7 +190,9 @@ class EpubReaderActivity final : public Activity {
   struct SavedPosition {
     int spineIndex;
     int pageNumber;
+    PdfExactReadingOrigin exactPdfOrigin;
   };
+  static_assert(sizeof(SavedPosition) <= 56, "footnote return position exceeded its bounded allocation");
   static constexpr int MAX_FOOTNOTE_DEPTH = 3;
   SavedPosition savedPositions[MAX_FOOTNOTE_DEPTH] = {};
   int footnoteDepth = 0;
@@ -223,44 +232,37 @@ class EpubReaderActivity final : public Activity {
   bool shouldUseFootnotePreview(int targetSpineIndex, const std::string& anchor) const;
   std::string footnotePreviewCacheSuffix(EpubRenderMode renderMode, const std::string& anchor) const;
   void clearFootnotePreviewState();
-  void silentIndexNextChapterIfNeeded(uint16_t viewportWidth, uint16_t viewportHeight);
-  // Pages laid out per incremental-build pump: on the render path (catching up to the page
-  // being shown) and per loop() tick (background build of a large chapter). Kept small so a
-  // background build chunk never noticeably delays input or a pending render.
-  static constexpr int BUILD_PAGES_PER_CHUNK = 8;
-  static constexpr int BACKGROUND_BUILD_PAGES_PER_TICK = 2;
-  // How many pages to keep laid out ahead of the reader for a still-building section. A page
-  // turn is ~1s on e-ink and a page builds in ~30ms, so the reader can't out-click the builder
-  // -- a tiny buffer is enough. The background build stops once the watermark is this far
-  // ahead and resumes as the reader advances; building unbounded instead locked up input by
-  // monopolizing the RenderLock. A giant single-spine book therefore never finalizes its .bin
-  // in one sitting -- instant reopen comes from Section::suspendBuild() persisting the pages
-  // already laid out as a partial file on exit/sleep.
-  static constexpr int BUILD_WINDOW_AHEAD = 5;
-  // Reopening a partial does not immediately restart its whole-chapter extension build.
-  // Start it only when the reader is close enough to need pages past the watermark.
-  static constexpr int PARTIAL_REBUILD_START_MARGIN = 15;
-  // Show the indexing popup when an initial build must lay out more than this many pages up front
-  // (a deep resume/jump into a not-yet-built section), so it isn't a silent wait. Kept independent
-  // of the small look-ahead window so ordinary landings stay popup-free.
-  static constexpr int BUILD_POPUP_PAGE_THRESHOLD = 20;
-  // Also show the popup when first building a spine larger than this (uncompressed bytes): its
-  // whole HTML must be inflated before page 1 can lay out (the giant single-spine case), which is
-  // a multi-second wait. Normal chapters are well under this and stay popup-free.
-  static constexpr size_t BUILD_POPUP_BYTE_THRESHOLD = 96 * 1024;
-  // If a build predicted to be fast still has not produced the requested page within this
-  // window, show the popup while the blocking build continues.
-  static constexpr unsigned long BUILD_POPUP_DEADLINE_MS = 1000;
-  // Only true during the blocking build-to-target phase. The parser retains the callback during
-  // background indexing, so this guard prevents it from drawing over an already-visible page.
-  bool buildPopupPending = false;
-  void showBuildPopup();
-  // Remap the cached reading position once the saved paragraph and prior readable watermark are rebuilt
+  bool captureSavedPosition(SavedPosition& savedPosition);
+  void applySavedNavigationPosition(const SavedPosition& savedPosition);
+  // Remap the cached relative reading position once the section's real page count is known
   // (used after a settings change re-paginates a chapter). Returns true if currentPage moved.
   bool isRelayoutCatchUpComplete() const;
   bool applyDeferredReposition();
-  bool saveProgress(int spineIndex, int currentPage, int pageCount);
-  void cacheCurrentSectionPosition();
+  bool saveProgress(int spineIndex, int currentPage, int pageCount, bool force = false);
+  void acceptPdfNavigation();
+  bool cacheCurrentSectionPosition();
+  void refreshCurrentPageSemanticRange();
+  const ReflowPageSemanticRange* currentPdfPageSemanticRange() const;
+  const PdfSavedItem* currentPdfPageBookmark() const;
+  bool supportsSavedItems() const;
+  bool initializePdfSavedItems();
+  bool reloadPdfSavedItemsAfterMutation(PdfSavedItemsSessionResult result);
+  bool applyPendingPdfSavedItemJump();
+  static PdfStatus loadPdfSavedItems(void* context, PdfSavedItemsBuffer* output);
+  static PdfStatus savePdfSavedItems(void* context, const PdfSavedItem* items, uint16_t count);
+  static PdfStatus validatePdfSavedItem(void* context, const PdfSavedItem& item);
+  static bool countPdfBookmarks(void* context, uint16_t* output);
+  static bool readPdfBookmarkId(void* context, uint16_t index, uint16_t* output);
+  static PdfSavedItemsLegacyMutationResult addPdfBookmark(void* context, uint16_t itemId);
+  static PdfSavedItemsLegacyMutationResult removePdfBookmark(void* context, uint16_t itemId);
+  static PdfSavedItemsLegacyMutationResult clearPdfBookmarks(void* context);
+  static bool countPdfClippings(void* context, uint16_t* output);
+  static bool readPdfClippingId(void* context, uint16_t index, uint16_t* output);
+  static PdfSavedItemsLegacyMutationResult addPdfClipping(void* context, uint16_t itemId);
+  static PdfSavedItemsLegacyMutationResult removePdfClipping(void* context, uint16_t itemId);
+  static PdfSavedItemsLegacyMutationResult clearPdfClippings(void* context);
+  static bool removePdfBookmarkFromList(void* context, uint16_t itemId);
+  static bool removePdfClippingFromList(void* context, uint16_t itemId);
   void pauseReadingPaceTimer(const char* reason = "unknown");
   void resumeReadingPaceTimer(const char* reason = "unknown");
   void armReadingPaceWarmup(const char* reason = "unknown");
@@ -339,11 +341,9 @@ class EpubReaderActivity final : public Activity {
   void restoreSavedPosition();
 
  public:
-  explicit EpubReaderActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, std::unique_ptr<Epub> epub,
-                              int initialRefreshCountdown)
-      : Activity("EpubReader", renderer, mappedInput),
-        epub(std::move(epub)),
-        pagesUntilFullRefresh(initialRefreshCountdown) {}
+  explicit EpubReaderActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
+                              std::unique_ptr<ReflowDocument> document);
+  ~EpubReaderActivity() override;
   void onEnter() override;
   void onExit() override;
   void loop() override;
@@ -366,15 +366,7 @@ class EpubReaderActivity final : public Activity {
   bool skipLoopDelay() override { return sectionBuildWantsTick() && !backgroundBuildPausedForLowMemory; }
   bool isReaderActivity() const override { return true; }
   bool canSnapshotForSleepOverlay() const override { return true; }
-  bool handlesReaderPowerSettingsOverride() const override { return true; }
-  bool openReaderSettingsMenu() override {
-    if (!epub) {
-      return false;
-    }
-    openReaderMenu();
-    return true;
-  }
-  std::string getCurrentBookPath() const override { return epub ? epub->getPath() : std::string{}; }
+  std::string getCurrentBookPath() const override { return document ? document->getPath() : std::string{}; }
   void setAutoPageTurnIntervalSeconds(uint16_t seconds);
   uint16_t getAutoPageTurnIntervalSeconds() const;
 

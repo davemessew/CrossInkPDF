@@ -13,8 +13,15 @@
 
 class EpubReaderBookmarkListActivity final : public Activity {
  public:
-  EpubReaderBookmarkListActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
-                                 const std::vector<Bookmark>& bookmarks);
+  using DeleteCallback = bool (*)(void* context, uint16_t itemId);
+
+  explicit EpubReaderBookmarkListActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
+                                           const std::vector<Bookmark>& bookmarks,
+                                           DeleteCallback deleteCallback = nullptr, void* deleteContext = nullptr)
+      : Activity("EpubReaderBookmarkList", renderer, mappedInput),
+        bookmarks(bookmarks),
+        deleteCallback(deleteCallback),
+        deleteContext(deleteContext) {}
 
   void onEnter() override;
   void onExit() override;
@@ -26,7 +33,9 @@ class EpubReaderBookmarkListActivity final : public Activity {
  private:
   std::vector<Bookmark> bookmarks;
   int selectedIndex = 0;
-  bool confirmingDelete = false;
+  bool longPressConfirmHandled = false;
+  DeleteCallback deleteCallback = nullptr;
+  void* deleteContext = nullptr;
   ButtonNavigator buttonNavigator;
   OptionPopup confirmPopup;
   using UiApp = freeink::ui::FreeInkApp<20, 4>;

@@ -1,0 +1,18 @@
+{
+  "error": null,
+  "fixture": "discarded_then_raster_cover",
+  "geometry_order": [
+    "Retained cover caption."
+  ],
+  "image_hashes": {
+    "image-6-tiny-gray8": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+    "image-7-cover-gray8": "d37a4c2900bb85dfd24592c0b52e8dcd72e0ea45c47fa2db0cf1c4c132c80c66"
+  },
+  "outline_link_map": {
+    "links": [],
+    "outline": []
+  },
+  "transcript": "Retained cover caption.",
+  "warning": null,
+  "word_count": 3
+}

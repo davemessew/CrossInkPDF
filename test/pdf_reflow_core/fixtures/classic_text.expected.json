@@ -1,0 +1,15 @@
+{
+  "error": null,
+  "fixture": "classic_text",
+  "geometry_order": [
+    "Hello PDF"
+  ],
+  "image_hashes": {},
+  "outline_link_map": {
+    "links": [],
+    "outline": []
+  },
+  "transcript": "Hello PDF",
+  "warning": null,
+  "word_count": 2
+}

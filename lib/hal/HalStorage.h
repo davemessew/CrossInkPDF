@@ -4,11 +4,30 @@
 #include <common/FsApiConstants.h>  // for oflag_t
 #include <freertos/semphr.h>
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
 
+#define HAL_STORAGE_HAS_CACHE_METADATA 1
+
+struct HalStorageOptionalUInt64 {
+  bool known = false;
+  uint64_t value = 0;
+};
+
+struct HalStorageCapacityInfo {
+  HalStorageOptionalUInt64 total{};
+  HalStorageOptionalUInt64 free{};
+};
+
 class HalFile;
+
+enum class HalDirectoryNextStatus : uint8_t {
+  Entry,
+  End,
+  Error,
+};
 
 class HalStorage {
  public:
@@ -48,6 +67,7 @@ class HalStorage {
   bool openFileForWrite(const char* moduleName, const std::string& path, HalFile& file);
   bool openFileForWrite(const char* moduleName, const String& path, HalFile& file);
   bool removeDir(const char* path);
+  HalStorageCapacityInfo capacityInfo();
 
   static HalStorage& getInstance() { return instance; }
 
@@ -83,6 +103,7 @@ class HalFile : public Print {
   uint64_t fileSize64();
   bool seek(size_t pos);
   bool seek64(uint64_t pos);
+  bool truncate64(uint64_t length);
   bool seekCur(int64_t offset);
   bool seekSet(size_t offset);
   int available() const;
@@ -97,7 +118,12 @@ class HalFile : public Print {
   void rewindDirectory();
   bool close();
   HalFile openNextFile();
+  // Reuses `entry` across a directory scan. Do not close `entry` between
+  // calls; this method closes the previous child before opening the next one.
+  // The caller must close `entry` once after Entry, End, or Error.
+  HalDirectoryNextStatus openNextFile(HalFile& entry);
   bool isOpen() const;
+  bool modificationTime(uint64_t* packedFatDateTime);
   operator bool() const;
 };
 

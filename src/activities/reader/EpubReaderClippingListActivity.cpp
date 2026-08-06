@@ -236,7 +236,13 @@ void EpubReaderClippingListActivity::rebuildDetailLayoutIfNeeded() {
 void EpubReaderClippingListActivity::deleteSelectedClipping() {
   if (selectedIndex < 0 || selectedIndex >= static_cast<int>(CLIPPINGS.clippingCount())) return;
 
-  if (!CLIPPINGS.removeClippingAt(static_cast<size_t>(selectedIndex))) return;
+  bool removed = false;
+  if (deleteCallback == nullptr) {
+    removed = CLIPPINGS.removeClippingAt(static_cast<size_t>(selectedIndex));
+  } else {
+    removed = deleteCallback(deleteContext, clippings[selectedIndex].paragraphIndex);
+  }
+  if (!removed) return;
 
   detailMode = false;
   detailText.clear();

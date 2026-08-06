@@ -1,0 +1,17 @@
+{
+  "error": null,
+  "fixture": "page_tree_inherited",
+  "geometry_order": [
+    "First A",
+    "First B",
+    "Second"
+  ],
+  "image_hashes": {},
+  "outline_link_map": {
+    "links": [],
+    "outline": []
+  },
+  "transcript": "First A First B Second",
+  "warning": null,
+  "word_count": 5
+}

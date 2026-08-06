@@ -1,0 +1,55 @@
+%PDF-1.7
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R 5 0 R 7 0 R] /Count 3 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 9 0 R >> >> /Contents 4 0 R >>
+endobj
+4 0 obj
+<< /Length 121 >>
+stream
+BT /F1 9 Tf 72 760 Td (Repeated Header) Tj 0 -80 Td /F1 12 Tf (First body.) Tj 0 -620 Td /F1 9 Tf (Repeated Footer) Tj ET
+endstream
+endobj
+5 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 9 0 R >> >> /Contents 6 0 R >>
+endobj
+6 0 obj
+<< /Length 122 >>
+stream
+BT /F1 9 Tf 72 760 Td (Repeated Header) Tj 0 -80 Td /F1 12 Tf (Second body.) Tj 0 -620 Td /F1 9 Tf (Repeated Footer) Tj ET
+endstream
+endobj
+7 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 9 0 R >> >> /Contents 8 0 R >>
+endobj
+8 0 obj
+<< /Length 121 >>
+stream
+BT /F1 9 Tf 72 760 Td (Repeated Header) Tj 0 -80 Td /F1 12 Tf (Third body.) Tj 0 -620 Td /F1 9 Tf (Repeated Footer) Tj ET
+endstream
+endobj
+9 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+xref
+0 10
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000133 00000 n 
+0000000259 00000 n 
+0000000431 00000 n 
+0000000557 00000 n 
+0000000730 00000 n 
+0000000856 00000 n 
+0000001028 00000 n 
+trailer
+<< /Size 10 /Root 1 0 R >>
+startxref
+1125
+%%EOF

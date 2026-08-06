@@ -35,8 +35,4 @@ static_assert(isNetworkBootTargetValue(static_cast<uint32_t>(NetworkBootTarget::
               "Every network boot target must pass RTC target validation");
 
 void silentRestart();          // home screen
-void silentRestartToReader();  // currently-open EPUB (APP_STATE.openEpubPath)
-void silentRestartToNetwork(NetworkBootTarget target, uint32_t payload = 0);
-
-void armSilentRestartReaderPageBuild(const std::string& bookPath, uint16_t spineIndex, uint16_t targetPage);
-bool consumeSilentRestartReaderPageBuild(const std::string& bookPath, uint16_t& spineIndex, uint16_t& targetPage);
+void silentRestartToReader();  // currently open book (APP_STATE.openBookPath())

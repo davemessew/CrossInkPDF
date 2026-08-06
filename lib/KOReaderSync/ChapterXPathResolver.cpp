@@ -516,14 +516,9 @@ class XPathProgressResolver final : public Print {
   std::string xpath;
 };
 
-std::string findXPathForElement(const std::shared_ptr<Epub>& epub, const int spineIndex, const uint16_t elementIndex,
-                                const char* tagName) {
-  if (!epub || elementIndex == 0 || spineIndex < 0 || spineIndex >= epub->getSpineItemsCount()) {
-    return "";
-  }
-
-  const auto href = epub->getSpineItem(spineIndex).href;
-  if (href.empty()) {
+std::string findXPathForElement(const std::shared_ptr<ReflowDocument>& document, const int spineIndex,
+                                const uint16_t elementIndex, const char* tagName) {
+  if (!document || elementIndex == 0 || spineIndex < 0 || spineIndex >= document->getSectionCount()) {
     return "";
   }
 
@@ -533,7 +528,7 @@ std::string findXPathForElement(const std::shared_ptr<Epub>& epub, const int spi
   }
 
   resolver.spineIndex = spineIndex;
-  if (!epub->readItemContentsToStream(href, resolver, 1024) || !resolver.finish()) {
+  if (!document->streamSection(spineIndex, resolver, 1024) || !resolver.finish()) {
     return "";
   }
 
@@ -547,24 +542,19 @@ std::string findXPathForElement(const std::shared_ptr<Epub>& epub, const int spi
 }
 }  // namespace
 
-std::string ChapterXPathResolver::findXPathForParagraph(const std::shared_ptr<Epub>& epub, const int spineIndex,
-                                                        const uint16_t paragraphIndex) {
-  return findXPathForElement(epub, spineIndex, paragraphIndex, "p");
+std::string ChapterXPathResolver::findXPathForParagraph(const std::shared_ptr<ReflowDocument>& document,
+                                                        const int spineIndex, const uint16_t paragraphIndex) {
+  return findXPathForElement(document, spineIndex, paragraphIndex, "p");
 }
 
-std::string ChapterXPathResolver::findXPathForListItem(const std::shared_ptr<Epub>& epub, const int spineIndex,
-                                                       const uint16_t listItemIndex) {
-  return findXPathForElement(epub, spineIndex, listItemIndex, "li");
+std::string ChapterXPathResolver::findXPathForListItem(const std::shared_ptr<ReflowDocument>& document,
+                                                       const int spineIndex, const uint16_t listItemIndex) {
+  return findXPathForElement(document, spineIndex, listItemIndex, "li");
 }
 
-std::string ChapterXPathResolver::findXPathForProgress(const std::shared_ptr<Epub>& epub, const int spineIndex,
-                                                       const float intraSpineProgress) {
-  if (!epub || spineIndex < 0 || spineIndex >= epub->getSpineItemsCount()) {
-    return "";
-  }
-
-  const auto href = epub->getSpineItem(spineIndex).href;
-  if (href.empty()) {
+std::string ChapterXPathResolver::findXPathForProgress(const std::shared_ptr<ReflowDocument>& document,
+                                                       const int spineIndex, const float intraSpineProgress) {
+  if (!document || spineIndex < 0 || spineIndex >= document->getSectionCount()) {
     return "";
   }
 
@@ -573,7 +563,7 @@ std::string ChapterXPathResolver::findXPathForProgress(const std::shared_ptr<Epu
   }
 
   ParagraphTextCounter counter;
-  if (!counter.ok() || !epub->readItemContentsToStream(href, counter, 1024) || !counter.finish()) {
+  if (!counter.ok() || !document->streamSection(spineIndex, counter, 1024) || !counter.finish()) {
     return "";
   }
 
@@ -592,7 +582,7 @@ std::string ChapterXPathResolver::findXPathForProgress(const std::shared_ptr<Epu
   }
 
   resolver.spineIndex = spineIndex;
-  if (!epub->readItemContentsToStream(href, resolver, 1024) || !resolver.finish()) {
+  if (!document->streamSection(spineIndex, resolver, 1024) || !resolver.finish()) {
     return "";
   }
 

@@ -32,6 +32,15 @@ constexpr char kLegacyXLocationsFormat[] = "crossink-locations";
 constexpr size_t kXLocationsMaxBytes = 64 * 1024;
 constexpr uint32_t kDefaultReferenceCharactersPerPage = 1500;
 
+bool formatEpubCachePath(char* const output, const size_t capacity,
+                         const char* const cacheDir, const uint64_t hash) {
+  if (output == nullptr || capacity == 0U || cacheDir == nullptr) return false;
+  const int written =
+      snprintf(output, capacity, "%s/epub_%llu", cacheDir,
+               static_cast<unsigned long long>(hash));
+  return written >= 0 && static_cast<size_t>(written) < capacity;
+}
+
 bool isSupportedLocationsFormat(const char* format) {
   return std::strcmp(format, kXLocationsFormat) == 0 || std::strcmp(format, kLegacyXLocationsFormat) == 0;
 }
@@ -179,6 +188,52 @@ std::string legacyCachePathForFilePath(const std::string& filepath, const std::s
   return cacheDir + "/epub_" + std::to_string(std::hash<std::string>{}(filepath));
 }
 
+bool readLegacyProgressFile(const std::string& path, ReflowReadingPosition& position) {
+  if (!Storage.exists(path.c_str())) return false;
+  FsFile file;
+  if (!Storage.openFileForRead("EBP", path, file)) return false;
+
+  uint8_t data[6] = {};
+  const size_t fileSize = file.size();
+  if (fileSize != 4 && fileSize != 6) {
+    LOG_ERR("EBP", "Progress file has unexpected size: %u", static_cast<unsigned>(fileSize));
+  }
+  if (fileSize > sizeof(data)) {
+    if (!file.close()) {
+      LOG_ERR("EBP", "Failed to close oversized progress file: %s", path.c_str());
+    }
+    return false;
+  }
+
+  const int bytesRead = file.read(data, fileSize);
+  const bool closeSucceeded = file.close();
+  if (bytesRead != static_cast<int>(fileSize)) {
+    LOG_ERR("EBP", "Short read loading progress: %d/%u bytes", bytesRead, static_cast<unsigned>(fileSize));
+    return false;
+  }
+  if (!closeSucceeded) {
+    LOG_ERR("EBP", "Failed to close progress file after read: %s", path.c_str());
+    return false;
+  }
+  if (fileSize != 4 && fileSize != 6) {
+    return false;
+  }
+
+  ReflowReadingPosition decoded;
+  decoded.sectionIndex = static_cast<int>(static_cast<uint16_t>(data[0]) |
+                                          (static_cast<uint16_t>(data[1]) << 8));
+  decoded.pageNumber = static_cast<int>(static_cast<uint16_t>(data[2]) |
+                                        (static_cast<uint16_t>(data[3]) << 8));
+  if (decoded.pageNumber == UINT16_MAX) decoded.pageNumber = 0;
+  if (fileSize == 6) {
+    decoded.pageCount = static_cast<int>(static_cast<uint16_t>(data[4]) |
+                                         (static_cast<uint16_t>(data[5]) << 8));
+    decoded.hasPageCount = true;
+  }
+  position = decoded;
+  return true;
+}
+
 class CoverImageRefScanner final : public Print {
  public:
   std::string imageRef;
@@ -249,6 +304,15 @@ class CoverImageRefScanner final : public Print {
 Epub::Epub(std::string filepath, const std::string& cacheDir) : filepath(std::move(filepath)) {
   cachePath = cachePathForFilePath(this->filepath, cacheDir);
   migrateLegacyCachePath(cacheDir);
+}
+
+ReflowDocumentFormat Epub::getFormat() const { return ReflowDocumentFormat::Epub; }
+
+const char* Epub::getStoreFormatKey() const { return "epub"; }
+
+ReflowCapabilitySet Epub::getCapabilities() const {
+  return ReflowCapability::ExternalProgressSync | ReflowCapability::NearbyProgressSync |
+         ReflowCapability::PublisherRenderModes | ReflowCapability::EmbeddedStyles | ReflowCapability::SavedItems;
 }
 
 std::string Epub::cachePathForFilePath(const std::string& filepath, const std::string& cacheDir) {
@@ -821,6 +885,64 @@ bool Epub::clearCache() const {
   return true;
 }
 
+bool Epub::clearCacheForFilePathNoPathAlloc(const std::string_view filepath,
+                                            const char* const cacheDir) {
+  if (cacheDir == nullptr) return false;
+
+  char currentPath[64];
+  char legacyPath[64];
+  if (!formatEpubCachePath(
+          currentPath, sizeof(currentPath), cacheDir,
+          ZipFile::fnvHash64(filepath.data(), filepath.size())) ||
+      !formatEpubCachePath(legacyPath, sizeof(legacyPath), cacheDir,
+                           std::hash<std::string_view>{}(filepath))) {
+    LOG_ERR("EBP", "EPUB cache path exceeds %u bytes",
+            static_cast<unsigned>(sizeof(currentPath)));
+    return false;
+  }
+
+  // Preserve the constructor's legacy migration semantics exactly: an
+  // existing current cache wins, while a legacy-only cache is renamed before
+  // clearCache() observes it. A failed rename leaves the legacy cache intact.
+  bool migrationComplete = true;
+  if (!Storage.exists(currentPath) && std::strcmp(legacyPath, currentPath) != 0 &&
+      Storage.exists(legacyPath)) {
+    if (Storage.rename(legacyPath, currentPath)) {
+      LOG_INF("EBP", "Migrated legacy EPUB cache: %s -> %s", legacyPath,
+              currentPath);
+    } else {
+      migrationComplete = false;
+      LOG_ERR("EBP", "Failed to migrate legacy EPUB cache: %s -> %s",
+              legacyPath, currentPath);
+    }
+  }
+
+  if (Storage.exists(currentPath)) {
+    if (!Storage.removeDir(currentPath)) {
+      LOG_ERR("EPB", "Failed to clear cache");
+      return false;
+    }
+    LOG_DBG("EPB", "Cache cleared successfully");
+  } else {
+    LOG_DBG("EPB", "Cache does not exist, no action needed");
+  }
+
+  const bool legacyRemains = std::strcmp(legacyPath, currentPath) != 0 &&
+                             Storage.exists(legacyPath);
+  if (legacyRemains) {
+    LOG_ERR("EPB", "Legacy EPUB cache remains after cleanup: %s", legacyPath);
+  }
+  return migrationComplete && !legacyRemains;
+}
+
+#if defined(CROSSINK_PRODUCTION_TEST_SEAMS)
+bool Epub::formatCachePathForTest(char* const output, const size_t capacity,
+                                  const char* const cacheDir,
+                                  const uint64_t hash) {
+  return formatEpubCachePath(output, capacity, cacheDir, hash);
+}
+#endif
+
 void Epub::setupCacheDir() const {
   if (Storage.exists(cachePath.c_str())) {
     return;
@@ -1171,6 +1293,40 @@ std::unique_ptr<ZipFileStreamReader> Epub::openItemContentsStream(const std::str
 bool Epub::getItemSize(const std::string& itemHref, size_t* size) const {
   const std::string path = FsHelpers::normalisePath(itemHref);
   return ZipFile(filepath).getInflatedFileSize(path.c_str(), size);
+}
+
+bool Epub::getLocalSectionPath(const int, ReflowResource& out) const {
+  out = ReflowResource::streamed();
+  return false;
+}
+
+bool Epub::streamSection(const int sectionIndex, Print& out, const size_t chunkSize) const {
+  if (sectionIndex < 0 || sectionIndex >= getSpineItemsCount()) {
+    LOG_ERR("EBP", "Cannot stream section with invalid index: %d", sectionIndex);
+    return false;
+  }
+  return readItemContentsToStream(getSpineItem(sectionIndex).href, out, chunkSize);
+}
+
+bool Epub::resolveResource(const int, const std::string&, ReflowResource& out) const {
+  out = ReflowResource::streamed();
+  return false;
+}
+
+bool Epub::streamResource(const int sectionIndex, const std::string& href, Print& out, const size_t chunkSize) const {
+  if (sectionIndex < 0 || sectionIndex >= getSpineItemsCount()) {
+    LOG_ERR("EBP", "Cannot stream resource for invalid section: %d", sectionIndex);
+    return false;
+  }
+  return readItemContentsToStream(href, out, chunkSize);
+}
+
+bool Epub::getResourceSize(const int sectionIndex, const std::string& href, size_t* size) const {
+  if (sectionIndex < 0 || sectionIndex >= getSpineItemsCount()) {
+    LOG_ERR("EBP", "Cannot size resource for invalid section: %d", sectionIndex);
+    return false;
+  }
+  return getItemSize(href, size);
 }
 
 bool Epub::loadXLocations() {
@@ -1574,6 +1730,95 @@ int Epub::getSpineIndexForTextReference() const {
   return 0;
 }
 
+int Epub::getSectionCount() const { return getSpineItemsCount(); }
+
+bool Epub::getSectionHref(const int sectionIndex, std::string& href) const {
+  const int spineCount = getSpineItemsCount();
+  if (sectionIndex < 0 || sectionIndex >= spineCount) {
+    href.clear();
+    return false;
+  }
+  href = getSpineItem(sectionIndex).href;
+  return !href.empty();
+}
+
+ReflowSectionInfo Epub::getSectionInfo(const int sectionIndex) const {
+  if (sectionIndex < 0 || sectionIndex >= getSpineItemsCount()) {
+    LOG_ERR("EBP", "Cannot get reflow section info for invalid index: %d", sectionIndex);
+    return {};
+  }
+
+  const auto spine = getSpineItem(sectionIndex);
+  const uint32_t previousCumulativeSize =
+      sectionIndex > 0 ? static_cast<uint32_t>(getCumulativeSpineItemSize(sectionIndex - 1)) : 0;
+  ReflowSectionInfo info;
+  info.href = spine.href;
+  info.byteSize = spine.cumulativeSize - previousCumulativeSize;
+  info.cumulativeSize = spine.cumulativeSize;
+  info.tocIndex = spine.tocIndex;
+  if (spine.tocIndex >= 0 && spine.tocIndex < getTocItemsCount()) {
+    info.title = getTocItem(spine.tocIndex).title;
+  }
+  if (xLocationsLoaded && sectionIndex < static_cast<int>(locationSpine.size())) {
+    const auto& location = locationSpine[static_cast<size_t>(sectionIndex)];
+    info.firstWordOrdinal = location.wordStart;
+    info.wordCount = location.wordCount;
+  }
+  return info;
+}
+
+bool Epub::getSectionSize(const int sectionIndex, size_t* size) const {
+  if (size == nullptr || sectionIndex < 0 || sectionIndex >= getSpineItemsCount()) {
+    LOG_ERR("EBP", "Cannot get reflow section size for invalid index: %d", sectionIndex);
+    return false;
+  }
+  *size = getSectionInfo(sectionIndex).byteSize;
+  return true;
+}
+
+size_t Epub::getCumulativeSectionSize(const int sectionIndex) const { return getCumulativeSpineItemSize(sectionIndex); }
+
+size_t Epub::getDocumentSize() const { return getBookSize(); }
+
+int Epub::getSectionIndexForTextReference() const { return getSpineIndexForTextReference(); }
+
+int Epub::getTocEntryCount() const { return getTocItemsCount(); }
+
+ReflowTocEntry Epub::getTocEntry(const int tocIndex) const {
+  if (tocIndex < 0 || tocIndex >= getTocItemsCount()) {
+    LOG_ERR("EBP", "Cannot get reflow TOC entry for invalid index: %d", tocIndex);
+    return {};
+  }
+
+  const auto toc = getTocItem(tocIndex);
+  int parentIndex = -1;
+  if (tocIndex > 0) {
+    const uint8_t rootLevel = getTocItem(0).level;
+    if (toc.level > rootLevel) {
+      for (int candidate = tocIndex - 1; candidate >= 0; --candidate) {
+        if (getTocItem(candidate).level < toc.level) {
+          parentIndex = candidate;
+          break;
+        }
+      }
+    }
+  }
+  return {
+      .title = toc.title,
+      .href = toc.href,
+      .anchor = toc.anchor,
+      .level = toc.level,
+      .sectionIndex = toc.spineIndex,
+      .parentIndex = parentIndex,
+  };
+}
+
+int Epub::getSectionIndexForTocIndex(const int tocIndex) const { return getSpineIndexForTocIndex(tocIndex); }
+
+int Epub::getTocIndexForSectionIndex(const int sectionIndex) const { return getTocIndexForSpineIndex(sectionIndex); }
+
+int Epub::resolveHrefToSectionIndex(const std::string& href) const { return resolveHrefToSpineIndex(href); }
+
 float Epub::calculateSizeProgress(const int currentSpineIndex, const float currentSpineRead) const {
   const size_t bookSize = getBookSize();
   if (bookSize == 0) {
@@ -1651,6 +1896,12 @@ bool Epub::resolveLocationPercentToSpineProgress(const int percent, int& spineIn
   return false;
 }
 
+bool Epub::resolveProgressPercentToSection(const int percent, int& sectionIndex, float& sectionProgress) const {
+  return resolveLocationPercentToSpineProgress(percent, sectionIndex, sectionProgress);
+}
+
+bool Epub::hasStableReferencePages() const { return hasStablePageNumbers(); }
+
 bool Epub::resolveReferencePage(const int currentSpineIndex, const float currentSpineRead, uint32_t& currentPage,
                                 uint32_t& pageCount) const {
   currentPage = 0;
@@ -1670,6 +1921,91 @@ bool Epub::resolveReferencePage(const int currentSpineIndex, const float current
       entry.wordStart + static_cast<uint32_t>(clampedProgress * static_cast<float>(entry.wordCount));
   currentPage = std::min<uint32_t>(completedWords / wordsPerReferencePage + 1, totalReferencePages);
   pageCount = totalReferencePages;
+  return true;
+}
+
+uint32_t Epub::getTotalWordCount() const { return totalWords; }
+
+bool Epub::loadReadingPosition(ReflowReadingPosition& position) const {
+  const std::string progressPath = cachePath + "/progress.bin";
+  if (readLegacyProgressFile(progressPath, position)) return true;
+
+  if (readLegacyProgressFile(progressPath + ".bak", position)) {
+    LOG_DBG("EBP", "Recovered progress from backup");
+    return true;
+  }
+  return false;
+}
+
+bool Epub::saveReadingPosition(const ReflowReadingPosition& position) const {
+  if (position.sectionIndex < 0 || position.sectionIndex > 0xFFFF || position.pageNumber < 0 ||
+      position.pageNumber > 0xFFFF || position.pageCount < 0 || position.pageCount > 0xFFFF) {
+    LOG_ERR("EBP", "Progress values out of range: section=%d page=%d count=%d", position.sectionIndex,
+            position.pageNumber, position.pageCount);
+    return false;
+  }
+
+  const std::string progressPath = cachePath + "/progress.bin";
+  const std::string tmpPath = progressPath + ".tmp";
+  const std::string backupPath = progressPath + ".bak";
+  if (Storage.exists(tmpPath.c_str()) && !Storage.remove(tmpPath.c_str())) {
+    LOG_ERR("EBP", "Could not remove stale progress temp file");
+    return false;
+  }
+
+  FsFile file;
+  if (!Storage.openFileForWrite("EBP", tmpPath, file)) {
+    LOG_ERR("EBP", "Could not open progress temp file for write");
+    return false;
+  }
+  const uint8_t data[6] = {
+      static_cast<uint8_t>(position.sectionIndex & 0xFF),
+      static_cast<uint8_t>((position.sectionIndex >> 8) & 0xFF),
+      static_cast<uint8_t>(position.pageNumber & 0xFF),
+      static_cast<uint8_t>((position.pageNumber >> 8) & 0xFF),
+      static_cast<uint8_t>(position.pageCount & 0xFF),
+      static_cast<uint8_t>((position.pageCount >> 8) & 0xFF),
+  };
+  const size_t written = file.write(data, sizeof(data));
+  if (written != sizeof(data)) {
+    LOG_ERR("EBP", "Short write saving progress: %u/%u bytes", static_cast<unsigned>(written),
+            static_cast<unsigned>(sizeof(data)));
+    file.close();
+    Storage.remove(tmpPath.c_str());
+    return false;
+  }
+  file.flush();
+  if (!file.sync()) {
+    LOG_ERR("EBP", "Failed to sync progress temp file");
+    file.close();
+    Storage.remove(tmpPath.c_str());
+    return false;
+  }
+  if (!file.close()) {
+    LOG_ERR("EBP", "Failed to close progress temp file");
+    Storage.remove(tmpPath.c_str());
+    return false;
+  }
+
+  if (Storage.exists(backupPath.c_str()) && !Storage.remove(backupPath.c_str())) {
+    LOG_ERR("EBP", "Could not remove old progress backup");
+    Storage.remove(tmpPath.c_str());
+    return false;
+  }
+  if (Storage.exists(progressPath.c_str()) && !Storage.rename(progressPath.c_str(), backupPath.c_str())) {
+    LOG_ERR("EBP", "Could not rotate progress backup");
+    Storage.remove(tmpPath.c_str());
+    return false;
+  }
+  if (!Storage.rename(tmpPath.c_str(), progressPath.c_str())) {
+    LOG_ERR("EBP", "Could not replace progress file");
+    if (Storage.exists(backupPath.c_str()) && !Storage.exists(progressPath.c_str())) {
+      Storage.rename(backupPath.c_str(), progressPath.c_str());
+    }
+    Storage.remove(tmpPath.c_str());
+    return false;
+  }
+  LOG_DBG("EBP", "Progress saved: section=%d page=%d", position.sectionIndex, position.pageNumber);
   return true;
 }
 

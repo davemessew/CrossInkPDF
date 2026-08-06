@@ -1,0 +1,17 @@
+{
+  "error": null,
+  "fixture": "hidden_ocr_visible_duplicate",
+  "geometry_order": [
+    "Duplicate visible text."
+  ],
+  "image_hashes": {
+    "image-6-gray": "3efad976b6cadb87c7da03753e8b485335cb19111f23a0c5aea321094cac8629"
+  },
+  "outline_link_map": {
+    "links": [],
+    "outline": []
+  },
+  "transcript": "Duplicate visible text.",
+  "warning": null,
+  "word_count": 3
+}

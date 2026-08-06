@@ -1,8 +1,6 @@
 #pragma once
-#include <Epub.h>
-#include <FreeInkApp.h>
-#include <FreeInkUIGfxRenderer.h>
 #include <I18n.h>
+#include <ReflowDocument.h>
 
 #include <array>
 #include <atomic>
@@ -62,7 +60,9 @@ class EpubReaderMenuActivity final : public Activity {
       ReaderOptionsActivity::GlobalSettingsEditCallback beginGlobalSettingsEditCallback = nullptr,
       void* beginGlobalSettingsEditContext = nullptr, bool stablePageNumbersAvailable = false,
       ReaderOptionsActivity::GlobalSettingsEditCallback endGlobalSettingsEditCallback = nullptr,
-      void* endGlobalSettingsEditContext = nullptr);
+      void* endGlobalSettingsEditContext = nullptr,
+      ReflowCapabilitySet documentCapabilities = ReflowCapability::ExternalProgressSync |
+                                                 ReflowCapability::NearbyProgressSync | ReflowCapability::SavedItems);
 
   void onEnter() override;
   void onExit() override;
@@ -91,7 +91,7 @@ class EpubReaderMenuActivity final : public Activity {
 
   static TabMenuItems buildMenuItems(bool hasFootnotes, bool hasBookmarks, bool hasClippings,
                                      bool isCurrentPageBookmarked, bool isBookCompleted, bool showReadingPaceReset,
-                                     bool hasDictionary);
+                                     ReflowCapabilitySet documentCapabilities);
   [[nodiscard]] const std::vector<MenuItem>& activeMenuItems() const;
   [[nodiscard]] size_t activeTabIndex() const { return static_cast<size_t>(activeTab); }
   void cycleActiveTab();

@@ -1,0 +1,93 @@
+{
+  "oracle": {
+    "image": {
+      "blank_hash": "33699F1167442A3E",
+      "frame_hash": "5D40C48012BBB9F2",
+      "non_white_pixels": 8,
+      "page_image_found": true,
+      "rect": [
+        238,
+        68,
+        4,
+        4
+      ],
+      "region_hash": "992F79653E0DDADB",
+      "retained": 1
+    },
+    "layout_controls": {
+      "landscape_frame": "AB2C0CE26689A64C",
+      "portrait_frame": "7B63F8FA5FE4E3D6",
+      "wide_margin_frame": "C65090594823EE20"
+    },
+    "navigation": {
+      "internal_links": 2,
+      "publisher_labels": 2,
+      "resolved_internal_links": 2,
+      "sections": 2,
+      "toc_entries": 3,
+      "toc_hash": "958ED520ACEC990A"
+    },
+    "progress": {
+      "nonterminal_percent_millionths": 600000,
+      "nonterminal_resumed_cursor": 6,
+      "nonterminal_saved_cursor": 6,
+      "percent_millionths": 1000000,
+      "resumed_cursor": 10,
+      "saved_cursor": 10,
+      "total_words": 10
+    },
+    "route": {
+      "cached_reopen": true,
+      "cancelled": true,
+      "on_device_preparation": true,
+      "raw_pdf": true,
+      "resumed": true
+    },
+    "typography": {
+      "device_font_positive": {
+        "first_frame": "E1648B30E7DF5B40",
+        "first_page_text_hash": "95EE2813D71DFE2E",
+        "font_id": 2019090238,
+        "font_point_size": 16,
+        "font_size": 3,
+        "last_frame": "E1648B30E7DF5B40",
+        "line_height_percent": 100,
+        "middle_frame": "E1648B30E7DF5B40",
+        "page_count": 1,
+        "semantic_hash": "95EE2813D71DFE2E",
+        "text_hash": "E1AC47B687F6E82A",
+        "word_count": 4
+      },
+      "fixed_page_canvas": false,
+      "pdf_6": {
+        "first_frame": "7B63F8FA5FE4E3D6",
+        "first_page_text_hash": "95EE2813D71DFE2E",
+        "font_id": -1406445118,
+        "font_point_size": 14,
+        "font_size": 2,
+        "last_frame": "7B63F8FA5FE4E3D6",
+        "line_height_percent": 100,
+        "middle_frame": "7B63F8FA5FE4E3D6",
+        "page_count": 1,
+        "semantic_hash": "95EE2813D71DFE2E",
+        "text_hash": "E1AC47B687F6E82A",
+        "word_count": 4
+      },
+      "pdf_72": {
+        "first_frame": "7B63F8FA5FE4E3D6",
+        "first_page_text_hash": "95EE2813D71DFE2E",
+        "font_id": -1406445118,
+        "font_point_size": 14,
+        "font_size": 2,
+        "last_frame": "7B63F8FA5FE4E3D6",
+        "line_height_percent": 100,
+        "middle_frame": "7B63F8FA5FE4E3D6",
+        "page_count": 1,
+        "semantic_hash": "95EE2813D71DFE2E",
+        "text_hash": "E1AC47B687F6E82A",
+        "word_count": 4
+      }
+    }
+  },
+  "schema_version": 1
+}

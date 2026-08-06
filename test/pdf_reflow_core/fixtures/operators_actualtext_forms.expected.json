@@ -1,0 +1,16 @@
+{
+  "error": null,
+  "fixture": "operators_actualtext_forms",
+  "geometry_order": [
+    "Form heading",
+    "Accessible replacement"
+  ],
+  "image_hashes": {},
+  "outline_link_map": {
+    "links": [],
+    "outline": []
+  },
+  "transcript": "Form heading Accessible replacement",
+  "warning": null,
+  "word_count": 4
+}

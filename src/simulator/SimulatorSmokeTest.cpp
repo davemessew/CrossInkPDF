@@ -12,7 +12,10 @@
 #include <vector>
 
 #include "CrossPointSettings.h"
+#include "EpubReflowRegressionOracle.h"
 #include "MappedInputManager.h"
+#include "PdfSimulatorAcceptance.h"
+#include "PdfUiSimulatorAcceptance.h"
 #include "activities/ActivityManager.h"
 #include "activities/reader/EpubReaderMenuActivity.h"
 #include "activities/reader/ReaderOptionsActivity.h"
@@ -156,8 +159,20 @@ class SimulatorSmokeTest {
         if (!CrossPointSettings::verifySleepScreenMigrationContract()) {
           fail("Sleep screen migration contract failed");
         }
-        if (!SimulatorHomeKeyInput::verifyTimingContract()) {
-          fail("Simulator Home key timing contract failed");
+        if (std::getenv("CROSSINK_SIMULATOR_PDF_ACCEPTANCE") != nullptr) {
+          std::string acceptanceError;
+          if (!runPdfSimulatorAcceptance(renderer, acceptanceError)) {
+            fail("PDF simulator acceptance failed: %s", acceptanceError.c_str());
+          }
+          std::_Exit(0);
+        }
+        if (std::getenv("CROSSINK_SIMULATOR_REFLOW_ORACLE") != nullptr) {
+          const char* bookPath = std::getenv("CROSSINK_SIMULATOR_SMOKE_BOOK");
+          const char* passName = std::getenv("CROSSINK_SIMULATOR_REFLOW_PASS");
+          std::string oracleError;
+          if (!runEpubReflowRegressionOracle(renderer, bookPath, passName, oracleError)) {
+            fail("EPUB reflow oracle failed: %s", oracleError.c_str());
+          }
         }
         applyRequestedTheme();
         activityManager.goHome();
@@ -461,6 +476,12 @@ SimulatorSmokeTest smokeTest;
 
 }  // namespace
 
-void runSimulatorSmokeTestTick() { smokeTest.tick(); }
+void runSimulatorSmokeTestTick() {
+  if (pdfUiSimulatorAcceptanceEnabled()) {
+    runPdfUiSimulatorAcceptanceTick();
+    return;
+  }
+  smokeTest.tick();
+}
 
 #endif

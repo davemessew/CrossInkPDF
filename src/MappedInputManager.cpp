@@ -129,7 +129,7 @@ bool readMappedSideButtons(const HalGPIO& gpio, bool (HalGPIO::*fn)(uint8_t) con
   return (primary != kNoButton && (gpio.*fn)(primary)) || (secondary != kNoButton && (gpio.*fn)(secondary));
 }
 
-#ifdef SIMULATOR
+#if defined(SIMULATOR) || defined(CROSSINK_QEMU)
 size_t buttonIndex(MappedInputManager::Button button) { return static_cast<size_t>(button); }
 #endif
 
@@ -600,7 +600,7 @@ bool MappedInputManager::wasLightPanelGesture() const { return hasHomeKeyHardwar
 #endif
 
 bool MappedInputManager::wasPressed(const Button button) const {
-#ifdef SIMULATOR
+#if defined(SIMULATOR) || defined(CROSSINK_QEMU)
   if (simulatorPressed[buttonIndex(button)]) {
     return true;
   }
@@ -630,7 +630,7 @@ bool MappedInputManager::wasPressed(const Button button) const {
 }
 
 bool MappedInputManager::wasReleased(const Button button) const {
-#ifdef SIMULATOR
+#if defined(SIMULATOR) || defined(CROSSINK_QEMU)
   if (simulatorReleased[buttonIndex(button)]) {
     return true;
   }
@@ -708,7 +708,7 @@ bool MappedInputManager::wasReleased(const Button button) const {
 }
 
 bool MappedInputManager::isPressed(const Button button) const {
-#ifdef SIMULATOR
+#if defined(SIMULATOR) || defined(CROSSINK_QEMU)
   if (simulatorHeld[buttonIndex(button)]) {
     return true;
   }
@@ -732,7 +732,7 @@ bool MappedInputManager::isPressed(const Button button) const {
 }
 
 bool MappedInputManager::wasAnyPressed() const {
-#ifdef SIMULATOR
+#if defined(SIMULATOR) || defined(CROSSINK_QEMU)
   if (std::any_of(simulatorPressed.begin(), simulatorPressed.end(), [](bool pressed) { return pressed; })) {
     return true;
   }
@@ -747,7 +747,7 @@ bool MappedInputManager::wasAnyPressed() const {
 }
 
 bool MappedInputManager::wasAnyReleased() const {
-#ifdef SIMULATOR
+#if defined(SIMULATOR) || defined(CROSSINK_QEMU)
   if (std::any_of(simulatorReleased.begin(), simulatorReleased.end(), [](bool released) { return released; })) {
     return true;
   }
@@ -763,15 +763,7 @@ bool MappedInputManager::wasAnyReleased() const {
 
 unsigned long MappedInputManager::getHeldTime() const {
   unsigned long heldTime = gpio.getHeldTime();
-#if CROSSINK_APP_CAP_TOUCH
-  if (!gpio.wasAnyPressed() && !gpio.wasAnyReleased() && touchHeldOverrideValid &&
-      millis() - touchHeldOverrideAt <= TOUCH_HELD_OVERRIDE_WINDOW_MS) {
-    heldTime = touchHeldOverrideMs;
-  } else {
-    touchHeldOverrideValid = false;
-  }
-#endif
-#ifdef SIMULATOR
+#if defined(SIMULATOR) || defined(CROSSINK_QEMU)
   const unsigned long now = millis();
   for (size_t i = 0; i < BUTTON_COUNT; i++) {
     if (simulatorHeld[i] && simulatorPressStart[i] > 0) {
@@ -858,7 +850,7 @@ int MappedInputManager::getReleasedFrontButton() const {
 
 bool MappedInputManager::isFrontButtonPressed(const uint8_t buttonIndex) const { return gpio.isPressed(buttonIndex); }
 
-#ifdef SIMULATOR
+#if defined(SIMULATOR) || defined(CROSSINK_QEMU)
 void MappedInputManager::simulatorInjectPress(Button button) {
   const size_t idx = buttonIndex(button);
   simulatorPressed[idx] = true;

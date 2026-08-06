@@ -16,10 +16,10 @@ To provide a lightweight, high-performance firmware that maximizes the potential
 
 * **User Experience:** E.g. User-friendly interfaces, and interactions, both inside the reader and navigating the
   firmware. This includes things like button mapping, book loading, and book navigation like bookmarks.
-* **Document Rendering:** E.g. Support for rendering documents (primarily EPUB) and improvements to the rendering
-  engine.
-* **Format Optimization:** E.g. Efficiently parsing EPUB (CSS/Images) and other documents within the device's
-  capabilities.
+* **Document Rendering:** E.g. Support for EPUB and reading-oriented reflow of supported PDFs, plus improvements to
+  the rendering engine.
+* **Format Optimization:** E.g. Efficiently parsing EPUB (CSS/Images), extracting supported PDF reading content, and
+  handling other documents within the device's capabilities.
 * **Typography & Legibility:** E.g. Custom font support, hyphenation engines, and adjustable line spacing.
 * **E-Ink Driver Refinement:** E.g. Reducing full-screen flashes (ghosting management) and improving general rendering.
 * **Library Management:** E.g. Simple, intuitive ways to organize and navigate a collection of books.
@@ -43,11 +43,11 @@ To provide a lightweight, high-performance firmware that maximizes the potential
 * **Media Playback:** No Audio players or Audiobooks.
 * **Complex Annotation:** No typed out notes. These features are better suited for devices with better input capabilities and more powerful chips.
 
-### In-scope — Technically Unsupported
+### In-Scope With Technical Boundaries
 
-*These features align with Crosspoint's goals but are impractical on the current hardware or produce poor UX.*
+*These features align with CrossInk's goals only when they can provide a stable reading experience on the current hardware.*
 
-* **PDF Rendering:** PDFs are fixed-layout documents, so rendering them requires displaying pages as images rather than reflowable text — resulting in constant panning and zooming that makes for a poor reading experience on e-ink.
+* **PDF Text Reflow:** Born-digital PDFs and OCRed PDFs with a usable text layer can be extracted on the device and read with CrossInk's normal fonts, margins, spacing, and pagination. Classical fixed-page PDF rendering, zoom, and pan remain out of scope because shrinking or navigating whole pages produces a poor reading experience on the small e-ink display. See [PDF Support](./docs/pdf-support.md) for the supported boundary.
 
 ## 3. Idea Evaluation
 

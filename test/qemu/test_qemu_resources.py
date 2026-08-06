@@ -1,0 +1,557 @@
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+CHECKER = REPO_ROOT / "scripts" / "check_qemu_resources.py"
+PASS_MARKER = "QEMU_RESOURCE_PASS\n"
+
+
+class QemuResourceCheckTest(unittest.TestCase):
+    def test_capture_rejects_runtime_type_and_heap_relationship_violations(
+        self,
+    ) -> None:
+        cases = {
+            "heap_uint32_one_over": (
+                self._runtime_line(heap_start=4294967296),
+                "uint32_t",
+            ),
+            "stack_uint32_one_over": (
+                self._runtime_line(stack_margin=4294967296),
+                "uint32_t",
+            ),
+            "largest_exceeds_free": (
+                self._runtime_line(min_free=70000, min_max_alloc=70001),
+                "relationships",
+            ),
+            "allocation_exceeds_free": (
+                self._runtime_line(
+                    min_free=1000,
+                    min_max_alloc=900,
+                    max_alloc=1001,
+                ),
+                "relationships",
+            ),
+        }
+        for mode, (runtime, expected_error) in cases.items():
+            with self.subTest(mode=mode):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    paths = self._create_inputs(Path(temporary_directory))
+                    paths["runtime"].write_text(
+                        "\n".join(
+                            (
+                                "QEMU_BOOT seq=0",
+                                runtime,
+                                "QEMU_BOOT seq=1",
+                                self._runtime_line(),
+                                "",
+                            )
+                        ),
+                        encoding="utf-8",
+                    )
+                    captured = self._run_capture(
+                        paths,
+                        self._size_environment(text=1000, static_dram=100),
+                    )
+
+                    self.assertEqual(captured.returncode, 1)
+                    self.assertIn(expected_error, captured.stderr)
+
+    def test_capture_requires_one_runtime_sample_from_each_boot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            paths = self._create_inputs(Path(temporary_directory))
+            paths["runtime"].write_text(
+                "QEMU_BOOT seq=1\n" + self._runtime_line() + "\n",
+                encoding="utf-8",
+            )
+            captured = self._run_capture(
+                paths, self._size_environment(text=1000, static_dram=100)
+            )
+
+            self.assertEqual(captured.returncode, 1)
+            self.assertEqual(captured.stdout, "")
+            self.assertIn("boot 0 and boot 1", captured.stderr)
+
+    def test_capture_and_verify_use_worst_boot_measurements(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            paths = self._create_inputs(Path(temporary_directory))
+            paths["runtime"].write_text(
+                "\n".join(
+                    (
+                        "QEMU_BOOT seq=0",
+                        (
+                            "QEMU_RUNTIME heap_start=100000 min_free=70000 "
+                            "min_max_alloc=50000 max_alloc=2000 stack_margin=1500"
+                        ),
+                        "QEMU_BOOT seq=1",
+                        (
+                            "QEMU_RUNTIME heap_start=100000 min_free=90000 "
+                            "min_max_alloc=80000 max_alloc=1000 stack_margin=3000"
+                        ),
+                        "",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            environment = self._size_environment(text=1000, static_dram=100)
+
+            captured = self._run_capture(paths, environment)
+            self.assertEqual(captured.returncode, 0)
+            self.assertEqual(captured.stdout, PASS_MARKER)
+            self.assertEqual(captured.stderr, "")
+
+            baseline = json.loads(paths["baseline"].read_text(encoding="utf-8"))
+            self.assertEqual(
+                baseline["measurements"],
+                {
+                    "code_rodata": 1000,
+                    "static_dram": 100,
+                    "peak_heap": 30000,
+                    "min_free_heap": 70000,
+                    "min_largest_block": 50000,
+                    "max_allocation": 2000,
+                    "min_stack_margin": 1500,
+                },
+            )
+
+            verified = self._run_verify(paths, environment)
+            self.assertEqual(verified.returncode, 0)
+            self.assertEqual(verified.stdout, PASS_MARKER)
+            self.assertEqual(verified.stderr, "")
+
+    def test_verify_rejects_environment_fingerprint_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            paths = self._create_inputs(Path(temporary_directory))
+            environment = self._size_environment(text=1000, static_dram=100)
+            self.assertEqual(self._run_capture(paths, environment).returncode, 0)
+
+            manifest = json.loads(paths["manifest"].read_text(encoding="utf-8"))
+            manifest["resource_fingerprint"]["framework"] = "changed"
+            paths["manifest"].write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
+
+            verified = self._run_verify(paths, environment)
+            self.assertEqual(verified.returncode, 1)
+            self.assertEqual(verified.stdout, "")
+            self.assertIn("resource fingerprint differs", verified.stderr)
+
+    def test_verify_rejects_flash_or_elf_manifest_binding_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            paths = self._create_inputs(Path(temporary_directory))
+            environment = self._size_environment(text=1000, static_dram=100)
+            self.assertEqual(self._run_capture(paths, environment).returncode, 0)
+
+            original_flash = paths["flash"].read_bytes()
+            paths["flash"].write_bytes(b"tampered-flash")
+            flash_result = self._run_verify(paths, environment)
+            self.assertEqual(flash_result.returncode, 1)
+            self.assertIn("flash SHA-256", flash_result.stderr)
+            paths["flash"].write_bytes(original_flash)
+
+            original_elf = paths["elf"].read_bytes()
+            paths["elf"].write_bytes(b"tampered-elf")
+            elf_result = self._run_verify(paths, environment)
+            self.assertEqual(elf_result.returncode, 1)
+            self.assertIn("ELF SHA-256", elf_result.stderr)
+            paths["elf"].write_bytes(original_elf)
+
+            alternate_elf = paths["elf"].with_name("alternate.elf")
+            alternate_elf.write_bytes(original_elf)
+            original_path = paths["elf"]
+            paths["elf"] = alternate_elf
+            path_result = self._run_verify(paths, environment)
+            self.assertEqual(path_result.returncode, 1)
+            self.assertIn("ELF path differs", path_result.stderr)
+            paths["elf"] = original_path
+
+    def test_verify_allows_qemu_harness_code_growth_beyond_old_release_proxy(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            paths = self._create_inputs(Path(temporary_directory))
+            baseline_environment = self._size_environment(
+                text=1000, static_dram=100
+            )
+            self.assertEqual(
+                self._run_capture(paths, baseline_environment).returncode, 0
+            )
+
+            verified = self._run_verify(
+                paths,
+                self._size_environment(
+                    text=1000 + 262145,
+                    static_dram=100,
+                ),
+            )
+
+            self.assertEqual(verified.returncode, 0)
+            self.assertEqual(verified.stdout, PASS_MARKER)
+            self.assertEqual(verified.stderr, "")
+
+    def test_verify_accepts_each_exact_resource_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            paths = self._create_inputs(Path(temporary_directory))
+            baseline_environment = self._size_environment(
+                text=1000, static_dram=100
+            )
+            self.assertEqual(
+                self._run_capture(paths, baseline_environment).returncode, 0
+            )
+            captured_baseline = json.loads(
+                paths["baseline"].read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                captured_baseline["limits"],
+                {
+                    "allocation": 32768,
+                    "free_heap": 45056,
+                    "largest_block": 40960,
+                    "pdf_heap": 81920,
+                    "stack_margin": 1024,
+                    "static_dram": 12288,
+                },
+            )
+            paths["runtime"].write_text(
+                "\n".join(
+                    (
+                        "QEMU_BOOT seq=0",
+                        self._runtime_line(
+                            heap_start=127976,
+                            min_free=45056,
+                            min_max_alloc=40960,
+                            max_alloc=32768,
+                            stack_margin=1024,
+                        ),
+                        "QEMU_BOOT seq=1",
+                        self._runtime_line(),
+                        "",
+                    )
+                ),
+                encoding="utf-8",
+            )
+
+            verified = self._run_verify(
+                paths,
+                self._size_environment(
+                    text=1000,
+                    static_dram=100 + 12288,
+                ),
+            )
+
+            self.assertEqual(verified.returncode, 0)
+            self.assertEqual(verified.stdout, PASS_MARKER)
+            self.assertEqual(verified.stderr, "")
+
+    def test_verify_rejects_each_one_byte_boundary_violation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            paths = self._create_inputs(Path(temporary_directory))
+            baseline_environment = self._size_environment(
+                text=1000, static_dram=100
+            )
+            self.assertEqual(
+                self._run_capture(paths, baseline_environment).returncode, 0
+            )
+
+            violations = (
+                {
+                    "name": "static_dram",
+                    "text": 1000,
+                    "static_dram": 100 + 12289,
+                    "runtime": self._runtime_line(),
+                },
+                {
+                    "name": "pdf_heap",
+                    "text": 1000,
+                    "static_dram": 100,
+                    "runtime": self._runtime_line(
+                        heap_start=152921, min_free=70000
+                    ),
+                },
+                {
+                    "name": "free_heap",
+                    "text": 1000,
+                    "static_dram": 100,
+                    "runtime": self._runtime_line(
+                        heap_start=46055,
+                        min_free=45055,
+                        min_max_alloc=40960,
+                    ),
+                },
+                {
+                    "name": "largest_block",
+                    "text": 1000,
+                    "static_dram": 100,
+                    "runtime": self._runtime_line(min_max_alloc=40959),
+                },
+                {
+                    "name": "allocation",
+                    "text": 1000,
+                    "static_dram": 100,
+                    "runtime": self._runtime_line(max_alloc=32769),
+                },
+                {
+                    "name": "stack_margin",
+                    "text": 1000,
+                    "static_dram": 100,
+                    "runtime": self._runtime_line(stack_margin=1023),
+                },
+            )
+
+            for violation in violations:
+                with self.subTest(boundary=violation["name"]):
+                    paths["runtime"].write_text(
+                        "\n".join(
+                            (
+                                "QEMU_BOOT seq=0",
+                                violation["runtime"],
+                                "QEMU_BOOT seq=1",
+                                self._runtime_line(),
+                                "",
+                            )
+                        ),
+                        encoding="utf-8",
+                    )
+                    environment = self._size_environment(
+                        text=violation["text"],
+                        static_dram=violation["static_dram"],
+                    )
+                    verified = self._run_verify(paths, environment)
+                    self.assertEqual(verified.returncode, 1)
+                    self.assertEqual(verified.stdout, "")
+                    self.assertIn(violation["name"], verified.stderr)
+
+    def test_capture_rejects_relative_size_tool_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            paths = self._create_inputs(Path(temporary_directory))
+            manifest = json.loads(paths["manifest"].read_text(encoding="utf-8"))
+            manifest["tools"]["size"]["path"] = "fake_size.py"
+            paths["manifest"].write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
+
+            captured = self._run_capture(
+                paths, self._size_environment(text=1000, static_dram=100)
+            )
+            self.assertEqual(captured.returncode, 1)
+            self.assertEqual(captured.stdout, "")
+            self.assertIn("absolute", captured.stderr)
+
+    def test_capture_accepts_vectors_folded_into_iram_text(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            paths = self._create_inputs(Path(temporary_directory))
+            environment = self._size_environment(
+                text=1000,
+                static_dram=100,
+                omit_section=".iram0.vectors",
+            )
+
+            captured = self._run_capture(paths, environment)
+            self.assertEqual(captured.returncode, 0)
+            self.assertEqual(captured.stdout, PASS_MARKER)
+            self.assertEqual(captured.stderr, "")
+
+            baseline = json.loads(paths["baseline"].read_text(encoding="utf-8"))
+            self.assertEqual(baseline["measurements"]["code_rodata"], 1000)
+
+    def test_capture_rejects_missing_required_output_section(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            paths = self._create_inputs(Path(temporary_directory))
+            environment = self._size_environment(
+                text=1000,
+                static_dram=100,
+                omit_section=".flash.text",
+            )
+
+            captured = self._run_capture(paths, environment)
+            self.assertEqual(captured.returncode, 1)
+            self.assertEqual(captured.stdout, "")
+            self.assertIn(".flash.text", captured.stderr)
+
+    def _create_inputs(self, directory: Path) -> dict[str, Path]:
+        fake_size = directory / "fake_size.py"
+        fake_size.write_text(
+            "\n".join(
+                (
+                    "import os",
+                    "import sys",
+                    "",
+                    "if len(sys.argv) != 3 or sys.argv[1] != '-A':",
+                    "    raise SystemExit(9)",
+                    "text = int(os.environ['QEMU_TEST_TEXT_SIZE'])",
+                    "dram = int(os.environ['QEMU_TEST_DRAM_SIZE'])",
+                    "omit = os.environ.get('QEMU_TEST_OMIT_SECTION', '')",
+                    "def emit(name, size):",
+                    "    if name != omit:",
+                    "        print(f'{name} {size} 0x0')",
+                    "print(f'{sys.argv[2]} :')",
+                    "print('section size addr')",
+                    "emit('.iram0.text', 0)",
+                    "emit('.iram0.vectors', 0)",
+                    "emit('.flash.text', text)",
+                    "emit('.flash.rodata', 0)",
+                    "emit('.dram0.data', dram)",
+                    "emit('.dram0.bss', 0)",
+                    "emit('.noinit', 0)",
+                    "print('.ignored 999999 0x0')",
+                    "",
+                )
+            ),
+            encoding="utf-8",
+        )
+        elf = directory / "firmware.elf"
+        elf.write_bytes(b"ELF")
+        flash = directory / "qemu_flash.bin"
+        flash.write_bytes(b"FLASH")
+        manifest = directory / "qemu_manifest.json"
+        manifest.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "images": {
+                        "flash": {
+                            "path": str(flash.resolve()),
+                            "sha256": hashlib.sha256(flash.read_bytes()).hexdigest(),
+                            "size": flash.stat().st_size,
+                        }
+                    },
+                    "artifacts": {
+                        "elf": {
+                            "path": str(elf.resolve()),
+                            "sha256": hashlib.sha256(elf.read_bytes()).hexdigest(),
+                            "size": elf.stat().st_size,
+                        }
+                    },
+                    "resource_fingerprint": {
+                        "toolchain": "riscv32-esp-elf-14.2.0",
+                        "platform": "55.03.37",
+                        "framework": "arduino-3.3.7",
+                        "build_flags": [
+                            " -fno-exceptions ",
+                            "-std=gnu++20",
+                        ],
+                        "partition_sha256": "partition-hash",
+                        "qemu_hal_sha256": "hal-hash",
+                        "qemu_config_sha256": "config-hash",
+                    },
+                    "tools": {
+                        "size": {
+                            "path": str(fake_size.resolve()),
+                            "version": "fake-size-1",
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        runtime = directory / "runtime.log"
+        runtime.write_text(
+            "\n".join(
+                (
+                    "QEMU_BOOT seq=0",
+                    self._runtime_line(),
+                    "QEMU_BOOT seq=1",
+                    self._runtime_line(),
+                    "",
+                )
+            ),
+            encoding="utf-8",
+        )
+        return {
+            "manifest": manifest,
+            "elf": elf,
+            "flash": flash,
+            "runtime": runtime,
+            "baseline": directory / "baseline.json",
+        }
+
+    @staticmethod
+    def _runtime_line(
+        *,
+        heap_start: int = 100000,
+        min_free: int = 99000,
+        min_max_alloc: int = 60000,
+        max_alloc: int = 1000,
+        stack_margin: int = 2000,
+    ) -> str:
+        return (
+            f"QEMU_RUNTIME heap_start={heap_start} min_free={min_free} "
+            f"min_max_alloc={min_max_alloc} max_alloc={max_alloc} "
+            f"stack_margin={stack_margin}"
+        )
+
+    @staticmethod
+    def _size_environment(
+        *,
+        text: int,
+        static_dram: int,
+        omit_section: str | None = None,
+    ) -> dict[str, str]:
+        environment = os.environ.copy()
+        environment["QEMU_TEST_TEXT_SIZE"] = str(text)
+        environment["QEMU_TEST_DRAM_SIZE"] = str(static_dram)
+        if omit_section is None:
+            environment.pop("QEMU_TEST_OMIT_SECTION", None)
+        else:
+            environment["QEMU_TEST_OMIT_SECTION"] = omit_section
+        return environment
+
+    @staticmethod
+    def _run_capture(
+        paths: dict[str, Path], environment: dict[str, str]
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                sys.executable,
+                str(CHECKER),
+                "capture",
+                "--manifest",
+                str(paths["manifest"]),
+                "--elf",
+                str(paths["elf"]),
+                "--runtime-log",
+                str(paths["runtime"]),
+                "--out",
+                str(paths["baseline"]),
+            ],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=environment,
+        )
+
+    @staticmethod
+    def _run_verify(
+        paths: dict[str, Path], environment: dict[str, str]
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                sys.executable,
+                str(CHECKER),
+                "verify",
+                "--baseline",
+                str(paths["baseline"]),
+                "--manifest",
+                str(paths["manifest"]),
+                "--elf",
+                str(paths["elf"]),
+                "--runtime-log",
+                str(paths["runtime"]),
+            ],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=environment,
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

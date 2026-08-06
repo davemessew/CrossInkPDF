@@ -1,5 +1,6 @@
 #include "CrossPointState.h"
 
+#include <ArduinoJson.h>
 #include <HalStorage.h>
 #include <Logging.h>
 #include <PersistableStore.h>
@@ -8,11 +9,47 @@
 #include <algorithm>
 #include <mutex>
 
+#include "util/BookMoveDurableFile.h"
+
 namespace {
 constexpr uint8_t STATE_FILE_VERSION = 5;
 constexpr char STATE_FILE_BIN[] = "/.crosspoint/state.bin";
 constexpr char STATE_FILE_JSON[] = "/.crosspoint/state.json";
 constexpr char STATE_FILE_BAK[] = "/.crosspoint/state.bin.bak";
+constexpr char STATE_MOVE_TEMP[] = "/.crosspoint/state.json.move.tmp";
+constexpr char STATE_MOVE_BACKUP[] = "/.crosspoint/state.json.move.bak";
+
+bool writeStatePayload(void* const context, void* const fileContext) {
+  if (context == nullptr || fileContext == nullptr) return false;
+  auto& state = *static_cast<CrossPointState*>(context);
+  auto& file = *static_cast<FsFile*>(fileContext);
+  return JsonSettingsIO::writeState(state, file);
+}
+
+bool verifyStatePayload(void* const context, const char* const path) {
+  if (context == nullptr || path == nullptr || !Storage.exists(path)) {
+    return false;
+  }
+  const auto& state = *static_cast<const CrossPointState*>(context);
+  const String json = Storage.readFile(path);
+  if (json.isEmpty()) return false;
+  JsonDocument doc;
+  if (deserializeJson(doc, json)) return false;
+  const char* const persisted = doc["openEpubPath"] | "";
+  return state.openBookPath() == persisted;
+}
+
+bool cleanupStateMoveArtifacts() {
+  bool cleaned = true;
+  if (Storage.exists(STATE_MOVE_TEMP) && !Storage.remove(STATE_MOVE_TEMP)) {
+    cleaned = false;
+  }
+  if (Storage.exists(STATE_MOVE_BACKUP) &&
+      !Storage.remove(STATE_MOVE_BACKUP)) {
+    cleaned = false;
+  }
+  return cleaned;
+}
 }  // namespace
 
 bool CrossPointState::isRecentSleep(uint16_t idx, uint8_t checkCount) const {
@@ -44,15 +81,83 @@ bool CrossPointState::saveToFile() const {
   return PersistableStoreBase::writeDocToFile(STATE_FILE_JSON, doc);
 }
 
+bool CrossPointState::activateOpenPathMigration(
+    const std::string& oldPath, const std::string& newPath) {
+  std::lock_guard<std::mutex> lock(_mutex);
+  const bool changed = openEpubPath == oldPath;
+  if (changed) openEpubPath = newPath;
+
+  const BookMoveDurableFile::Payload payload{
+      this, &writeStatePayload, &verifyStatePayload};
+  Storage.mkdir("/.crosspoint");
+  if (BookMoveDurableFile::replace(STATE_FILE_JSON, STATE_MOVE_TEMP,
+                                   STATE_MOVE_BACKUP, payload)) {
+    return true;
+  }
+  if (changed) openEpubPath = oldPath;
+  return false;
+}
+
+bool CrossPointState::verifyPersistedOpenPathMigration(
+    const std::string& oldPath, const std::string& newPath) const {
+  std::string expectedPath;
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    expectedPath = openEpubPath;
+  }
+  if (!Storage.exists(STATE_FILE_JSON)) return false;
+  const String json = Storage.readFile(STATE_FILE_JSON);
+  if (json.isEmpty()) return false;
+  JsonDocument doc;
+  if (deserializeJson(doc, json)) return false;
+  const char* const persistedValue = doc["openEpubPath"] | "";
+  const std::string persisted = persistedValue;
+  if (expectedPath == oldPath) return false;
+  if (expectedPath == newPath) return persisted == newPath;
+  return persisted == expectedPath;
+}
+
 bool CrossPointState::loadFromFile() {
+  if (!Storage.exists(STATE_FILE_JSON)) {
+    if (Storage.exists(STATE_MOVE_BACKUP)) {
+      if (!Storage.rename(STATE_MOVE_BACKUP, STATE_FILE_JSON)) {
+        LOG_ERR("CPS", "Failed to restore interrupted state move");
+        return false;
+      }
+      (void)Storage.remove(STATE_MOVE_TEMP);
+    } else if (Storage.exists(STATE_MOVE_TEMP) &&
+               !Storage.rename(STATE_MOVE_TEMP, STATE_FILE_JSON)) {
+      LOG_ERR("CPS", "Failed to promote interrupted state move");
+      return false;
+    }
+  }
+
   // Try JSON first
   if (Storage.exists(STATE_FILE_JSON)) {
-    std::lock_guard<std::mutex> storeLock(storeMutex);
-    JsonDocument doc;
-    if (PersistableStoreBase::readDocFromFile(STATE_FILE_JSON, doc)) {
-      std::lock_guard<std::mutex> stateLock(_mutex);
-      return fromJson(doc.as<JsonVariantConst>());
+    String json = Storage.readFile(STATE_FILE_JSON);
+    if (!json.isEmpty()) {
+      std::lock_guard<std::mutex> lock(_mutex);
+      if (JsonSettingsIO::loadState(*this, json.c_str())) {
+        if (!cleanupStateMoveArtifacts()) {
+          LOG_ERR("CPS", "Failed to clean state move artifacts");
+        }
+        return true;
+      }
     }
+    if (Storage.exists(STATE_MOVE_BACKUP)) {
+      if (!Storage.remove(STATE_FILE_JSON) ||
+          !Storage.rename(STATE_MOVE_BACKUP, STATE_FILE_JSON) ||
+          !cleanupStateMoveArtifacts()) {
+        LOG_ERR("CPS", "Failed to roll back interrupted state move");
+        return false;
+      }
+      json = Storage.readFile(STATE_FILE_JSON);
+      if (!json.isEmpty()) {
+        std::lock_guard<std::mutex> lock(_mutex);
+        return JsonSettingsIO::loadState(*this, json.c_str());
+      }
+    }
+    return false;
   }
 
   // Fall back to binary migration
@@ -132,6 +237,7 @@ bool CrossPointState::loadFromBinaryFile() {
     return false;
   }
 
+  // Legacy binary compatibility: retain the persisted member and field order.
   serialization::readString(inputFile, openEpubPath);
   if (version >= 2) {
     uint8_t legacyLastSleep = UINT8_MAX;

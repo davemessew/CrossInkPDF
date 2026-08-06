@@ -1,0 +1,16 @@
+{
+  "error": null,
+  "fixture": "tounicode_simple_and_cid",
+  "geometry_order": [
+    "Simple",
+    "CID\u03a9\u03c0"
+  ],
+  "image_hashes": {},
+  "outline_link_map": {
+    "links": [],
+    "outline": []
+  },
+  "transcript": "Simple CID\u03a9\u03c0",
+  "warning": null,
+  "word_count": 2
+}

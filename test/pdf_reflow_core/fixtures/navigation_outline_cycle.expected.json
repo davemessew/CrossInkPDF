@@ -1,0 +1,13 @@
+{
+  "error": "OutlineCycle",
+  "fixture": "navigation_outline_cycle",
+  "geometry_order": [],
+  "image_hashes": {},
+  "outline_link_map": {
+    "links": [],
+    "outline": []
+  },
+  "transcript": "Cycle body.",
+  "warning": null,
+  "word_count": 2
+}

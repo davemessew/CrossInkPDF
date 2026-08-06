@@ -5,6 +5,7 @@
 #include "activities/home/FileBrowserActivity.h"
 
 class Epub;
+class ReflowDocument;
 class Xtc;
 class Txt;
 
@@ -26,9 +27,23 @@ class ReaderActivity final : public Activity {
 
   void goToLibrary(const std::string& fromBookPath = "");
   void onGoToEpubReader(std::unique_ptr<Epub> epub);
+  void onGoToReflowReader(std::unique_ptr<ReflowDocument> document);
   void onGoToXtcReader(std::unique_ptr<Xtc> xtc);
   void onGoToTxtReader(std::unique_ptr<Txt> txt);
   void onGoToBmpViewer(const std::string& path);
+
+  bool openLibraryRoute();
+  bool openImageRoute();
+  bool openXtcRoute();
+  bool openTextRoute();
+  bool openPdfRoute();
+  bool openEpubRoute();
+  static bool dispatchLibrary(void* context);
+  static bool dispatchImage(void* context);
+  static bool dispatchXtc(void* context);
+  static bool dispatchText(void* context);
+  static bool dispatchPdf(void* context);
+  static bool dispatchEpub(void* context);
 
   void onGoBack();
   int initialRefreshCountdown() const;

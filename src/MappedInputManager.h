@@ -145,7 +145,7 @@ class MappedInputManager {
   int getReleasedFrontButton() const;
   bool isFrontButtonPressed(uint8_t buttonIndex) const;
 
-#ifdef SIMULATOR
+#if defined(SIMULATOR) || defined(CROSSINK_QEMU)
   void simulatorInjectPress(Button button);
   void simulatorInjectRelease(Button button);
   void simulatorClearInputFrame();
@@ -168,10 +168,7 @@ class MappedInputManager {
   mutable bool suppressConfirmRelease = false;
   mutable bool suppressPowerRelease = false;
   mutable bool suppressPowerConfirmRelease = false;
-#if CROSSINK_APP_CAP_TOUCH
-  mutable bool suppressTouchTap = false;
-#endif
-#ifdef SIMULATOR
+#if defined(SIMULATOR) || defined(CROSSINK_QEMU)
   std::array<bool, BUTTON_COUNT> simulatorPressed{};
   std::array<bool, BUTTON_COUNT> simulatorReleased{};
   std::array<bool, BUTTON_COUNT> simulatorHeld{};

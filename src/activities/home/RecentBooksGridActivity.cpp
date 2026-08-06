@@ -209,13 +209,23 @@ void ensureReusableCoverPath(RecentBook& book) {
 
 void RecentBooksGridActivity::loadRecentBooks() {
   recentBooks.clear();
+#if defined(CROSSINK_ENABLE_PDF) && CROSSINK_ENABLE_PDF
+  pdfProductCache.reset();
+#endif
   const auto& books = RECENT_BOOKS.getBooks();
   recentBooks.reserve(std::min(books.size(), static_cast<size_t>(MAX_GRID_BOOKS)));
 
   for (const auto& book : books) {
     if (recentBooks.size() >= MAX_GRID_BOOKS) break;
-    if (!Storage.exists(book.path.c_str())) continue;
-    recentBooks.push_back(BookState{book});
+    if (RecentBooksStore::isMissing(book)) continue;
+    RecentBook displayBook = book;
+#if defined(CROSSINK_ENABLE_PDF) && CROSSINK_ENABLE_PDF
+    float progress = -1.0f;
+    const bool pdfHydrated = RecentBookProgress::hydratePdfBook(pdfProductCache, displayBook, &progress);
+    recentBooks.push_back(BookState{std::move(displayBook), progress, pdfHydrated});
+#else
+    recentBooks.push_back(BookState{std::move(displayBook), -1.0f, false});
+#endif
   }
 }
 
@@ -235,6 +245,11 @@ void RecentBooksGridActivity::loadPageCovers(int pageStart) {
   bool needsGeneration = false;
   for (int i = pageStart; i < pageEnd; ++i) {
     RecentBook& book = recentBooks[i].book;
+#if defined(CROSSINK_ENABLE_PDF) && CROSSINK_ENABLE_PDF
+    if (FsHelpers::hasPdfExtension(book.path)) {
+      continue;
+    }
+#endif
     ensureReusableCoverPath(book);
     if (book.coverBmpPath.empty()) {
       needsGeneration = true;
@@ -258,6 +273,12 @@ void RecentBooksGridActivity::loadPageCovers(int pageStart) {
 
   for (int i = pageStart; i < pageEnd; ++i) {
     RecentBook& book = recentBooks[i].book;
+#if defined(CROSSINK_ENABLE_PDF) && CROSSINK_ENABLE_PDF
+    if (FsHelpers::hasPdfExtension(book.path)) {
+      processedCount++;
+      continue;
+    }
+#endif
     const std::string coverPath =
         book.coverBmpPath.empty() ? "" : UITheme::getCoverThumbPath(book.coverBmpPath, COVER_WIDTH, COVER_HEIGHT);
     if (needsCoverThumbGeneration(book, coverPath)) {
@@ -318,6 +339,9 @@ void RecentBooksGridActivity::onEnter() {
 void RecentBooksGridActivity::onExit() {
   Activity::onExit();
   recentBooks.clear();
+#if defined(CROSSINK_ENABLE_PDF) && CROSSINK_ENABLE_PDF
+  pdfProductCache.reset();
+#endif
 }
 
 int RecentBooksGridActivity::bookIndexFromPoint(const int x, const int y) {
@@ -474,13 +498,26 @@ void RecentBooksGridActivity::promptDeleteBook(const RecentBook& book) {
       return;
     }
 
-    BookActions::clearFileMetadata(path);
-    if (!Storage.remove(path.c_str())) {
-      LOG_ERR("RBGA", "Failed to delete file: %s", path.c_str());
-      return;
+    LOG_DBG("RBGA", "Attempting to delete: %s", path.c_str());
+    // PDF_DELETE_ADAPTER_BEGIN
+#if defined(CROSSINK_ENABLE_PDF) && CROSSINK_ENABLE_PDF
+    if (FsHelpers::hasPdfExtension(path)) {
+      if (!BookActions::deletePdfBook(path)) {
+        LOG_ERR("RBGA", "Failed to delete PDF safely: %s", path.c_str());
+        return;
+      }
+    } else {
+#endif
+      BookActions::clearFileMetadata(path);
+      if (!Storage.remove(path.c_str())) {
+        LOG_ERR("RBGA", "Failed to delete file: %s", path.c_str());
+        return;
+      }
+      RECENT_BOOKS.removeByPath(path);
+#if defined(CROSSINK_ENABLE_PDF) && CROSSINK_ENABLE_PDF
     }
-
-    RECENT_BOOKS.removeByPath(path);
+#endif
+    // PDF_DELETE_ADAPTER_END
     reloadAfterBookAction();
   };
 

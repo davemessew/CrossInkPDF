@@ -1,17 +1,19 @@
 #pragma once
+
+#include <HalStorage.h>
+#include <ReflowDocument.h>
+
 #include <functional>
 #include <memory>
 #include <optional>
 #include <string>
 
-#include "Epub.h"
 #include "EpubRenderMode.h"
 #include "ReaderRenderSpec.h"
 
 class Page;
 class GfxRenderer;
-class ChapterHtmlSlimParser;
-class CssParser;
+class TextBlock;
 
 struct SectionBuildOptions {
   const char* previewAnchor = nullptr;
@@ -21,74 +23,29 @@ struct SectionBuildOptions {
 };
 
 class Section {
-  std::shared_ptr<Epub> epub;
-  const int spineIndex;
+  std::shared_ptr<ReflowDocument> document;
+  const int sectionIndex;
   GfxRenderer& renderer;
   std::string filePath;
   HalFile file;
-
-  struct PageLutEntry {
-    uint32_t fileOffset;
-    uint16_t paragraphIndex;
-    uint16_t listItemIndex;
-  };
-
-  struct BuildContext {
-    std::unique_ptr<ChapterHtmlSlimParser> parser;
-    std::unique_ptr<PageLutEntry[]> lut;
-    uint16_t lutCapacity = 0;
-    uint16_t lutCount = 0;
-    std::string parsePath;
-    std::string contentBase;
-    std::string imageBasePath;
-    std::string htmlPath;
-    std::string tmpHtmlPath;
-    std::string tmpSectionPath;
-    bool reusedHtml = false;
-    bool pageCompletionFailed = false;
-    CssParser* cssParser = nullptr;
-    // HTML byte progress, for estimating the section's total page count while it's still building.
-    uint32_t bytesConsumed = 0;
-    uint32_t totalBytes = 0;
-    // Exponentially-smoothed page-count estimate (0 = not yet seeded) and the bytesConsumed at its
-    // last update. The raw byte-ratio estimate jitters as the build crosses dense/sparse regions;
-    // the EMA is stepped once per build advance (not per redraw) to damp that wobble.
-    float smoothedEstimate = 0;
-    uint32_t smoothedAtConsumed = 0;
-  };
-  std::unique_ptr<BuildContext> build_;
-  bool buildComplete_ = false;
-  bool lastImagesWereSuppressed_ = false;
-  bool lastLayoutAbortedForLowMemory_ = false;
-  // Pages laid out by the active build. Distinct from pageCount, which is the pages
-  // available to read and may include a loaded partial file's pages.
-  uint16_t builtPageCount_ = 0;
-  bool partial_ = false;
-  uint16_t partialPageCount_ = 0;
-  uint32_t partialBytesConsumed_ = 0;
-  uint32_t partialTotalBytes_ = 0;
-  std::string activeBuildTmpSectionPath_;
-
-  bool writeSectionFileHeader(const ReaderRenderSpec& spec);
+  struct PdfPageBuildContext;
+  bool writeSectionFileHeader(int fontId, float lineCompression, bool extraParagraphSpacing, bool forceParagraphIndents,
+                              uint8_t paragraphAlignment, uint16_t viewportWidth, uint16_t viewportHeight,
+                              bool hyphenationEnabled, bool embeddedStyle, uint8_t imageRendering,
+                              bool bionicReadingEnabled, bool guideReadingEnabled, EpubRenderMode renderMode);
   uint32_t onPageComplete(std::unique_ptr<Page> page);
-  bool ensureBuildFileOpen();
-  bool finalizeBuild();
-  // Write the LUTs/anchor map (and, for a partial, the watermark trailer), patch the
-  // header, stamp the version byte, and swap the tmp .bin over filePath.
-  bool commitBuildFile(uint8_t version, uint32_t bytesConsumed, uint32_t totalBytes);
-  // Builds write here and are swapped over filePath only on commit, so a prior
-  // partial/finalized file stays readable while a rebuild is in progress.
-  std::string binTmpPath() const { return filePath + ".part"; }
-  std::unique_ptr<Page> loadPageAt(int page) const;
-  // Read a page already laid out by the in-progress build (page < build LUT size), from
-  // the partially-written tmp .bin without disturbing the build's write cursor.
-  std::unique_ptr<Page> loadPageDuringBuild(int page);
+  bool usesPdfWordIndex() const;
+  static void completePdfPage(void* context, std::unique_ptr<Page> page, uint16_t paragraphIndex,
+                              uint16_t listItemIndex);
+  static bool finishPdfTextBlock(void* context, const Page* currentPage);
+  static bool beginPdfTextBlock(void* context, const char* anchor, size_t anchorLength);
+  static bool trackPdfTextLine(void* context, const TextBlock* line);
 
  public:
   uint16_t pageCount = 0;
   int currentPage = 0;
 
-  explicit Section(const std::shared_ptr<Epub>& epub, int spineIndex, GfxRenderer& renderer,
+  explicit Section(const std::shared_ptr<ReflowDocument>& document, int sectionIndex, GfxRenderer& renderer,
                    const char* cacheSuffix = "");
   ~Section();
   bool loadSectionFile(const ReaderRenderSpec& spec);
@@ -161,4 +118,12 @@ class Section {
 
   // Look up the running list-item index for the given rendered page.
   std::optional<uint16_t> getListItemIndexForPage(uint16_t page) const;
+
+  // PDF-only, fixed-record semantic positions. EPUB sections never create or
+  // read this sidecar, so their v44 cache bytes remain unchanged.
+  std::optional<ReflowPageSemanticRange> getSemanticRangeForPage(uint16_t page);
+  std::optional<uint16_t> getPageForSemanticPosition(const char* blockAnchor, uint32_t blockWordOffset,
+                                                     uint32_t globalWordOrdinal);
+  std::optional<uint16_t> getPageForSemanticCursor(uint32_t wordCursor);
+  const std::string& getCacheFilePath() const { return filePath; }
 };

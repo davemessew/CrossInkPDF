@@ -1,0 +1,19 @@
+{
+  "error": null,
+  "fixture": "duplicate_raster_figures",
+  "geometry_order": [
+    "First duplicate figure.",
+    "Second duplicate figure."
+  ],
+  "image_hashes": {
+    "image-6-flate-gray8": "03b722a15d4658be01f1eb9def5e8be124710cc0e88842f78107abfda3e23ea8",
+    "image-7-flate-gray8": "03b722a15d4658be01f1eb9def5e8be124710cc0e88842f78107abfda3e23ea8"
+  },
+  "outline_link_map": {
+    "links": [],
+    "outline": []
+  },
+  "transcript": "First duplicate figure. Second duplicate figure.",
+  "warning": null,
+  "word_count": 6
+}

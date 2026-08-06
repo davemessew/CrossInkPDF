@@ -1,0 +1,15 @@
+{
+  "error": null,
+  "fixture": "xref_stream_objstm",
+  "geometry_order": [
+    "Compressed object stream text."
+  ],
+  "image_hashes": {},
+  "outline_link_map": {
+    "links": [],
+    "outline": []
+  },
+  "transcript": "Compressed object stream text.",
+  "warning": null,
+  "word_count": 4
+}

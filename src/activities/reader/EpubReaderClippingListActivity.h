@@ -14,7 +14,15 @@
 
 class EpubReaderClippingListActivity final : public Activity {
  public:
-  EpubReaderClippingListActivity(GfxRenderer& renderer, MappedInputManager& mappedInput);
+  using DeleteCallback = bool (*)(void* context, uint16_t itemId);
+
+  EpubReaderClippingListActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
+                                 std::vector<Clipping> clippings, DeleteCallback deleteCallback = nullptr,
+                                 void* deleteContext = nullptr)
+      : Activity("EpubClippingList", renderer, mappedInput),
+        clippings(std::move(clippings)),
+        deleteCallback(deleteCallback),
+        deleteContext(deleteContext) {}
 
   void onEnter() override;
   void loop() override;
@@ -30,19 +38,8 @@ class EpubReaderClippingListActivity final : public Activity {
   int detailLinesPerPage = 0;
   bool longPressConfirmHandled = false;
   bool detailMode = false;
-  using UiApp = freeink::ui::FreeInkApp<20, 4>;
-  freeink::ui::GfxRendererTarget uiTarget;
-  UiApp app;
-  std::atomic<bool> uiReady{false};
-  int visibleRows = 1;
-  int topIndex = 0;
-  int listTop = 0;
-  int listBottom = 0;
-  int listRowHeight = 0;
-  int listRowStep = 0;
-  std::vector<freeink::ui::ListItem> uiItems;
-  std::array<std::string, 20> uiRawText;
-  std::array<std::string, 20> uiLabels;
+  DeleteCallback deleteCallback = nullptr;
+  void* deleteContext = nullptr;
 
   static void listScreen(UiApp::ScreenType& screen, void* user);
   static void onRowEvent(const freeink::ui::ActionEvent& event, void* user);

@@ -1,0 +1,15 @@
+{
+  "error": null,
+  "fixture": "incremental_xref_stream",
+  "geometry_order": [
+    "Updated xref stream wins."
+  ],
+  "image_hashes": {},
+  "outline_link_map": {
+    "links": [],
+    "outline": []
+  },
+  "transcript": "Updated xref stream wins.",
+  "warning": null,
+  "word_count": 4
+}

@@ -29,6 +29,18 @@ class InflateReader {
   // Returns false if the stream ends before producing len bytes, or on error.
   bool read(uint8_t* dest, size_t len);
 
+  // Decompress up to maxLen bytes into dest.
+  // Sets *produced to the number of bytes written.
+  // Returns Done when the stream ends cleanly, Ok when there is more to read,
+  // and Error on failure.
+  InflateStatus readAtMost(uint8_t* dest, size_t maxLen, size_t* produced);
+
+  // Returns a pointer to the underlying TINF_DATA.
+  // Useful for advanced streaming setups where the callback needs access to the
+  // uzlib struct directly (e.g. updating source/source_limit).
+  uzlib_uncomp* raw() { return &decomp; }
+  bool usesExternalDictionary() const { return ringBuffer != nullptr && !ownsRingBuffer; }
+
  private:
   uzlib_uncomp decomp = {};
 };

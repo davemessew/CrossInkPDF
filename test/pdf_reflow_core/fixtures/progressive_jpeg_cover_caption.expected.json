@@ -1,0 +1,17 @@
+{
+  "error": null,
+  "fixture": "progressive_jpeg_cover_caption",
+  "geometry_order": [
+    "Progressive JPEG cover caption."
+  ],
+  "image_hashes": {
+    "image-6-progressive-cover-jpeg": "c20ec47af47ad16857e2fb7b89e58395d96e409a858c496ec15534b0262d5d47"
+  },
+  "outline_link_map": {
+    "links": [],
+    "outline": []
+  },
+  "transcript": "Progressive JPEG cover caption.",
+  "warning": null,
+  "word_count": 4
+}

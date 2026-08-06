@@ -1,0 +1,15 @@
+{
+  "error": null,
+  "fixture": "inline_dct_boundary",
+  "geometry_order": [
+    "Inline dct boundary survives."
+  ],
+  "image_hashes": {},
+  "outline_link_map": {
+    "links": [],
+    "outline": []
+  },
+  "transcript": "Inline dct boundary survives.",
+  "warning": null,
+  "word_count": 4
+}

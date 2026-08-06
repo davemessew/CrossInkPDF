@@ -1,0 +1,15 @@
+{
+  "error": null,
+  "fixture": "inline_flate_boundary",
+  "geometry_order": [
+    "Inline flate boundary survives."
+  ],
+  "image_hashes": {},
+  "outline_link_map": {
+    "links": [],
+    "outline": []
+  },
+  "transcript": "Inline flate boundary survives.",
+  "warning": null,
+  "word_count": 4
+}

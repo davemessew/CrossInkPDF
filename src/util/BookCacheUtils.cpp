@@ -1,14 +1,23 @@
 #include "BookCacheUtils.h"
+#include "BookMoveUtils.h"
 
 #include <Epub.h>
 #include <FsHelpers.h>
 #include <Logging.h>
+#include <Memory.h>
+#include <PdfSourceIdentity.h>
 #include <Txt.h>
 #include <Xtc.h>
 
 #include <algorithm>
+#include <cctype>
+#if defined(SIMULATOR)
+#include <cerrno>
+#endif
+#include <cstdio>
 #include <cstring>
 #include <iterator>
+#include <limits>
 #include <vector>
 
 namespace {
@@ -49,6 +58,59 @@ constexpr size_t MAX_PRESERVED_CACHE_FILES = std::size(EPUB_USER_STATE_FILES) > 
 constexpr size_t MAX_STATS_FILES_TO_PRESERVE = 8;
 constexpr char STATS_PREFIX[] = "stats";
 constexpr char STATS_SUFFIX[] = ".bin";
+constexpr size_t MAX_PDF_GENERATIONS_TO_CLEAR = 32;
+
+constexpr const char* PDF_DERIVED_ROOT_FILES[] = {
+    "manifest.a", "manifest.b", "build.a", "build.b", "manifest.a.tmp", "manifest.b.tmp", "build.a.tmp", "build.b.tmp",
+};
+static_assert(std::size(PDF_DERIVED_ROOT_FILES) <= 8);
+constexpr const char* PDF_DERIVED_ROOT_DIRECTORIES[] = {"sections"};
+static_assert(std::size(PDF_DERIVED_ROOT_DIRECTORIES) <= 8);
+
+struct PdfCacheClearWorkspace {
+  char path[PDF_CACHE_PATH_CAPACITY]{};
+  char entryName[PDF_CACHE_ENTRY_NAME_CAPACITY]{};
+  uint32_t generations[MAX_PDF_GENERATIONS_TO_CLEAR]{};
+  uint8_t generationCount = 0;
+  uint8_t derivedRootMask = 0;
+  uint8_t derivedDirectoryMask = 0;
+};
+static_assert(sizeof(PdfCacheClearWorkspace) <= 356);
+
+enum class PdfCacheDirectoryNextResult : uint8_t {
+  Entry,
+  End,
+  Error,
+};
+
+PdfCacheDirectoryNextResult nextPdfCacheEntry(FsFile& directory, FsFile& entry) {
+#if defined(SIMULATOR)
+  // The external native simulator HAL predates explicit directory status and
+  // constructs HalFile with throwing host `new`. Keep that host-only behavior
+  // isolated here. ESP32-C3 and QEMU compile the fallible, reusable-wrapper
+  // branch below and never silently collapse allocation or I/O errors into EOF.
+  if (!entry.close()) {
+    return PdfCacheDirectoryNextResult::Error;
+  }
+  errno = 0;
+  entry = directory.openNextFile();
+  if (entry) {
+    return PdfCacheDirectoryNextResult::Entry;
+  }
+  // POSIX readdir leaves errno at zero for clean EOF. A non-zero value is
+  // conservatively treated as an error, so derived state is not deleted.
+  return errno == 0 ? PdfCacheDirectoryNextResult::End : PdfCacheDirectoryNextResult::Error;
+#else
+  const HalDirectoryNextStatus status = directory.openNextFile(entry);
+  if (status == HalDirectoryNextStatus::Entry) {
+    return PdfCacheDirectoryNextResult::Entry;
+  }
+  if (status == HalDirectoryNextStatus::End) {
+    return PdfCacheDirectoryNextResult::End;
+  }
+  return PdfCacheDirectoryNextResult::Error;
+#endif
+}
 
 std::string getBookCachePath(const std::string& path) {
   if (FsHelpers::hasEpubExtension(path)) {
@@ -61,6 +123,260 @@ std::string getBookCachePath(const std::string& path) {
     return Txt(path, "/.crosspoint").getCachePath();
   }
   return "";
+}
+
+bool parsePdfGenerationName(const char* const name, uint32_t& generation) {
+  constexpr char PREFIX[] = "gen_";
+  constexpr size_t PREFIX_LENGTH = std::size(PREFIX) - 1;
+  if (!name || strncmp(name, PREFIX, PREFIX_LENGTH) != 0 || name[PREFIX_LENGTH] == '\0' || name[PREFIX_LENGTH] == '0') {
+    return false;
+  }
+
+  uint32_t value = 0;
+  for (size_t index = PREFIX_LENGTH; name[index] != '\0'; ++index) {
+    const unsigned char character = static_cast<unsigned char>(name[index]);
+    if (!std::isdigit(character)) {
+      return false;
+    }
+    const uint32_t digit = character - static_cast<unsigned char>('0');
+    if (value > (std::numeric_limits<uint32_t>::max() - digit) / 10U) {
+      return false;
+    }
+    value = value * 10U + digit;
+  }
+  generation = value;
+  return true;
+}
+
+bool appendPdfCacheLeaf(PdfCacheClearWorkspace& workspace, const size_t rootLength, const char* const leaf) {
+  if (!leaf) {
+    return false;
+  }
+  const size_t leafLength = strlen(leaf);
+  if (rootLength + 1 + leafLength + 1 > sizeof(workspace.path)) {
+    return false;
+  }
+  workspace.path[rootLength] = '/';
+  memcpy(workspace.path + rootLength + 1, leaf, leafLength + 1);
+  return true;
+}
+
+bool removePdfDerivedRootFiles(PdfCacheClearWorkspace& workspace, const size_t rootLength) {
+  for (size_t index = 0; index < std::size(PDF_DERIVED_ROOT_FILES); ++index) {
+    if ((workspace.derivedRootMask & (1U << index)) == 0) {
+      continue;
+    }
+    const char* const name = PDF_DERIVED_ROOT_FILES[index];
+    if (!appendPdfCacheLeaf(workspace, rootLength, name)) {
+      LOG_ERR("BookCache", "PDF cache derived path is too long: %s", workspace.path);
+      return false;
+    }
+    if (!Storage.remove(workspace.path)) {
+      LOG_ERR("BookCache", "Failed to remove PDF derived cache file: %s", workspace.path);
+      return false;
+    }
+    workspace.path[rootLength] = '\0';
+  }
+  return true;
+}
+
+bool removePdfDerivedRootDirectories(PdfCacheClearWorkspace& workspace, const size_t rootLength) {
+  for (size_t index = 0; index < std::size(PDF_DERIVED_ROOT_DIRECTORIES); ++index) {
+    if ((workspace.derivedDirectoryMask & (1U << index)) == 0) {
+      continue;
+    }
+    const char* const name = PDF_DERIVED_ROOT_DIRECTORIES[index];
+    if (!appendPdfCacheLeaf(workspace, rootLength, name)) {
+      LOG_ERR("BookCache", "PDF cache derived directory path is too long: %s", workspace.path);
+      return false;
+    }
+    if (!Storage.removeDir(workspace.path)) {
+      LOG_ERR("BookCache", "Failed to remove PDF derived cache directory: %s", workspace.path);
+      return false;
+    }
+    workspace.path[rootLength] = '\0';
+  }
+  return true;
+}
+
+[[gnu::noinline]] bool collectPdfGenerations(PdfCacheClearWorkspace& workspace) {
+  FsFile directory = Storage.open(workspace.path);
+  if (!directory) {
+    LOG_ERR("BookCache", "Failed to open PDF cache directory: %s", workspace.path);
+    return false;
+  }
+  if (!directory.isDirectory()) {
+    directory.close();
+    LOG_ERR("BookCache", "PDF cache path is not a directory: %s", workspace.path);
+    return false;
+  }
+
+  bool ok = true;
+  FsFile entry;
+  while (ok) {
+    const PdfCacheDirectoryNextResult result = nextPdfCacheEntry(directory, entry);
+    if (result == PdfCacheDirectoryNextResult::End) {
+      break;
+    }
+    if (result == PdfCacheDirectoryNextResult::Error) {
+      LOG_ERR("BookCache", "Failed to enumerate PDF cache directory: %s", workspace.path);
+      ok = false;
+      break;
+    }
+
+    const bool isDirectory = entry.isDirectory();
+    const size_t nameLength = entry.getName(workspace.entryName, sizeof(workspace.entryName));
+    if (nameLength == 0 || nameLength >= sizeof(workspace.entryName)) {
+      ok = false;
+      break;
+    }
+
+    if (!isDirectory) {
+      for (size_t index = 0; index < std::size(PDF_DERIVED_ROOT_FILES); ++index) {
+        if (strcmp(workspace.entryName, PDF_DERIVED_ROOT_FILES[index]) == 0) {
+          workspace.derivedRootMask |= static_cast<uint8_t>(1U << index);
+          break;
+        }
+      }
+      continue;
+    }
+
+    bool knownDerivedDirectory = false;
+    for (size_t index = 0; index < std::size(PDF_DERIVED_ROOT_DIRECTORIES); ++index) {
+      if (strcmp(workspace.entryName, PDF_DERIVED_ROOT_DIRECTORIES[index]) == 0) {
+        workspace.derivedDirectoryMask |= static_cast<uint8_t>(1U << index);
+        knownDerivedDirectory = true;
+        break;
+      }
+    }
+    if (knownDerivedDirectory) {
+      continue;
+    }
+
+    uint32_t generation = 0;
+    if (!parsePdfGenerationName(workspace.entryName, generation)) {
+      continue;
+    }
+    if (workspace.generationCount >= MAX_PDF_GENERATIONS_TO_CLEAR) {
+      LOG_ERR("BookCache", "Too many PDF cache generations: %s", workspace.path);
+      ok = false;
+      break;
+    }
+    workspace.generations[workspace.generationCount++] = generation;
+  }
+  const bool entryCloseOk = entry.close();
+  const bool closeOk = directory.close();
+  if (!entryCloseOk || !closeOk) {
+    ok = false;
+  }
+  return ok;
+}
+
+bool removePdfGenerations(PdfCacheClearWorkspace& workspace, const size_t rootLength) {
+  for (size_t index = 0; index < workspace.generationCount; ++index) {
+    const int written = snprintf(workspace.path + rootLength, sizeof(workspace.path) - rootLength, "/gen_%lu",
+                                 static_cast<unsigned long>(workspace.generations[index]));
+    if (written <= 0 || static_cast<size_t>(written) >= sizeof(workspace.path) - rootLength) {
+      LOG_ERR("BookCache", "PDF generation cache path is too long: %s", workspace.path);
+      return false;
+    }
+    if (!Storage.removeDir(workspace.path)) {
+      LOG_ERR("BookCache", "Failed to remove PDF cache generation: %s", workspace.path);
+      return false;
+    }
+    workspace.path[rootLength] = '\0';
+  }
+  return true;
+}
+
+bool clearPdfDerivedCacheWorkspace(PdfCacheClearWorkspace& workspace) {
+  const size_t rootLength = strlen(workspace.path);
+  if (!collectPdfGenerations(workspace)) {
+    return false;
+  }
+  return removePdfDerivedRootFiles(workspace, rootLength) && removePdfDerivedRootDirectories(workspace, rootLength) &&
+         removePdfGenerations(workspace, rootLength);
+}
+
+std::unique_ptr<PdfCacheClearWorkspace> allocatePdfCacheClearWorkspace() {
+  // This cold upload path needs 356 bytes of mutable path/list storage. One
+  // fallible allocation keeps it off the small task stack, and the fixed arrays
+  // avoid container growth while scanning and deleting cache entries.
+  auto workspace = makeUniqueNoThrow<PdfCacheClearWorkspace>();
+  if (!workspace) {
+    LOG_ERR("BookCache", "Failed to allocate PDF cache-clear workspace (%u bytes)",
+            static_cast<unsigned>(sizeof(PdfCacheClearWorkspace)));
+  }
+  return workspace;
+}
+
+[[gnu::noinline]] bool clearPdfDerivedCache(const std::string& path) {
+  const uint64_t normalCacheHash = pdfPathHash64(path.c_str(), path.size());
+  uint64_t resolvedCacheHash = normalCacheHash;
+  bool readOnlyFallback = true;
+  if (!BookMoveUtils::migrationCacheHash(path, normalCacheHash, &resolvedCacheHash, &readOnlyFallback) ||
+      readOnlyFallback || resolvedCacheHash != normalCacheHash) {
+    LOG_ERR("BookCache", "Refusing PDF cache deletion while migration state is unresolved");
+    return false;
+  }
+
+  char cachePath[PDF_CACHE_PATH_CAPACITY]{};
+  const PdfStatus status =
+      pdfFormatCacheRootForHash("/.crosspoint", normalCacheHash, cachePath, sizeof(cachePath));
+  if (!status) {
+    LOG_ERR("BookCache", "Failed to resolve PDF cache path: %s", path.c_str());
+    return false;
+  }
+  if (!Storage.exists(cachePath)) {
+    return true;
+  }
+
+  auto workspace = allocatePdfCacheClearWorkspace();
+  if (!workspace) {
+    return false;
+  }
+  memcpy(workspace->path, cachePath, sizeof(cachePath));
+  return clearPdfDerivedCacheWorkspace(*workspace);
+}
+
+size_t trimmedCacheDirectoryPathLength(const std::string& cachePath) {
+  size_t length = cachePath.size();
+  while (length > 1 && cachePath[length - 1] == '/') {
+    --length;
+  }
+  return length;
+}
+
+bool isPdfCacheDirectoryPath(const std::string& cachePath) {
+  const size_t length = trimmedCacheDirectoryPathLength(cachePath);
+  size_t nameOffset = length;
+  while (nameOffset != 0 && cachePath[nameOffset - 1] != '/') {
+    --nameOffset;
+  }
+  constexpr char PDF_PREFIX[] = "pdf_";
+  constexpr size_t PDF_PREFIX_LENGTH = std::size(PDF_PREFIX) - 1;
+  return length - nameOffset >= PDF_PREFIX_LENGTH &&
+         memcmp(cachePath.data() + nameOffset, PDF_PREFIX, PDF_PREFIX_LENGTH) == 0;
+}
+
+[[gnu::noinline]] bool clearPdfDerivedCacheDirectory(const std::string& cachePath) {
+  const size_t pathLength = trimmedCacheDirectoryPathLength(cachePath);
+  char normalizedPath[PDF_CACHE_PATH_CAPACITY]{};
+  if (pathLength == 0 || pathLength >= sizeof(normalizedPath)) {
+    LOG_ERR("BookCache", "PDF cache directory path is invalid");
+    return false;
+  }
+  memcpy(normalizedPath, cachePath.c_str(), pathLength);
+  if (!Storage.exists(normalizedPath)) {
+    return true;
+  }
+
+  auto workspace = allocatePdfCacheClearWorkspace();
+  if (!workspace) {
+    return false;
+  }
+  memcpy(workspace->path, normalizedPath, sizeof(normalizedPath));
+  return clearPdfDerivedCacheWorkspace(*workspace);
 }
 
 const PreservedCacheFile* preservedFilesForPath(const std::string& path, size_t& count) {
@@ -302,17 +618,21 @@ bool isBookCacheDirectoryName(const char* name) {
   }
 
   constexpr char EPUB_PREFIX[] = "epub_";
+  constexpr char PDF_PREFIX[] = "pdf_";
   constexpr char TXT_PREFIX[] = "txt_";
   constexpr char XTC_PREFIX[] = "xtc_";
 
   return strncmp(name, EPUB_PREFIX, std::size(EPUB_PREFIX) - 1) == 0 ||
+         strncmp(name, PDF_PREFIX, std::size(PDF_PREFIX) - 1) == 0 ||
          strncmp(name, TXT_PREFIX, std::size(TXT_PREFIX) - 1) == 0 ||
          strncmp(name, XTC_PREFIX, std::size(XTC_PREFIX) - 1) == 0;
 }
 
 void clearBookCache(const std::string& path) { clearBookCachePreservingUserState(path); }
 
-bool clearBookCachePreservingUserState(const std::string& path) {
+// Keep the legacy preservation frame out of the PDF dispatcher. The legacy
+// implementation predates PDF support and has a larger stats-sorting frame.
+[[gnu::noinline]] static bool clearLegacyBookCachePreservingUserState(const std::string& path) {
   size_t preservedCount = 0;
   const PreservedCacheFile* preservedFiles = preservedFilesForPath(path, preservedCount);
   if (!preservedFiles || preservedCount == 0) {
@@ -347,7 +667,16 @@ bool clearBookCachePreservingUserState(const std::string& path) {
   return clearOk && restoreOk;
 }
 
+bool clearBookCachePreservingUserState(const std::string& path) {
+  if (FsHelpers::hasPdfExtension(path)) {
+    return clearPdfDerivedCache(path);
+  }
+  return clearLegacyBookCachePreservingUserState(path);
+}
+
 bool clearBookCacheDirectoryPreservingStats(const std::string& cachePath) {
-  return clearCacheDirectoryPreservingFiles(cachePath, CACHE_CLEAR_USER_STATE_FILES,
-                                            std::size(CACHE_CLEAR_USER_STATE_FILES), true, "clear_preserve_");
+  if (isPdfCacheDirectoryPath(cachePath)) {
+    return clearPdfDerivedCacheDirectory(cachePath);
+  }
+  return clearCacheDirectoryPreservingFiles(cachePath, nullptr, 0, true, "clear_preserve_");
 }

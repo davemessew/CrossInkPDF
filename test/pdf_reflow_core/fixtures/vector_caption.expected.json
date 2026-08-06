@@ -1,0 +1,15 @@
+{
+  "error": null,
+  "fixture": "vector_caption",
+  "geometry_order": [
+    "Figure one: bounded vector caption."
+  ],
+  "image_hashes": {},
+  "outline_link_map": {
+    "links": [],
+    "outline": []
+  },
+  "transcript": "Figure one: bounded vector caption.",
+  "warning": "VectorArtOmitted",
+  "word_count": 5
+}

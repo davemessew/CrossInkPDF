@@ -1,0 +1,15 @@
+{
+  "error": null,
+  "fixture": "soft_mask_caption",
+  "geometry_order": [
+    "Masked caption."
+  ],
+  "image_hashes": {},
+  "outline_link_map": {
+    "links": [],
+    "outline": []
+  },
+  "transcript": "Masked caption.",
+  "warning": null,
+  "word_count": 2
+}

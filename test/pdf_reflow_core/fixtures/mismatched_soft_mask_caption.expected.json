@@ -1,0 +1,15 @@
+{
+  "error": null,
+  "fixture": "mismatched_soft_mask_caption",
+  "geometry_order": [
+    "Mismatched mask text survives."
+  ],
+  "image_hashes": {},
+  "outline_link_map": {
+    "links": [],
+    "outline": []
+  },
+  "transcript": "Mismatched mask text survives.",
+  "warning": null,
+  "word_count": 4
+}

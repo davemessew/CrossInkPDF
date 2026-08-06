@@ -1,0 +1,4 @@
+test/pdf_reflow_core/fixtures/** -text
+test/pdf_reflow_core/fixtures/*.pdf binary
+test/qemu/data/qemu/classic_text.pdf binary
+test/qemu/data/qemu/navigation_outline.pdf binary

@@ -1,0 +1,60 @@
+{
+  "error": null,
+  "fixture": "navigation_outline",
+  "geometry_order": [],
+  "image_hashes": {},
+  "outline_link_map": {
+    "links": [
+      {
+        "href": "sections/000000.xhtml#b00000000",
+        "kind": "same-section",
+        "text": "Chapter One"
+      },
+      {
+        "href": "sections/000001.xhtml#b00000003",
+        "kind": "cross-section",
+        "text": "Chapter Two"
+      },
+      {
+        "page_label": "i",
+        "source_page": 0
+      },
+      {
+        "page_label": "A-1",
+        "source_page": 1
+      },
+      {
+        "ignored_action": "URI"
+      },
+      {
+        "ignored_action": "JavaScript"
+      }
+    ],
+    "outline": [
+      {
+        "anchor": "b00000000",
+        "destination": "named:part-one",
+        "level": 1,
+        "section": 0,
+        "title": "Part One"
+      },
+      {
+        "anchor": "b00000000",
+        "destination": "explicit:page-0",
+        "level": 2,
+        "section": 0,
+        "title": "Chapter One"
+      },
+      {
+        "anchor": "b00000003",
+        "destination": "named:chapter-two",
+        "level": 2,
+        "section": 1,
+        "title": "Chapter Two"
+      }
+    ]
+  },
+  "transcript": "Contents Chapter One Chapter Two Chapter Two Index Chapter One",
+  "warning": null,
+  "word_count": 10
+}

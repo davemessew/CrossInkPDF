@@ -43,6 +43,7 @@ For focused reference material, see [Reader Features](./reader-features.md),
       - [Custom images](#custom-images)
     - [3.8 Custom Fonts (SD Card)](#38-custom-fonts-sd-card)
   - [4. Reading Mode](#4-reading-mode)
+    - [Opening and Reading PDFs](#opening-and-reading-pdfs)
     - [Page Turning](#page-turning)
     - [Chapter Navigation](#chapter-navigation)
     - [Auto Page Turn](#auto-page-turn)
@@ -53,7 +54,7 @@ For focused reference material, see [Reader Features](./reader-features.md),
   - [5. Reader Menu](#5-reader-menu)
     - [5.1 Chapter Selection](#51-chapter-selection)
     - [5.2 Bookmarks](#52-bookmarks)
-  - [6. Current Limitations & Roadmap](#6-current-limitations--roadmap)
+  - [6. Format Limits](#6-format-limits)
   - [7. Troubleshooting Issues & Escaping Bootloop](#7-troubleshooting-issues--escaping-bootloop)
 
 ## 1. Hardware Overview
@@ -112,7 +113,7 @@ The Browse Files screen acts as a file and folder browser. The full path to the 
 - **Navigate List:** Use **Left** (or **Volume Up**), or **Right** (or **Volume Down**) to move the selection cursor up and down through folders and books. You can also long-press these buttons to scroll a full page up or down.
 - **Open Selection:** Press **Confirm** to open a folder or start reading a selected book. Selecting a `.bmp` file will open the image viewer.
 - **Delete Files or Folders:** Hold and release **Confirm** to open the selected file or folder action menu, then choose **Delete**. You will be given an option to either confirm or cancel. Folder deletion is limited to empty folders.
-- **Book Actions:** EPUB and XTC files can also show options such as **Delete Cache** or **Mark Finished** from the same action menu.
+- **Book Actions:** EPUB, PDF, and XTC files can also show options such as **Delete Cache** or **Mark Finished** from the same action menu.
 
 ### 3.4 Recent Books Screen
 
@@ -241,7 +242,7 @@ device model and build.
 
 - **Hyphenation**: Whether to hyphenate text in Reading Mode; options are "ON" or "OFF".
 
-- **Reading Orientation**: Set the screen orientation for reading EPUB files:
+- **Reading Orientation**: Set the screen orientation for reflowable books:
   - "Portrait" (default) - Standard portrait orientation
   - "Landscape CW" - Landscape, rotated clockwise
   - "Portrait 180" - Portrait, upside down
@@ -255,7 +256,13 @@ device model and build.
   **Guide Dots** are directly available from the Reader settings. See
   [Reader Features](./reader-features.md) for their behavior.
 
-- **Customize Status Bar**: Configure the status bar displayed while reading:
+- **Images**: Whether to display supported embedded images found in reflowable books; options are "Display" (default), "Placeholder", or "Suppress".
+
+- **Bionic Reading**: Bolds the first part of each word to create visual fixation points. This can help improve reading speed and focus; options are "ON" or "OFF" (default).
+
+- **Guide Dots**: Adds guide dots between words; options are "ON" or "OFF" (default).
+
+- **Customise Status Bar**: Configure the status bar displayed while reading:
   - Chapter Page Count - Show/Hide the current page in the chapter (ex: 5/25). Page count may change based on the font size and margins set.
   - Book Progress Percentage - Show/Hide the current percent progress in the book.
   - Progress Bar - Show/Hide a progress bar for either the book or chapter.
@@ -550,6 +557,24 @@ See [SD Card Fonts](./sd-card-fonts.md) for full installation details and SD car
 
 Once you have opened a book, the button layout changes to facilitate reading.
 
+### Opening and Reading PDFs
+
+Select a `.pdf` file in **Browse Files** to open it. On the first open,
+CrossInk shows **Preparing PDF** while it creates a reflowable reading cache on
+the SD card. Preparation happens entirely on the reader and does not alter the
+source PDF. You can cancel and resume a valid preparation later.
+
+Supported PDFs use the reader's selected font, font size, margins, line
+spacing, orientation, and hyphenation. PDF point sizes and original page
+dimensions do not control the reading view. Outlines become chapter
+navigation, resolvable internal links remain usable, and progress is calculated
+from words reached across the extracted book.
+
+PDFs must contain selectable text or a usable OCR text layer. Image-only scans
+without OCR and password-protected PDFs cannot be opened. See
+[PDF Support](./docs/pdf-support.md) for document and image limits, cache
+behavior, and recovery guidance.
+
 ### Page Turning
 
 | Action            | Buttons                              |
@@ -570,7 +595,7 @@ This feature can be disabled in **Settings > Controls > Front Buttons** to help 
 
 ### Auto Page Turn
 
-Auto Page Turn automatically advances pages at a set interval, useful for hands-free reading. This feature can be enabled and configured from the **[Reader Menu](#5-reader-menu)** while reading an EPUB.
+Auto Page Turn automatically advances pages at a set interval, useful for hands-free reading. This feature can be enabled and configured from the **[Reader Menu](#5-reader-menu)** while reading a reflowable book.
 
 ### Tilt Page Turn (X3 and Sticky)
 
@@ -617,7 +642,7 @@ Available options include:
 - **View Bookmarks / Delete Bookmarks** – Manage existing bookmarks when the book has bookmarks.
 - **Take screenshot** – Save a screenshot of the current page to the `screenshots/` folder.
 - **Show page as QR** – Display a QR code encoding the current reading position.
-- **Delete Book Cache** – Clear the cached layout data for the current book, forcing a re-index on next open.
+- **Delete Book Cache** – Clear the prepared layout data for the current book, forcing a rebuild on next open. For PDFs, word progress, bookmarks, and clippings are preserved.
 - **Sync Progress** – Push or pull reading progress with a KOReader sync server (see [KOReader Sync Quick Setup](#367-koreader-sync-quick-setup)).
 - **Reading Stats** – Open the current book's reading stats.
 - **Mark Finished / Mark Unfinished** – Toggle whether the current book is marked as finished.
@@ -644,21 +669,20 @@ To create a bookmark, hold **Confirm** for 1 second while inside a book. A popup
 
 To open bookmarks, press **Confirm** while inside a book. Then navigate to the **Bookmarks** menu. Bookmarks can be opened by navigating to them and pressing **Confirm**, which will redirect you to that place in the book. You can delete bookmarks by holding **Confirm** for 1 second, and then pressing **Confirm** again to confirm deletion, or **Back** to cancel.
 
-Bookmarks are stored as per-book `.bin` files in the `.crosspoint/bookmarks` folder.
+Bookmarks are stored per book on the SD card. PDF bookmarks also retain a
+semantic text position so they can be restored after changing typography or
+rebuilding the prepared layout. See [Data Cache](./docs/data-cache.md) for the
+storage and cache-clearing behavior.
 
-### 5.3 Dictionary
+## 6. Format Limits
 
-Dictionary lookup supports word selection, recent per-book history, chained lookups from definitions, and per-book dictionary overrides. See the [Dictionary guide](./docs/dictionary.md) for installation and preparation instructions.
+CrossInk prioritizes reliable reading within the X3/X4 memory and display
+limits:
 
-## 6. Current Limitations & Roadmap
-
-Please note that this firmware is currently in active development. The following features are **not yet supported** but are planned for future updates:
-
-- **Cover Images:** Large cover images embedded into EPUB can take several
-  seconds to convert for the sleep screen and home-screen thumbnail. Use the
-  built-in [EPUB optimization](./webserver.md#epub-optimization) before upload
-  if a book is slow or memory-sensitive.
+- **PDFs:** A PDF needs selectable text or a usable OCR text layer. CrossInk does not run OCR, decrypt password-protected files, or reproduce fixed pages, forms, vector artwork, and complex magazine layouts. See [PDF Support](./docs/pdf-support.md).
+- **Cover Images:** Large cover images embedded into EPUB require several seconds (~10s for ~2000 pixel tall image) to convert for sleep screen and home screen thumbnail. Consider optimizing the EPUB with e.g. https://github.com/bigbag/epub-to-xtc-converter to speed this up.
 - **Unsupported Image Formats:** Most JPG and PNG images in EPUBs render correctly. GIFs and progressive JPEGs are not supported and will fall back to an `[Image]` placeholder.
+- **Dictionary Lookup:** Inline word lookup is unavailable.
 
 ---
 
@@ -711,4 +735,10 @@ Press **Ctrl-C** or close the graph window to exit.
 
 If the device is stuck in a bootloop, press and release the Reset button. Then, press and hold on to the configured Back button and the Power Button to boot to the Home Screen.
 
-There can be issues with broken cache or config. In this case, delete the `.crosspoint` directory on your SD card (or consider deleting only `settings.json`, `state.json`, or `epub_*` cache directories in the `.crosspoint/` folder).
+If cached reading data is damaged, use **Delete Book Cache** for one book or
+**Settings > System > Files & Cache > Clear Reading Cache** first. These actions
+preserve supported user state. Manual deletion of an `epub_*` directory clears
+that EPUB's cached data. Prefer the device action for `pdf_*` directories
+because PDF progress and saved items share the directory with prepared layout
+data. Deleting the entire `.crosspoint` directory also removes settings,
+networks, recent books, progress, bookmarks, clippings, and reading statistics.

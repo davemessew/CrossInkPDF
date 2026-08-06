@@ -1,0 +1,17 @@
+{
+  "error": null,
+  "fixture": "hidden_ocr",
+  "geometry_order": [
+    "Hidden OCR layer text."
+  ],
+  "image_hashes": {
+    "image-6-gray": "3efad976b6cadb87c7da03753e8b485335cb19111f23a0c5aea321094cac8629"
+  },
+  "outline_link_map": {
+    "links": [],
+    "outline": []
+  },
+  "transcript": "Hidden OCR layer text.",
+  "warning": null,
+  "word_count": 4
+}

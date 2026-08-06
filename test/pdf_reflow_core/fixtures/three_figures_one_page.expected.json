@@ -1,0 +1,21 @@
+{
+  "error": null,
+  "fixture": "three_figures_one_page",
+  "geometry_order": [
+    "First figure caption.",
+    "Second figure caption.",
+    "Third figure caption."
+  ],
+  "image_hashes": {
+    "image-6-flate-gray8": "03b722a15d4658be01f1eb9def5e8be124710cc0e88842f78107abfda3e23ea8",
+    "image-7-flate-gray8": "1fe056749338c5ee93d5ccfb6334c96585da9f9c69c4cc52fa60090ab856b166",
+    "image-8-flate-gray8": "b7d1b3a1104cc86b1cea310793cf777002db0517281d135a02de079b0ea87c23"
+  },
+  "outline_link_map": {
+    "links": [],
+    "outline": []
+  },
+  "transcript": "First figure caption. Second figure caption. Third figure caption.",
+  "warning": null,
+  "word_count": 9
+}

@@ -1,0 +1,434 @@
+// Historical executable upload oracle fixture.
+// Source: 3849685de92d90a7f3e4177e643ef43a4d45113c:src/network/CrossPointWebServer.cpp
+// Keep this bounded to functions extracted by legacy_transport_trace_test.js.
+bool isProtectedPath(const String& path) {
+  int start = 0;
+  while (start < (int)path.length()) {
+    if (path.charAt(start) == '/') {
+      start++;
+      continue;
+    }
+    int end = path.indexOf('/', start);
+    if (end == -1) end = path.length();
+    String segment = path.substring(start, end);
+    if (!SETTINGS.showHiddenFiles && segment.startsWith(".")) return true;
+    for (const auto* item : HIDDEN_ITEMS) {
+      if (segment.equals(item)) return true;
+    }
+    start = end + 1;
+  }
+  return false;
+}
+
+static bool flushUploadBuffer(CrossPointWebServer::UploadState& state) {
+  if (state.bufferPos > 0 && state.file) {
+    esp_task_wdt_reset();  // Reset watchdog before potentially slow SD write
+    const unsigned long writeStart = millis();
+    const size_t written = state.file.write(state.buffer.data(), state.bufferPos);
+    totalWriteTime += millis() - writeStart;
+    writeCount++;
+    esp_task_wdt_reset();  // Reset watchdog after SD write
+
+    if (written != state.bufferPos) {
+      LOG_DBG("WEB", "[UPLOAD] Buffer flush failed: expected %d, wrote %d", state.bufferPos, written);
+      state.bufferPos = 0;
+      return false;
+    }
+    state.bufferPos = 0;
+  }
+  return true;
+}
+
+void CrossPointWebServer::abortWsUpload(const char* tag) {
+  // Explicit close() required: file-scope global persists beyond function scope
+  wsUploadFile.close();
+  String filePath = wsUploadPath;
+  if (!filePath.endsWith("/")) filePath += "/";
+  filePath += wsUploadFileName;
+  if (Storage.remove(filePath.c_str())) {
+    LOG_DBG(tag, "Deleted incomplete upload: %s", filePath.c_str());
+  } else {
+    LOG_DBG(tag, "Failed to delete incomplete upload: %s", filePath.c_str());
+  }
+  wsUploadInProgress = false;
+  wsUploadClientNum = 255;
+  wsLastProgressSent = 0;
+}
+
+void CrossPointWebServer::stop() {
+  if (!running || !server) {
+    LOG_DBG("WEB", "stop() called but already stopped (running=%d, server=%p)", running, server.get());
+    return;
+  }
+
+  LOG_DBG("WEB", "STOP INITIATED - setting running=false first");
+  running = false;  // Set this FIRST to prevent handleClient from using server
+
+  LOG_DBG("WEB", "[MEM] Free heap before stop: %d bytes", ESP.getFreeHeap());
+
+  // Close any in-progress WebSocket upload and remove partial file
+  if (wsUploadInProgress && wsUploadFile) {
+    abortWsUpload("WEB");
+  }
+
+  // Stop WebSocket server
+  if (wsServer) {
+    LOG_DBG("WEB", "Stopping WebSocket server...");
+    wsServer->close();
+    wsServer.reset();
+    wsInstance = nullptr;
+    LOG_DBG("WEB", "WebSocket server stopped");
+  }
+
+  if (udpActive) {
+    udp.stop();
+    udpActive = false;
+  }
+
+  // Brief delay to allow any in-flight handleClient() calls to complete
+  delay(20);
+
+  server->stop();
+  LOG_DBG("WEB", "[MEM] Free heap after server->stop(): %d bytes", ESP.getFreeHeap());
+
+  // Brief delay before deletion
+  delay(10);
+
+  server.reset();
+  LOG_DBG("WEB", "Web server stopped and deleted");
+  LOG_DBG("WEB", "[MEM] Free heap after delete server: %d bytes", ESP.getFreeHeap());
+
+  // Note: Static upload variables (uploadFileName, uploadPath, uploadError) are declared
+  // later in the file and will be cleared when they go out of scope or on next upload
+  LOG_DBG("WEB", "[MEM] Free heap final: %d bytes", ESP.getFreeHeap());
+}
+
+void CrossPointWebServer::handleUpload(UploadState& state) const {
+  static size_t lastLoggedSize = 0;
+
+  // Reset watchdog at start of every upload callback - HTTP parsing can be slow
+  esp_task_wdt_reset();
+
+  // Safety check: ensure server is still valid
+  if (!running || !server) {
+    LOG_DBG("WEB", "[UPLOAD] ERROR: handleUpload called but server not running!");
+    return;
+  }
+
+  const HTTPUpload& upload = server->upload();
+
+  if (upload.status == UPLOAD_FILE_START) {
+    // Reset watchdog - this is the critical 1% crash point
+    esp_task_wdt_reset();
+
+    state.fileName = StringUtils::sanitizeFilename(upload.filename.c_str()).c_str();
+    state.size = 0;
+    state.success = false;
+    state.error = "";
+    uploadStartTime = millis();
+    lastLoggedSize = 0;
+    state.bufferPos = 0;
+    totalWriteTime = 0;
+    writeCount = 0;
+
+    // Get upload path from query parameter (defaults to root if not specified)
+    // Note: We use query parameter instead of form data because multipart form
+    // fields aren't available until after file upload completes
+    if (server->hasArg("path")) {
+      state.path = normalizeWebPath(server->arg("path"));
+    } else {
+      state.path = "/";
+    }
+
+    LOG_DBG("WEB", "[UPLOAD] START: %s to path: %s", state.fileName.c_str(), state.path.c_str());
+    LOG_DBG("WEB", "[UPLOAD] Free heap: %d bytes", ESP.getFreeHeap());
+
+    // Create file path
+    String filePath = state.path;
+    if (!filePath.endsWith("/")) filePath += "/";
+    filePath += state.fileName;
+
+    if (isProtectedPath(filePath)) {
+      state.error = "Access denied to protected path";
+      LOG_DBG("WEB", "[UPLOAD] FAILED: Access denied to protected path: %s", filePath.c_str());
+      return;
+    }
+
+    // Check if file already exists - SD operations can be slow
+    esp_task_wdt_reset();
+    if (Storage.exists(filePath.c_str())) {
+      LOG_DBG("WEB", "[UPLOAD] Overwriting existing file: %s", filePath.c_str());
+      esp_task_wdt_reset();
+      Storage.remove(filePath.c_str());
+    }
+
+    // Open file for writing - this can be slow due to FAT cluster allocation
+    esp_task_wdt_reset();
+    if (!Storage.openFileForWrite("WEB", filePath, state.file)) {
+      state.error = "Failed to create file on SD card";
+      LOG_DBG("WEB", "[UPLOAD] FAILED to create file: %s", filePath.c_str());
+      return;
+    }
+    esp_task_wdt_reset();
+
+    LOG_DBG("WEB", "[UPLOAD] File created successfully: %s", filePath.c_str());
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (state.file && state.error.isEmpty()) {
+      // Buffer incoming data and flush when buffer is full
+      // This reduces SD card write operations and improves throughput
+      const uint8_t* data = upload.buf;
+      size_t remaining = upload.currentSize;
+
+      while (remaining > 0) {
+        const size_t space = UploadState::UPLOAD_BUFFER_SIZE - state.bufferPos;
+        const size_t toCopy = (remaining < space) ? remaining : space;
+
+        memcpy(state.buffer.data() + state.bufferPos, data, toCopy);
+        state.bufferPos += toCopy;
+        data += toCopy;
+        remaining -= toCopy;
+
+        // Flush buffer when full
+        if (state.bufferPos >= UploadState::UPLOAD_BUFFER_SIZE) {
+          if (!flushUploadBuffer(state)) {
+            state.error = "Failed to write to SD card - disk may be full";
+            state.file.close();
+            return;
+          }
+        }
+      }
+
+      state.size += upload.currentSize;
+
+      // Log progress every 100KB
+      if (state.size - lastLoggedSize >= 102400) {
+        const unsigned long elapsed = millis() - uploadStartTime;
+        const float kbps = (elapsed > 0) ? (state.size / 1024.0) / (elapsed / 1000.0) : 0;
+        LOG_DBG("WEB", "[UPLOAD] %d bytes (%.1f KB), %.1f KB/s, %d writes", state.size, state.size / 1024.0, kbps,
+                writeCount);
+        lastLoggedSize = state.size;
+      }
+    }
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (state.file) {
+      // Flush any remaining buffered data
+      if (!flushUploadBuffer(state)) {
+        state.error = "Failed to write final data to SD card";
+      }
+      state.file.close();
+
+      if (state.error.isEmpty()) {
+        state.success = true;
+        const unsigned long elapsed = millis() - uploadStartTime;
+        const float avgKbps = (elapsed > 0) ? (state.size / 1024.0) / (elapsed / 1000.0) : 0;
+        const float writePercent = (elapsed > 0) ? (totalWriteTime * 100.0 / elapsed) : 0;
+        LOG_DBG("WEB", "[UPLOAD] Complete: %s (%d bytes in %lu ms, avg %.1f KB/s)", state.fileName.c_str(), state.size,
+                elapsed, avgKbps);
+        LOG_DBG("WEB", "[UPLOAD] Diagnostics: %d writes, total write time: %lu ms (%.1f%%)", writeCount, totalWriteTime,
+                writePercent);
+
+        // Clear epub cache to prevent stale metadata issues when overwriting files
+        String filePath = state.path;
+        if (!filePath.endsWith("/")) filePath += "/";
+        filePath += state.fileName;
+        clearBookCachePreservingUserState(filePath.c_str());
+      }
+    }
+  } else if (upload.status == UPLOAD_FILE_ABORTED) {
+    state.bufferPos = 0;  // Discard buffered data
+    if (state.file) {
+      state.file.close();
+      // Try to delete the incomplete file
+      String filePath = state.path;
+      if (!filePath.endsWith("/")) filePath += "/";
+      filePath += state.fileName;
+      Storage.remove(filePath.c_str());
+    }
+    state.error = "Upload aborted";
+    LOG_DBG("WEB", "Upload aborted");
+  }
+}
+
+void CrossPointWebServer::handleUploadPost(UploadState& state) const {
+  if (state.success) {
+    server->send(200, "text/plain", "File uploaded successfully: " + state.fileName);
+  } else {
+    const String error = state.error.isEmpty() ? "Unknown error during upload" : state.error;
+    server->send(400, "text/plain", error);
+  }
+}
+
+void CrossPointWebServer::onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
+  switch (type) {
+    case WStype_DISCONNECTED:
+      LOG_DBG("WS", "Client %u disconnected", num);
+      // Only clean up if this is the client that owns the active upload.
+      // A new client may have already started a fresh upload before this
+      // DISCONNECTED event fires (race condition on quick cancel + retry).
+      if (num == wsUploadClientNum && wsUploadInProgress && wsUploadFile) {
+        abortWsUpload("WS");
+      }
+      break;
+
+    case WStype_CONNECTED: {
+      LOG_DBG("WS", "Client %u connected", num);
+      break;
+    }
+
+    case WStype_TEXT: {
+      // Parse control messages
+      String msg = String((char*)payload);
+      LOG_DBG("WS", "Text from client %u: %s", num, msg.c_str());
+
+      if (msg.startsWith("START:")) {
+        // Reject any START while an upload is already active to prevent
+        // leaking the open wsUploadFile handle (owning client re-START included)
+        if (wsUploadInProgress) {
+          wsServer->sendTXT(num, "ERROR:Upload already in progress");
+          break;
+        }
+
+        // Parse: START:<filename>:<size>:<path>
+        int firstColon = msg.indexOf(':', 6);
+        int secondColon = msg.indexOf(':', firstColon + 1);
+
+        if (firstColon > 0 && secondColon > 0) {
+          wsUploadFileName = StringUtils::sanitizeFilename(msg.substring(6, firstColon).c_str()).c_str();
+          String sizeToken = msg.substring(firstColon + 1, secondColon);
+          bool sizeValid = sizeToken.length() > 0;
+          int digitStart = (sizeValid && sizeToken[0] == '+') ? 1 : 0;
+          if (digitStart > 0 && sizeToken.length() < 2) sizeValid = false;
+          for (int i = digitStart; i < (int)sizeToken.length() && sizeValid; i++) {
+            if (!isdigit((unsigned char)sizeToken[i])) sizeValid = false;
+          }
+          if (!sizeValid) {
+            LOG_DBG("WS", "START rejected: invalid size token '%s'", sizeToken.c_str());
+            wsServer->sendTXT(num, "ERROR:Invalid START format");
+            return;
+          }
+          wsUploadSize = sizeToken.toInt();
+          wsUploadPath = normalizeWebPath(msg.substring(secondColon + 1));
+          wsUploadReceived = 0;
+          wsLastProgressSent = 0;
+          wsUploadStartTime = millis();
+
+          // Build file path
+          String filePath = wsUploadPath;
+          if (!filePath.endsWith("/")) filePath += "/";
+          filePath += wsUploadFileName;
+
+          if (isProtectedPath(filePath)) {
+            wsServer->sendTXT(num, "ERROR:Access denied to protected path");
+            wsUploadInProgress = false;
+            wsUploadClientNum = 255;
+            return;
+          }
+
+          LOG_DBG("WS", "Starting upload: %s (%d bytes) to %s", wsUploadFileName.c_str(), wsUploadSize,
+                  filePath.c_str());
+
+          // Check if file exists and remove it
+          esp_task_wdt_reset();
+          if (Storage.exists(filePath.c_str())) {
+            Storage.remove(filePath.c_str());
+          }
+
+          // Open file for writing
+          esp_task_wdt_reset();
+          if (!Storage.openFileForWrite("WS", filePath, wsUploadFile)) {
+            wsServer->sendTXT(num, "ERROR:Failed to create file");
+            wsUploadInProgress = false;
+            wsUploadClientNum = 255;
+            return;
+          }
+          esp_task_wdt_reset();
+
+          // Zero-byte upload: complete immediately without waiting for BIN frames
+          if (wsUploadSize == 0) {
+            // Explicit close() required: file-scope global persists beyond function scope
+            wsUploadFile.close();
+            wsLastCompleteName = wsUploadFileName;
+            wsLastCompleteSize = 0;
+            wsLastCompleteAt = millis();
+            LOG_DBG("WS", "Zero-byte upload complete: %s", filePath.c_str());
+            clearBookCachePreservingUserState(filePath.c_str());
+            wsServer->sendTXT(num, "DONE");
+            wsLastProgressSent = 0;
+            break;
+          }
+
+          wsUploadClientNum = num;
+          wsUploadInProgress = true;
+          wsServer->sendTXT(num, "READY");
+        } else {
+          wsServer->sendTXT(num, "ERROR:Invalid START format");
+        }
+      }
+      break;
+    }
+
+    case WStype_BIN: {
+      if (!wsUploadInProgress || !wsUploadFile || num != wsUploadClientNum) {
+        wsServer->sendTXT(num, "ERROR:No upload in progress");
+        return;
+      }
+
+      // Write binary data directly to file
+      size_t remaining = wsUploadSize - wsUploadReceived;
+      if (length > remaining) {
+        abortWsUpload("WS");
+        wsServer->sendTXT(num, "ERROR:Upload overflow");
+        return;
+      }
+      esp_task_wdt_reset();
+      size_t written = wsUploadFile.write(payload, length);
+      esp_task_wdt_reset();
+
+      if (written != length) {
+        abortWsUpload("WS");
+        wsServer->sendTXT(num, "ERROR:Write failed - disk full?");
+        return;
+      }
+
+      wsUploadReceived += written;
+
+      // Send progress update (every 64KB or at end)
+      if (wsUploadReceived - wsLastProgressSent >= 65536 || wsUploadReceived >= wsUploadSize) {
+        String progress = "PROGRESS:" + String(wsUploadReceived) + ":" + String(wsUploadSize);
+        wsServer->sendTXT(num, progress);
+        wsLastProgressSent = wsUploadReceived;
+      }
+
+      // Check if upload complete
+      if (wsUploadReceived >= wsUploadSize) {
+        // Explicit close() required: file-scope global persists beyond function scope
+        wsUploadFile.close();
+        wsUploadInProgress = false;
+        wsUploadClientNum = 255;
+
+        wsLastCompleteName = wsUploadFileName;
+        wsLastCompleteSize = wsUploadSize;
+        wsLastCompleteAt = millis();
+
+        unsigned long elapsed = millis() - wsUploadStartTime;
+        float kbps = (elapsed > 0) ? (wsUploadSize / 1024.0) / (elapsed / 1000.0) : 0;
+
+        LOG_DBG("WS", "Upload complete: %s (%d bytes in %lu ms, %.1f KB/s)", wsUploadFileName.c_str(), wsUploadSize,
+                elapsed, kbps);
+
+        // Clear epub cache to prevent stale metadata issues when overwriting files
+        String filePath = wsUploadPath;
+        if (!filePath.endsWith("/")) filePath += "/";
+        filePath += wsUploadFileName;
+        clearBookCachePreservingUserState(filePath.c_str());
+
+        wsServer->sendTXT(num, "DONE");
+        wsLastProgressSent = 0;
+      }
+      break;
+    }
+
+    default:
+      break;
+  }
+}

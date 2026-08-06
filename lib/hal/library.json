@@ -1,0 +1,6 @@
+{
+  "name": "crossink-hardware-hal",
+  "version": "1.0.0",
+  "frameworks": "*",
+  "platforms": "*"
+}

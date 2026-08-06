@@ -5,6 +5,9 @@
 #include <vector>
 
 #include "./FileBrowserActivity.h"
+#if defined(CROSSINK_ENABLE_PDF) && CROSSINK_ENABLE_PDF
+#include "RecentBookProgress.h"
+#endif
 #include "activities/Activity.h"
 #include "activities/reader/BookReadingStats.h"
 #include "activities/reader/GlobalReadingStats.h"
@@ -63,6 +66,11 @@ class HomeActivity final : public Activity {
   // Per-book stats and progress cached at onEnter() to avoid SD reads during navigation.
   std::array<BookReadingStats, kMaxCachedBooks> cachedBookStats{};
   std::array<float, kMaxCachedBooks> cachedBookProgress{};
+#if defined(CROSSINK_ENABLE_PDF) && CROSSINK_ENABLE_PDF
+  std::array<std::string, kMaxCachedBooks> cachedBookChapters{};
+  std::array<bool, kMaxCachedBooks> cachedPdfProducts{};
+  RecentBookProgress::PdfProductCache pdfProductCache;
+#endif
   bool bookStatsCached = false;
 
   uint8_t* carouselFrames[kCarouselFrameCount] = {};
@@ -105,6 +113,9 @@ class HomeActivity final : public Activity {
   void showNextRecentBookOnHome();
   void updateHighlightedBookContext(bool allowEpubLoad = true);
   void loadRecentBooks(int maxBooks);
+#if defined(CROSSINK_ENABLE_PDF) && CROSSINK_ENABLE_PDF
+  void loadPdfRecentProducts();
+#endif
   void loadAllBookStats();
   void loadRecentCovers(int coverHeight);
 

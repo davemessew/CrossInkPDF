@@ -1,0 +1,17 @@
+{
+  "error": null,
+  "fixture": "repeated_bands",
+  "geometry_order": [
+    "First body.",
+    "Second body.",
+    "Third body."
+  ],
+  "image_hashes": {},
+  "outline_link_map": {
+    "links": [],
+    "outline": []
+  },
+  "transcript": "First body. Second body. Third body.",
+  "warning": "RepeatedBandsSuppressed",
+  "word_count": 6
+}

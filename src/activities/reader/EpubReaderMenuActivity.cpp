@@ -12,9 +12,7 @@
 #include "CrossPointSettings.h"
 #include "EpubReaderClippingListActivity.h"
 #include "MappedInputManager.h"
-#include "ReaderUtils.h"
-#include "components/TouchHeaderBackButton.h"
-#include "components/TouchRegistry.h"
+#include "ReflowCapabilityPolicy.h"
 #include "components/UITheme.h"
 #include "components/UIThemeTokens.h"
 #include "components/UiAppHelpers.h"
@@ -181,10 +179,11 @@ EpubReaderMenuActivity::EpubReaderMenuActivity(
     void* saveReaderSettingsContext, ReaderOptionsActivity::SaveGlobalSettingsCallback saveGlobalSettingsCallback,
     void* saveGlobalSettingsContext, ReaderOptionsActivity::GlobalSettingsEditCallback beginGlobalSettingsEditCallback,
     void* beginGlobalSettingsEditContext, const bool stablePageNumbersAvailable,
-    ReaderOptionsActivity::GlobalSettingsEditCallback endGlobalSettingsEditCallback, void* endGlobalSettingsEditContext)
+    ReaderOptionsActivity::GlobalSettingsEditCallback endGlobalSettingsEditCallback, void* endGlobalSettingsEditContext,
+    const ReflowCapabilitySet documentCapabilities)
     : Activity("EpubReaderMenu", renderer, mappedInput),
       menuItems(buildMenuItems(hasFootnotes, hasBookmarks, hasClippings, isCurrentPageBookmarked, isBookCompleted,
-                               showReadingPaceReset, hasDictionary)),
+                               showReadingPaceReset, documentCapabilities)),
       title(title),
       pendingOrientation(currentOrientation),
       currentPage(currentPage),
@@ -206,15 +205,20 @@ EpubReaderMenuActivity::EpubReaderMenuActivity(
 
 EpubReaderMenuActivity::TabMenuItems EpubReaderMenuActivity::buildMenuItems(
     bool hasFootnotes, bool hasBookmarks, bool hasClippings, bool isCurrentPageBookmarked, bool isBookCompleted,
-    bool showReadingPaceReset, bool hasDictionary) {
+    bool showReadingPaceReset, ReflowCapabilitySet documentCapabilities) {
   TabMenuItems items;
   auto& mainItems = items[MAIN_TAB_INDEX];
   auto& bookmarkItems = items[BOOKMARKS_TAB_INDEX];
   auto& settingsItems = items[SETTINGS_TAB_INDEX];
 
-  mainItems.reserve(9 + (hasFootnotes ? 1u : 0u) + (hasDictionary ? 2u : 0u));
-  bookmarkItems.reserve(9 + (hasBookmarks ? 2u : 0u) + (hasClippings ? 1u : 0u));
-  settingsItems.reserve(3 + (showReadingPaceReset ? 1u : 0u));
+  mainItems.reserve(8 + (hasFootnotes ? 1u : 0u));
+  const bool showExternalSync =
+      reflowSupportsMenuAction(documentCapabilities, ReflowReaderSyncAction::ExternalProgress);
+  const bool showNearbySync = reflowSupportsMenuAction(documentCapabilities, ReflowReaderSyncAction::NearbyProgress);
+  const bool showSavedItems = reflowSupportsSavedItems(documentCapabilities);
+  bookmarkItems.reserve(2 + (showExternalSync ? 1u : 0u) + (showNearbySync ? 1u : 0u) + (showSavedItems ? 2u : 0u) +
+                        (showSavedItems && hasBookmarks ? 2u : 0u) + (showSavedItems && hasClippings ? 1u : 0u));
+  settingsItems.reserve(2 + (showReadingPaceReset ? 1u : 0u));
 
   if (hasFootnotes) {
     mainItems.push_back({MenuAction::FOOTNOTES, StrId::STR_FOOTNOTES});
@@ -231,18 +235,24 @@ EpubReaderMenuActivity::TabMenuItems EpubReaderMenuActivity::buildMenuItems(
   mainItems.push_back({MenuAction::READING_STATS, StrId::STR_READING_STATS});
   mainItems.push_back(
       {MenuAction::TOGGLE_COMPLETED, isBookCompleted ? StrId::STR_MARK_UNFINISHED : StrId::STR_MARK_FINISHED});
-  bookmarkItems.push_back({MenuAction::SYNC, StrId::STR_SYNC_PROGRESS});
-  bookmarkItems.push_back({MenuAction::NEARBY_POSITION_SYNC, StrId::STR_NEARBY_POSITION_SYNC});
-  bookmarkItems.push_back({MenuAction::SEND_NEARBY_BOOK, StrId::STR_SEND_NEARBY_BOOK});
-  bookmarkItems.push_back({MenuAction::SAVE_CLIPPING, StrId::STR_SAVE_CLIPPING});
-  if (hasClippings) {
-    bookmarkItems.push_back({MenuAction::VIEW_CLIPPINGS, StrId::STR_VIEW_CLIPPINGS});
+
+  if (showExternalSync) {
+    bookmarkItems.push_back({MenuAction::SYNC, StrId::STR_SYNC_PROGRESS});
   }
-  bookmarkItems.push_back(
-      {MenuAction::BOOKMARK_TOGGLE, isCurrentPageBookmarked ? StrId::STR_REMOVE_BOOKMARK : StrId::STR_ADD_BOOKMARK});
-  if (hasBookmarks) {
-    bookmarkItems.push_back({MenuAction::VIEW_BOOKMARKS, StrId::STR_VIEW_BOOKMARKS});
-    bookmarkItems.push_back({MenuAction::DELETE_BOOKMARKS, StrId::STR_DELETE_BOOKMARKS});
+  if (showNearbySync) {
+    bookmarkItems.push_back({MenuAction::NEARBY_POSITION_SYNC, StrId::STR_NEARBY_POSITION_SYNC});
+  }
+  if (showSavedItems) {
+    bookmarkItems.push_back({MenuAction::SAVE_CLIPPING, StrId::STR_SAVE_CLIPPING});
+    if (hasClippings) {
+      bookmarkItems.push_back({MenuAction::VIEW_CLIPPINGS, StrId::STR_VIEW_CLIPPINGS});
+    }
+    bookmarkItems.push_back(
+        {MenuAction::BOOKMARK_TOGGLE, isCurrentPageBookmarked ? StrId::STR_REMOVE_BOOKMARK : StrId::STR_ADD_BOOKMARK});
+    if (hasBookmarks) {
+      bookmarkItems.push_back({MenuAction::VIEW_BOOKMARKS, StrId::STR_VIEW_BOOKMARKS});
+      bookmarkItems.push_back({MenuAction::DELETE_BOOKMARKS, StrId::STR_DELETE_BOOKMARKS});
+    }
   }
   bookmarkItems.push_back({MenuAction::SCREENSHOT, StrId::STR_SCREENSHOT_BUTTON});
   bookmarkItems.push_back({MenuAction::DISPLAY_QR, StrId::STR_DISPLAY_QR});

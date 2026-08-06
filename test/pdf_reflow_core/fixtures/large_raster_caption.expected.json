@@ -1,0 +1,15 @@
+{
+  "error": null,
+  "fixture": "large_raster_caption",
+  "geometry_order": [
+    "Large raster caption."
+  ],
+  "image_hashes": {},
+  "outline_link_map": {
+    "links": [],
+    "outline": []
+  },
+  "transcript": "Large raster caption.",
+  "warning": null,
+  "word_count": 3
+}

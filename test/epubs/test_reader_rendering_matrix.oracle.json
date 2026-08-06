@@ -1,0 +1,118 @@
+{
+  "fixture": "test_reader_rendering_matrix.epub",
+  "oracle": {
+    "bookmark": {
+      "chapter": "Inline Styles and Text Decoration",
+      "page_count": 3,
+      "progress_millionths": 333333,
+      "section_index": 2,
+      "snippet": "struck text and plain text after. Already bold full sentence sh"
+    },
+    "frames": {
+      "first": {
+        "framebuffer_hash": "7CA29CCA4042D6CF",
+        "page_count": 2,
+        "page_index": 0,
+        "section_index": 0,
+        "text": "Reader Rendering Matrix Use this EPUB as a visual smoke test after changing the reader layout, parser, font, cache, guide dots, bionic reading, hyphenation, or embedded-style behavior. Recommended pass: open each chapter with Embedded Style ON, then repeat the alignment chapter with Embedded Style OFF and with Reader Paragraph Alignment set to Left, Center, Right, Justify, and Book's Style. Also toggle Guide Dots, Bionic Reading, Extra Paragraph Spacing, Force Paragraph Indents, and Hyphenation while"
+      },
+      "last": {
+        "framebuffer_hash": "886EF3AF92E7C0F0",
+        "page_count": 4,
+        "page_index": 3,
+        "section_index": 4,
+        "text": "nonbreaking space A   B, middle dot \u00b7, em dash \u2014, curly quotes \u201cquoted\u201d, and apostrophe \u2019. Accented and non-English text: cafe, caf\u00e9, naive, jalapeno, facade, Sao Paulo, Krakow, Zurich. These should render or fall back without corrupting the line."
+      },
+      "middle": {
+        "framebuffer_hash": "59AC8316F54DBE42",
+        "page_count": 3,
+        "page_index": 1,
+        "section_index": 2,
+        "text": "struck text and plain text after. Already bold full sentence should stay bold from start to finish, including the final word. This sentence mixes bold , italic , underline , strike , bold italic , and normal text in one paragraph. This justified paragraph contains bold words , italic words , underlined words , and struck words . Guide dots should still appear between the visible word groups when enabled. This paragraph has small inline text and large inline text to check line height, baseline placement, and clipping around mixed font sizes. This paragraph contains nested"
+      }
+    },
+    "metadata": {
+      "author": "CrossPoint Test Fixture",
+      "language": "en",
+      "title": "Test: Reader Rendering Matrix"
+    },
+    "progress": {
+      "book_millionths": 430450,
+      "page_count": 3,
+      "page_index": 1,
+      "section_index": 2
+    },
+    "resume": {
+      "framebuffer_hash": "59AC8316F54DBE42",
+      "text": "struck text and plain text after. Already bold full sentence should stay bold from start to finish, including the final word. This sentence mixes bold , italic , underline , strike , bold italic , and normal text in one paragraph. This justified paragraph contains bold words , italic words , underlined words , and struck words . Guide dots should still appear between the visible word groups when enabled. This paragraph has small inline text and large inline text to check line height, baseline placement, and clipping around mixed font sizes. This paragraph contains nested"
+    },
+    "schema_version": 1,
+    "section_cache": {
+      "bytes": 23381,
+      "fnv1a64": "4C6301D7AC85FA08"
+    },
+    "section_count": 5,
+    "section_page_counts": [
+      2,
+      4,
+      3,
+      6,
+      4
+    ],
+    "selected_toc": [
+      {
+        "anchor": "",
+        "href": "OEBPS/chapter1.xhtml",
+        "index": 0,
+        "level": 1,
+        "resolved_spine_index": 0,
+        "spine_index": 0,
+        "title": "How to Use This Fixture"
+      },
+      {
+        "anchor": "",
+        "href": "OEBPS/chapter3.xhtml",
+        "index": 2,
+        "level": 1,
+        "resolved_spine_index": 2,
+        "spine_index": 2,
+        "title": "Inline Styles and Text Decoration"
+      },
+      {
+        "anchor": "",
+        "href": "OEBPS/chapter5.xhtml",
+        "index": 4,
+        "level": 1,
+        "resolved_spine_index": 4,
+        "spine_index": 4,
+        "title": "Blocks, Lists, Tables, and Edge Cases"
+      }
+    ],
+    "settings": {
+      "embedded_style": 1,
+      "font_family": 0,
+      "font_id": -1406445118,
+      "font_size": 2,
+      "hyphenation": 0,
+      "line_height_percent": 100,
+      "orientation": 0,
+      "screen_height": 800,
+      "screen_margin": 5,
+      "screen_width": 480,
+      "text_antialiasing": 0
+    },
+    "streamed_xhtml": {
+      "bytes": 11057,
+      "fnv1a64": "06E64AC4EE355504"
+    },
+    "viewport": {
+      "bottom": 8,
+      "height": 778,
+      "left": 8,
+      "right": 8,
+      "top": 14,
+      "width": 464
+    }
+  },
+  "schema_version": 1
+}

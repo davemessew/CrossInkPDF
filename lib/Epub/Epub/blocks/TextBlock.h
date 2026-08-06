@@ -42,8 +42,10 @@ class TextBlock final : public Block {
  public:
   static constexpr uint8_t WORD_FLAG_BACKGROUND_BLACK = 0x01;
   static constexpr uint8_t WORD_FLAG_INSERTED_HYPHEN = 0x02;
-  static constexpr uint8_t WORD_FLAG_LINK_ID_SHIFT = 2;
-  static constexpr uint8_t WORD_FLAG_LINK_ID_MASK = 0xFC;
+  // Layout-only semantic flags are emitted only for PDF reflow pages. EPUB
+  // callers leave them unset, preserving their v44 serialized bytes.
+  static constexpr uint8_t WORD_FLAG_SEMANTIC_ATTACHES = 0x04;
+  static constexpr uint8_t WORD_FLAG_SEMANTIC_SPLIT_CONTINUATION = 0x08;
 
   explicit TextBlock(const std::vector<std::string>& words, const std::vector<int16_t>& wordXpos,
                      const std::vector<EpdFontFamily::Style>& wordStyles, const std::vector<uint8_t>& bionicBoundary,

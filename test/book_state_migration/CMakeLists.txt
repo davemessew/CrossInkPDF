@@ -1,0 +1,49 @@
+cmake_minimum_required(VERSION 3.16)
+
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  project(book_state_migration_tests CXX)
+
+  set(CMAKE_CXX_STANDARD 17)
+  set(CMAKE_CXX_STANDARD_REQUIRED ON)
+  set(CMAKE_CXX_EXTENSIONS OFF)
+
+  include(FetchContent)
+  FetchContent_Declare(
+    googletest
+    GIT_REPOSITORY https://github.com/google/googletest.git
+    GIT_TAG v1.17.0
+  )
+  set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+  set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
+  set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)
+  FetchContent_MakeAvailable(googletest)
+
+  enable_testing()
+  include(GoogleTest)
+
+  get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+endif()
+
+add_executable(BookStateMigrationJournalTest
+  ${REPO_ROOT}/lib/BookStateMigration/BookStateMigrationJournal.cpp
+  BookStateMigrationJournalTest.cpp
+)
+
+target_include_directories(BookStateMigrationJournalTest PRIVATE
+  ${REPO_ROOT}/lib/BookStateMigration
+)
+
+target_link_libraries(BookStateMigrationJournalTest PRIVATE
+  GTest::gtest_main
+)
+
+target_compile_options(BookStateMigrationJournalTest PRIVATE
+  -Wall
+  -Wextra
+  -Werror
+  -pedantic
+  -fno-exceptions
+  -fno-rtti
+)
+
+gtest_discover_tests(BookStateMigrationJournalTest TEST_PREFIX "BookStateMigration")

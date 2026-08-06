@@ -5,9 +5,9 @@ nav_order: 5
 
 # Reader Features
 
-This page covers a subset of CrossInk reader features that go beyond basic page turning. It is not a complete list of every reader setting or action. For a more complete list of features as they were released, see the [releases page](https://github.com/uxjulia/CrossInk/releases).
-
-The sections here focus on larger CrossInk-specific reader features. Small fixes, implementation details, and features that only arrived from upstream CrossPoint are intentionally left out.
+CrossInk adds reading controls, navigation, saved items, and reading statistics
+designed for the X3 and X4. Version-by-version changes are available on the
+[releases page](https://github.com/uxjulia/CrossInk/releases).
 
 ## In-book Reader Options
 
@@ -30,6 +30,22 @@ Changes take effect immediately.
 For books that are slow to index or fail because of complex publisher styling,
 see [EPUB Indexing Methods](./epub-indexing.md) and
 [EPUB Render Modes](./epub-render-modes.md).
+
+## Reflowable PDF Reading
+
+Supported PDFs open as reflowable books rather than fixed page images. CrossInk
+extracts readable content on the device, then lays it out with the selected
+reader font, size, margins, spacing, orientation, and hyphenation.
+
+PDF outlines, resolvable internal links, contents and index text, publisher page
+labels, meaningful supported raster images, word-based progress, bookmarks, and
+clippings remain connected to the reading flow. The first open prepares a safe,
+resumable cache; later opens normally reuse it.
+
+PDFs need selectable text or a usable OCR text layer. CrossInk does not decrypt
+password-protected files, run OCR, or display fixed pages with zoom and pan.
+See [PDF Support](./pdf-support.md) for supported document and image limits,
+first-open behavior, and recovery help.
 
 ## Font Sizes And Downloadable Font Ranges
 
@@ -104,7 +120,7 @@ Use **Reset Reading Pace** if the estimate was trained by unusual reading behavi
 
 ## Bookmarks
 
-CrossInk supports EPUB bookmarks from the reader.
+CrossInk supports bookmarks in EPUB and supported PDF books from the reader.
 
 You can:
 
@@ -116,7 +132,7 @@ You can:
 
 ## Clippings And Highlights
 
-CrossInk supports EPUB text clippings from the reader. Use **Create Clipping**
+CrossInk supports text clippings in EPUB and supported PDF books. Use **Create Clipping**
 from the reader menu, select text on the current page, and save it.
 
 On button devices, move the cursor with the direction buttons, press **Select**
