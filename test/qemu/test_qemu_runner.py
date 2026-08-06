@@ -206,8 +206,34 @@ class QemuRunnerTest(unittest.TestCase):
                 kind="open",
                 mode="read",
                 request=0,
-                total_us=12500,
-                callback_us=12000,
+                total_us=16500,
+                callback_us=16000,
+                nonio_us=500,
+            ),
+            self._slow_atom(
+                kind="open",
+                mode="readwrite",
+                request=0,
+                total_us=36500,
+                callback_us=36000,
+                nonio_us=500,
+            ),
+            self._slow_atom(
+                calls=4,
+                kind="multiple",
+                mode="read",
+                request=1024,
+                total_us=36500,
+                callback_us=36000,
+                nonio_us=500,
+            ),
+            self._slow_atom(
+                calls=5,
+                kind="multiple",
+                mode="readwrite",
+                request=1024,
+                total_us=16500,
+                callback_us=16000,
                 nonio_us=500,
             ),
         )
@@ -233,8 +259,8 @@ class QemuRunnerTest(unittest.TestCase):
                 kind="open",
                 mode="read",
                 request=0,
-                total_us=12501,
-                callback_us=12001,
+                total_us=16501,
+                callback_us=16001,
                 nonio_us=500,
             ),
             self._slow_atom(total_us=8502, callback_us=8001, nonio_us=501),
@@ -242,7 +268,14 @@ class QemuRunnerTest(unittest.TestCase):
             self._slow_atom(calls=2),
             self._slow_atom(recursive=1),
             self._slow_atom(kind="multiple"),
-            self._slow_atom(kind="open", mode="readwrite", request=0),
+            self._slow_atom(
+                kind="open",
+                mode="readwrite",
+                request=0,
+                total_us=36501,
+                callback_us=36001,
+                nonio_us=500,
+            ),
             self._slow_atom(kind="read"),
         )
         for line in rejected:
@@ -509,7 +542,7 @@ class QemuRunnerTest(unittest.TestCase):
         exact_cases = {
             "write_count": [write] * 22,
             "rename_count": [rename] * 2,
-            "open_read_count": [open_read] * 2,
+            "open_read_count": [open_read] * 8,
             "request_bytes": [
                 {**write, "request": 1024},
                 {**write, "request": 1024},
@@ -539,7 +572,7 @@ class QemuRunnerTest(unittest.TestCase):
                 }
             ]
             * 10,
-            "total_count": [write] * 22 + [rename] * 2 + [open_read] * 2,
+            "total_count": [write] * 22 + [rename] * 2 + [open_read] * 8,
         }
         for name, atoms in exact_cases.items():
             with self.subTest(exact=name):
@@ -548,7 +581,7 @@ class QemuRunnerTest(unittest.TestCase):
         one_over_cases = {
             "write_count": [write] * 23,
             "rename_count": [rename] * 3,
-            "open_read_count": [open_read] * 3,
+            "open_read_count": [open_read] * 9,
             "request_bytes": exact_cases["request_bytes"] + [write],
             "callback_us": [
                 {

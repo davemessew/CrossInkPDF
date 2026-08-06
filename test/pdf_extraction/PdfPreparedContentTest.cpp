@@ -326,6 +326,27 @@ TEST(PdfPreparedContentStreams, DecodesRawAndFlateStreamsIntoStableDeclaredRange
   EXPECT_EQ(decodedStore.resetCount(), 1U);
 }
 
+TEST(PdfPreparedContentStreams, AppendsWithoutResetAndReturnsOnlyTheNewRange) {
+  PdfTestByteSource source(std::vector<uint8_t>{'n', 'e', 'w'});
+  const PdfEncodedContentStream stream{source.source(), {}, 0};
+  CountingByteStore store{32, 5};
+  std::array<uint8_t, PdfLimits::SourceBufferBytes> sourceBuffer{};
+  std::array<uint8_t, PdfLimits::DecoderOutputBytes> outputBuffer{};
+  std::array<uint8_t, PdfLimits::UzlibDictionaryBytes> dictionary{};
+  PdfPreparedContentStreams prepared(
+      {sourceBuffer.data(), sourceBuffer.size(), outputBuffer.data(), outputBuffer.size(), dictionary.data(),
+       dictionary.size()});
+
+  ASSERT_TRUE(prepared.beginAppend(&stream, 1, store.store(), 5).ok());
+  const PdfStepResult result = runPrepared(prepared);
+  ASSERT_TRUE(result.complete()) << "error=" << static_cast<int>(result.status.error)
+                                 << " offset=" << result.status.offset;
+  ASSERT_EQ(prepared.count(), 1U);
+  EXPECT_EQ(prepared.decodedBytes(), 8U);
+  EXPECT_EQ(prepared.sources()[0].size, 3U);
+  EXPECT_EQ(store.length, 8U);
+}
+
 TEST(PdfPreparedContentStreams, ClearsPartialSpoolBeforeReportingRequiredStreamFailure) {
   static constexpr char first[] = "first decoded bytes";
   static constexpr char unsupported[] = "unsupported bytes";

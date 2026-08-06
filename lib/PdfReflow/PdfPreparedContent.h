@@ -21,6 +21,8 @@ class PdfPreparedContentStreams {
 
   PdfStatus begin(const PdfEncodedContentStream* streams, uint8_t count, PdfByteStore decodedStore,
                   PdfStreamDecodeLimits limits = {});
+  PdfStatus beginAppend(const PdfEncodedContentStream* streams, uint8_t count, PdfByteStore decodedStore,
+                        uint64_t existingBytes, PdfStreamDecodeLimits limits = {});
   PdfStepResult step(PdfWorkBudget& budget);
 
   const PdfByteSource* sources() const { return sources_; }
@@ -41,6 +43,8 @@ class PdfPreparedContentStreams {
   };
 
   PdfStepResult fail(PdfStatus status);
+  PdfStatus beginInternal(const PdfEncodedContentStream* streams, uint8_t count, PdfByteStore decodedStore,
+                          uint64_t existingBytes, bool resetStore, PdfStreamDecodeLimits limits);
 
   PdfStreamDecoder decoder_;
   const PdfEncodedContentStream* streams_ = nullptr;

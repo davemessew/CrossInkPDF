@@ -321,6 +321,136 @@ PdfStatus pdfEncodeMetadata(const PdfMetadata& metadata, const PdfMetadataSectio
   return status ? encoder.finish() : status;
 }
 
+PdfStepResult pdfStepEncodeMetadata(const PdfMetadata& metadata, const PdfMetadataSectionSource& sections,
+                                    const PdfByteSink& destination, PdfMetadataEncodeRuntime& runtime,
+                                    PdfWorkBudget& budget) {
+  if (!destination.valid() || !validMetadata(metadata, sections)) {
+    return PdfStepResult::failure(PdfStatus::failure(PdfError::InvalidArgument));
+  }
+  if (runtime.stage == PdfMetadataEncodeStage::Complete) {
+    return PdfStepResult::completed();
+  }
+  if (budget.stopRequested() || budget.operationsRemaining == 0 || budget.bytesRemaining == 0) {
+    return PdfStepResult::paused();
+  }
+
+  const auto writeChunk = [&](const uint8_t* bytes, const size_t length, const bool includeInCrc) -> PdfStepResult {
+    const size_t chunk = std::min<size_t>(length, PdfMetadataLimits::IoChunkBytes);
+    if (chunk == 0) {
+      return PdfStepResult::completed();
+    }
+    if (budget.operationsRemaining == 0 || budget.bytesRemaining < chunk || budget.stopRequested()) {
+      return PdfStepResult::paused();
+    }
+    (void)budget.consumeOperation();
+    (void)budget.takeBytes(chunk);
+    const PdfStatus status = pdfWriteExact(destination, bytes, chunk);
+    if (!status) {
+      return PdfStepResult::failure(status);
+    }
+    if (includeInCrc) {
+      runtime.crc32 = pdfCacheCrc32(bytes, chunk, runtime.crc32);
+    }
+    return PdfStepResult::completed();
+  };
+
+  if (runtime.stage == PdfMetadataEncodeStage::Header) {
+    uint8_t header[kHeaderBytes]{};
+    std::memcpy(header, kMagic, sizeof(kMagic));
+    putU16(header + 4, PdfMetadataLimits::CodecVersion);
+    putU16(header + 6, static_cast<uint16_t>(kHeaderBytes));
+    putU16(header + 8, metadata.sectionCount);
+    putU16(header + 10, metadata.outlineCount);
+    putU32(header + 12, metadata.totalWords);
+    putU16(header + 16, metadata.titleLength);
+    putU16(header + 18, metadata.authorLength);
+    putU16(header + 20, metadata.languageLength);
+    const PdfStepResult written = writeChunk(header, sizeof(header), true);
+    if (written.complete()) {
+      runtime.stage = PdfMetadataEncodeStage::Title;
+    }
+    return written.complete() ? PdfStepResult::paused() : written;
+  }
+
+  const auto writeField = [&](const uint8_t* bytes, const uint16_t length,
+                              const PdfMetadataEncodeStage next) -> PdfStepResult {
+    if (runtime.fieldOffset >= length) {
+      runtime.fieldOffset = 0;
+      runtime.stage = next;
+      return PdfStepResult::paused();
+    }
+    const PdfStepResult written = writeChunk(bytes + runtime.fieldOffset, length - runtime.fieldOffset, true);
+    if (written.complete()) {
+      runtime.fieldOffset = static_cast<uint16_t>(
+          runtime.fieldOffset + std::min<size_t>(length - runtime.fieldOffset, PdfMetadataLimits::IoChunkBytes));
+      if (runtime.fieldOffset == length) {
+        runtime.fieldOffset = 0;
+        runtime.stage = next;
+      }
+    }
+    return written.complete() ? PdfStepResult::paused() : written;
+  };
+
+  if (runtime.stage == PdfMetadataEncodeStage::Title) {
+    return writeField(reinterpret_cast<const uint8_t*>(metadata.title), metadata.titleLength,
+                      PdfMetadataEncodeStage::Author);
+  }
+  if (runtime.stage == PdfMetadataEncodeStage::Author) {
+    return writeField(reinterpret_cast<const uint8_t*>(metadata.author), metadata.authorLength,
+                      PdfMetadataEncodeStage::Language);
+  }
+  if (runtime.stage == PdfMetadataEncodeStage::Language) {
+    return writeField(reinterpret_cast<const uint8_t*>(metadata.language), metadata.languageLength,
+                      PdfMetadataEncodeStage::Sections);
+  }
+
+  if (runtime.stage == PdfMetadataEncodeStage::Sections) {
+    if (runtime.sectionIndex >= sections.count) {
+      if (runtime.cumulativeWords != metadata.totalWords) {
+        return PdfStepResult::failure(PdfStatus::failure(PdfError::Malformed, runtime.cumulativeWords));
+      }
+      runtime.stage = PdfMetadataEncodeStage::Crc;
+      return PdfStepResult::paused();
+    }
+    if (budget.operationsRemaining < 4U || budget.bytesRemaining < kSectionBytes ||
+        !budget.consumeOperation() || budget.takeBytes(kSectionBytes) != kSectionBytes) {
+      return PdfStepResult::paused();
+    }
+    PdfMetadataSection section{};
+    PdfStatus status = sections.read(sections.context, runtime.sectionIndex, &section);
+    if (status) {
+      status = validateSection(metadata, section, runtime.sectionIndex, runtime.cumulativeBytes,
+                               runtime.cumulativeWords);
+    }
+    if (!status) {
+      return PdfStepResult::failure(status);
+    }
+    uint8_t encoded[kSectionBytes]{};
+    encodeSection(section, encoded);
+    status = pdfWriteExact(destination, encoded, sizeof(encoded));
+    if (!status) {
+      return PdfStepResult::failure(status);
+    }
+    runtime.crc32 = pdfCacheCrc32(encoded, sizeof(encoded), runtime.crc32);
+    runtime.cumulativeBytes = section.cumulativeSize;
+    runtime.cumulativeWords += section.wordCount;
+    ++runtime.sectionIndex;
+    return PdfStepResult::paused();
+  }
+
+  if (runtime.stage == PdfMetadataEncodeStage::Crc) {
+    uint8_t encoded[kCrcBytes]{};
+    putU32(encoded, runtime.crc32);
+    const PdfStepResult written = writeChunk(encoded, sizeof(encoded), false);
+    if (written.complete()) {
+      runtime.stage = PdfMetadataEncodeStage::Complete;
+      return PdfStepResult::completed();
+    }
+    return written;
+  }
+  return PdfStepResult::failure(PdfStatus::failure(PdfError::InvalidArgument));
+}
+
 PdfStatus pdfInspectMetadata(const PdfByteSource& source, PdfMetadata* const metadata) {
   if (!source.valid() || metadata == nullptr || source.size < kHeaderBytes + kCrcBytes) {
     return PdfStatus::failure(PdfError::InvalidArgument);

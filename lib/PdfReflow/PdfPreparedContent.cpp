@@ -9,12 +9,25 @@ PdfPreparedContentStreams::PdfPreparedContentStreams(const PdfStreamDecoderWorks
 
 PdfStatus PdfPreparedContentStreams::begin(const PdfEncodedContentStream* const streams, const uint8_t count,
                                            const PdfByteStore decodedStore, const PdfStreamDecodeLimits limits) {
+  return beginInternal(streams, count, decodedStore, 0, true, limits);
+}
+
+PdfStatus PdfPreparedContentStreams::beginAppend(const PdfEncodedContentStream* const streams, const uint8_t count,
+                                                 const PdfByteStore decodedStore, const uint64_t existingBytes,
+                                                 const PdfStreamDecodeLimits limits) {
+  return beginInternal(streams, count, decodedStore, existingBytes, false, limits);
+}
+
+PdfStatus PdfPreparedContentStreams::beginInternal(const PdfEncodedContentStream* const streams,
+                                                   const uint8_t count, const PdfByteStore decodedStore,
+                                                   const uint64_t existingBytes, const bool resetStore,
+                                                   const PdfStreamDecodeLimits limits) {
   streams_ = nullptr;
   streamCount_ = 0;
   decodedStore_ = {};
   limits_ = {};
   failure_ = PdfStatus::success();
-  decodedBytes_ = 0;
+  decodedBytes_ = existingBytes;
   streamIndex_ = 0;
   finalizeIndex_ = 0;
   storeReady_ = false;
@@ -27,7 +40,7 @@ PdfStatus PdfPreparedContentStreams::begin(const PdfEncodedContentStream* const 
   }
 
   if (streams == nullptr || count == 0 || !decodedStore.valid() || decodedStore.capacity == 0 ||
-      limits.maxExpandedBytes == 0 || limits.maxExpansionRatio == 0) {
+      existingBytes > decodedStore.capacity || limits.maxExpandedBytes == 0 || limits.maxExpansionRatio == 0) {
     return PdfStatus::failure(PdfError::InvalidArgument);
   }
   if (count > MaxSources) {
@@ -50,7 +63,7 @@ PdfStatus PdfPreparedContentStreams::begin(const PdfEncodedContentStream* const 
       limits_.maxExpandedBytes, PdfLimits::MaxExpandedRequiredStreamBytes);
   limits_.maxExpansionRatio = std::min<uint16_t>(
       limits_.maxExpansionRatio, PdfLimits::MaxExpansionRatio);
-  phase_ = Phase::ResetStore;
+  phase_ = resetStore ? Phase::ResetStore : Phase::BeginStream;
   return PdfStatus::success();
 }
 

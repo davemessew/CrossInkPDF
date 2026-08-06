@@ -8,13 +8,13 @@
     "static_dram": 12288
   },
   "measurements": {
-    "code_rodata": 5376104,
-    "max_allocation": 0,
-    "min_free_heap": 119364,
-    "min_largest_block": 114676,
-    "min_stack_margin": 14148,
-    "peak_heap": 40280,
-    "static_dram": 95896
+    "code_rodata": 5930482,
+    "max_allocation": 32768,
+    "min_free_heap": 54200,
+    "min_largest_block": 47092,
+    "min_stack_margin": 9204,
+    "peak_heap": 105156,
+    "static_dram": 96056
   },
   "resource_fingerprint": {
     "build_flags": [
@@ -48,7 +48,7 @@
     "partition_sha256": "98e02c50532c388d85cc3b7c96d004142dc713b23368d293c881ecdcb419e44e",
     "platform": "55.03.37",
     "qemu_config_sha256": "a0a5a2d3058dffc67eef72b6052dc18ea725605b4a04cc0b50909cb867a76c93",
-    "qemu_hal_sha256": "5de8c754015dffb3a8bae3032c2ed0bfb989161b6ebd23247b00378ea9f0198d",
+    "qemu_hal_sha256": "808c07d3815eee5ad756a1baef14f2496cf0e5b27f26debc7d6597967cd094d4",
     "toolchain": "14.2.0+20251107"
   },
   "schema_version": 1

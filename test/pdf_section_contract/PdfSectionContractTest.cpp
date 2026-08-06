@@ -203,21 +203,38 @@ std::vector<uint8_t> makeManyOutlinesPdf(const uint16_t count) {
   if (count == 0) {
     return {};
   }
-  const uint32_t fontObject = 3U + static_cast<uint32_t>(count) * 2U;
+  constexpr uint16_t kPagesPerNode = 16;
+  const uint16_t pageNodeCount = static_cast<uint16_t>((count + kPagesPerNode - 1U) / kPagesPerNode);
+  const uint32_t firstPageNodeObject = 3U;
+  const uint32_t firstPageObject = firstPageNodeObject + pageNodeCount;
+  const uint32_t fontObject = firstPageObject + static_cast<uint32_t>(count) * 2U;
   const uint32_t outlineRootObject = fontObject + 1U;
   const uint32_t firstOutlineObject = outlineRootObject + 1U;
-  std::string kids;
-  for (uint16_t index = 0; index < count; ++index) {
-    kids += std::to_string(3U + static_cast<uint32_t>(index) * 2U) + " 0 R ";
+  std::string rootKids;
+  for (uint16_t index = 0; index < pageNodeCount; ++index) {
+    rootKids += std::to_string(firstPageNodeObject + index) + " 0 R ";
   }
 
   std::vector<std::string> objects;
-  objects.reserve(static_cast<size_t>(count) * 3U + 3U);
+  objects.reserve(static_cast<size_t>(count) * 3U + pageNodeCount + 3U);
   objects.push_back("<< /Type /Catalog /Pages 2 0 R /Outlines " + std::to_string(outlineRootObject) + " 0 R >>");
-  objects.push_back("<< /Type /Pages /Count " + std::to_string(count) + " /Kids [" + kids + "] >>");
+  objects.push_back("<< /Type /Pages /Count " + std::to_string(count) + " /Kids [" + rootKids + "] >>");
+  for (uint16_t nodeIndex = 0; nodeIndex < pageNodeCount; ++nodeIndex) {
+    const uint16_t firstPage = static_cast<uint16_t>(nodeIndex * kPagesPerNode);
+    const uint16_t nodePages = std::min<uint16_t>(kPagesPerNode, static_cast<uint16_t>(count - firstPage));
+    std::string kids;
+    for (uint16_t pageOffset = 0; pageOffset < nodePages; ++pageOffset) {
+      kids += std::to_string(firstPageObject + static_cast<uint32_t>(firstPage + pageOffset) * 2U) + " 0 R ";
+    }
+    objects.push_back("<< /Type /Pages /Parent 2 0 R /Count " + std::to_string(nodePages) + " /Kids [" + kids +
+                      "] >>");
+  }
   for (uint16_t index = 0; index < count; ++index) {
-    const uint32_t contentObject = 4U + static_cast<uint32_t>(index) * 2U;
-    objects.push_back("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 " +
+    const uint32_t pageObject = firstPageObject + static_cast<uint32_t>(index) * 2U;
+    const uint32_t contentObject = pageObject + 1U;
+    const uint32_t parentObject = firstPageNodeObject + index / kPagesPerNode;
+    objects.push_back("<< /Type /Page /Parent " + std::to_string(parentObject) +
+                      " 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 " +
                       std::to_string(fontObject) + " 0 R >> >> /Contents " + std::to_string(contentObject) +
                       " 0 R >>");
     objects.push_back(streamObject("BT /F1 12 Tf 72 720 Td (" + manyOutlineTitle(index) + ") Tj ET"));
@@ -228,7 +245,7 @@ std::vector<uint8_t> makeManyOutlinesPdf(const uint16_t count) {
                     " >>");
   for (uint16_t index = 0; index < count; ++index) {
     const uint32_t outlineObject = firstOutlineObject + index;
-    const uint32_t pageObject = 3U + static_cast<uint32_t>(index) * 2U;
+    const uint32_t pageObject = firstPageObject + static_cast<uint32_t>(index) * 2U;
     std::string links;
     if (index != 0) {
       links += " /Prev " + std::to_string(outlineObject - 1U) + " 0 R";
@@ -453,7 +470,9 @@ bool continuousNoOutline(const Observation& observation) {
 }
 
 bool outlineDefinesOnlySectionBoundary(const Observation& observation) {
-  return observation.metadataDecoded && observation.metadata.sectionCount == 2U && observation.xhtml.size() == 2U &&
+  return observation.metadataDecoded && observation.metadata.sectionCount == 2U && observation.sections.size() == 2U &&
+         observation.sections[0].tocIndex == -1 && observation.sections[1].tocIndex == 0 &&
+         observation.xhtml.size() == 2U &&
          containsInOrder(observation.xhtml[0], kLeadText, kNumericLinkText) &&
          containsInOrder(observation.xhtml[0], kNumericLinkText, kOutsideRectText) &&
          contains(observation.xhtml[1], kDestinationText);
@@ -546,6 +565,10 @@ Observation syntheticObservation(const std::vector<std::string>& xhtml, const ui
   Observation observation;
   observation.metadataDecoded = true;
   observation.metadata.sectionCount = sectionCount;
+  observation.sections.resize(sectionCount);
+  if (sectionCount > 1U) {
+    observation.sections[1].tocIndex = 0;
+  }
   observation.xhtml = xhtml;
   observation.outlineDecoded = true;
   PdfOutlineEntry entry{};
@@ -632,13 +655,13 @@ bool preparedLinkLayoutDeclared(const std::string_view implementation) {
 }
 
 bool navigationLayoutDeclared(const std::string_view implementation) {
-  return contains(withoutWhitespace(implementation), "static_assert(sizeof(NavigationWorkspace)==14608");
+  return contains(withoutWhitespace(implementation), "static_assert(sizeof(NavigationWorkspace)==14568");
 }
 
 bool navigationSpillMappingDeclared(const std::string_view implementation) {
   const std::string compact = withoutWhitespace(implementation);
   return contains(compact, "static_assert(PdfLimits::PageTextBytes==8192") &&
-         contains(compact, "static_assert(runTailBytes==6416") &&
+         contains(compact, "static_assert(runTailBytes==6376") &&
          contains(compact, "static_assert(operandSpillBytes==0");
 }
 
@@ -653,8 +676,8 @@ int runLayoutContract() {
       "struct PreparedLink { uint16_t sourcePage; uint16_t targetPage; uint16_t xMin; uint16_t yMin; "
       "uint16_t xMax; uint16_t yMax; }; "
       "static_assert(sizeof(PreparedSectionRecord) == 152); static_assert(sizeof(PreparedLink) == 12); "
-      "static_assert(sizeof(NavigationWorkspace) == 14608); "
-      "static_assert(PdfLimits::PageTextBytes == 8192); static_assert(runTailBytes == 6416); "
+      "static_assert(sizeof(NavigationWorkspace) == 14568); "
+      "static_assert(PdfLimits::PageTextBytes == 8192); static_assert(runTailBytes == 6376); "
       "static_assert(operandSpillBytes == 0);";
   const std::string knownOldHeader =
       "struct PreparedPageRecord { uint32_t sourcePageIndex; uint32_t firstAnchor; };";
@@ -666,7 +689,7 @@ int runLayoutContract() {
                    preparedLinkLayoutDeclared(knownGoodImplementation) &&
                    navigationLayoutDeclared(knownGoodImplementation) &&
                    navigationSpillMappingDeclared(knownGoodImplementation),
-               "the source oracle accepts the exact 152/12/14608/8192+6416+0 contract");
+               "the source oracle accepts the exact 152/12/14568/8192+6376+0 contract");
   report.check("LAYOUT_ORACLE_NEGATIVE",
                !preparedSectionLayoutDeclared(knownOldHeader, knownOldImplementation) &&
                    !preparedLinkLayoutDeclared(knownOldImplementation) &&
@@ -679,9 +702,9 @@ int runLayoutContract() {
                "production declares and asserts the 152-byte logical-section record");
   report.check("PREPARED_LINK_LAYOUT_12", preparedLinkLayoutDeclared(implementation),
                "production declares and asserts the 12-byte page-and-Rect link record");
-  report.check("NAVIGATION_WORKSPACE_LAYOUT_14608", navigationLayoutDeclared(implementation),
+  report.check("NAVIGATION_WORKSPACE_LAYOUT_14568", navigationLayoutDeclared(implementation),
                "production asserts the exact reduced RV32 navigation workspace");
-  report.check("NAVIGATION_SPILL_MAPPING_8192_6416_0", navigationSpillMappingDeclared(implementation),
+  report.check("NAVIGATION_SPILL_MAPPING_8192_6376_0", navigationSpillMappingDeclared(implementation),
                "production asserts page-text, run-tail, and zero operand spill partitions");
   return report.failures == 0 ? 0 : 1;
 }
@@ -968,7 +991,7 @@ bool manyOutlineOrderPreserved(const Observation& observation, const uint16_t ex
     const PdfOutlineEntry& entry = observation.outline[index];
     const std::string title = manyOutlineTitle(index);
     if (entry.titleLength != title.size() || std::memcmp(entry.title, title.data(), title.size()) != 0 ||
-        entry.sourcePageIndex != index || entry.sectionIndex != index || entry.parentIndex != -1 || entry.level != 0) {
+        entry.sourcePageIndex != index || entry.sectionIndex != index || entry.parentIndex != -1 || entry.level != 1) {
       return false;
     }
   }
@@ -992,7 +1015,9 @@ int runOutlineCapacityContract() {
                    observation.xhtml.size() == expectedCount,
                "256 distinct target pages produce the bounded 256 logical sections");
   std::cout << "OBSERVED completed=" << observation.completed << " error="
-            << static_cast<unsigned>(observation.terminalStatus.error) << " outline=" << observation.outline.size()
+            << static_cast<unsigned>(observation.terminalStatus.error)
+            << " offset=" << observation.terminalStatus.offset
+            << " outline=" << observation.outline.size()
             << " sections=" << observation.metadata.sectionCount << '\n';
   return report.failures == 0 ? 0 : 1;
 }

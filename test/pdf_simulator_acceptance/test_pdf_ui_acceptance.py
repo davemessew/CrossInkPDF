@@ -384,7 +384,19 @@ def validate_ui_source_contract(
     if error_start < 0 or error_end < 0 or error_render < error_end:
         raise AssertionError("PdfPrepare translated error render path is missing")
     error_body = prepare_source[error_start:error_end]
-    if "return tr(pdfPrepareErrorTranslationKey(error));" not in error_body:
+    translated_errors = (
+        "STR_PDF_NO_READABLE_TEXT",
+        "STR_PDF_ENCRYPTED",
+        "STR_PDF_UNSUPPORTED_FILTER",
+        "STR_PDF_UNSUPPORTED_ENCODING",
+        "STR_PDF_INSUFFICIENT_MEMORY",
+        "STR_PDF_INSUFFICIENT_STORAGE",
+        "STR_PDF_PREPARATION_PAUSED",
+        "STR_PDF_DAMAGED_OR_UNSAFE",
+        "STR_PDF_UNSUPPORTED",
+        "STR_PDF_PREPARATION_FAILED",
+    )
+    if any(f"return tr({key});" not in error_body for key in translated_errors):
         raise AssertionError("PdfPrepare error messages must all use translations")
 
 
@@ -1007,7 +1019,7 @@ class PdfUiAcceptanceTest(unittest.TestCase):
                     )
 
         mutated_prepare = PREPARE_SOURCE.read_text(encoding="utf-8").replace(
-            "return tr(pdfPrepareErrorTranslationKey(error));",
+            "return tr(STR_PDF_NO_READABLE_TEXT);",
             'return "No readable text";',
             1,
         )

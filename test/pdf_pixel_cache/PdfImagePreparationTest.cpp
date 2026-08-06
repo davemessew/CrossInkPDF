@@ -3,7 +3,6 @@
 
 #include <algorithm>
 #include <chrono>
-#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -2671,18 +2670,23 @@ TEST(PdfImagePreparation, TenPagesKeepUniqueFiguresAndSuppressTheRepeatedHeaderP
                                  << " phase=" << static_cast<int>(preparation.phase());
   const std::string generationRoot =
       std::string(preparation.cacheRoot()) + "/gen_" + std::to_string(preparation.generation());
+  const std::string sectionPath = generationRoot + "/sections/000000.xhtml";
+  ASSERT_TRUE(harness.storage.exists(sectionPath));
+  EXPECT_FALSE(harness.storage.exists(generationRoot + "/sections/000001.xhtml"));
+  const std::string xhtml(harness.storage.bytes(sectionPath).begin(), harness.storage.bytes(sectionPath).end());
+  size_t previousCaption = 0;
   for (uint8_t page = 0; page < 10; ++page) {
-    char leaf[32]{};
-    std::snprintf(leaf, sizeof(leaf), "/sections/%06u.xhtml", page);
-    const std::string sectionPath = generationRoot + leaf;
-    ASSERT_TRUE(harness.storage.exists(sectionPath)) << sectionPath;
-    const std::string xhtml(harness.storage.bytes(sectionPath).begin(), harness.storage.bytes(sectionPath).end());
     const std::string caption = "Unique figure " + std::to_string(page + 1U) + ".";
-    EXPECT_NE(xhtml.find(caption), std::string::npos) << sectionPath;
-    const size_t image = xhtml.find("<img ");
-    ASSERT_NE(image, std::string::npos) << sectionPath;
-    EXPECT_EQ(xhtml.find("<img ", image + 1U), std::string::npos) << sectionPath;
+    const size_t captionPosition = xhtml.find(caption, previousCaption);
+    ASSERT_NE(captionPosition, std::string::npos) << sectionPath;
+    EXPECT_GE(captionPosition, previousCaption);
+    previousCaption = captionPosition;
   }
+  size_t sectionImageCount = 0;
+  for (size_t image = xhtml.find("<img "); image != std::string::npos; image = xhtml.find("<img ", image + 5U)) {
+    ++sectionImageCount;
+  }
+  EXPECT_EQ(sectionImageCount, 10U);
   const auto paths = harness.storage.paths();
   const auto imageCount = std::count_if(paths.begin(), paths.end(), [&](const std::string& path) {
     return path.starts_with(generationRoot + "/images/") && path.ends_with(".pxc");
@@ -2693,7 +2697,7 @@ TEST(PdfImagePreparation, TenPagesKeepUniqueFiguresAndSuppressTheRepeatedHeaderP
   PdfCacheManifestSelection selection{};
   ASSERT_TRUE(cache.loadManifestSlots(preparation.sourceIdentity(), &selection).ok());
   ASSERT_TRUE(selection.selected);
-  EXPECT_EQ(selection.manifest.requiredFileCount, 24U);
+  EXPECT_EQ(selection.manifest.requiredFileCount, 15U);
   EXPECT_EQ(harness.storage.openHandleCount(), 0U);
 }
 
@@ -2736,7 +2740,7 @@ TEST(PdfImagePreparation, SixtyFourFiguresPersistThroughTheManifestSpoolIncludin
   ASSERT_TRUE(cache.loadManifestSlots(preparation.sourceIdentity(), &selection).ok());
   ASSERT_TRUE(selection.selected);
   EXPECT_EQ(selection.manifest.warningFlags, 0U);
-  EXPECT_EQ(selection.manifest.requiredFileCount, 76U);
+  EXPECT_EQ(selection.manifest.requiredFileCount, 69U);
   EXPECT_EQ(harness.storage.openHandleCount(), 0U);
 }
 
@@ -2867,7 +2871,7 @@ TEST(PdfImagePreparation, SixtyFifthFigureIsGracefullyOmittedWithoutBreakingText
   ASSERT_TRUE(cache.loadManifestSlots(preparation.sourceIdentity(), &selection).ok());
   ASSERT_TRUE(selection.selected);
   EXPECT_NE(selection.manifest.warningFlags, 0U);
-  EXPECT_EQ(selection.manifest.requiredFileCount, 77U);
+  EXPECT_EQ(selection.manifest.requiredFileCount, 69U);
   EXPECT_EQ(harness.storage.openHandleCount(), 0U);
 }
 

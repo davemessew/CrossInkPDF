@@ -365,7 +365,7 @@ modification-time-known flag, generation, counts, and record sizes. It also
 stores an aggregate CRC-32 and FNV-1a ledger over all xref and explicit-page
 records. Xrefs must decode in strictly increasing object-number order.
 
-After the discovery trailer, committed prepared pages append `PRJR` version 1, 512 bytes each.
+After the discovery trailer, committed prepared pages append `PRJR` version 2, 512 bytes each.
 A record binds its sequence, source identity, generation, completed page and
 section counts, semantic word and anchor cursors, output byte totals, page
 geometry, section path, section size and CRC-32, and ends with its own CRC-32.

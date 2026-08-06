@@ -971,7 +971,7 @@ def make_tounicode_simple_and_cid() -> Fixture:
 
 def make_operators_actualtext_forms() -> Fixture:
     page_content = (
-        b"q 1 0 0 1 0 0 cm /Fm1 Do Q\n"
+        b"q 1 0 0 1 0 650 cm /Fm1 Do Q\n"
         b"BT /F1 10 Tf 1 0 0 1 72 680 Tm "
         b"/Span << /ActualText (Accessible replacement) >> BDC "
         b"(Visual glyphs) Tj EMC ET"

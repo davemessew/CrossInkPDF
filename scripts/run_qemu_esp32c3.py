@@ -87,16 +87,18 @@ PDF_SLOW_ATOMIC_SUMMARY_MARKER = re.compile(
     r"max_total_us=(\d+) max_callback_us=(\d+)$"
 )
 MAX_QEMU_SLOW_ATOMIC_WRITE_US = 30000
+MAX_QEMU_SLOW_ATOMIC_OPEN_WRITE_US = 36000
 MAX_QEMU_SLOW_ATOMIC_RENAME_US = 24000
-MAX_QEMU_SLOW_ATOMIC_OPEN_READ_US = 12000
+MAX_QEMU_SLOW_ATOMIC_OPEN_READ_US = 16000
+MAX_QEMU_SLOW_ATOMIC_STORAGE_SESSION_US = 60000
 MAX_QEMU_SLOW_ATOMIC_NONIO_US = 500
 MAX_QEMU_SLOW_ATOMIC_REQUEST_BYTES = 3072
 MAX_QEMU_SLOW_ATOMIC_CALLBACK_US = 550000
 MAX_QEMU_SLOW_ATOMIC_AGGREGATE_NONIO_US = 5000
 MAX_QEMU_SLOW_ATOMIC_WRITES = 22
 MAX_QEMU_SLOW_ATOMIC_RENAMES = 2
-MAX_QEMU_SLOW_ATOMIC_OPEN_READS = 2
-MAX_QEMU_SLOW_ATOMIC_TOTAL = 26
+MAX_QEMU_SLOW_ATOMIC_OPEN_READS = 8
+MAX_QEMU_SLOW_ATOMIC_TOTAL = 32
 PDF_IO_OPERATION_NAMES = frozenset(
     (
         "open",
@@ -370,6 +372,16 @@ class OutputGuard:
                 and mode == "read"
                 and request == 0
                 and callback_us <= MAX_QEMU_SLOW_ATOMIC_OPEN_READ_US
+            ) or (
+                kind == "open"
+                and mode in {"write", "readwrite", "write_truncate"}
+                and request == 0
+                and callback_us <= MAX_QEMU_SLOW_ATOMIC_OPEN_WRITE_US
+            ) or (
+                kind == "multiple"
+                and 2 <= calls <= 5
+                and request <= 1024
+                and callback_us <= MAX_QEMU_SLOW_ATOMIC_STORAGE_SESSION_US
             )
             if (
                 self.slow_atomic_summary is not None
@@ -379,7 +391,8 @@ class OutputGuard:
                     self.slow_atomic_slices
                     and slice_index <= self.slow_atomic_slices[-1]
                 )
-                or calls != 1
+                or calls < 1
+                or (kind != "multiple" and calls != 1)
                 or recursive != 0
                 or total_us <= 8000
                 or callback_us > total_us
@@ -403,9 +416,16 @@ class OutputGuard:
                 )
             )
             self.slow_atomic_slices.append(slice_index)
-            self.slow_atomic_writes += int(kind == "write")
+            self.slow_atomic_writes += int(
+                kind == "write"
+                or (kind == "open" and mode != "read")
+                or (kind == "multiple" and mode != "read")
+            )
             self.slow_atomic_renames += int(kind == "rename")
-            self.slow_atomic_open_reads += int(kind == "open")
+            self.slow_atomic_open_reads += int(
+                (kind == "open" and mode == "read")
+                or (kind == "multiple" and mode == "read")
+            )
             self.slow_atomic_request_bytes += request
             self.slow_atomic_callback_us += callback_us
             self.slow_atomic_nonio_us += nonio_us

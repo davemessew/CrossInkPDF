@@ -175,9 +175,15 @@ struct ResolverHarness {
     objectStream.forbidReadsWhile(&externalReaderOpen);
   }
 
-  static PdfStatus setSourceAccess(void* context, const PdfObjectResolverReader reader) {
+  static PdfStepResult setSourceAccess(void* context, const PdfObjectResolverReader reader, PdfWorkBudget& budget) {
     if (context == nullptr) {
-      return PdfStatus::failure(PdfError::InvalidArgument);
+      return PdfStepResult::failure(PdfStatus::failure(PdfError::InvalidArgument));
+    }
+    if (budget.cancelRequested()) {
+      return PdfStepResult::failure(PdfStatus::failure(PdfError::Cancelled));
+    }
+    if (!budget.consumeOperation()) {
+      return PdfStepResult::paused();
     }
     auto& harness = *static_cast<ResolverHarness*>(context);
     harness.reader = reader;
@@ -185,7 +191,7 @@ struct ResolverHarness {
     harness.xrefBlocked = reader != PdfObjectResolverReader::Xref;
     harness.externalReaderOpen = reader != PdfObjectResolverReader::ObjectStore;
     harness.transitions.push_back(harness.sourceOpen);
-    return PdfStatus::success();
+    return PdfStepResult::completed();
   }
 
   static PdfStatus setTraversalAccess(void* context, const bool required) {
@@ -211,7 +217,7 @@ struct ResolverHarness {
   }
 
   PdfObjectResolverWorkspace workspace(const bool withDecoder = false) {
-    return {withDecoder ? &decoder : nullptr, objectStream.store(), this, setSourceAccess};
+    return {withDecoder ? &decoder : nullptr, objectStream.store(), this, setSourceAccess, PdfStreamDecodeLimits{}};
   }
 
   std::array<uint8_t, 4096> sourceBuffer{};
@@ -966,7 +972,7 @@ TEST(PdfResolverSourceAccessContract, CompressedUncachedKeepsSourceClosedAcrossB
   EXPECT_TRUE(harness.sourceOpen);
 }
 
-TEST(PdfResolverSourceAccessContract, CachedCompressedLookupNeverReopensTheSource) {
+TEST(PdfResolverSourceAccessContract, CachedCompressedLookupReselectsXrefThenDirectObjectStreamSource) {
   const std::string objectStream =
       "10 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length 6 >>\nstream\n2 0 42\nendstream\nendobj\n";
   PdfTestByteSource bytes({objectStream.begin(), objectStream.end()});
@@ -984,16 +990,17 @@ TEST(PdfResolverSourceAccessContract, CachedCompressedLookupNeverReopensTheSourc
 
   ASSERT_TRUE(resolver.begin({2, 0}).ok());
   ASSERT_TRUE(runResolver(resolver).complete());
-  ASSERT_FALSE(harness.sourceOpen);
+  ASSERT_TRUE(harness.sourceOpen);
   harness.transitions.clear();
 
   ASSERT_TRUE(resolver.begin({2, 0}).ok());
   EXPECT_TRUE(harness.transitions.empty());
-  EXPECT_FALSE(harness.sourceOpen);
+  EXPECT_TRUE(harness.sourceOpen);
   EXPECT_TRUE(runResolver(resolver).complete());
+  EXPECT_EQ(harness.transitions, (std::vector<bool>{false, true}));
 }
 
-TEST(PdfResolverSourceAccessContract, PageTreeReassertsXrefAfterTraversalEvictsCachedCompressedReader) {
+TEST(PdfResolverSourceAccessContract, PageTreeReassertsXrefAfterTraversalEvictsDirectObjectStreamReader) {
   const std::string pages = "<< /Type /Pages /Count 1 /Kids [3 0 R] >>";
   const std::string page = "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>";
   const std::string index = "2 0 3 " + std::to_string(pages.size() + 1U) + " ";
@@ -1028,7 +1035,7 @@ TEST(PdfResolverSourceAccessContract, PageTreeReassertsXrefAfterTraversalEvictsC
 
   ASSERT_TRUE(result.complete()) << static_cast<unsigned>(result.status.error) << "@" << result.status.offset;
   EXPECT_EQ(harness.pageCount, 1U);
-  EXPECT_GE(static_cast<uint32_t>(std::count(harness.transitions.begin(), harness.transitions.end(), false)), 3U);
+  EXPECT_EQ(harness.transitions, (std::vector<bool>{false, true, false, true}));
 }
 
 TEST(PdfResolverSourceAccessContract, LookupFailureLeavesOnlyTheXrefReaderSelected) {

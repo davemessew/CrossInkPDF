@@ -64,7 +64,32 @@ void PdfPrepareActivity::resourceEvent(void*, const PdfResourceEvent& event) {
 }
 
 const char* PdfPrepareActivity::errorMessage(const PdfError error) {
-  return I18N.get(pdfPrepareErrorTranslationKey(error));
+  switch (error) {
+    case PdfError::NoReadableText:
+      return tr(STR_PDF_NO_READABLE_TEXT);
+    case PdfError::Encrypted:
+      return tr(STR_PDF_ENCRYPTED);
+    case PdfError::UnsupportedFilter:
+      return tr(STR_PDF_UNSUPPORTED_FILTER);
+    case PdfError::UnsupportedEncoding:
+      return tr(STR_PDF_UNSUPPORTED_ENCODING);
+    case PdfError::InsufficientMemory:
+      return tr(STR_PDF_INSUFFICIENT_MEMORY);
+    case PdfError::InsufficientStorage:
+      return tr(STR_PDF_INSUFFICIENT_STORAGE);
+    case PdfError::Cancelled:
+      return tr(STR_PDF_PREPARATION_PAUSED);
+    case PdfError::ExpansionLimit:
+    case PdfError::LimitExceeded:
+    case PdfError::Malformed:
+    case PdfError::InvalidOffset:
+    case PdfError::UnexpectedEof:
+      return tr(STR_PDF_DAMAGED_OR_UNSAFE);
+    case PdfError::Unsupported:
+      return tr(STR_PDF_UNSUPPORTED);
+    default:
+      return tr(STR_PDF_PREPARATION_FAILED);
+  }
 }
 
 void PdfPrepareActivity::onEnter() {

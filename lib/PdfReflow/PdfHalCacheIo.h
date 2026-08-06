@@ -4,7 +4,7 @@
 
 #include "PdfCacheIo.h"
 
-constexpr uint8_t PDF_HAL_CACHE_HANDLE_COUNT = 3;
+constexpr uint8_t PDF_HAL_CACHE_HANDLE_COUNT = 4;
 
 struct PdfHalCacheIoContext {
   HalFile files[PDF_HAL_CACHE_HANDLE_COUNT];

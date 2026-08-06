@@ -211,6 +211,7 @@ def preparation_scheduler_failures(source: str) -> list[str]:
         source, "stepTrackedPdfPreparation", helper_name
     )
     run = source_between_functions(source, "runPreparation", "preparePdf")
+    prepare = source_between_functions(source, "preparePdf", "loadPdfDocument")
     cancellation = source_between_functions(
         source, "checkPdfCancellation", "workCountersResumeLess"
     )
@@ -226,13 +227,13 @@ def preparation_scheduler_failures(source: str) -> list[str]:
 
     if "if (result.yielded()) {\n    yield();\n  }" not in helper:
         failures.append("yield only after yielded PDF preparation result")
-    if source.count("yield();") != 1 or source.count(helper_call) != 5:
+    if source.count("yield();") != 1 or source.count(helper_call) != 7:
         failures.append("exact QEMU PDF preparation scheduler coverage")
     if helper_call in tracked_step or "yield();" in tracked_step:
         failures.append("no scheduler yield inside tracked PDF step interval")
     if helper_call in forced_oom:
         failures.append("no scheduler yield after terminal forced-OOM probe")
-    if source.count("stepTrackedPdfPreparation(") != 7:
+    if source.count("stepTrackedPdfPreparation(") != 9:
         failures.append("complete PdfPreparation step-site inventory")
 
     if (
@@ -241,6 +242,9 @@ def preparation_scheduler_failures(source: str) -> list[str]:
         "    if (!result.yielded())" not in run
     ):
         failures.append("runPreparation post-accounting scheduler yield")
+
+    if prepare.count(helper_call) != 2 or prepare.count("stepTrackedPdfPreparation(") != 2:
+        failures.append("framebuffer-guarded preparation scheduler yield")
 
     setup_block = (
         "    ++setupSteps;\n"
@@ -736,17 +740,18 @@ def acceptance_source_failures(source: str) -> list[str]:
     for token in (
         "constexpr uint32_t kQemuSlowAtomicWriteMicroseconds = 30000;",
         "constexpr uint32_t kQemuSlowAtomicRenameMicroseconds = 24000;",
-        "constexpr uint32_t kQemuSlowAtomicOpenReadMicroseconds = 12000;",
+        "constexpr uint32_t kQemuSlowAtomicOpenReadMicroseconds = 16000;",
+        "constexpr uint32_t kQemuSlowAtomicStorageSessionMicroseconds = 60000;",
         "constexpr uint32_t kQemuSlowAtomicNonIoMicroseconds = 500;",
         "constexpr uint32_t kQemuSlowAtomicAggregateRequestBytes = 3072;",
         "constexpr uint32_t kQemuSlowAtomicAggregateCallbackMicroseconds = 550000;",
         "constexpr uint32_t kQemuSlowAtomicAggregateNonIoMicroseconds = 5000;",
         "constexpr uint16_t kQemuSlowAtomicWriteCount = 22;",
         "constexpr uint16_t kQemuSlowAtomicRenameCount = 2;",
-        "constexpr uint16_t kQemuSlowAtomicOpenReadCount = 2;",
-        "constexpr uint16_t kQemuSlowAtomicTotalCount = 26;",
+        "constexpr uint16_t kQemuSlowAtomicOpenReadCount = 8;",
+        "constexpr uint16_t kQemuSlowAtomicTotalCount = 32;",
         "bool qemuSlowAtomicAllowed(",
-        "trace.calls != 1",
+        "const bool singleCall = trace.calls == 1;",
         "trace.recursive",
         "trace.callbackElapsedUs > elapsedUs",
         "nonIoUs > kQemuSlowAtomicNonIoMicroseconds",
@@ -761,6 +766,10 @@ def acceptance_source_failures(source: str) -> list[str]:
         "TracedPdfCacheIo::Operation::Open",
         "trace.openMode == TracedPdfCacheIo::OpenMode::Read",
         "trace.callbackElapsedUs <= kQemuSlowAtomicOpenReadMicroseconds",
+        "trace.operation == TracedPdfCacheIo::Operation::Multiple",
+        "trace.calls >= 2",
+        "trace.calls <= 5",
+        "trace.callbackElapsedUs <= kQemuSlowAtomicStorageSessionMicroseconds",
         '"QEMU_PDF_SLOW_ATOMIC index=%u slice=%u calls=%lu kind=%s mode=%s "',
         '"recursive=%u request=%lu total_us=%lu callback_us=%lu nonio_us=%lu\\n"',
         '"QEMU_PDF_SLOW_ATOMIC_SUMMARY generation=%lu slices=%u total=%u write=%u "',
@@ -1312,8 +1321,8 @@ class QemuPdfAcceptanceContractTest(unittest.TestCase):
                 1,
             ),
             "slow open ceiling": source.replace(
-                "kQemuSlowAtomicOpenReadMicroseconds = 12000",
-                "kQemuSlowAtomicOpenReadMicroseconds = 12001",
+                "kQemuSlowAtomicOpenReadMicroseconds = 16000",
+                "kQemuSlowAtomicOpenReadMicroseconds = 16001",
                 1,
             ),
             "slow nonio ceiling": source.replace(
@@ -1347,13 +1356,13 @@ class QemuPdfAcceptanceContractTest(unittest.TestCase):
                 1,
             ),
             "slow open count": source.replace(
-                "kQemuSlowAtomicOpenReadCount = 2",
-                "kQemuSlowAtomicOpenReadCount = 3",
+                "kQemuSlowAtomicOpenReadCount = 8",
+                "kQemuSlowAtomicOpenReadCount = 9",
                 1,
             ),
             "slow total count": source.replace(
-                "kQemuSlowAtomicTotalCount = 26",
-                "kQemuSlowAtomicTotalCount = 27",
+                "kQemuSlowAtomicTotalCount = 32",
+                "kQemuSlowAtomicTotalCount = 33",
                 1,
             ),
             "per-slice trace reset": source.replace(

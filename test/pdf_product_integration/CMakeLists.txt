@@ -95,7 +95,11 @@ add_executable(PdfPreparedCacheRenderingTest
   ${REPO_ROOT}/lib/PdfReflow/PdfBuildCheckpoint.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfCacheManifest.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfCacheStore.cpp
+  ${REPO_ROOT}/lib/PdfReflow/PdfCMap.cpp
+  ${REPO_ROOT}/lib/PdfReflow/PdfContentInterpreter.cpp
+  ${REPO_ROOT}/lib/PdfReflow/PdfEncoding.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfFixedRecordSpool.cpp
+  ${REPO_ROOT}/lib/PdfReflow/PdfFontMap.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfIo.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfImageBuildSpool.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfImageCache.cpp
@@ -110,8 +114,10 @@ add_executable(PdfPreparedCacheRenderingTest
   ${REPO_ROOT}/lib/PdfReflow/PdfObjectParser.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfObjectResolver.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfOutline.cpp
+  ${REPO_ROOT}/lib/PdfReflow/PdfPageModel.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfPageTree.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfPixelCacheWriter.cpp
+  ${REPO_ROOT}/lib/PdfReflow/PdfPreparedContent.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfPreparation.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfProgressStore.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfReflowDocument.cpp

@@ -59,6 +59,8 @@ class PdfSemanticWriter {
  public:
   PdfStatus begin(PdfByteSink output, PdfSemanticBlockSink blockSink, PdfSemanticWriterWorkspace workspace,
                   uint32_t initialWords = 0);
+  PdfStatus resume(PdfByteSink output, PdfSemanticBlockSink blockSink, PdfSemanticWriterWorkspace workspace,
+                   uint32_t initialWords, uint32_t lastAnchorOrdinal, bool hasLastAnchor);
   PdfStatus beginBlock(const PdfSemanticBlock& block);
   PdfStatus writeText(const uint8_t* text, size_t length);
   PdfStatus writeRetainedImage(const uint8_t* resource, size_t length, uint16_t width, uint16_t height);

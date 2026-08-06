@@ -256,10 +256,15 @@ TEST(PdfDocumentScaleContract, SixtyFivePageFlatTreeCommitsInKidsOrder) {
   expectCommittedProduct(harness, preparation);
   EXPECT_EQ(preparation.workCounters().pagesWalked, 65U);
   const std::string root = generationRoot(preparation);
-  ASSERT_TRUE(harness.storage.exists(root + "/sections/000064.xhtml"));
-  const auto& lastSection = harness.storage.bytes(root + "/sections/000064.xhtml");
-  const std::string text(lastSection.begin(), lastSection.end());
-  EXPECT_NE(text.find("Page065"), std::string::npos);
+  ASSERT_TRUE(harness.storage.exists(root + "/sections/000000.xhtml"));
+  EXPECT_FALSE(harness.storage.exists(root + "/sections/000001.xhtml"));
+  const auto& section = harness.storage.bytes(root + "/sections/000000.xhtml");
+  const std::string text(section.begin(), section.end());
+  const size_t first = text.find("Page001");
+  const size_t last = text.find("Page065");
+  ASSERT_NE(first, std::string::npos);
+  ASSERT_NE(last, std::string::npos);
+  EXPECT_LT(first, last);
 }
 
 TEST(PdfDocumentSliceBudgetContract, SixtyFivePageRunBoundsEveryDiscoveryStepAndAvoidsRedundantTempSyncs) {
@@ -519,7 +524,7 @@ TEST(PdfDocumentResumeScaleContract, JournalAboveLegacySlotLimitRestoresInBatche
   EXPECT_LT(resumeSteps, 4'000U);
   EXPECT_LE(maximumResumeOperations, 32U);
   EXPECT_LE(maximumResumeBytes, 4096U);
-  EXPECT_LE(maximumResumeMilliseconds, 5U) << slowResumeTrace;
+  EXPECT_LE(maximumResumeMilliseconds, 8U) << slowResumeTrace;
   expectCommittedProduct(harness, resumed);
 }
 

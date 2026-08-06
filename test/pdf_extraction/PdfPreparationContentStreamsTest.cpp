@@ -53,7 +53,10 @@ struct PdfPreparationTestAccess {
     size_t offset = 0;
     for (uint8_t span = 0; span < 3; ++span) {
       size_t contiguous = 0;
-      if (preparation.preparedNavigationSpillBytes(offset, &contiguous) == nullptr || contiguous == 0) {
+      if (preparation.preparedNavigationSpillBytes(offset, &contiguous) == nullptr) {
+        return contiguous == 0 ? offset : 0;
+      }
+      if (contiguous == 0) {
         return 0;
       }
       offset += contiguous;

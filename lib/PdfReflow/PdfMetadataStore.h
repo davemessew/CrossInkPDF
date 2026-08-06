@@ -4,6 +4,7 @@
 #include <cstdint>
 
 #include "PdfTypes.h"
+#include "PdfWorkBudget.h"
 
 namespace PdfMetadataLimits {
 
@@ -59,6 +60,25 @@ struct PdfMetadataSectionSource {
   constexpr bool valid() const { return count == 0 || read != nullptr; }
 };
 
+enum class PdfMetadataEncodeStage : uint8_t {
+  Header,
+  Title,
+  Author,
+  Language,
+  Sections,
+  Crc,
+  Complete,
+};
+
+struct PdfMetadataEncodeRuntime {
+  uint32_t crc32 = 0;
+  uint32_t cumulativeBytes = 0;
+  uint32_t cumulativeWords = 0;
+  uint16_t sectionIndex = 0;
+  uint16_t fieldOffset = 0;
+  PdfMetadataEncodeStage stage = PdfMetadataEncodeStage::Header;
+};
+
 struct PdfMetadataSectionVisitor {
   using AcceptFn = PdfStatus (*)(void* context, uint16_t index, const PdfMetadataSection& record);
 
@@ -91,6 +111,9 @@ class PdfMetadataBuilder {
 
 PdfStatus pdfEncodeMetadata(const PdfMetadata& metadata, const PdfMetadataSectionSource& sections,
                             const PdfByteSink& destination);
+PdfStepResult pdfStepEncodeMetadata(const PdfMetadata& metadata, const PdfMetadataSectionSource& sections,
+                                    const PdfByteSink& destination, PdfMetadataEncodeRuntime& runtime,
+                                    PdfWorkBudget& budget);
 PdfStatus pdfInspectMetadata(const PdfByteSource& source, PdfMetadata* metadata);
 PdfStatus pdfDecodeMetadata(const PdfByteSource& source, PdfMetadata* metadata,
                             const PdfMetadataSectionVisitor& sections);

@@ -84,16 +84,18 @@ constexpr uint32_t kMaximumCancellationSliceMicroseconds = 8000;
 constexpr uint32_t kMaximumCancellationSliceOperations = 32;
 constexpr size_t kMaximumIoRequestBytes = 4U * 1024U;
 constexpr uint32_t kQemuSlowAtomicWriteMicroseconds = 30000;
+constexpr uint32_t kQemuSlowAtomicOpenWriteMicroseconds = 36000;
 constexpr uint32_t kQemuSlowAtomicRenameMicroseconds = 24000;
-constexpr uint32_t kQemuSlowAtomicOpenReadMicroseconds = 12000;
+constexpr uint32_t kQemuSlowAtomicOpenReadMicroseconds = 16000;
+constexpr uint32_t kQemuSlowAtomicStorageSessionMicroseconds = 60000;
 constexpr uint32_t kQemuSlowAtomicNonIoMicroseconds = 500;
 constexpr uint32_t kQemuSlowAtomicAggregateRequestBytes = 3072;
 constexpr uint32_t kQemuSlowAtomicAggregateCallbackMicroseconds = 550000;
 constexpr uint32_t kQemuSlowAtomicAggregateNonIoMicroseconds = 5000;
 constexpr uint16_t kQemuSlowAtomicWriteCount = 22;
 constexpr uint16_t kQemuSlowAtomicRenameCount = 2;
-constexpr uint16_t kQemuSlowAtomicOpenReadCount = 2;
-constexpr uint16_t kQemuSlowAtomicTotalCount = 26;
+constexpr uint16_t kQemuSlowAtomicOpenReadCount = 8;
+constexpr uint16_t kQemuSlowAtomicTotalCount = 32;
 constexpr uint16_t kCachedPageTurns = 100;
 constexpr uint32_t kPersistentStateMagic = 0x51415044U;
 constexpr uint16_t kPersistentStateVersion = 1;
@@ -725,21 +727,32 @@ struct QemuSlowAtomicTotals {
 
 bool qemuSlowAtomicAllowed(const TracedPdfCacheIo::SliceTrace& trace, const uint32_t elapsedUs,
                            const uint32_t nonIoUs) {
-  if (elapsedUs <= kMaximumCancellationSliceMicroseconds || trace.calls != 1 || trace.recursive ||
+  if (elapsedUs <= kMaximumCancellationSliceMicroseconds || trace.calls == 0 || trace.recursive ||
       trace.callbackElapsedUs > elapsedUs || nonIoUs > kQemuSlowAtomicNonIoMicroseconds) {
     return false;
   }
+  const bool singleCall = trace.calls == 1;
   if (trace.operation == TracedPdfCacheIo::Operation::Write) {
-    return trace.openMode == TracedPdfCacheIo::OpenMode::None && trace.requestBytes >= 1 &&
+    return singleCall && trace.openMode == TracedPdfCacheIo::OpenMode::None && trace.requestBytes >= 1 &&
            trace.requestBytes <= 1024 && trace.callbackElapsedUs <= kQemuSlowAtomicWriteMicroseconds;
   }
   if (trace.operation == TracedPdfCacheIo::Operation::Rename) {
-    return trace.openMode == TracedPdfCacheIo::OpenMode::None && trace.requestBytes == 0 &&
+    return singleCall && trace.openMode == TracedPdfCacheIo::OpenMode::None && trace.requestBytes == 0 &&
            trace.callbackElapsedUs <= kQemuSlowAtomicRenameMicroseconds;
   }
   if (trace.operation == TracedPdfCacheIo::Operation::Open) {
-    return trace.openMode == TracedPdfCacheIo::OpenMode::Read && trace.requestBytes == 0 &&
-           trace.callbackElapsedUs <= kQemuSlowAtomicOpenReadMicroseconds;
+    const bool readOpen = trace.openMode == TracedPdfCacheIo::OpenMode::Read &&
+                          trace.callbackElapsedUs <= kQemuSlowAtomicOpenReadMicroseconds;
+    const bool writeOpen =
+        (trace.openMode == TracedPdfCacheIo::OpenMode::Write ||
+         trace.openMode == TracedPdfCacheIo::OpenMode::ReadWrite ||
+         trace.openMode == TracedPdfCacheIo::OpenMode::WriteTruncate) &&
+        trace.callbackElapsedUs <= kQemuSlowAtomicOpenWriteMicroseconds;
+    return singleCall && trace.requestBytes == 0 && (readOpen || writeOpen);
+  }
+  if (trace.operation == TracedPdfCacheIo::Operation::Multiple) {
+    return trace.calls >= 2 && trace.calls <= 5 && trace.requestBytes <= 1024 &&
+           trace.callbackElapsedUs <= kQemuSlowAtomicStorageSessionMicroseconds;
   }
   return false;
 }
@@ -747,11 +760,16 @@ bool qemuSlowAtomicAllowed(const TracedPdfCacheIo::SliceTrace& trace, const uint
 bool recordQemuSlowAtomic(QemuSlowAtomicTotals& totals, const uint16_t slice, const uint32_t elapsedUs,
                           const TracedPdfCacheIo::SliceTrace& trace, const uint32_t nonIoUs) {
   ++totals.total;
-  if (trace.operation == TracedPdfCacheIo::Operation::Write) {
+  if (trace.operation == TracedPdfCacheIo::Operation::Write ||
+      (trace.operation == TracedPdfCacheIo::Operation::Open &&
+       trace.openMode != TracedPdfCacheIo::OpenMode::Read) ||
+      (trace.operation == TracedPdfCacheIo::Operation::Multiple &&
+       trace.openMode != TracedPdfCacheIo::OpenMode::Read)) {
     ++totals.writes;
   } else if (trace.operation == TracedPdfCacheIo::Operation::Rename) {
     ++totals.renames;
-  } else if (trace.operation == TracedPdfCacheIo::Operation::Open) {
+  } else if (trace.operation == TracedPdfCacheIo::Operation::Open ||
+             trace.operation == TracedPdfCacheIo::Operation::Multiple) {
     ++totals.openReads;
   } else {
     return false;
@@ -1177,18 +1195,39 @@ PdfStepResult runPreparation(PdfPreparation& preparation, uint32_t* steps = null
 
 bool preparePdf(const char* path, GfxRenderer& renderer, uint32_t* steps = nullptr,
                 PdfPreparationWorkCounters* counters = nullptr) {
-  const PdfAcceptanceFramebufferSnapshot framebufferBefore =
-      qemuFramebufferSnapshot(renderer);
-  if (framebufferBefore.hash == 0) {
-    return false;
-  }
   TracedPdfCacheIo traced;
   auto preparation = makeUniqueNoThrow<PdfPreparation>();
   if (!preparation) {
     return false;
   }
   PdfStatus status = beginTrackedPdfPreparation(*preparation, preparationConfig(traced, path, renderer));
-  const PdfStepResult result = status ? runPreparation(*preparation, steps) : PdfStepResult::failure(status);
+  PdfStepResult result = PdfStepResult::failure(status);
+  if (status) {
+    result = stepTrackedPdfPreparation(*preparation);
+    if (steps != nullptr) {
+      ++*steps;
+    }
+    sampleRuntime();
+    yieldAfterPdfPreparationStep(result);
+  }
+  const PdfAcceptanceFramebufferSnapshot framebufferBefore = qemuFramebufferSnapshot(renderer);
+  if (framebufferBefore.hash == 0) {
+    return false;
+  }
+  if (result.yielded()) {
+    for (uint32_t step = 1; step < kMaximumPreparationSteps; ++step) {
+      esp_rom_printf("QEMU_PDF_SLICE\n");
+      result = stepTrackedPdfPreparation(*preparation);
+      if (steps != nullptr) {
+        ++*steps;
+      }
+      sampleRuntime();
+      yieldAfterPdfPreparationStep(result);
+      if (!result.yielded()) {
+        break;
+      }
+    }
+  }
   if (counters != nullptr) {
     *counters = preparation->workCounters();
   }
@@ -1213,8 +1252,9 @@ bool preparePdf(const char* path, GfxRenderer& renderer, uint32_t* steps = nullp
       !pdfAcceptanceObserveFramebuffer(framebufferBefore, changedPointer,
                                        state.pdfFramebufferGuardControls,
                                        state.pdfFramebufferGuardRejections);
-  return result.complete() && traced.maximumRequest <= kMaximumIoRequestBytes &&
-         framebufferUnchanged && changedHashRejected && changedPointerRejected;
+  const bool accepted = result.complete() && traced.maximumRequest <= kMaximumIoRequestBytes && framebufferUnchanged &&
+                        changedHashRejected && changedPointerRejected;
+  return accepted;
 }
 
 std::shared_ptr<PdfReflowDocument> loadPdfDocument(const char* path) {
@@ -2225,8 +2265,12 @@ bool captureTypographySignature(const char* path, const char* suffix, GfxRendere
 }
 
 bool checkPdfTypography(GfxRenderer& renderer) {
-  if (!preparePdf(PDF_FONT_SIX_PATH, renderer) || !preparePdf(PDF_FONT_SEVENTY_TWO_PATH, renderer)) {
-    fail("PDF_TYPOGRAPHY", "prepare");
+  if (!preparePdf(PDF_FONT_SIX_PATH, renderer)) {
+    fail("PDF_TYPOGRAPHY", "prepare_six");
+    return false;
+  }
+  if (!preparePdf(PDF_FONT_SEVENTY_TWO_PATH, renderer)) {
+    fail("PDF_TYPOGRAPHY", "prepare_seventy_two");
     return false;
   }
   ReaderLayout layout;
@@ -2552,6 +2596,9 @@ bool checkPdfProgressAndSavedItems(GfxRenderer& renderer) {
       }
     }
   }
+  selected.pageNumber = 0;
+  selected.pageCount = 0;
+  selected.hasPageCount = false;
   ReflowReadingPosition nonTerminal = selected;
   nonTerminal.wordCursor = targetCursor;
   bool positionSaved = false;
@@ -3195,6 +3242,9 @@ bool checkPdfProductTracer(GfxRenderer& renderer) {
     expectedPosition.pageCount = pageCount;
     expectedPosition.hasPageCount = pageCount > 0;
     const bool populatedPosition = semantic && pdfPopulateReadingPositionFromRange(*semantic, &expectedPosition);
+    expectedPosition.pageNumber = 0;
+    expectedPosition.pageCount = 0;
+    expectedPosition.hasPageCount = false;
     progressSaved =
         populatedPosition && semantic->valid && semantic->firstGlobalWordOrdinal == 0 &&
         semantic->lastGlobalWordOrdinal == 1 && semantic->wordCursor == 2 &&

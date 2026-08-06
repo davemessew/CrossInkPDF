@@ -739,7 +739,7 @@ TEST(PdfPreparation, PreservesGeneratedNavigationInCommittedReflowCache) {
   EXPECT_NE(section0.find("aria-label=\"i\""), std::string::npos);
   EXPECT_NE(section1.find("aria-label=\"A-1\""), std::string::npos);
   EXPECT_NE(section0.find(">Contents</h1>"), std::string::npos);
-  EXPECT_NE(section0.find("<a href=\"sections/000001.xhtml#b00000003\">Chapter Two</a>"), std::string::npos);
+  EXPECT_NE(section0.find("<a href=\"sections/000001.xhtml#p00000001\">Chapter Two</a>"), std::string::npos);
   EXPECT_NE(section1.find(">Index</p>"), std::string::npos);
 
   PdfTestByteSource metadataSource(harness.storage.bytes(generationRoot + "/metadata.bin"));
@@ -1035,8 +1035,8 @@ TEST(PdfPreparation, RecreatedInstanceResumesTheSameGenerationAfterOneVerifiedPa
   ASSERT_TRUE(freshResult.complete()) << static_cast<int>(freshResult.status.error) << "@" << freshResult.status.offset
                                       << " phase=" << static_cast<int>(fresh.phase());
   const std::string freshRoot = std::string(fresh.cacheRoot()) + "/gen_" + std::to_string(fresh.generation());
-  const std::vector<uint8_t> freshFirst = freshHarness.storage.bytes(freshRoot + "/sections/000000.xhtml");
-  const std::vector<uint8_t> freshSecond = freshHarness.storage.bytes(freshRoot + "/sections/000001.xhtml");
+  const std::vector<uint8_t> freshSection = freshHarness.storage.bytes(freshRoot + "/sections/000000.xhtml");
+  ASSERT_FALSE(freshHarness.storage.exists(freshRoot + "/sections/000001.xhtml"));
   const PdfPreparationWorkCounters freshWork = fresh.workCounters();
 
   PreparationHarness harness;
@@ -1102,9 +1102,11 @@ TEST(PdfPreparation, RecreatedInstanceResumesTheSameGenerationAfterOneVerifiedPa
   EXPECT_TRUE(resumed.resumedFromCheckpoint());
   EXPECT_EQ(resumed.resumedPhase(), PdfBuildResumePhase::AfterPage);
   EXPECT_EQ(resumed.generation(), generation);
-  EXPECT_EQ(harness.storage.bytes(firstPath), firstBytes);
-  EXPECT_EQ(harness.storage.bytes(firstPath), freshFirst);
-  EXPECT_EQ(harness.storage.bytes(generationRoot + "/sections/000001.xhtml"), freshSecond);
+  const std::vector<uint8_t>& resumedSection = harness.storage.bytes(firstPath);
+  ASSERT_GE(resumedSection.size(), firstBytes.size());
+  EXPECT_TRUE(std::equal(firstBytes.begin(), firstBytes.end(), resumedSection.begin()));
+  EXPECT_EQ(resumedSection, freshSection);
+  EXPECT_FALSE(harness.storage.exists(generationRoot + "/sections/000001.xhtml"));
   EXPECT_EQ(resumed.workCounters().xrefSteps, 0U);
   EXPECT_EQ(resumed.workCounters().pagesWalked, 0U);
   EXPECT_LT(resumed.workCounters().xrefSteps, freshWork.xrefSteps);
@@ -1133,10 +1135,12 @@ TEST(PdfPreparation, RecreatedInstanceResumesTheSameGenerationAfterOneVerifiedPa
   EXPECT_EQ(tailResume.resumedPhase(), PdfBuildResumePhase::AfterPage);
   EXPECT_EQ(tailResume.generation(), generation);
   ASSERT_TRUE(tailed.storage.exists(firstPath));
-  ASSERT_TRUE(tailed.storage.exists(generationRoot + "/sections/000001.xhtml"));
+  EXPECT_FALSE(tailed.storage.exists(generationRoot + "/sections/000001.xhtml"));
   ASSERT_TRUE(tailed.storage.exists(journalPath));
-  EXPECT_EQ(tailed.storage.bytes(firstPath), firstBytes);
-  EXPECT_EQ(tailed.storage.bytes(generationRoot + "/sections/000001.xhtml"), freshSecond);
+  const auto& tailedSection = tailed.storage.bytes(firstPath);
+  ASSERT_GE(tailedSection.size(), firstBytes.size());
+  EXPECT_TRUE(std::equal(firstBytes.begin(), firstBytes.end(), tailedSection.begin()));
+  EXPECT_EQ(tailedSection, freshSection);
   EXPECT_EQ(tailed.storage.bytes(journalPath).size(), checkpoint.checkpoint.journalBytes + 512U);
   EXPECT_TRUE(std::any_of(tailed.storage.openObservations().begin(), tailed.storage.openObservations().end(),
                           [&](const PdfTestOpenObservation& observation) {

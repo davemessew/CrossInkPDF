@@ -528,8 +528,8 @@ def validate_checkpoint_and_resume_documentation(
             "constexpr size_t kDiscoveryTrailerBytes = 72;"
         ),
         "discovery codec 1": "constexpr uint16_t kDiscoveryVersion = 1;",
-        "page record codec 1": (
-            "constexpr uint16_t kPageResumeRecordVersion = 1;"
+        "page record codec 2": (
+            "constexpr uint16_t kPageResumeRecordVersion = 2;"
         ),
         "discovery header magic": 'std::memcpy(output, "PDRH", 4);',
         "discovery trailer magic": 'std::memcpy(output, "PDRT", 4);',
@@ -571,7 +571,7 @@ def validate_checkpoint_and_resume_documentation(
         "sorted xref": "sorted 24-byte xref records",
         "explicit pages": "244-byte explicit page records",
         "discovery trailer": "`PDRT` version 1, 72 bytes",
-        "page records": "`PRJR` version 1, 512 bytes each",
+        "page records": "`PRJR` version 2, 512 bytes each",
         "aggregate integrity": "aggregate CRC-32 and FNV-1a ledger",
         "source validation": "source identity",
         "generation validation": "generation",

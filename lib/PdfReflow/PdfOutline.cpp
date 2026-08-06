@@ -1019,6 +1019,11 @@ PdfStepResult pdfStepEncodeOutline(
       runtime.stage = PdfOutlineEncodeStage::Crc;
       return PdfStepResult::paused();
     }
+    if (budget.bytesRemaining < PdfOutlineLimits::EncodedRecordBytes ||
+        !budget.consumeOperation() ||
+        budget.takeBytes(PdfOutlineLimits::EncodedRecordBytes) != PdfOutlineLimits::EncodedRecordBytes) {
+      return PdfStepResult::paused();
+    }
     workspace.entry = {};
     PdfStatus status = entries.read(
         entries.context, runtime.recordIndex, &workspace.entry);
@@ -1046,12 +1051,6 @@ PdfStepResult pdfStepEncodeOutline(
     if (!status) {
       return PdfStepResult::failure(status);
     }
-    if (budget.bytesRemaining <
-            PdfOutlineLimits::EncodedRecordBytes ||
-        !budget.consumeOperation()) {
-      return PdfStepResult::paused();
-    }
-    (void)budget.takeBytes(PdfOutlineLimits::EncodedRecordBytes);
     encodeEntry(workspace.entry, workspace.encoded);
     const uint32_t crc = pdfCacheCrc32(
         workspace.encoded, PdfOutlineLimits::EncodedRecordBytes,

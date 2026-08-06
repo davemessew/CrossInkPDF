@@ -1347,6 +1347,9 @@ bool captureNavigation(const std::shared_ptr<PdfReflowDocument>& document, GfxRe
     return false;
   }
 
+  selected.pageNumber = 0;
+  selected.pageCount = 0;
+  selected.hasPageCount = false;
   ReflowReadingPosition nonTerminal = selected;
   nonTerminal.wordCursor = targetCursor;
   if (targetCursor != 6 || nonTerminal.wordCursor == 0 ||

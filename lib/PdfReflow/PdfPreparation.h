@@ -19,6 +19,8 @@
 #include "PdfResourceTracker.h"
 #include "PdfSemanticWriter.h"
 
+struct PdfContentXObject;
+
 using PdfPreparationNowMsFn = uint32_t (*)(void* context);
 
 struct PdfPreparationConfig {
@@ -106,6 +108,10 @@ enum class PdfPreparationPhase : uint8_t {
   Complete,
   Failed,
   Cancelled,
+  DiscoverForms,
+  PrepareFormContent,
+  BeginPage,
+  PrepareNavigationRecords,
 };
 
 class PdfPreparationPaintGate {
@@ -165,15 +171,11 @@ class PdfPreparation {
   struct PreparedContentRuntime;
   struct PreparedContentOverlay;
 
-  struct PreparedPageRecord {
+  struct PreparedSectionRecord {
     PdfMetadataSection section{};
     PdfRequiredFileRecord file{};
-    uint32_t sourcePageIndex = UINT32_MAX;
-    uint32_t firstAnchor = UINT32_MAX;
-    uint16_t firstSection = UINT16_MAX;
-    uint16_t width = 0;
-    uint16_t height = 0;
-    uint16_t reserved = 0;
+    uint32_t firstSourcePage = 0;
+    uint32_t lastSourcePageExclusive = 0;
   };
 
   enum class NavigationTask : uint8_t {
@@ -436,6 +438,7 @@ class PdfPreparation {
     RestoreCancellationNavigation,
     RestoreAfterImageNavigation,
     PrepareEmitSectionsResume,
+    PrepareResumeNavigationRecords,
     OpenResumeMetadata,
     WriteResumeMetadata,
     CloseResumeMetadata,
@@ -554,6 +557,11 @@ class PdfPreparation {
                                              size_t* bytesWritten);
   static PdfStatus readPreparedContentSource(void* context, uint64_t offset, uint8_t* destination,
                                              size_t requested, size_t* bytesRead);
+  static PdfStatus readPreparedFormContent(void* context, uint64_t offset, uint8_t* destination,
+                                           size_t requested, size_t* bytesRead);
+  static PdfStepResult replayPreparedInlineImage(void* context, const PdfByteSource& source,
+                                                 uint64_t idEndOffset, PdfWorkBudget& budget,
+                                                 uint64_t* resumeOffset, PdfContentXObject* image);
   static PdfStatus resetPreparedContentStore(void* context);
   static uint64_t preparedContentStoreSize(void* context);
   static PdfStatus readPreparedContentStore(void* context, uint64_t offset, uint8_t* destination,
@@ -564,9 +572,6 @@ class PdfPreparation {
                                          size_t requested, size_t* bytesRead);
   static PdfStatus writePreparedFontStore(void* context, const uint8_t* source, size_t requested,
                                           size_t* bytesWritten);
-  static PdfStatus readPreparedFontRecord(void* context, uint32_t ordinal, void* record, size_t recordSize);
-  static PdfStatus writePreparedFontRecord(void* context, uint32_t ordinal, const void* record,
-                                           size_t recordSize);
   static PdfStatus observePreparedFontRecord(void* context, uint32_t ordinal, const void* record,
                                              size_t recordSize);
   static PdfStatus setPreparedFontSourceAccess(void* context, bool sourceRequired);
@@ -612,9 +617,9 @@ class PdfPreparation {
   PdfStatus finishPreparedPageSpool();
   PdfStatus sealPreparedPageSpool();
   PdfStatus loadPageRecord(uint32_t index);
-  PdfStatus readPreparedPageRecord(uint16_t index, PreparedPageRecord* record);
-  PdfStatus writePreparedPageRecord(const PreparedPageRecord& record);
-  PdfStatus rewritePreparedPageRecord(PdfWorkBudget& budget, uint16_t index, const PreparedPageRecord& record);
+  PdfStatus readPreparedPageRecord(uint16_t index, PreparedSectionRecord* record);
+  PdfStatus writePreparedPageRecord(const PreparedSectionRecord& record);
+  PdfStatus rewritePreparedPageRecord(PdfWorkBudget& budget, uint16_t index, const PreparedSectionRecord& record);
   PdfStatus formatPageSpoolPath(bool prepared, char* output, size_t capacity) const;
   PdfStatus formatTraversalSpoolPath(char* output, size_t capacity) const;
   void abortPageSpools();
@@ -661,6 +666,13 @@ class PdfPreparation {
   PdfStatus beginNavigationDiscovery();
   PdfStatus finishNavigationObject();
   PdfStepResult stepStartNextNavigationObject(PdfWorkBudget& budget);
+  PdfStatus flushOutlineBatch();
+  PdfStatus readNavigationRecord(uint32_t index, PdfOutlineEntry* record);
+  PdfStatus writeNavigationRecord(uint32_t index, const PdfOutlineEntry& record);
+  uint16_t* sectionBoundaryPages();
+  const uint16_t* sectionBoundaryPages() const;
+  bool isSectionBoundary(uint32_t pageIndex) const;
+  uint16_t sectionForPage(uint32_t pageIndex) const;
   PdfStatus readXmpMetadata();
   PdfStatus resolveDestination(const PdfRawDestination& raw, PdfResolvedDestination* destination);
   PdfStatus beginCurrentPageImages();
@@ -704,6 +716,10 @@ class PdfPreparation {
   PdfStepResult restoreContentNavigation(PdfWorkBudget& budget);
   PdfStepResult openDecodedContent(PdfWorkBudget& budget);
   PdfStepResult cleanupPreparedContentStore(PdfWorkBudget& budget);
+  PdfStatus beginFormReachability();
+  PdfStepResult stepFormReachability(PdfWorkBudget& budget);
+  PdfStepResult prepareReachableForm(PdfWorkBudget& budget);
+  PdfStatus setPreparedContentRange(uint8_t logicalIndex);
   PdfStatus beginDecodedContentExtraction();
   PdfStatus beginPreparedFonts();
   PdfStepResult spoolFontNavigation(PdfWorkBudget& budget);
@@ -737,15 +753,16 @@ class PdfPreparation {
   PdfStatus finishExtractedPage();
   PdfStepResult stepReadingOrder(PdfWorkBudget& budget);
   PdfStatus formatCurrentSectionPath();
-  PdfStatus formatInternalLink(uint16_t sourcePageIndex, const uint8_t* text, size_t textLength, char* href,
-                               size_t capacity, size_t* hrefLength);
-  PdfStatus openSection();
+  PdfStatus formatInternalLink(uint16_t sourcePageIndex, int16_t x, int16_t y, char* href, size_t capacity,
+                               size_t* hrefLength) const;
+  PdfStepResult stepOpenSection(PdfWorkBudget& budget);
   PdfStepResult emitSection(PdfWorkBudget& budget);
-  PdfStatus closeSection();
-  PdfStatus prepareNavigationRecords();
+  PdfStepResult stepCloseSection(PdfWorkBudget& budget);
+  PdfStatus beginNavigationRecords();
+  PdfStepResult stepPrepareNavigationRecords(PdfWorkBudget& budget);
   PdfStepResult stepTypographyAssets(PdfWorkBudget& budget);
   PdfStatus openMetadata();
-  PdfStatus writeMetadata();
+  PdfStepResult stepWriteMetadata(PdfWorkBudget& budget);
   PdfStatus closeMetadata();
   PdfStatus openOutline();
   PdfStepResult stepWriteOutline(PdfWorkBudget& budget);
@@ -839,7 +856,6 @@ class PdfPreparation {
   NavigationWorkspace* navigation_ = nullptr;
   std::optional<PdfNamedDestinationMap> namedDestinations_;
   std::optional<PdfPageLabelMap> pageLabels_;
-  std::optional<PdfOutlineBuilder> outlineBuilder_;
   PdfCatalogNavigation catalogNavigation_{};
   PdfObjectReference infoReference_{};
   PdfObjectReference activeNavigationReference_{};
@@ -852,14 +868,21 @@ class PdfPreparation {
   uint16_t sectionCount_ = 0;
   uint16_t explicitOutlineCount_ = 0;
   uint16_t outlinePendingCount_ = 0;
-  uint16_t outlineSeenCount_ = 0;
+  uint16_t sectionBoundaryCount_ = 0;
+  uint16_t outlineVisitedCount_ = 0;
+  bool synthesizedOutline_ = false;
   int16_t currentOutlineParent_ = -1;
+  uint8_t currentOutlineParentLevel_ = 0;
+  uint8_t outlineBatchCount_ = 0;
   uint16_t currentAnnotationPage_ = 0;
   uint8_t currentAnnotationIndex_ = 0;
   uint8_t navigationStage_ = 0;
   NavigationTask navigationTask_ = NavigationTask::None;
   ImageResolveTask imageResolveTask_ = ImageResolveTask::None;
   uint8_t imageCandidateCount_ = 0;
+  uint8_t xObjectCandidateCount_ = 0;
+  uint8_t formScopeCount_ = 0;
+  uint8_t imageDescriptorCandidateIndex_ = UINT8_MAX;
   uint8_t currentPageImageStart_ = 0;
   uint8_t currentPageImageEnd_ = 0;
   uint8_t sectionEmitImageIndex_ = 0;
@@ -934,6 +957,9 @@ class PdfPreparation {
   uint8_t imageRepetitionEntryCount_ = 0;
   bool continueAfterImageDecode_ = false;
   SectionEmitStage sectionEmitStage_ = SectionEmitStage::Idle;
+  bool sectionOpenPrepared_ = false;
+  bool sectionClosePrepared_ = false;
+  bool sectionCloseNewSection_ = false;
   bool rasterRuntimeActive_ = false;
   bool maskDecodeRuntimeActive_ = false;
   bool maskCompositeRuntimeActive_ = false;
@@ -943,6 +969,11 @@ class PdfPreparation {
   bool hasInfoReference_ = false;
   PdfByteRange contentRange_{};
   std::optional<PdfLexer> contentLexer_;
+  uint32_t contentAppendOffset_ = 0;
+  uint32_t contentAppendLength_ = 0;
+  uint8_t formReachabilityIndex_ = 0;
+  uint8_t formAppendCandidateIndex_ = UINT8_MAX;
+  bool contentAppendActive_ = false;
   size_t transcriptLength_ = 0;
   uint32_t nextAnchorOrdinal_ = 0;
   uint32_t currentSectionFirstWord_ = 0;
@@ -977,6 +1008,7 @@ class PdfPreparation {
   bool resumeLedgerValid_ = false;
   bool resumeGenerationRejected_ = false;
   bool resumeValidationFailed_ = false;
+  bool resumePageNeedsTruncate_ = false;
   bool resumeAfterPage_ = false;
   bool manifestRecordsMaterialized_ = false;
   bool cacheGenerationsListed_ = false;

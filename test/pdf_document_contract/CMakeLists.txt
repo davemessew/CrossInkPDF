@@ -55,6 +55,7 @@ add_executable(PdfDocumentContractTest
   ${REPO_ROOT}/lib/PdfReflow/PdfBuildCheckpoint.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfCacheStore.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfResourceTracker.cpp
+  ${REPO_ROOT}/lib/PdfReflow/PdfPreparedContent.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfPreparation.cpp
   ${REPO_ROOT}/lib/InflateReader/InflateReader.cpp
   ${REPO_ROOT}/lib/uzlib/src/tinflate.c

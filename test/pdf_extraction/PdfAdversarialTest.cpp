@@ -319,6 +319,8 @@ struct FormChain {
     object->content = resolver.chain->sources[index]->source();
     object->resources = index + 1U < resolver.chain->resources.size() ? &resolver.chain->resources[index + 1U]
                                                                       : &resolver.chain->resources[index];
+    object->bbox = {0, 0, PdfFixed16::fromInteger(100).raw, PdfFixed16::fromInteger(100).raw};
+    object->hasBBox = true;
     return PdfStatus::success();
   }
 };

@@ -206,6 +206,34 @@ PdfStatus PdfSemanticWriter::begin(const PdfByteSink output, const PdfSemanticBl
   return appendLiteral(DOCUMENT_BEGIN);
 }
 
+PdfStatus PdfSemanticWriter::resume(const PdfByteSink output, const PdfSemanticBlockSink blockSink,
+                                    const PdfSemanticWriterWorkspace workspace, const uint32_t initialWords,
+                                    const uint32_t lastAnchorOrdinal, const bool hasLastAnchor) {
+  output_ = output;
+  blockSink_ = blockSink;
+  workspace_ = workspace;
+  status_ = PdfStatus::success();
+  outputLength_ = 0;
+  totalWords_ = initialWords;
+  currentAnchorOrdinal_ = 0;
+  currentWordStart_ = initialWords;
+  lastAnchorOrdinal_ = lastAnchorOrdinal;
+  currentKind_ = PdfSemanticBlockKind::Paragraph;
+  currentHeadingLevel_ = 0;
+  initialized_ = output_.valid() && blockSink_.valid() && workspace_.output != nullptr &&
+                 workspace_.outputCapacity >= PdfSemanticWriterLimits::MinimumOutputBufferBytes;
+  finished_ = false;
+  blockOpen_ = false;
+  linkOpen_ = false;
+  tableOpen_ = false;
+  tableRowOpen_ = false;
+  hasLastAnchor_ = hasLastAnchor;
+  if (!initialized_) {
+    return fail(PdfStatus::failure(PdfError::InvalidArgument));
+  }
+  return wordCounter_.reset();
+}
+
 PdfStatus PdfSemanticWriter::beginBlock(const PdfSemanticBlock& block) {
   if (!status_.ok()) {
     return status_;

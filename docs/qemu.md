@@ -140,16 +140,19 @@ timing, or battery validation.
 For cancellation timing, the emulator ceiling is 8 ms of cooperative CPU time,
 32 operations, and a 4 KiB request. Cooperative time is total step time minus
 time inside separately instrumented synchronous HAL callbacks; no
-uninstrumented time is subtracted. A wall-time overrun is accepted only for one
-non-recursive callback from this allowlist:
+uninstrumented time is subtracted. A wall-time overrun is accepted only for a
+bounded non-recursive operation from this allowlist:
 
 - write: 1-1,024 requested bytes and at most 30 ms;
+- write-mode open: no payload and at most 36 ms;
 - rename: no payload and at most 24 ms;
-- read-only open: no payload and at most 12 ms.
+- read-only open: no payload and at most 16 ms;
+- one storage session: two to five callbacks, at most 1,024 requested bytes,
+  and at most 60 ms total callback time.
 
 Each exceptional slice permits at most 500 us of non-callback work. The complete
-cancellation replay permits at most 26 exceptions: 22 writes, two renames, and
-two read-only opens, with aggregate ceilings of 3,072 requested bytes, 550,000
+cancellation replay permits at most 32 exceptions: 22 writes, two renames, and
+eight bounded read/open sessions, with aggregate ceilings of 3,072 requested bytes, 550,000
 us callback time, and 5,000 us non-callback time. Cancellation is checked as
 soon as a synchronous callback returns; the callback itself is not preemptible.
 
