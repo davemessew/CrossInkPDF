@@ -1,161 +1,191 @@
-> **This is a personal fork of [CrossPoint Reader](https://github.com/crosspoint-reader/crosspoint-reader)** with a focus on improved fonts and minimal reading stats.
+# CrossInk PDF Reflow
 
-## What's different in this fork
+> **A personal fork of [CrossInk](https://github.com/uxjulia/CrossInk) that makes supported PDFs read like EPUBs directly on the Xteink.**
 
-My goal with this fork was to maintain the core Crosspoint firmware while integrating my preferred typography and some lightweight reading statistics. I’ve focused on keeping the underlying system stable while layering in a few "nice-to-have" features and UI refinements along the way.
+I wanted PDF files on the Xteink to feel like books, not screenshots. A normal PDF viewer has to squeeze an entire fixed page onto the small display. The text becomes tiny, and moving around a zoomed page with buttons is not much better.
 
-<table>
-  <tr>
-    <td align="center">
-      <img src="./docs/images/bitter-small-15-margin.jpg" alt="Font: Bitter, Size: 12 pt, Margin: 15" /><br/>
-      <em>Font: Bitter, Size: 12 pt, Margin: 15</em>
-    </td>
-    <td align="center">
-      <img src="./docs/images/reading-stats.jpg" alt="Reading Stats with custom front button mapping shown" /><br/>
-      <em>Reading Stats with custom front button mapping shown</em>
-    </td>
-  </tr>
-</table>
+This fork takes a different approach. It pulls the reading content out of a supported PDF on the device and passes it through CrossInk's existing reflow reader. The PDF then uses the same font, font size, margins, spacing, orientation, page turns, bookmarks, and reading tools as an EPUB.
 
----
+There is no desktop conversion step and nothing special to do before upload. Copy the PDF to the SD card and open it.
 
-**Note**: This firmware is confirmed to be working on both the X3 and X4.
+> [!IMPORTANT]
+> ### Download the PDF Reflow firmware
+>
+> **[Download `firmware-tiny-pdf-reflow.bin`](https://github.com/davemessew/CrossInkPDF/releases/download/pdf-reflow-f349288a/firmware-tiny-pdf-reflow.bin)**
+>
+> [Release page](https://github.com/davemessew/CrossInkPDF/releases/tag/pdf-reflow-f349288a) · [Installation guide](./docs/installation.md)
+>
+> This is the normal-font `tiny` build. It contains the full CrossInk firmware, PDF support, emoji and symbol support, and the 10, 12, 14, and 16 pt reader sizes. It is not a PDF-only image.
 
-### Highlights
+## PDFs should read like books
 
-- On-device [PDF text reflow](./docs/pdf-support.md) for supported born-digital and OCR-text-layer PDFs, using the reader's selected typography instead of shrinking fixed pages.
-- New reader fonts: Lexend Deca and Bitter.
-- Unicode emoji and miscellaneous symbols support (a limited subset).
-- Adjusted font sizes: 8 pt, 9 pt, 10 pt, 12 pt, 14 pt, 16 pt, 18 pt, and 20 pt. See [Font Build Variants](./docs/font-build-variants.md) for more details.
-- Added ~~strikethrough~~ support.
-- Made <u>underlines</u> thicker for better visibility.
-- Added a custom `Minimal` theme and sleep screen option for the minimalists out there.
-- Added a custom `Dashboard` theme and sleep screen option for reading stats enthusiasts.
-- Added support for `<hr>` section breaks.
-- Added support for "redaction" style rendering.
-- Added improved support for tables with simple markup.
-- Added ability to add bookmarks.
-- Added ability to remap front buttons that only applies in the reader.
-- Added Bionic Reading and Guide Dots as optional reader modes.
-- Added Force Paragraph Indents for books that render as one giant wall of text.
-- Added ability to pin a sleep image as a favorite. The favorited image will always be displayed when your sleep settings are set to `Custom` or `Cover + Custom` (when no cover is available).
-- Added more in-reader control remapping options for side buttons, short power button clicks, and long-press menu actions.
-- Added ability to mark a book as finished from the in-book menu. A pop-up will also display once 99% of the book is reached. This status allows tracking of total books read.
-- Added ability to move finished books to "Read" folder.
-- In-book menu to quickly adjust reader options without having to exit the book.
-- Reading stats: total books read, total reading time, number of sessions, pages turned, average session time, pages turned per minute. You can also set your reading stats as your sleep screen.
-- All-time reading stats [syncing](./docs/reading-stats-sync.md) between two CrossInk devices.
-- Reading [progress sync](./docs/nearby-position-sync.md) between two CrossInk devices.
-- Added customizable Auto Page Turn Interval (anything between 5-120 seconds).
-- Added ability to view Recent Books as a 3x3 grid view.
-- To view a more detailed list for each version, visit the [releases](https://github.com/uxjulia/CrossInk/releases) page to read release notes.
+The point is not to reproduce the printed page. On a display this size, that usually produces something technically accurate but unpleasant to read. The point is to keep the document's reading structure and let the device decide how the text should look.
 
----
+| A fixed-page PDF viewer | PDF Reflow in this fork |
+| --- | --- |
+| Shrinks the original page | Repaginates the text for the display |
+| Keeps the PDF's font sizes | Uses your CrossInk font and size |
+| Needs zoom and pan | Uses normal page turns |
+| Measures progress in PDF pages | Measures progress by words read |
+| Reopens the original layout | Reuses prepared reading data from the SD card |
 
-### Reader Fonts
+The PDF is still the source file. CrossInk does not replace it or modify it.
 
-The default fonts have been replaced with Lexend Deca and Bitter. These fonts have been chosen specifically to improve reading fluency and e-ink performance. These 'sturdier' typefaces feature uniform stroke weights and open geometries, allowing the X4/X3 to render crisp, high-contrast text with font-aliasing on while significantly reducing ghosting and artifacts.
+## What is preserved
 
-- [Lexend Deca](https://fonts.google.com/specimen/Lexend+Deca) - A research-backed sans-serif typeface designed to improve reading fluency. Lexend was engineered based on the theory that reading issues are often a design problem (visual crowding) rather than a cognitive one.
-- [Bitter](https://fonts.google.com/specimen/Bitter) - A "contemporary" slab serif typeface for text, it is specially designed for comfortably reading on digital screens. The consistent stroke weight of Bitter helps it render particularly well on e-ink devices. The medium weight has been chosen specifically for improved rendering on the X4/X3.
+For supported PDFs, the reader keeps the parts that matter when reading:
 
-The UI now uses [Inter](https://fonts.google.com/specimen/Inter) as the display font which has improved readability at smaller sizes.
+- Document title and author metadata
+- Chapters and table of contents
+- Nested outline entries and document index entries
+- Internal links and named destinations
+- Publisher page labels
+- Supported JPEG and raster images
+- Reading position, calculated from words read across the book
+- Resume position, bookmarks, and clippings
 
-### Emojis and Misc Glyphs
+The PDF's visual font sizes and page dimensions are deliberately ignored. Your selected CrossInk typography is used instead.
 
-- Support for a limited set of Unicode [Emoticons](https://unicode-explorer.com/b/1F600) and [Miscellaneous Symbols](https://unicode-explorer.com/b/2600) using [Noto Emoji](https://fonts.google.com/noto/specimen/Noto+Emoji) and [Noto Sans Symbols](https://fonts.google.com/noto/specimen/Noto+Sans+Symbols) font.
+## What happens when a PDF is opened
 
----
+The first open prepares the book directly on the reader:
 
-### Font Sizes
+1. CrossInk reads the PDF in small pieces.
+2. Text, navigation, and supported images are written to reusable reading data on the SD card.
+3. The normal reflow reader lays out the text with the current device settings.
+4. Later opens and page turns reuse that saved data instead of parsing the PDF again.
 
-There are 2 available build variants to choose from due to build size constraints: `tiny`, and `xlarge`.
+The first open can take longer than opening an EPUB, especially for a large or complicated document. Once preparation is complete, normal reading does not keep reprocessing the source PDF. This keeps processor work and SD-card traffic down while reading.
 
-See [Font Build Variants](./docs/font-build-variants.md) for the full point-size and emoji-support matrix.
+Preparation is bounded for the ESP32-C3's limited memory. It does not borrow a second display framebuffer or try to hold the whole document in RAM.
 
----
+## Which PDFs work
 
-### Reader features
+PDF Reflow is intended for:
 
-Reader Options, Bionic Reading, Guide Dots, Force Paragraph Indents, reading stats, and finished-book behavior are documented in [Reader Features](./docs/reader-features.md).
+- Born-digital PDFs with selectable text
+- Scanned PDFs that already contain a usable OCR text layer
+- Documents with ordinary text columns, headings, tables, links, and supported images
 
-### Custom button actions
+It is not intended for:
 
-CrossInk adds configurable button shortcuts.
+- Image-only scans without OCR text
+- Password-protected or encrypted PDFs
+- Comics, magazines, forms, or documents where the exact printed page is the content
+- PDFs that depend on unsupported encodings, filters, or interactive features
 
-See [Controls](./docs/controls.md) for the full action list and defaults.
+Complex layouts are simplified into a reading order. Optional visual material that cannot be handled safely may be left out. See [PDF Support](./docs/pdf-support.md) for the detailed boundary.
 
----
+## If a PDF cannot be prepared
 
-## Tips for the best reading experience
+A damaged or unsupported PDF should not take down the rest of the reader. If parsing fails, storage runs out, or the PDF needs more memory than the device can safely provide, preparation stops and the PDF stays closed. CrossInk does not publish a half-built book cache.
 
-CrossInk runs on an ESP32-C3 with limited RAM, so very large folders or complex EPUBs can be slower than they would be on a phone, tablet, or desktop app.
+The source PDF is left unchanged, so it can be removed, replaced, or tried again later.
 
-- Keep folders under about 200 files. For the smoothest browsing, aim for 50-100 files per folder.
-- Having 1000+ books on the SD card is fine if they are split into smaller folders, such as by author, series, genre, or read/unread status.
-- Avoid putting every book in the SD card root. The file browser has to scan and sort the current folder before it can show it.
-- Text-first EPUBs are the best fit. Large image-heavy EPUBs, scanned books, comics, and omnibus files with thousands of sections may load slowly or fail under memory pressure.
-- As a rough target, EPUBs under 20 MB tend to work the best. Files over 50 MB may still work, but they are more likely to be slow or memory-sensitive, especially if they contain many large images.
-- If an EPUB is unusually slow, try [optimizing](./docs/webserver.md#epub-optimization) it with the built-in web optimizer (via File Transfer) before copying it to the SD card: remove unused high-resolution images, split very large omnibus files, and avoid embedding multiple full font families when possible.
-- PDFs work best when they contain selectable text. Image-only scans need an OCR text layer before they are copied to the reader, and password-protected PDFs are not supported. See [PDF Support](./docs/pdf-support.md) for the full boundary.
-- Use a reliable SD card and leave some free space. CrossInk stores settings, reading progress, cache files, stats, and generated book data on the card.
+## The rest of CrossInk is still here
 
-## Development Device Simulator
+PDF support is added to the existing CrossInk reading experience. EPUB behavior and its cache format remain separate.
 
-The [device simulator](https://github.com/uxjulia/crosspoint-simulator) renders the e-ink display in an SDL2 window so firmware changes can be sanity-checked without flashing hardware.
+This fork also includes:
 
-See [Simulator](./docs/simulator.md) for setup, platform notes, keyboard controls, and cache tips.
+- EPUB, TXT, and XTC reading
+- Lexend Deca and Bitter reader fonts
+- Inter for the interface
+- Unicode emoji and miscellaneous symbol support
+- Thicker underlines, strikethroughs, section breaks, and improved simple tables
+- Minimal and Dashboard themes and sleep screens
+- Bionic Reading, Guide Dots, redaction-style rendering, and forced paragraph indents
+- Bookmarks and in-book reader settings
+- Reader-specific front and side button remapping
+- Automatic page turning
+- Reading time, sessions, pages turned, finished-book tracking, and reading-stat sleep screens
+- Nearby reading-position and all-time reading-stat sync
+- Recent Books grid view and finished-book filing
+- Local file transfer and the built-in EPUB optimizer
 
----
+The full list of reading options is in [Reader Features](./docs/reader-features.md), and button actions are listed in [Controls](./docs/controls.md).
+
+## Fonts and build variants
+
+CrossInk has two firmware variants because the ESP32-C3 does not have enough flash to bundle every point size at once.
+
+### `tiny`
+
+The general-purpose build and the one linked at the top of this page:
+
+- 10, 12, 14, and 16 pt reader sizes
+- Emoji and miscellaneous symbols
+- Full PDF Reflow support
+
+### `xlarge`
+
+For readers who only want larger text:
+
+- 16, 18, and 20 pt reader sizes
+- Emoji and miscellaneous symbols
+- Full PDF Reflow support when built from source
+
+See [Font Build Variants](./docs/font-build-variants.md) for more detail.
 
 ## Installation
 
-Download a `firmware-*.bin` from the [releases page](https://github.com/uxjulia/CrossInk/releases), then flash it with the web installer or command line.
+The easiest route is the web installer:
 
-See [Installation](./docs/installation.md) for step-by-step flashing and revert instructions.
+1. Download [`firmware-tiny-pdf-reflow.bin`](https://github.com/davemessew/CrossInkPDF/releases/download/pdf-reflow-f349288a/firmware-tiny-pdf-reflow.bin).
+2. Open the CrossInk web installer.
+3. Select **Custom .bin**.
+4. Choose the downloaded file and flash it.
 
----
+Command-line installation and revert instructions are in the [Installation guide](./docs/installation.md).
+
+## Tips for a smoother library
+
+CrossInk runs on a single-core ESP32-C3 with limited RAM. A little organization makes a noticeable difference:
+
+- Keep folders below about 200 files; 50–100 files per folder is more comfortable.
+- A large library is fine when books are split into folders by author, series, genre, or read status.
+- Avoid putting every book in the SD-card root.
+- Text-first EPUBs and PDFs work best.
+- For PDFs, check that text can be selected before copying the file to the reader.
+- Image-only scans need OCR before they can be reflowed.
+- Use a reliable SD card and leave free space for settings, progress, statistics, and prepared book data.
+
+More cache and storage details are available in [Data Cache](./docs/data-cache.md).
 
 ## Documentation
 
 - [User Guide](./USER_GUIDE.md)
+- [PDF Support](./docs/pdf-support.md)
 - [Installation](./docs/installation.md)
 - [Font Build Variants](./docs/font-build-variants.md)
 - [Reader Features](./docs/reader-features.md)
-- [PDF Support](./docs/pdf-support.md)
 - [Controls](./docs/controls.md)
-- [Simulator](./docs/simulator.md)
+- [Reading Stats Sync](./docs/reading-stats-sync.md)
+- [Nearby Position Sync](./docs/nearby-position-sync.md)
 - [Data Cache](./docs/data-cache.md)
 - [Web server usage](./docs/webserver.md)
-- [Web server endpoints](./docs/webserver-endpoints.md)
 - [Common issues](./docs/troubleshooting.md)
 - [Project scope](./SCOPE.md)
-- [Contributing docs](./docs/contributing/README.md)
+- [Contributing](./docs/contributing/README.md)
 
----
+## Development
 
-## Development quick start
-
-CrossInk uses PlatformIO for building and flashing firmware.
-
-See [Getting Started](./docs/contributing/getting-started.md) for prerequisites, clone setup, hooks, and validation commands.
-
-### Build / flash / monitor
-
-Connect your Xteink X4 or X3 via USB-C and run:
+CrossInk uses PlatformIO. Build the normal-font firmware with:
 
 ```sh
-pio run -e tiny --target upload
+pio run -e tiny
 ```
 
-Replace `tiny` with another build variant if needed. See [Font Build Variants](./docs/font-build-variants.md).
+Build the large-font variant with:
 
-See [Testing and Debugging](./docs/contributing/testing-debugging.md) for serial logging, simulator checks, static analysis, and bug-report guidance.
+```sh
+pio run -e xlarge
+```
 
----
+See [Getting Started](./docs/contributing/getting-started.md) for setup and [Testing and Debugging](./docs/contributing/testing-debugging.md) for the development tools.
 
-## Internals
+## Project lineage
 
-The ESP32-C3 has about 380 KB of usable RAM, so CrossInk stores reusable book and device data on the SD card instead of rebuilding everything in memory.
+This project is based on [CrossInk](https://github.com/uxjulia/CrossInk), which is itself a personal fork of [CrossPoint Reader](https://github.com/crosspoint-reader/crosspoint-reader).
 
-See [Data Cache](./docs/data-cache.md) for the `.crosspoint` layout and [File Formats](./docs/file-formats.md) for binary cache details.
+The aim of this fork is narrow: keep CrossInk's focused, readable e-ink experience and make supported PDFs behave like books instead of miniature printed pages.
