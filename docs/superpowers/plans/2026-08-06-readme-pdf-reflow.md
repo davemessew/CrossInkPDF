@@ -93,7 +93,7 @@ Run:
 ```powershell
 git add -- README.md docs/superpowers/specs/2026-08-06-readme-pdf-reflow-design.md docs/superpowers/plans/2026-08-06-readme-pdf-reflow.md
 git commit -m "docs: explain EPUB-like PDF reading"
-git push origin codex/pdf-reflow
+git push origin main
 ```
 
-Expected: `origin/codex/pdf-reflow` resolves to the new commit.
+Expected: `origin/main` resolves to the new commit.

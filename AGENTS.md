@@ -1,7 +1,7 @@
 # CrossInk — Shared Agent Guide
 
 This is the canonical repo instruction file.
-`CLAUDE.md` should point here so Codex and Claude read the same guidance.
+`CLAUDE.md` should point here so development tools read the same guidance.
 
 Project: Open-source e-reader firmware for Xteink X4 (ESP32-C3).
 
