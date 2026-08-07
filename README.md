@@ -13,13 +13,13 @@ There is no desktop conversion step and nothing special to do before upload. Cop
 >
 > **Standard text — 10, 12, 14, and 16 pt**
 >
-> **[Download `firmware-tiny-pdf-reflow-v1.5.0.1.bin`](https://github.com/davemessew/CrossInkPDF/releases/download/pdf-reflow-v1.5.0.1/firmware-tiny-pdf-reflow-v1.5.0.1.bin)**
+> **[Download `firmware-tiny-pdf-reflow-v1.5.0.2.bin`](https://github.com/davemessew/CrossInkPDF/releases/download/pdf-reflow-v1.5.0.2/firmware-tiny-pdf-reflow-v1.5.0.2.bin)**
 >
 > **Large text — 16, 18, and 20 pt**
 >
-> **[Download `firmware-xlarge-pdf-reflow-v1.5.0.1.bin`](https://github.com/davemessew/CrossInkPDF/releases/download/pdf-reflow-v1.5.0.1/firmware-xlarge-pdf-reflow-v1.5.0.1.bin)**
+> **[Download `firmware-xlarge-pdf-reflow-v1.5.0.2.bin`](https://github.com/davemessew/CrossInkPDF/releases/download/pdf-reflow-v1.5.0.2/firmware-xlarge-pdf-reflow-v1.5.0.2.bin)**
 >
-> [Release page](https://github.com/davemessew/CrossInkPDF/releases/tag/pdf-reflow-v1.5.0.1) · [Installation guide](./docs/installation.md)
+> [Release page](https://github.com/davemessew/CrossInkPDF/releases/tag/pdf-reflow-v1.5.0.2) · [Installation guide](./docs/installation.md)
 >
 > Both downloads contain the full CrossInk firmware, PDF support, emoji, and symbol support. They are not PDF-only images.
 
@@ -137,7 +137,7 @@ See [Font Build Variants](./docs/font-build-variants.md) for more detail.
 
 The easiest route is the web installer:
 
-1. Download the [`tiny` firmware](https://github.com/davemessew/CrossInkPDF/releases/download/pdf-reflow-v1.5.0.1/firmware-tiny-pdf-reflow-v1.5.0.1.bin) for standard text or the [`xlarge` firmware](https://github.com/davemessew/CrossInkPDF/releases/download/pdf-reflow-v1.5.0.1/firmware-xlarge-pdf-reflow-v1.5.0.1.bin) for large text.
+1. Download the [`tiny` firmware](https://github.com/davemessew/CrossInkPDF/releases/download/pdf-reflow-v1.5.0.2/firmware-tiny-pdf-reflow-v1.5.0.2.bin) for standard text or the [`xlarge` firmware](https://github.com/davemessew/CrossInkPDF/releases/download/pdf-reflow-v1.5.0.2/firmware-xlarge-pdf-reflow-v1.5.0.2.bin) for large text.
 2. Open the CrossInk web installer.
 3. Select **Custom .bin**.
 4. Choose the downloaded file and flash it.

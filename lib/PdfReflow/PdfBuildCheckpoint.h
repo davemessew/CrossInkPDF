@@ -25,6 +25,7 @@ enum class PdfBuildResumePhase : uint8_t {
   AfterPage,
   AfterImage,
   AfterImageRepair,
+  AfterDiscovery,
 };
 
 inline constexpr uint16_t PDF_BUILD_CHECKPOINT_CODEC_VERSION = 3;

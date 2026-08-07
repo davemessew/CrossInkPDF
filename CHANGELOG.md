@@ -1,3 +1,12 @@
+## [v1.5.0.2] - 2026-08-07
+
+### Fixed
+
+- Cancelling PDF preparation now saves the completed PDF discovery work and resumes from it instead of starting again at zero.
+- Internal PDF links now use the already allocated preparation workspace instead of repeatedly rescanning page records on the SD card.
+- PDF resume data now preserves excess link annotations, so link-heavy books can resume safely after cancellation.
+- Final PDF preparation no longer rewrites the full discovery snapshot after every prepared page.
+
 ## [v1.5.0.1] - 2026-08-07
 
 ### Fixed

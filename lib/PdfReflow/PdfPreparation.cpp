@@ -660,7 +660,8 @@ constexpr size_t kPageResumeRecordCrcOffset = kPageResumeRecordBytes - sizeof(ui
 constexpr uint16_t kPageResumeRecordVersion = 2;
 constexpr size_t kDiscoveryHeaderBytes = 192;
 constexpr size_t kDiscoveryXrefRecordBytes = 24;
-constexpr size_t kDiscoveryPageRecordBytes = 244;
+constexpr size_t kDiscoveryPageRecordBytes = 248;
+constexpr size_t kDiscoveryOverflowRecordBytes = 12;
 constexpr uint32_t kResumeXrefBatchRecords = 64;
 static_assert(kResumeXrefBatchRecords * (kDiscoveryXrefRecordBytes + sizeof(PdfXrefEntry)) <= kSliceBytes);
 static_assert(kResumeXrefBatchRecords * sizeof(PdfXrefEntry) <= PdfLimits::PageRunBytes);
@@ -668,8 +669,9 @@ constexpr size_t kDiscoveryTrailerBytes = 72;
 constexpr size_t kDiscoveryHeaderCrcOffset = kDiscoveryHeaderBytes - sizeof(uint32_t);
 constexpr size_t kDiscoveryXrefRecordCrcOffset = kDiscoveryXrefRecordBytes - sizeof(uint32_t);
 constexpr size_t kDiscoveryPageRecordCrcOffset = kDiscoveryPageRecordBytes - sizeof(uint32_t);
+constexpr size_t kDiscoveryOverflowRecordCrcOffset = kDiscoveryOverflowRecordBytes - sizeof(uint32_t);
 constexpr size_t kDiscoveryTrailerCrcOffset = kDiscoveryTrailerBytes - sizeof(uint32_t);
-constexpr uint16_t kDiscoveryVersion = 1;
+constexpr uint16_t kDiscoveryVersion = 2;
 constexpr uint8_t kDiscoveryCatalogPages = 1U << 0U;
 constexpr uint8_t kDiscoveryCatalogOutlines = 1U << 1U;
 constexpr uint8_t kDiscoveryCatalogNamedDestinations = 1U << 2U;
@@ -682,7 +684,9 @@ constexpr uint8_t kEmitSectionsResumeFlagCoverAvailable = 1U << 1U;
 constexpr uint8_t kEmitSectionsResumeFlagCoverJpeg = 1U << 2U;
 constexpr uint64_t kMaximumDiscoveryResumeBytes =
     kDiscoveryHeaderBytes + static_cast<uint64_t>(kMaximumXrefRecords) * kDiscoveryXrefRecordBytes +
-    static_cast<uint64_t>(PdfLimits::MaxPages) * kDiscoveryPageRecordBytes + kDiscoveryTrailerBytes;
+    static_cast<uint64_t>(PdfLimits::MaxPages) * kDiscoveryPageRecordBytes +
+    static_cast<uint64_t>(kMaximumAnnotationOverflowRecords) * kDiscoveryOverflowRecordBytes +
+    kDiscoveryTrailerBytes;
 constexpr uint64_t kMaximumResumeJournalBytes =
     kMaximumDiscoveryResumeBytes + static_cast<uint64_t>(PdfLimits::MaxPages) * kPageResumeRecordBytes;
 // A cancelled append can leave at most one uncommitted fixed-size page record
@@ -764,9 +768,11 @@ uint64_t readLe64Prep(const uint8_t* const input) {
   return value;
 }
 
-uint32_t discoveryEncodedBytes(const uint32_t xrefCount, const uint16_t pageCount) {
+uint32_t discoveryEncodedBytes(const uint32_t xrefCount, const uint16_t pageCount, const uint32_t overflowCount) {
   return static_cast<uint32_t>(kDiscoveryHeaderBytes + static_cast<uint64_t>(xrefCount) * kDiscoveryXrefRecordBytes +
-                               static_cast<uint64_t>(pageCount) * kDiscoveryPageRecordBytes + kDiscoveryTrailerBytes);
+                               static_cast<uint64_t>(pageCount) * kDiscoveryPageRecordBytes +
+                               static_cast<uint64_t>(overflowCount) * kDiscoveryOverflowRecordBytes +
+                               kDiscoveryTrailerBytes);
 }
 
 void encodeDiscoveryReference(const PdfObjectReference reference, uint8_t* const output) {
@@ -2867,6 +2873,7 @@ bool PdfPreparation::cancelledGenerationReady() const {
     case CacheSetupStage::ValidateResumeDiscoveryXref:
     case CacheSetupStage::ValidateResumeDiscoveryCatalog:
     case CacheSetupStage::ValidateResumeDiscoveryPages:
+    case CacheSetupStage::ValidateResumeDiscoveryOverflow:
     case CacheSetupStage::ValidateResumeDiscoveryPage:
     case CacheSetupStage::ValidateResumeDiscoveryTrailer:
     case CacheSetupStage::RestoreResumeDiscoveryHeader:
@@ -2929,15 +2936,22 @@ bool PdfPreparation::canPreserveSelectedPageResumeOnCancel() const {
     return false;
   }
   const PdfBuildCheckpoint& checkpoint = checkpointSelection_.checkpoint;
+  const bool discoveryCandidate =
+      checkpoint.resumePhase == PdfBuildResumePhase::AfterDiscovery &&
+      (checkpoint.phase == PdfBuildPhase::ParsePages || checkpoint.phase == PdfBuildPhase::Cancelled) &&
+      checkpoint.generation != 0 && checkpoint.lastVerifiedPage == 0 && checkpoint.lastVerifiedObject == 0 &&
+      checkpoint.emittedSections == 0 && checkpoint.emittedImages == 0 && checkpoint.outputBytes == 0 &&
+      checkpoint.cumulativeWords <= PdfLimits::MaxExpandedRequiredStreamBytes &&
+      checkpoint.journalBytes >= kDiscoveryHeaderBytes + kDiscoveryTrailerBytes;
   const bool pageCandidate =
       checkpoint.resumePhase == PdfBuildResumePhase::AfterPage &&
       (checkpoint.phase == PdfBuildPhase::ParsePages || checkpoint.phase == PdfBuildPhase::Cancelled) &&
       checkpoint.generation != 0 && checkpoint.lastVerifiedPage != 0 &&
       checkpoint.lastVerifiedPage <= PdfLimits::MaxPages && checkpoint.emittedSections != 0 &&
-      checkpoint.emittedSections <= checkpoint.lastVerifiedPage &&
-      checkpoint.emittedImages == 0 && checkpoint.lastVerifiedObject != 0 && checkpoint.journalBytes != 0 &&
+      checkpoint.emittedSections <= checkpoint.lastVerifiedPage && checkpoint.emittedImages == 0 &&
+      checkpoint.lastVerifiedObject != 0 && checkpoint.journalBytes != 0 &&
       checkpoint.journalBytes >= kDiscoveryHeaderBytes + kDiscoveryTrailerBytes + kPageResumeRecordBytes;
-  return pageCandidate && cacheSetupStage_ >= CacheSetupStage::OpenResumeLedger &&
+  return (discoveryCandidate || pageCandidate) && cacheSetupStage_ >= CacheSetupStage::OpenResumeLedger &&
          cacheSetupStage_ <= CacheSetupStage::ValidateResumePageClose;
 }
 
@@ -3341,6 +3355,7 @@ PdfStatus PdfPreparation::capturePage(void* context, const PdfPageInfo& page) {
   if (!status) {
     return status;
   }
+  self.rememberPageReference(self.pageCount_, page.pageReference);
   if (page.pageIndex < PdfLimits::MaxCoverScanPages && page.hasResources &&
       self.coverCandidateSourceCount_ < PdfLimits::MaxCoverCandidateSources) {
     const PdfObjectReference reference = page.resourcesIndirect ? page.resourceReference : page.resourceOwner;
@@ -5742,6 +5757,7 @@ PdfStatus PdfPreparation::encodeDiscoveryHeader(uint8_t* const output, const siz
   PdfObjectReference root{};
   PdfObjectReference info{};
   const bool hasInfo = xref_->info(&info);
+  const uint32_t overflowCount = annotationOverflowSpool_.recordCount();
   if (!xref_->root(&root) || root.objectNumber == 0) {
     return PdfStatus::failure(PdfError::Malformed);
   }
@@ -5755,7 +5771,8 @@ PdfStatus PdfPreparation::encodeDiscoveryHeader(uint8_t* const output, const siz
   std::memcpy(output, "PDRH", 4);
   writeLe16Bmp(output + 4, kDiscoveryVersion);
   writeLe16Bmp(output + 6, static_cast<uint16_t>(kDiscoveryHeaderBytes));
-  writeLe32Bmp(output + 8, discoveryEncodedBytes(xref_->entryCount(), static_cast<uint16_t>(pageCount_)));
+  writeLe32Bmp(output + 8,
+               discoveryEncodedBytes(xref_->entryCount(), static_cast<uint16_t>(pageCount_), overflowCount));
   writeLe32Bmp(output + 12, generation_);
   output[16] = sourceIdentity_.modificationTime.known ? 1U : 0U;
   output[17] = hasInfo ? 1U : 0U;
@@ -5778,6 +5795,7 @@ PdfStatus PdfPreparation::encodeDiscoveryHeader(uint8_t* const output, const siz
   encodeDiscoveryReference(catalogNavigation_.pageLabels, output + 94);
   encodeDiscoveryReference(catalogNavigation_.metadata, output + 100);
   std::memcpy(output + 106, catalogNavigation_.language, catalogNavigation_.languageLength);
+  writeLe32Bmp(output + 180, overflowCount);
   writeLe32Bmp(output + kDiscoveryHeaderCrcOffset, pdfCacheCrc32(output, kDiscoveryHeaderCrcOffset));
   return PdfStatus::success();
 }
@@ -5794,6 +5812,7 @@ PdfStatus PdfPreparation::decodeDiscoveryHeader(const uint8_t* const input, cons
   const uint8_t languageLength = input[19];
   const uint32_t xrefCount = readLe32Prep(input + 52);
   const uint16_t recordPageCount = readLe16Prep(input + 56);
+  const uint32_t overflowCount = readLe32Prep(input + 180);
   const PdfObjectReference root = decodeDiscoveryReference(input + 64);
   const PdfObjectReference info = decodeDiscoveryReference(input + 70);
   const PdfObjectReference pages = decodeDiscoveryReference(input + 76);
@@ -5802,7 +5821,7 @@ PdfStatus PdfPreparation::decodeDiscoveryHeader(const uint8_t* const input, cons
   const PdfObjectReference pageLabels = decodeDiscoveryReference(input + 94);
   const PdfObjectReference metadata = decodeDiscoveryReference(input + 100);
   const uint32_t storedCrc = readLe32Prep(input + kDiscoveryHeaderCrcOffset);
-  const uint32_t expectedTotal = discoveryEncodedBytes(xrefCount, recordPageCount);
+  const uint32_t expectedTotal = discoveryEncodedBytes(xrefCount, recordPageCount, overflowCount);
   const PdfBuildCheckpoint& checkpoint = checkpointSelection_.checkpoint;
   if (std::memcmp(input, "PDRH", 4) != 0 || readLe16Prep(input + 4) != kDiscoveryVersion ||
       readLe16Prep(input + 6) != kDiscoveryHeaderBytes ||
@@ -5811,11 +5830,14 @@ PdfStatus PdfPreparation::decodeDiscoveryHeader(const uint8_t* const input, cons
       languageLength >= PdfMetadataLimits::LanguageBytes || xrefCount == 0 ||
       xrefCount > kMaximumXrefRecords ||
       recordPageCount == 0 || recordPageCount > PdfLimits::MaxPages ||
+      overflowCount > kMaximumAnnotationOverflowRecords ||
       readLe16Prep(input + 58) != kDiscoveryXrefRecordBytes || readLe16Prep(input + 60) != kDiscoveryPageRecordBytes ||
       readLe16Prep(input + 62) != kDiscoveryTrailerBytes || totalBytes != expectedTotal ||
       totalBytes > resumeJournalPhysicalBytes_ ||
       checkpoint.journalBytes !=
-          totalBytes + static_cast<uint64_t>(checkpoint.lastVerifiedPage) * kPageResumeRecordBytes ||
+          totalBytes + (checkpoint.resumePhase == PdfBuildResumePhase::AfterDiscovery
+                            ? 0U
+                            : static_cast<uint64_t>(checkpoint.lastVerifiedPage) * kPageResumeRecordBytes) ||
       checkpoint.lastVerifiedPage > recordPageCount || recordGeneration != checkpoint.generation ||
       sourceIdentity_.size != readLe64Prep(input + 20) ||
       sourceIdentity_.modificationTime.known != (sourceFlags != 0) ||
@@ -5830,13 +5852,18 @@ PdfStatus PdfPreparation::decodeDiscoveryHeader(const uint8_t* const input, cons
       ((catalogFlags & kDiscoveryCatalogNamedDestinations) == 0) != (namedDestinations.objectNumber == 0) ||
       ((catalogFlags & kDiscoveryCatalogPageLabels) == 0) != (pageLabels.objectNumber == 0) ||
       ((catalogFlags & kDiscoveryCatalogMetadata) == 0) != (metadata.objectNumber == 0) ||
-      !bytesAreZero(input + 106 + languageLength, kDiscoveryHeaderCrcOffset - 106 - languageLength)) {
+      !bytesAreZero(input + 106 + languageLength, 180 - 106 - languageLength) ||
+      !bytesAreZero(input + 184, kDiscoveryHeaderCrcOffset - 184)) {
     return PdfStatus::failure(PdfError::Malformed);
   }
 
   cacheSetupFileSize_ = totalBytes;
   cacheSetupDecodedFileBytes_ = xrefCount;
   resumePageValidationIndex_ = recordPageCount;
+  // Section validation does not use this offset until discovery restoration
+  // has finished, so retain the overflow count here without growing the
+  // fixed preparation control state.
+  resumePageValidationOffset_ = overflowCount;
   if (!restore) {
     return PdfStatus::success();
   }
@@ -5862,6 +5889,7 @@ PdfStatus PdfPreparation::decodeDiscoveryHeader(const uint8_t* const input, cons
   catalogNavigation_.hasMetadata = (catalogFlags & kDiscoveryCatalogMetadata) != 0;
   pageCount_ = 0;
   coverCandidateSourceCount_ = 0;
+  currentAnnotationOverflowOrdinal_ = 0;
   return pdfApplyCatalogMetadata(catalogNavigation_, &metadataBuilder_);
 }
 
@@ -5960,9 +5988,7 @@ PdfStatus PdfPreparation::encodeDiscoveryPageRecord(const uint16_t ordinal, uint
   output[236] = page.contentCount;
   output[237] = page.annotationCount;
   output[238] = (page.hasResources ? 1U : 0U) | (page.resourcesIndirect ? 2U : 0U);
-  // Overflow references live in a session-only spool. Mark the snapshot so a
-  // later boot restarts discovery instead of restoring incomplete link data.
-  output[239] = page.overflowAnnotationCount == 0 ? 0U : 1U;
+  writeLe16Bmp(output + 239, page.overflowAnnotationCount);
   writeLe32Bmp(output + kDiscoveryPageRecordCrcOffset, pdfCacheCrc32(output, kDiscoveryPageRecordCrcOffset));
   return PdfStatus::success();
 }
@@ -5975,6 +6001,7 @@ PdfStatus PdfPreparation::decodeDiscoveryPageRecord(const uint8_t* const input, 
   const uint8_t contentCount = input[236];
   const uint8_t annotationCount = input[237];
   const uint8_t flags = input[238];
+  const uint16_t overflowAnnotationCount = readLe16Prep(input + 239);
   const uint16_t rotation = readLe16Prep(input + 234);
   const PdfObjectReference pageReference = decodeDiscoveryReference(input + 8);
   const PdfObjectReference resourceOwner = decodeDiscoveryReference(input + 14);
@@ -5986,7 +6013,7 @@ PdfStatus PdfPreparation::decodeDiscoveryPageRecord(const uint8_t* const input, 
       readLe16Prep(input + 230) == 0 || readLe16Prep(input + 232) == 0 ||
       (rotation != 0 && rotation != 90 && rotation != 180 && rotation != 270) ||
       contentCount > PdfLimits::MaxContentStreamsPerPage || annotationCount > PdfLimits::MaxLinkAnnotationsPerPage ||
-      (flags & ~3U) != 0 || input[239] != 0 || ((flags & 2U) != 0 && (flags & 1U) == 0) ||
+      (flags & ~3U) != 0 || !bytesAreZero(input + 241, 3) || ((flags & 2U) != 0 && (flags & 1U) == 0) ||
       ((flags & 1U) != 0 && ((flags & 2U) != 0 ? resourceReference.objectNumber : resourceOwner.objectNumber) == 0) ||
       readLe32Prep(input + kDiscoveryPageRecordCrcOffset) != pdfCacheCrc32(input, kDiscoveryPageRecordCrcOffset)) {
     return PdfStatus::failure(PdfError::Malformed, ordinal);
@@ -6036,8 +6063,47 @@ PdfStatus PdfPreparation::decodeDiscoveryPageRecord(const uint8_t* const input, 
   page->rotation = rotation;
   page->contentCount = contentCount;
   page->annotationCount = annotationCount;
+  page->overflowAnnotationCount = overflowAnnotationCount;
   page->hasResources = (flags & 1U) != 0;
   page->resourcesIndirect = (flags & 2U) != 0;
+  return PdfStatus::success();
+}
+
+PdfStatus PdfPreparation::encodeDiscoveryOverflowRecord(const uint32_t ordinal, uint8_t* const output,
+                                                        const size_t capacity) {
+  if (output == nullptr || capacity < kDiscoveryOverflowRecordBytes || !annotationOverflowSpool_.isOpen() ||
+      ordinal >= annotationOverflowSpool_.recordCount()) {
+    return PdfStatus::failure(PdfError::InvalidArgument, ordinal);
+  }
+  PdfObjectReference reference{};
+  PdfStatus status = pdfReadRecord(annotationOverflowSpool_.store(), ordinal, &reference);
+  if (!status) {
+    return status;
+  }
+  if (!discoveryReferenceEncodingValid(reference, false)) {
+    return PdfStatus::failure(PdfError::Malformed, ordinal);
+  }
+  std::memset(output, 0, kDiscoveryOverflowRecordBytes);
+  encodeDiscoveryReference(reference, output);
+  writeLe32Bmp(output + kDiscoveryOverflowRecordCrcOffset,
+               pdfCacheCrc32(output, kDiscoveryOverflowRecordCrcOffset));
+  return PdfStatus::success();
+}
+
+PdfStatus PdfPreparation::decodeDiscoveryOverflowRecord(const uint8_t* const input, const size_t length,
+                                                        const uint32_t ordinal,
+                                                        PdfObjectReference* const reference) const {
+  if (input == nullptr || length != kDiscoveryOverflowRecordBytes || reference == nullptr ||
+      ordinal >= static_cast<uint32_t>(resumePageValidationOffset_)) {
+    return PdfStatus::failure(PdfError::InvalidArgument, ordinal);
+  }
+  const PdfObjectReference decoded = decodeDiscoveryReference(input);
+  if (!discoveryReferenceEncodingValid(decoded, false) || !bytesAreZero(input + 6, 2) ||
+      readLe32Prep(input + kDiscoveryOverflowRecordCrcOffset) !=
+          pdfCacheCrc32(input, kDiscoveryOverflowRecordCrcOffset)) {
+    return PdfStatus::failure(PdfError::Malformed, ordinal);
+  }
+  *reference = decoded;
   return PdfStatus::success();
 }
 
@@ -6050,7 +6116,8 @@ PdfStatus PdfPreparation::encodeDiscoveryTrailer(uint8_t* const output, const si
   std::memcpy(output, "PDRT", 4);
   writeLe16Bmp(output + 4, kDiscoveryVersion);
   writeLe16Bmp(output + 6, static_cast<uint16_t>(kDiscoveryTrailerBytes));
-  writeLe32Bmp(output + 8, discoveryEncodedBytes(xref_->entryCount(), static_cast<uint16_t>(pageCount_)));
+  writeLe32Bmp(output + 8, discoveryEncodedBytes(xref_->entryCount(), static_cast<uint16_t>(pageCount_),
+                                                 annotationOverflowSpool_.recordCount()));
   writeLe32Bmp(output + 12, generation_);
   writeLe32Bmp(output + 16, xref_->entryCount());
   writeLe16Bmp(output + 20, static_cast<uint16_t>(pageCount_));
@@ -6113,7 +6180,9 @@ PdfStatus PdfPreparation::beginDiscoveryXrefRestore() {
 PdfStatus PdfPreparation::finishDiscoveryXrefRestore() {
   if (!xref_.has_value() || !runRecords_ || !pageText_ || !xrefSpools_[0].isOpen() ||
       xrefSpools_[0].recordCount() != cacheSetupDecodedFileBytes_ || !pageSpool_.isOpen() ||
-      pageSpool_.recordCount() != pageCount_ || pageCount_ != resumePageValidationIndex_) {
+      pageSpool_.recordCount() != pageCount_ || pageCount_ != resumePageValidationIndex_ ||
+      !annotationOverflowSpool_.isOpen() ||
+      annotationOverflowSpool_.recordCount() != static_cast<uint32_t>(resumePageValidationOffset_)) {
     return PdfStatus::failure(PdfError::InvalidArgument);
   }
   // The restored xref is a session spool. Checked close provides the required
@@ -6172,6 +6241,7 @@ PdfStatus PdfPreparation::appendDiscoveryPage(const PdfPageInfo& page) {
   if (!pageStatus) {
     return pageStatus;
   }
+  rememberPageReference(pageCount_, page.pageReference);
   if (page.pageIndex < PdfLimits::MaxCoverScanPages && page.hasResources &&
       coverCandidateSourceCount_ < PdfLimits::MaxCoverCandidateSources) {
     const PdfObjectReference reference = page.resourcesIndirect ? page.resourceReference : page.resourceOwner;
@@ -6638,6 +6708,13 @@ PdfStepResult PdfPreparation::stepSetupCheckpointAndManifest(PdfWorkBudget& budg
 
   if (cacheSetupStage_ == CacheSetupStage::OpenResumeLedger) {
     const PdfBuildCheckpoint& checkpoint = checkpointSelection_.checkpoint;
+    const bool discoveryCandidate =
+        checkpointSelection_.selected && checkpoint.resumePhase == PdfBuildResumePhase::AfterDiscovery &&
+        (checkpoint.phase == PdfBuildPhase::ParsePages || checkpoint.phase == PdfBuildPhase::Cancelled) &&
+        checkpoint.generation != 0 && checkpoint.lastVerifiedPage == 0 && checkpoint.lastVerifiedObject == 0 &&
+        checkpoint.emittedSections == 0 && checkpoint.emittedImages == 0 && checkpoint.outputBytes == 0 &&
+        checkpoint.cumulativeWords <= PdfLimits::MaxExpandedRequiredStreamBytes &&
+        checkpoint.journalBytes >= kDiscoveryHeaderBytes + kDiscoveryTrailerBytes;
     const bool pageCandidate =
         checkpointSelection_.selected && checkpoint.resumePhase == PdfBuildResumePhase::AfterPage &&
         (checkpoint.phase == PdfBuildPhase::ParsePages || checkpoint.phase == PdfBuildPhase::Cancelled) &&
@@ -6646,7 +6723,7 @@ PdfStepResult PdfPreparation::stepSetupCheckpointAndManifest(PdfWorkBudget& budg
         checkpoint.emittedSections <= checkpoint.lastVerifiedPage && checkpoint.emittedImages == 0 &&
         checkpoint.lastVerifiedObject != 0 && checkpoint.journalBytes != 0 &&
         checkpoint.journalBytes >= kDiscoveryHeaderBytes + kDiscoveryTrailerBytes + kPageResumeRecordBytes;
-    if (pageCandidate) {
+    if (discoveryCandidate || pageCandidate) {
       const int pathLength = std::snprintf(resumeJournalPath_, sizeof(resumeJournalPath_), "%s/gen_%lu/resume.journal",
                                            cacheRoot_, static_cast<unsigned long>(checkpoint.generation));
       if (pathLength <= 0 || static_cast<size_t>(pathLength) >= sizeof(resumeJournalPath_)) {
@@ -6845,6 +6922,12 @@ PdfStepResult PdfPreparation::stepSetupDiscoveryRestore(PdfWorkBudget& budget) {
         status = decodeDiscoveryPageRecord(sourceWindow_.get(), kDiscoveryPageRecordBytes,
                                            static_cast<uint16_t>(cacheSetupRecordIndex_), &navigation_->pageScratch);
       }
+      if (status &&
+          (currentAnnotationOverflowOrdinal_ > static_cast<uint32_t>(resumePageValidationOffset_) ||
+           navigation_->pageScratch.overflowAnnotationCount >
+               static_cast<uint32_t>(resumePageValidationOffset_) - currentAnnotationOverflowOrdinal_)) {
+        status = PdfStatus::failure(PdfError::Malformed, cacheSetupRecordIndex_);
+      }
       if (status) {
         status = appendDiscoveryPage(navigation_->pageScratch);
       }
@@ -6858,9 +6941,53 @@ PdfStepResult PdfPreparation::stepSetupDiscoveryRestore(PdfWorkBudget& budget) {
       cacheSetupCrc32_ = pdfCacheCrc32(sourceWindow_.get(), kDiscoveryPageRecordBytes, cacheSetupCrc32_);
       cacheSetupDecodedLedger_ = pdfCacheFnv64(sourceWindow_.get(), kDiscoveryPageRecordBytes, cacheSetupDecodedLedger_);
       cacheSetupOffset_ += kDiscoveryPageRecordBytes;
+      currentAnnotationOverflowOrdinal_ += navigation_->pageScratch.overflowAnnotationCount;
       ++cacheSetupRecordIndex_;
     }
-    cacheSetupStage_ = CacheSetupStage::ValidateResumeDiscoveryTrailer;
+    if (currentAnnotationOverflowOrdinal_ != static_cast<uint32_t>(resumePageValidationOffset_)) {
+      rejectResumeState();
+      return PdfStepResult::paused();
+    }
+    cacheSetupRecordIndex_ = 0;
+    cacheSetupStage_ = resumePageValidationOffset_ == 0 ? CacheSetupStage::ValidateResumeDiscoveryTrailer
+                                                        : CacheSetupStage::ValidateResumeDiscoveryOverflow;
+    return PdfStepResult::paused();
+  }
+
+  if (cacheSetupStage_ == CacheSetupStage::ValidateResumeDiscoveryOverflow) {
+    if (cacheSetupRecordIndex_ >= resumePageValidationOffset_) {
+      cacheSetupStage_ = CacheSetupStage::ValidateResumeDiscoveryTrailer;
+      return PdfStepResult::paused();
+    }
+    constexpr size_t kOverflowIoBytes = kDiscoveryOverflowRecordBytes + sizeof(PdfObjectReference);
+    if (budget.operationsRemaining < 2U || budget.bytesRemaining < kOverflowIoBytes ||
+        !budget.consumeOperation()) {
+      return pauseForBudget();
+    }
+    PdfStatus status =
+        readCacheSetupBytes(budget, cacheSetupOffset_, sourceWindow_.get(), kDiscoveryOverflowRecordBytes);
+    PdfObjectReference reference{};
+    if (status) {
+      status = decodeDiscoveryOverflowRecord(sourceWindow_.get(), kDiscoveryOverflowRecordBytes,
+                                             cacheSetupRecordIndex_, &reference);
+    }
+    if (status) {
+      (void)budget.takeBytes(sizeof(PdfObjectReference));
+      status = pdfWriteRecord(annotationOverflowSpool_.store(), cacheSetupRecordIndex_, &reference);
+    }
+    if (!status) {
+      if (status.error == PdfError::IoFailure || status.error == PdfError::InsufficientStorage) {
+        return PdfStepResult::failure(status);
+      }
+      rejectResumeState();
+      return PdfStepResult::paused();
+    }
+    cacheSetupCrc32_ =
+        pdfCacheCrc32(sourceWindow_.get(), kDiscoveryOverflowRecordBytes, cacheSetupCrc32_);
+    cacheSetupDecodedLedger_ =
+        pdfCacheFnv64(sourceWindow_.get(), kDiscoveryOverflowRecordBytes, cacheSetupDecodedLedger_);
+    cacheSetupOffset_ += kDiscoveryOverflowRecordBytes;
+    ++cacheSetupRecordIndex_;
     return PdfStepResult::paused();
   }
 
@@ -7118,12 +7245,23 @@ PdfStepResult PdfPreparation::stepSetupDiscoveryRestore(PdfWorkBudget& budget) {
       return PdfStepResult::failure(status);
     }
     const PdfBuildCheckpoint& checkpoint = checkpointSelection_.checkpoint;
-    if (resumeJournalScanOffset_ != resumeJournalCommittedBytes_ || currentPageIndex_ != checkpoint.lastVerifiedPage ||
-        sectionCount_ != checkpoint.emittedSections || retainedImageFileCount_ != checkpoint.emittedImages ||
-        totalWords_ != checkpoint.cumulativeWords || cumulativeSectionBytes_ != checkpoint.outputBytes ||
-        warningFlags_ != checkpoint.warningFlags || cacheSetupDecodedLedger_ != checkpoint.lastVerifiedObject) {
+    const bool discoveryResume = checkpoint.resumePhase == PdfBuildResumePhase::AfterDiscovery;
+    const bool stateMismatch =
+        discoveryResume
+            ? currentPageIndex_ != 0 || sectionCount_ != 0 || retainedImageFileCount_ != 0 || totalWords_ != 0 ||
+                  cumulativeSectionBytes_ != 0 || cumulativeImageBytes_ != 0 || cacheSetupDecodedLedger_ != 0 ||
+                  checkpoint.cumulativeWords > PdfLimits::MaxExpandedRequiredStreamBytes
+            : currentPageIndex_ != checkpoint.lastVerifiedPage || sectionCount_ != checkpoint.emittedSections ||
+                  retainedImageFileCount_ != checkpoint.emittedImages || totalWords_ != checkpoint.cumulativeWords ||
+                  cumulativeSectionBytes_ != checkpoint.outputBytes || warningFlags_ != checkpoint.warningFlags ||
+                  cacheSetupDecodedLedger_ != checkpoint.lastVerifiedObject;
+    if (resumeJournalScanOffset_ != resumeJournalCommittedBytes_ || stateMismatch) {
       rejectResumeState();
       return PdfStepResult::paused();
+    }
+    if (discoveryResume) {
+      expandedRequiredBytes_ = checkpoint.cumulativeWords;
+      warningFlags_ = checkpoint.warningFlags;
     }
     resumePageValidationIndex_ = 0;
     resumePageValidationOffset_ = 0;
@@ -7137,8 +7275,8 @@ PdfStepResult PdfPreparation::stepSetupDiscoveryRestore(PdfWorkBudget& budget) {
       resumeAfterPage_ = true;
       resumeLedgerValid_ = true;
       resumeLedgerReady_ = true;
-      durableResumePhase_ = PdfBuildResumePhase::AfterPage;
-      resumedPhase_ = PdfBuildResumePhase::AfterPage;
+      durableResumePhase_ = checkpointSelection_.checkpoint.resumePhase;
+      resumedPhase_ = checkpointSelection_.checkpoint.resumePhase;
       durableResumePage_ = checkpointSelection_.checkpoint.lastVerifiedPage;
       resumeJournalRecordSequence_ = resumeJournalScanSequence_;
       cacheSetupStage_ = CacheSetupStage::SelectGeneration;
@@ -7982,7 +8120,8 @@ PdfStepResult PdfPreparation::stepSetupGeneration(PdfWorkBudget& budget) {
          checkpointSelection_.checkpoint.resumePhase == PdfBuildResumePhase::AfterEmitSections ||
          checkpointSelection_.checkpoint.resumePhase == PdfBuildResumePhase::AfterImage ||
          checkpointSelection_.checkpoint.resumePhase == PdfBuildResumePhase::AfterImageRepair ||
-         checkpointSelection_.checkpoint.resumePhase == PdfBuildResumePhase::AfterPage);
+         checkpointSelection_.checkpoint.resumePhase == PdfBuildResumePhase::AfterPage ||
+         checkpointSelection_.checkpoint.resumePhase == PdfBuildResumePhase::AfterDiscovery);
     bool checkpointGenerationProtected = false;
     if (checkpointSelection_.selected) {
       for (const PdfCacheManifestSlotState& slot : manifestSelection_.slots) {
@@ -8237,7 +8376,10 @@ PdfStepResult PdfPreparation::stepSetupOutputs(PdfWorkBudget& budget) {
       if (!xref_.has_value() || !xref_->finalized() || pageCount_ == 0) {
         status = PdfStatus::failure(PdfError::Malformed);
       } else {
-        status = resetResolverWorkspace();
+        status = configureNavigationParserArena();
+        if (status) {
+          status = resetResolverWorkspace();
+        }
         if (status) {
           status = beginNavigationDiscovery();
         }
@@ -8635,6 +8777,63 @@ uint16_t PdfPreparation::sectionForPage(const uint32_t pageIndex) const {
   return section;
 }
 
+uint32_t PdfPreparation::pageReferenceLookupCapacity() const {
+  if (navigation_ == nullptr) {
+    return 0;
+  }
+  // Navigation finishes before image preparation. The image cache has no live
+  // entries yet, and beginCurrentPageImages() resets the candidates before use,
+  // so these phase-dead bytes can hold page references without extra RAM.
+  static_assert(sizeof(navigation_->imageCacheEntries) % sizeof(PdfObjectReference) == 0);
+  static_assert(sizeof(navigation_->imageCandidates) % sizeof(PdfObjectReference) == 0);
+  return static_cast<uint32_t>((sizeof(navigation_->imageCacheEntries) + sizeof(navigation_->imageCandidates)) /
+                               sizeof(PdfObjectReference));
+}
+
+void PdfPreparation::rememberPageReference(const uint32_t pageIndex, const PdfObjectReference reference) {
+  if (navigation_ == nullptr) {
+    return;
+  }
+  constexpr uint32_t kCacheEntryCapacity =
+      sizeof(navigation_->imageCacheEntries) / (sizeof(PdfObjectReference));
+  if (pageIndex < kCacheEntryCapacity) {
+    std::memcpy(reinterpret_cast<uint8_t*>(navigation_->imageCacheEntries) +
+                    pageIndex * sizeof(PdfObjectReference),
+                &reference, sizeof(reference));
+    return;
+  }
+  const uint32_t candidateIndex = pageIndex - kCacheEntryCapacity;
+  if (candidateIndex < sizeof(navigation_->imageCandidates) / (sizeof(PdfObjectReference))) {
+    std::memcpy(reinterpret_cast<uint8_t*>(navigation_->imageCandidates) +
+                    candidateIndex * sizeof(PdfObjectReference),
+                &reference, sizeof(reference));
+  }
+}
+
+PdfObjectReference PdfPreparation::recalledPageReference(const uint32_t pageIndex) const {
+  PdfObjectReference reference{};
+  if (navigation_ == nullptr) {
+    return reference;
+  }
+  constexpr uint32_t kCacheEntryCapacity =
+      sizeof(navigation_->imageCacheEntries) / (sizeof(PdfObjectReference));
+  if (pageIndex < kCacheEntryCapacity) {
+    std::memcpy(&reference,
+                reinterpret_cast<const uint8_t*>(navigation_->imageCacheEntries) +
+                    pageIndex * sizeof(PdfObjectReference),
+                sizeof(reference));
+    return reference;
+  }
+  const uint32_t candidateIndex = pageIndex - kCacheEntryCapacity;
+  if (candidateIndex < sizeof(navigation_->imageCandidates) / (sizeof(PdfObjectReference))) {
+    std::memcpy(&reference,
+                reinterpret_cast<const uint8_t*>(navigation_->imageCandidates) +
+                    candidateIndex * sizeof(PdfObjectReference),
+                sizeof(reference));
+  }
+  return reference;
+}
+
 PdfStatus PdfPreparation::readNavigationRecord(const uint32_t index, PdfOutlineEntry* const record) {
   if (record == nullptr || index >= traversalSpool_.recordCount()) {
     return PdfStatus::failure(PdfError::InvalidOffset, index);
@@ -8921,6 +9120,18 @@ PdfStatus PdfPreparation::resolveDestination(const PdfRawDestination& raw,
   }
   if (explicitDestination.kind != PdfRawDestinationKind::Explicit) {
     return PdfStatus::failure(PdfError::InvalidOffset);
+  }
+  if (pageCount_ <= pageReferenceLookupCapacity()) {
+    for (uint32_t page = 0; page < pageCount_ && page <= UINT16_MAX; ++page) {
+      if (recalledPageReference(page) == explicitDestination.pageReference) {
+        destination->sectionIndex = sectionForPage(page);
+        destination->sourcePageIndex = static_cast<uint16_t>(page);
+        destination->anchorOrdinal = 0;
+        destination->resolved = true;
+        return PdfStatus::success();
+      }
+    }
+    return PdfStatus::failure(PdfError::InvalidOffset, explicitDestination.pageReference.objectNumber);
   }
   // A destination lookup may inspect every source page. Keep the page spool
   // open for that scan instead of handing the single SD reader from the PDF to
@@ -16971,12 +17182,14 @@ PdfStepResult PdfPreparation::stepCommitPageResume(PdfWorkBudget& budget) {
   if (pageText_ == nullptr || navigation_ == nullptr || !config_.io.valid()) {
     return PdfStepResult::failure(PdfStatus::failure(PdfError::InvalidArgument));
   }
+  const bool discoveryResume = phase_ == PdfPreparationPhase::CommitDiscoveryResume;
   if (resumePointStage_ == ResumePointStage::Idle) {
     if (resumeJournalHandle_.valid() || checkpointCommitStage_ != CheckpointCommitStage::Idle ||
-        currentPageIndex_ >= pageCount_) {
+        (!discoveryResume && currentPageIndex_ >= pageCount_) ||
+        (discoveryResume && (currentPageIndex_ != 0 || sectionCount_ != 0 || resumeJournalCommittedBytes_ != 0))) {
       return PdfStepResult::failure(PdfStatus::failure(PdfError::InvalidArgument, currentPageIndex_));
     }
-    pendingResumePage_ = currentPageIndex_ + 1U;
+    pendingResumePage_ = discoveryResume ? 0U : currentPageIndex_ + 1U;
     const int pathLength = std::snprintf(resumeJournalPath_, sizeof(resumeJournalPath_), "%s/gen_%lu/resume.journal",
                                          cacheRoot_, static_cast<unsigned long>(generation_));
     if (pathLength <= 0 || static_cast<size_t>(pathLength) >= sizeof(resumeJournalPath_)) {
@@ -16986,7 +17199,8 @@ PdfStepResult PdfPreparation::stepCommitPageResume(PdfWorkBudget& budget) {
     if (resumeJournalCommittedBytes_ == 0) {
       status = finalizeDiscoveryXref();
       if (status) {
-        cacheSetupFileSize_ = discoveryEncodedBytes(xref_->entryCount(), static_cast<uint16_t>(pageCount_));
+        cacheSetupFileSize_ = discoveryEncodedBytes(xref_->entryCount(), static_cast<uint16_t>(pageCount_),
+                                                    annotationOverflowSpool_.recordCount());
         cacheSetupOffset_ = 0;
         cacheSetupRecordIndex_ = 0;
         resumePageValidationIndex_ = 0;
@@ -16994,7 +17208,11 @@ PdfStepResult PdfPreparation::stepCommitPageResume(PdfWorkBudget& budget) {
         cacheSetupDecodedLedger_ = PDF_CACHE_FNV64_OFFSET;
       }
     }
-    if (status) {
+    if (status && discoveryResume && cacheSetupFileSize_ > 0x00ffffffU) {
+      resumePointStage_ = ResumePointStage::Complete;
+      return PdfStepResult::paused();
+    }
+    if (status && !discoveryResume) {
       status = encodePageResumeRecord(pageText_.get(), PdfLimits::PageTextBytes);
     }
     if (!status) {
@@ -17083,7 +17301,10 @@ PdfStepResult PdfPreparation::stepCommitPageResume(PdfWorkBudget& budget) {
   }
   if (resumePointStage_ == ResumePointStage::WriteDiscoveryPages) {
     if (resumePageValidationIndex_ >= pageCount_) {
-      resumePointStage_ = ResumePointStage::WriteDiscoveryTrailer;
+      cacheSetupRecordIndex_ = 0;
+      resumePointStage_ = annotationOverflowSpool_.recordCount() == 0
+                              ? ResumePointStage::WriteDiscoveryTrailer
+                              : ResumePointStage::WriteDiscoveryOverflow;
       return PdfStepResult::paused();
     }
     const PdfStatus status =
@@ -17101,6 +17322,68 @@ PdfStepResult PdfPreparation::stepCommitPageResume(PdfWorkBudget& budget) {
     ++resumePageValidationIndex_;
     return PdfStepResult::paused();
   }
+  if (resumePointStage_ == ResumePointStage::WriteDiscoveryOverflow) {
+    const uint32_t overflowCount = annotationOverflowSpool_.recordCount();
+    if (!annotationOverflowSpool_.isOpen()) {
+      if (sourceHandle_.valid()) {
+        if (!budget.consumeOperation()) {
+          return PdfStepResult::paused();
+        }
+        const PdfStatus status = closeSource();
+        return status ? PdfStepResult::paused() : PdfStepResult::failure(status);
+      }
+      if (xrefFinalSpool_ < std::size(xrefSpools_) && xrefSpools_[xrefFinalSpool_].isOpen()) {
+        if (!budget.consumeOperation()) {
+          return PdfStepResult::paused();
+        }
+        const PdfStatus status = xrefSpools_[xrefFinalSpool_].close();
+        return status ? PdfStepResult::paused() : PdfStepResult::failure(status);
+      }
+      if (!budget.consumeOperation()) {
+        return PdfStepResult::paused();
+      }
+      char path[PDF_CACHE_PATH_CAPACITY]{};
+      PdfStatus status = formatAnnotationOverflowSpoolPath(path, sizeof(path));
+      if (status) {
+        status = annotationOverflowSpool_.open(path, PdfCacheOpenMode::Read, overflowCount);
+      }
+      return status ? PdfStepResult::paused() : PdfStepResult::failure(status);
+    }
+    if (cacheSetupRecordIndex_ >= overflowCount) {
+      if (!budget.consumeOperation()) {
+        return PdfStepResult::paused();
+      }
+      const PdfStatus status = annotationOverflowSpool_.close();
+      if (!status) {
+        return PdfStepResult::failure(status);
+      }
+      resumePointStage_ = ResumePointStage::WriteDiscoveryTrailer;
+      return PdfStepResult::paused();
+    }
+    constexpr size_t kOverflowIoBytes = sizeof(PdfObjectReference) + kDiscoveryOverflowRecordBytes;
+    if (budget.operationsRemaining < 2U || budget.bytesRemaining < kOverflowIoBytes ||
+        !budget.consumeOperation()) {
+      return PdfStepResult::paused();
+    }
+    (void)budget.takeBytes(sizeof(PdfObjectReference));
+    const PdfStatus status =
+        encodeDiscoveryOverflowRecord(cacheSetupRecordIndex_, sourceWindow_.get(), PdfLimits::SourceBufferBytes);
+    if (!status) {
+      return PdfStepResult::failure(status);
+    }
+    const PdfStepResult result =
+        writeResumeJournalBuffer(budget, sourceWindow_.get(), kDiscoveryOverflowRecordBytes);
+    if (!result.complete()) {
+      return result;
+    }
+    cacheSetupCrc32_ =
+        pdfCacheCrc32(sourceWindow_.get(), kDiscoveryOverflowRecordBytes, cacheSetupCrc32_);
+    cacheSetupDecodedLedger_ =
+        pdfCacheFnv64(sourceWindow_.get(), kDiscoveryOverflowRecordBytes, cacheSetupDecodedLedger_);
+    cacheSetupOffset_ += kDiscoveryOverflowRecordBytes;
+    ++cacheSetupRecordIndex_;
+    return PdfStepResult::paused();
+  }
   if (resumePointStage_ == ResumePointStage::WriteDiscoveryTrailer) {
     const PdfStatus status = encodeDiscoveryTrailer(sourceWindow_.get(), PdfLimits::SourceBufferBytes);
     if (!status) {
@@ -17114,7 +17397,7 @@ PdfStepResult PdfPreparation::stepCommitPageResume(PdfWorkBudget& budget) {
     if (cacheSetupOffset_ != cacheSetupFileSize_) {
       return PdfStepResult::failure(PdfStatus::failure(PdfError::Malformed, cacheSetupOffset_));
     }
-    resumePointStage_ = ResumePointStage::WriteRecord;
+    resumePointStage_ = discoveryResume ? ResumePointStage::CloseJournal : ResumePointStage::WriteRecord;
     return PdfStepResult::paused();
   }
   if (resumePointStage_ == ResumePointStage::WriteRecord) {
@@ -17153,10 +17436,12 @@ PdfStepResult PdfPreparation::stepCommitPageResume(PdfWorkBudget& budget) {
     if (resumeJournalCommittedBytes_ == 0) {
       resumeJournalCommittedBytes_ = cacheSetupFileSize_;
     }
-    resumeJournalCommittedBytes_ += kPageResumeRecordBytes;
-    ++resumeJournalRecordSequence_;
+    if (!discoveryResume) {
+      resumeJournalCommittedBytes_ += kPageResumeRecordBytes;
+      ++resumeJournalRecordSequence_;
+    }
     durableResumePage_ = pendingResumePage_;
-    durableResumePhase_ = PdfBuildResumePhase::AfterPage;
+    durableResumePhase_ = discoveryResume ? PdfBuildResumePhase::AfterDiscovery : PdfBuildResumePhase::AfterPage;
     resumeLedgerReady_ = true;
     ++sequence_;
     checkpointCommitStage_ = CheckpointCommitStage::Idle;
@@ -17225,17 +17510,23 @@ PdfStepResult PdfPreparation::stepCommitCheckpoint(PdfWorkBudget& budget, const 
     }
     PdfBuildCheckpoint& checkpoint = checkpointSelection_.checkpoint;
     const PdfBuildCheckpoint durableCheckpoint = checkpoint;
+    const bool committingDiscovery =
+        phase == PdfBuildPhase::ParsePages && phase_ == PdfPreparationPhase::CommitDiscoveryResume;
     const bool committingPage = phase == PdfBuildPhase::ParsePages && pendingResumePage_ != 0;
+    const bool cancellingAtDiscovery =
+        phase == PdfBuildPhase::Cancelled && durableResumePhase_ == PdfBuildResumePhase::AfterDiscovery &&
+        durableCheckpoint.resumePhase == PdfBuildResumePhase::AfterDiscovery && durableCheckpoint.journalBytes != 0;
     const bool cancellingAtPage =
         phase == PdfBuildPhase::Cancelled && durableResumePhase_ == PdfBuildResumePhase::AfterPage &&
         durableCheckpoint.resumePhase == PdfBuildResumePhase::AfterPage && durableCheckpoint.journalBytes != 0;
     resetInPlace(checkpoint);
-    if (cancellingAtPage) {
+    if (cancellingAtDiscovery || cancellingAtPage) {
       checkpoint = durableCheckpoint;
       checkpoint.sequence = sequence_;
       checkpoint.phase = PdfBuildPhase::Cancelled;
     } else {
-      const uint32_t verifiedPage = committingPage ? pendingResumePage_ : std::min(currentPageIndex_, pageCount_);
+      const uint32_t verifiedPage =
+          committingDiscovery ? 0U : committingPage ? pendingResumePage_ : std::min(currentPageIndex_, pageCount_);
       const bool reuseVerifiedObject = resumedFromCheckpoint_ && verifiedPage != 0 &&
                                         durableCheckpoint.lastVerifiedPage == verifiedPage &&
                                         durableCheckpoint.lastVerifiedObject != 0;
@@ -17253,7 +17544,8 @@ PdfStepResult PdfPreparation::stepCommitCheckpoint(PdfWorkBudget& budget, const 
       checkpoint.source = sourceIdentity_;
       checkpoint.generation = generation_;
       checkpoint.phase = phase;
-      checkpoint.resumePhase = committingPage ? PdfBuildResumePhase::AfterPage
+      checkpoint.resumePhase = committingDiscovery ? PdfBuildResumePhase::AfterDiscovery
+                               : committingPage     ? PdfBuildResumePhase::AfterPage
                                : phase != PdfBuildPhase::Cancelled || !resumeLedgerReady_ ? PdfBuildResumePhase::None
                                : emitSectionsResumeReady_                                 ? durableResumePhase_
                                                           : PdfBuildResumePhase::CommitManifest;
@@ -17263,21 +17555,28 @@ PdfStepResult PdfPreparation::stepCommitCheckpoint(PdfWorkBudget& budget, const 
                                           : verifiedPage != 0 && navigation_ != nullptr
                                                 ? navigation_->pageScratch.pageReference.objectNumber
                                                 : 0;
-      checkpoint.emittedSections = sectionCount_;
-      checkpoint.emittedImages = retainedImageFileCount_;
-      checkpoint.cumulativeWords = totalWords_;
-      checkpoint.outputBytes =
-          cumulativeSectionBytes_ + cumulativeImageBytes_ + metadataRecord_.size + outlineRecord_.size;
+      checkpoint.emittedSections = committingDiscovery ? 0U : sectionCount_;
+      checkpoint.emittedImages = committingDiscovery ? 0U : retainedImageFileCount_;
+      // Before page emission this field carries the already-consumed required
+      // stream expansion budget. Page checkpoints use it for their word count.
+      checkpoint.cumulativeWords = committingDiscovery ? expandedRequiredBytes_ : totalWords_;
+      checkpoint.outputBytes = committingDiscovery
+                                   ? 0U
+                                   : cumulativeSectionBytes_ + cumulativeImageBytes_ + metadataRecord_.size +
+                                         outlineRecord_.size;
       checkpoint.warningFlags = warningFlags_;
       checkpoint.journalBytes =
-          committingPage ? static_cast<uint32_t>(resumeJournalCommittedBytes_ + kPageResumeRecordBytes +
-                                                 (resumeJournalCommittedBytes_ == 0 ? cacheSetupFileSize_ : 0))
+          committingDiscovery ? static_cast<uint32_t>(cacheSetupFileSize_)
+          : committingPage ? static_cast<uint32_t>(resumeJournalCommittedBytes_ + kPageResumeRecordBytes +
+                                                   (resumeJournalCommittedBytes_ == 0 ? cacheSetupFileSize_ : 0))
           : checkpoint.resumePhase == PdfBuildResumePhase::AfterImage ||
                   checkpoint.resumePhase == PdfBuildResumePhase::AfterImageRepair
               ? static_cast<uint32_t>(resumeJournalCommittedBytes_)
               : 0;
-      for (uint8_t index = 0; index < coverFileCount_; ++index) {
-        checkpoint.outputBytes += coverRecords_[index].size;
+      if (!committingDiscovery) {
+        for (uint8_t index = 0; index < coverFileCount_; ++index) {
+          checkpoint.outputBytes += coverRecords_[index].size;
+        }
       }
     }
     FixedMemorySink sink{pageText_.get(), kCheckpointBytes, 0};
@@ -17565,11 +17864,13 @@ PdfStepResult PdfPreparation::step() {
   // Finish the two-record durability handoff once it has started. A power loss
   // still selects the older checkpoint, while an explicit cancellation cannot
   // strand the in-memory checkpoint selection between journal and slot writes.
-  if (cancelRequested_ && phase_ != PdfPreparationPhase::CommitResumePoint) {
+  const bool committingResumePoint = phase_ == PdfPreparationPhase::CommitResumePoint ||
+                                     phase_ == PdfPreparationPhase::CommitDiscoveryResume;
+  if (cancelRequested_ && !committingResumePoint) {
     return cancel();
   }
 
-  const bool finishResumePoint = cancelRequested_ && phase_ == PdfPreparationPhase::CommitResumePoint;
+  const bool finishResumePoint = cancelRequested_ && committingResumePoint;
   PdfWorkBudget budget{kSliceOperations, kSliceBytes, finishResumePoint ? nullptr : this,
                        finishResumePoint ? nullptr : cancelRequested, this, sliceExpired};
   PdfStatus& operation = operationStatus_;
@@ -17775,8 +18076,21 @@ PdfStepResult PdfPreparation::step() {
       if (!operation) {
         return fail(operation);
       }
+      setPhase(PdfPreparationPhase::CommitDiscoveryResume, 52);
+      return pause();
+
+    case PdfPreparationPhase::CommitDiscoveryResume: {
+      const PdfStepResult result = stepCommitPageResume(budget);
+      if (result.failed()) {
+        return fail(result.status);
+      }
+      if (result.yielded()) {
+        return pause();
+      }
+      resumePointStage_ = ResumePointStage::Idle;
       setPhase(PdfPreparationPhase::ResolveNavigation, 55);
       return pause();
+    }
 
     case PdfPreparationPhase::ResolveNavigation: {
       if (navigationTask_ == NavigationTask::None) {

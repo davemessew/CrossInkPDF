@@ -2,6 +2,8 @@
 
 #include <cstring>
 
+#include "PdfLimits.h"
+
 namespace {
 
 constexpr uint8_t kCheckpointMagic[] = {'P', 'R', 'C', 'P'};
@@ -135,6 +137,13 @@ bool validResumePhase(const PdfBuildCheckpoint& checkpoint) {
   if (checkpoint.resumePhase == PdfBuildResumePhase::None) {
     return checkpoint.journalBytes == 0;
   }
+  if (checkpoint.resumePhase == PdfBuildResumePhase::AfterDiscovery) {
+    return checkpoint.generation != 0 && checkpoint.lastVerifiedPage == 0 && checkpoint.lastVerifiedObject == 0 &&
+           checkpoint.emittedSections == 0 && checkpoint.emittedImages == 0 && checkpoint.outputBytes == 0 &&
+           checkpoint.cumulativeWords <= PdfLimits::MaxExpandedRequiredStreamBytes && checkpoint.journalBytes != 0 &&
+           checkpoint.journalBytes <= 0x00ffffffU &&
+           (checkpoint.phase == PdfBuildPhase::ParsePages || checkpoint.phase == PdfBuildPhase::Cancelled);
+  }
   if (checkpoint.generation == 0 || checkpoint.lastVerifiedPage == 0 || checkpoint.lastVerifiedObject == 0 ||
       checkpoint.emittedSections == 0 || checkpoint.outputBytes == 0 || checkpoint.journalBytes > 0x00ffffffU) {
     return false;
@@ -152,6 +161,7 @@ bool validResumePhase(const PdfBuildCheckpoint& checkpoint) {
     case PdfBuildResumePhase::AfterImageRepair:
       return checkpoint.journalBytes != 0 &&
              (checkpoint.phase == PdfBuildPhase::Finalize || checkpoint.phase == PdfBuildPhase::Cancelled);
+    case PdfBuildResumePhase::AfterDiscovery:
     case PdfBuildResumePhase::None:
     default:
       return false;
@@ -162,7 +172,7 @@ bool validResumePhase(const PdfBuildCheckpoint& checkpoint) {
 
 PdfStatus pdfEncodeBuildCheckpoint(const PdfBuildCheckpoint& checkpoint, const PdfByteSink& destination) {
   if (!destination.valid() || checkpoint.phase > PdfBuildPhase::Cancelled ||
-      checkpoint.resumePhase > PdfBuildResumePhase::AfterImageRepair || !validResumePhase(checkpoint)) {
+      checkpoint.resumePhase > PdfBuildResumePhase::AfterDiscovery || !validResumePhase(checkpoint)) {
     return PdfStatus::failure(PdfError::InvalidArgument);
   }
   FixedEncoder encoder;
@@ -244,7 +254,7 @@ PdfStatus pdfDecodeBuildCheckpoint(const PdfByteSource& source, PdfBuildCheckpoi
   PDF_CACHE_RETURN_IF_ERROR(decoder.u32(&storedCrc));
   if (std::memcmp(magic, kCheckpointMagic, sizeof(magic)) != 0 || codecVersion != PDF_BUILD_CHECKPOINT_CODEC_VERSION ||
       reserved16 != 0 || modificationTimeKnown > 1 || phase > static_cast<uint8_t>(PdfBuildPhase::Cancelled) ||
-      resumePhase > static_cast<uint8_t>(PdfBuildResumePhase::AfterImageRepair) || phaseReserved16 != 0 ||
+      resumePhase > static_cast<uint8_t>(PdfBuildResumePhase::AfterDiscovery) || phaseReserved16 != 0 ||
       storedLength != kCheckpointBytes || storedCrc != calculatedCrc) {
     return PdfStatus::failure(PdfError::Malformed);
   }

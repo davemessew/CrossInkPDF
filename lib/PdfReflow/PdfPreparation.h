@@ -113,6 +113,7 @@ enum class PdfPreparationPhase : uint8_t {
   BeginPage,
   PreparePageLinks,
   PrepareNavigationRecords,
+  CommitDiscoveryResume,
 };
 
 class PdfPreparationPaintGate {
@@ -363,6 +364,7 @@ class PdfPreparation {
     ReadResumeDiscoveryHeader,
     ValidateResumeDiscoveryXref,
     ValidateResumeDiscoveryPages,
+    ValidateResumeDiscoveryOverflow,
     ValidateResumeDiscoveryTrailer,
     RestoreResumeDiscoveryHeader,
     ValidateResumeDiscoveryCatalog,
@@ -499,6 +501,7 @@ class PdfPreparation {
     WriteDiscoveryHeader,
     WriteDiscoveryXref,
     WriteDiscoveryPages,
+    WriteDiscoveryOverflow,
     WriteDiscoveryTrailer,
     WriteRecord,
     CloseJournal,
@@ -662,6 +665,9 @@ class PdfPreparation {
   PdfStatus decodeDiscoveryXrefRecord(const uint8_t* input, size_t length, uint32_t ordinal, PdfXrefEntry* entry) const;
   PdfStatus encodeDiscoveryPageRecord(uint16_t ordinal, uint8_t* output, size_t capacity);
   PdfStatus decodeDiscoveryPageRecord(const uint8_t* input, size_t length, uint16_t ordinal, PdfPageInfo* page) const;
+  PdfStatus encodeDiscoveryOverflowRecord(uint32_t ordinal, uint8_t* output, size_t capacity);
+  PdfStatus decodeDiscoveryOverflowRecord(const uint8_t* input, size_t length, uint32_t ordinal,
+                                          PdfObjectReference* reference) const;
   PdfStatus encodeDiscoveryTrailer(uint8_t* output, size_t capacity) const;
   PdfStatus decodeDiscoveryTrailer(const uint8_t* input, size_t length) const;
   PdfStatus beginDiscoveryXrefRestore();
@@ -690,6 +696,9 @@ class PdfPreparation {
   bool isSectionBoundary(uint32_t pageIndex) const;
   uint16_t sectionForPage(uint32_t pageIndex) const;
   PdfStatus readXmpMetadata();
+  uint32_t pageReferenceLookupCapacity() const;
+  void rememberPageReference(uint32_t pageIndex, PdfObjectReference reference);
+  PdfObjectReference recalledPageReference(uint32_t pageIndex) const;
   PdfStatus resolveDestination(const PdfRawDestination& raw, PdfResolvedDestination* destination);
   PdfStatus beginCurrentPageImages();
   PdfStatus skipCurrentUnreadablePage();
