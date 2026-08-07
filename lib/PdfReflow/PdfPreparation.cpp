@@ -8922,18 +8922,53 @@ PdfStatus PdfPreparation::resolveDestination(const PdfRawDestination& raw,
   if (explicitDestination.kind != PdfRawDestinationKind::Explicit) {
     return PdfStatus::failure(PdfError::InvalidOffset);
   }
-  for (uint32_t page = 0; page < pageCount_ && page <= UINT16_MAX; ++page) {
-    const PdfStatus pageStatus = loadPageRecord(page);
-    if (!pageStatus) {
-      return pageStatus;
+  // A destination lookup may inspect every source page. Keep the page spool
+  // open for that scan instead of handing the single SD reader from the PDF to
+  // the page spool and back for every comparison.
+  const bool sourceWasOpen = sourceHandle_.valid();
+  const bool xrefWasOpen = xrefFinalSpool_ < std::size(xrefSpools_) && xrefSpools_[xrefFinalSpool_].isOpen();
+  PdfStatus status = sourceWasOpen ? closeSource() : PdfStatus::success();
+  if (status && xrefWasOpen) {
+    status = xrefSpools_[xrefFinalSpool_].close();
+  }
+  const bool openedHere = !pageSpool_.isOpen();
+  char path[PDF_CACHE_PATH_CAPACITY]{};
+  if (status && openedHere) {
+    status = formatPageSpoolPath(false, path, sizeof(path));
+    if (status) {
+      status = pageSpool_.open(path, PdfCacheOpenMode::Read, pageCount_);
     }
-    if (navigation_->pageScratch.pageReference == explicitDestination.pageReference) {
-      destination->sectionIndex = sectionForPage(page);
-      destination->sourcePageIndex = static_cast<uint16_t>(page);
-      destination->anchorOrdinal = 0;
-      destination->resolved = true;
-      return PdfStatus::success();
+  }
+
+  uint32_t matchedPage = UINT32_MAX;
+  for (uint32_t page = 0; status && page < pageCount_ && page <= UINT16_MAX; ++page) {
+    status = pdfReadRecord(pageSpool_.store(), page, &navigation_->pageScratch);
+    loadedPageIndex_ = status ? page : UINT32_MAX;
+    if (status && navigation_->pageScratch.pageReference == explicitDestination.pageReference) {
+      matchedPage = page;
+      break;
     }
+  }
+  if (openedHere && pageSpool_.isOpen()) {
+    const PdfStatus closeStatus = pageSpool_.close();
+    if (status && !closeStatus) {
+      status = closeStatus;
+    }
+  }
+  if (status && sourceWasOpen) {
+    status = reopenSource();
+  } else if (status && xrefWasOpen) {
+    status = switchResolverSourceAccess(PdfObjectResolverReader::Xref);
+  }
+  if (!status) {
+    return status;
+  }
+  if (matchedPage != UINT32_MAX) {
+    destination->sectionIndex = sectionForPage(matchedPage);
+    destination->sourcePageIndex = static_cast<uint16_t>(matchedPage);
+    destination->anchorOrdinal = 0;
+    destination->resolved = true;
+    return PdfStatus::success();
   }
   return PdfStatus::failure(PdfError::InvalidOffset, explicitDestination.pageReference.objectNumber);
 }

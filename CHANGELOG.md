@@ -2,6 +2,7 @@
 
 ### Fixed
 
+- PDFs with many internal links no longer stall during final navigation preparation.
 - PDFs with many links now spool excess link annotations to the SD card instead of failing preparation or consuming more RAM.
 - Dense PDF pages, large font dictionaries, malformed optional artwork, and recursive Form objects now fall back safely instead of closing the whole document.
 - Hidden OCR text layers and separately positioned words now reflow with readable spacing and accurate word-count progress.
