@@ -18,9 +18,12 @@ constexpr fui::ActionId ACTION_ROW = 1;
 }  // namespace
 
 EpubReaderBookmarkListActivity::EpubReaderBookmarkListActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
-                                                               const std::vector<Bookmark>& bookmarks)
+                                                               const std::vector<Bookmark>& bookmarks,
+                                                               DeleteCallback deleteCallback, void* deleteContext)
     : Activity("EpubReaderBookmarkList", renderer, mappedInput),
       bookmarks(bookmarks),
+      deleteCallback(deleteCallback),
+      deleteContext(deleteContext),
       uiTarget(makeUiTarget(renderer)),
       app(uiTarget, uiTarget.deviceContext()) {}
 
@@ -41,15 +44,13 @@ void EpubReaderBookmarkListActivity::onExit() { Activity::onExit(); }
 void EpubReaderBookmarkListActivity::deleteSelectedBookmark() {
   if (bookmarks.empty() || selectedIndex < 0 || selectedIndex >= static_cast<int>(bookmarks.size())) return;
 
-  bool removed = false;
   if (deleteCallback == nullptr) {
-    removed = BOOKMARKS.removeBookmarkAt(static_cast<size_t>(selectedIndex));
+    if (!BOOKMARKS.removeBookmarkAt(static_cast<size_t>(selectedIndex))) return;
+    bookmarks = BOOKMARKS.getBookmarks();
   } else {
-    removed = deleteCallback(deleteContext, bookmarks[selectedIndex].paragraphIndex);
+    if (!deleteCallback(deleteContext, bookmarks[selectedIndex].paragraphIndex)) return;
+    bookmarks.erase(bookmarks.begin() + selectedIndex);
   }
-  if (!removed) return;
-
-  bookmarks = BOOKMARKS.getBookmarks();
   if (bookmarks.empty())
     selectedIndex = 0;
   else if (selectedIndex >= static_cast<int>(bookmarks.size()))
@@ -77,33 +78,12 @@ void EpubReaderBookmarkListActivity::selectBookmark() {
   finish();
 }
 
-  startActivityForResult(
-      std::make_unique<FileBrowserActionActivity>(renderer, mappedInput, chapter, std::move(items),
-                                                  ignoreInitialConfirmRelease),
-      [this, selectedBookmark](const ActivityResult& result) {
-        longPressConfirmHandled = false;
-        if (result.isCancelled) {
-          requestUpdate();
-          return;
-        }
-
-        const auto* actionResult = std::get_if<FileBrowserActionResult>(&result.data);
-        if (!actionResult || static_cast<FileBrowserAction>(actionResult->action) != FileBrowserAction::Delete) {
-          requestUpdate();
-          return;
-        }
-
-        const auto it = std::find_if(bookmarks.begin(), bookmarks.end(), [this, &selectedBookmark](const Bookmark& bm) {
-          return bm.spineIndex == selectedBookmark.spineIndex && bm.progress == selectedBookmark.progress &&
-                 (deleteCallback == nullptr || bm.paragraphIndex == selectedBookmark.paragraphIndex);
-        });
-        if (it != bookmarks.end()) {
-          selectedIndex = static_cast<int>(std::distance(bookmarks.begin(), it));
-          deleteSelectedBookmark();
-        } else {
-          requestUpdate();
-        }
-      });
+void EpubReaderBookmarkListActivity::onRowEvent(const fui::ActionEvent& event, void* user) {
+  auto* self = static_cast<EpubReaderBookmarkListActivity*>(user);
+  if (event.value < 0 || event.value >= static_cast<int16_t>(self->bookmarks.size())) return;
+  self->selectedIndex = event.value;
+  self->app.clearTapFlash();
+  self->selectBookmark();
 }
 
 void EpubReaderBookmarkListActivity::loop() {

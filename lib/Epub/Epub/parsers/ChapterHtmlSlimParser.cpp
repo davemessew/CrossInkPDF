@@ -31,6 +31,7 @@
 // Minimum file size (in bytes) to show indexing popup - smaller chapters don't benefit from it
 constexpr size_t MIN_SIZE_FOR_POPUP = 10 * 1024;  // 10KB
 constexpr size_t PARSE_BUFFER_SIZE = 1024;
+constexpr size_t IMAGE_EXTRACT_CHUNK_SIZE = 1024;
 // Initial slab for the parse arena. Covers both style stacks (~2 KB) with headroom for growth.
 constexpr size_t PARSE_ARENA_SLAB_SIZE = 4 * 1024;
 constexpr uint32_t MIN_FREE_HEAP_FOR_TABLE_BUFFERING = 64 * 1024;
@@ -1935,7 +1936,18 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
                     self->skipCurrentElement();
                     return;
                   }
-                }
+                  int displayWidth = 0;
+                  int displayHeight = 0;
+                  const float emSize = static_cast<float>(self->renderer.getFontAscenderSize(self->fontId));
+                  CssStyle imgStyle;
+                  if (!self->isLightMode()) {
+                    imgStyle = self->cssParser
+                                   ? (self->usesSimpleCssLookup()
+                                          ? self->cssParser->resolveStyle("img", classAttr)
+                                          : self->cssParser->resolveStyle("img", classAttr, self->ancestorStack_))
+                                   : CssStyle{};
+                    if (!styleAttr.empty()) imgStyle.applyOver(CssParser::parseInlineStyle(styleAttr));
+                  }
                 const bool hasCssHeight = imgStyle.hasImageHeight();
                 const bool hasCssWidth = imgStyle.hasImageWidth();
                 int containerWidth = self->viewportWidth;
@@ -2003,72 +2015,17 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
                         static_cast<int>(displayHeight * (static_cast<float>(dims.width) / dims.height) + 0.5f);
                     if (displayWidth < 1) displayWidth = 1;
                   }
-                  if (self->currentTextBlock && !self->currentTextBlock->isEmpty()) {
-                    const BlockStyle parentBlockStyle = self->currentTextBlock->getBlockStyle();
-                    self->startNewTextBlock(parentBlockStyle);
-                  }
-
-                  int16_t imageMarginTop = 0;
-                  int16_t imageMarginBottom = 0;
-                  if (self->currentTextBlock && self->currentTextBlock->isEmpty()) {
-                    const auto& bs = self->currentTextBlock->getBlockStyle();
-                    imageMarginTop = bs.topInset();
-                    if (self->blockStyleCount_ > 1) {
-                      imageMarginBottom = self->blockStyleBuf_[self->blockStyleCount_ - 1].bottomInset();
-                    }
-                  }
-
-                  // Create page for image - only break if image won't fit remaining space
-                  if (!self->headingOpenerActive && self->currentPage && !self->currentPage->elements.empty() &&
-                      (self->currentPageNextY + imageMarginTop + displayHeight + imageMarginBottom >
-                       self->viewportHeight)) {
-                    self->completeCurrentPage();
-                    self->completedPageCount++;
-                    self->stopPreviewIfPageLimitReached();
-                    if (self->previewStopRequested) {
-                      return;
-                    }
-                    if (!self->startNewPage("image page break")) {
-                      return;
-                    }
-                  } else if (!self->currentPage) {
-                    if (!self->startNewPage("image page")) {
-                      return;
-                    }
-                  }
-
-                  self->currentPageNextY += imageMarginTop;
-                  self->attachPendingPublisherPageMarkers(self->currentPageNextY);
-
-                  // Create ImageBlock and add to page
-                  auto imageBlock = std::shared_ptr<ImageBlock>(
-                      new (std::nothrow) ImageBlock(paginatorImagePath, displayWidth, displayHeight));
-                  if (!imageBlock) {
-                    LOG_ERR("EHP", "Failed to create ImageBlock");
-                    return;
-                  }
-                  int xPos = (self->viewportWidth - displayWidth) / 2;
-                  auto pageImage = std::shared_ptr<PageImage>(new (std::nothrow)
-                                                                  PageImage(imageBlock, xPos, self->currentPageNextY));
-                  if (!pageImage) {
-                    LOG_ERR("EHP", "Failed to create PageImage");
-                    return;
-                  }
-                  self->currentPage->elements.push_back(pageImage);
-                  self->markCurrentPageFromCurrentElement();
-                  self->currentPageNextY += displayHeight + imageMarginBottom;
-
-                  if (self->currentTextBlock && self->currentTextBlock->isEmpty()) {
-                    self->currentTextBlock->setBlockStyle(
-                        self->blockStyleBuf_[self->blockStyleCount_ - 1].withoutBottom());
-                  }
-
-                  self->pushCssAncestor(self->depth, name, classAttr);
-                  self->depth += 1;
-                  return;
+                  if (displayHeight < 1) displayHeight = 1;
                 } else {
-                  LOG_ERR("EHP", "Failed to get image dimensions");
-                  removePaginatorImage();
+                  const float scaleX = dims.width > containerWidth
+                                           ? static_cast<float>(containerWidth) / dims.width
+                                           : 1.0f;
+                  const float scaleY = dims.height > self->viewportHeight
+                                           ? static_cast<float>(self->viewportHeight) / dims.height
+                                           : 1.0f;
+                  const float scale = std::min(scaleX, scaleY);
+                  displayWidth = std::max(1, static_cast<int>(dims.width * scale));
+                  displayHeight = std::max(1, static_cast<int>(dims.height * scale));
                 }
 
                 // Flush any pending text block so it appears before the image
@@ -2122,7 +2079,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
                 self->attachPendingPublisherPageMarkers(self->currentPageNextY);
 
                 // Create ImageBlock and add to page
-                auto imageBlock = makeUniqueNoThrow<ImageBlock>(std::move(cachedImagePath), std::move(sourcePath),
+                auto imageBlock = makeUniqueNoThrow<ImageBlock>(std::move(paginatorImagePath), std::string{},
                                                                 displayWidth, displayHeight);
                 if (!imageBlock) {
                   LOG_ERR("EHP", "Failed to create ImageBlock");
@@ -2156,6 +2113,10 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
                 self->depth += 1;
                 return;
               } else {
+                LOG_ERR("EHP", "Failed to get image dimensions");
+                removePaginatorImage();
+              }
+            } else {
                 removePaginatorImage();
                 const uint32_t postFailureFreeHeap = ESP.getFreeHeap();
                 const uint32_t postFailureMaxAllocHeap = ESP.getMaxAllocHeap();
@@ -2166,7 +2127,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
                           postFailureFreeHeap, postFailureMaxAllocHeap);
                 }
                 LOG_ERR("EHP", "Failed to get image dimensions");
-              }
+            }
             }  // isFormatSupported
           }
         }

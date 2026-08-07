@@ -90,7 +90,8 @@ std::string documentMatchingDetail(const DocumentMatchMethod matchMethod) {
 NearbyBookPositionSyncActivity::NearbyBookPositionSyncActivity(
     GfxRenderer& renderer, MappedInputManager& mappedInput, std::shared_ptr<ReflowDocument> document,
     const std::string& documentPath, int currentSpineIndex, int currentPage, int totalPagesInSpine,
-    KOReaderPosition localKoPos, std::string localChapterName, std::optional<uint16_t> currentParagraphIndex,
+    KOReaderPosition localKoPos, std::string localChapterName, const DocumentMatchMethod matchMethod,
+    std::optional<uint16_t> currentParagraphIndex,
     std::optional<uint16_t> currentListItemIndex)
     : Activity("NearbyBookPositionSync", renderer, mappedInput),
       document_(std::move(document)),
@@ -669,7 +670,8 @@ void onEspNowReceive(const esp_now_recv_info_t* info, const uint8_t* data, int l
 NearbyBookPositionSyncActivity::NearbyBookPositionSyncActivity(
     GfxRenderer& renderer, MappedInputManager& mappedInput, std::shared_ptr<ReflowDocument> document,
     const std::string& documentPath, int currentSpineIndex, int currentPage, int totalPagesInSpine,
-    KOReaderPosition localKoPos, std::string localChapterName, std::optional<uint16_t> currentParagraphIndex,
+    KOReaderPosition localKoPos, std::string localChapterName, const DocumentMatchMethod matchMethod,
+    std::optional<uint16_t> currentParagraphIndex,
     std::optional<uint16_t> currentListItemIndex)
     : Activity("NearbyBookPositionSync", renderer, mappedInput),
       eventMutex_(xSemaphoreCreateMutex()),
@@ -1202,7 +1204,10 @@ bool NearbyBookPositionSyncActivity::applyPeerPosition() {
     setError(tr(STR_SAVE_PROGRESS_FAILED));
     return false;
   }
-  RecentBookProgress::saveCachedEpubPercent(*epub_, peerCrossPoint_.spineIndex, peerCrossPoint_.pageNumber, pageCount);
+  if (document_->getFormat() == ReflowDocumentFormat::Epub) {
+    RecentBookProgress::saveCachedEpubPercent(document_->getCachePath(),
+                                              qToPercentage(peerPosition_.percentageQ) * 100.0f);
+  }
   setState(State::SYNCED);
   return true;
 }

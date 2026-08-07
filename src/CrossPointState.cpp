@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <mutex>
 
+#include "JsonSettingsIO.h"
 #include "util/BookMoveDurableFile.h"
 
 namespace {

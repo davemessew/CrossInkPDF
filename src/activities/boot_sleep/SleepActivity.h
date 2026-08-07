@@ -19,7 +19,8 @@ class SleepActivity final : public Activity {
       : Activity("Sleep", renderer, mappedInput),
         canSnapshotOverlayBackground(canSnapshotOverlayBackground),
         currentBookPath(std::move(currentBookPath)),
-        fromTimeout(fromTimeout) {
+        fromTimeout(fromTimeout),
+        sleepPopupOrientation(sleepPopupOrientation) {
 #if defined(CROSSINK_ENABLE_PDF) && CROSSINK_ENABLE_PDF
     // Capture before the outgoing reader restores global settings in onExit().
     pdfOverlayLayout =
@@ -52,6 +53,7 @@ class SleepActivity final : public Activity {
   bool overlayBackgroundBufferStored = false;
   std::string currentBookPath;
   bool fromTimeout = false;
+  GfxRenderer::Orientation sleepPopupOrientation = GfxRenderer::Orientation::Portrait;
 #if defined(CROSSINK_ENABLE_PDF) && CROSSINK_ENABLE_PDF
   PdfSleepProductCache pdfSleepProductCache;
   RecentBook pdfCachedBook;

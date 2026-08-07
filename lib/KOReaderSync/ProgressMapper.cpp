@@ -7,6 +7,7 @@
 #include <cstring>
 
 #include "ChapterXPathResolver.h"
+#include "Epub.h"
 #include "Epub/Section.h"
 #include "Epub/htmlEntities.h"
 #include "Utf8.h"
@@ -795,7 +796,8 @@ bool streamSection(const std::shared_ptr<ReflowDocument>& document, const int se
 }  // namespace
 
 KOReaderPosition ProgressMapper::toKOReader(const std::shared_ptr<ReflowDocument>& document,
-                                            const CrossPointPosition& pos) {
+                                            const CrossPointPosition& pos,
+                                            const PositionCoordinateSpace coordinateSpace) {
   KOReaderPosition result{};
   if (!document) return result;
 
@@ -815,23 +817,86 @@ KOReaderPosition ProgressMapper::toKOReader(const std::shared_ptr<ReflowDocument
   if (result.xpath.empty()) {
     result.xpath = generateXPath(document, pos.spineIndex, intra);
   }
-  if (coordinateSpace == PositionCoordinateSpace::SourceDocument &&
-      !mapCurrentXPathToSource(epub, pos.spineIndex, result.xpath)) {
-    LOG_ERR("PM", "Source position map unavailable for optimized spine %d; re-optimize the EPUB", pos.spineIndex);
-    result.xpath.clear();
-    result.valid = false;
-    return result;
+  if (coordinateSpace == PositionCoordinateSpace::SourceDocument) {
+    if (document->getFormat() != ReflowDocumentFormat::Epub ||
+        !mapCurrentXPathToSource(std::static_pointer_cast<Epub>(document), pos.spineIndex, result.xpath)) {
+      LOG_ERR("PM", "Source position map unavailable for optimized spine %d; re-optimize the EPUB", pos.spineIndex);
+      result.xpath.clear();
+      result.valid = false;
+      return result;
+    }
   }
   LOG_DBG("PM", "-> KO: spine=%d page=%d/%d %.2f%% %s", pos.spineIndex, pos.pageNumber, pos.totalPages,
           result.percentage * 100, result.xpath.c_str());
   return result;
 }
 
+std::optional<CrossPointPosition> ProgressMapper::fromRichPosition(const std::shared_ptr<Epub>& epub,
+                                                                   const KOReaderRichPosition& rich,
+                                                                   GfxRenderer& renderer) {
+  const int spineCount = epub->getSpineItemsCount();
+  if (static_cast<int>(rich.spineIndex) >= spineCount) {
+    LOG_DBG("PM", "Rich position spine %u out of range (%d spine items)", rich.spineIndex, spineCount);
+    return std::nullopt;
+  }
+
+  CrossPointPosition result{};
+  result.spineIndex = rich.spineIndex;
+
+  Section tempSection(epub, result.spineIndex, renderer);
+  const auto cachedCount = tempSection.getCachedPageCount();
+  if (!cachedCount || *cachedCount <= 0) {
+    LOG_DBG("PM", "Rich position spine %u has no cached page count", rich.spineIndex);
+    return std::nullopt;
+  }
+  result.totalPages = *cachedCount;
+
+  const int remotePages = rich.totalPages > 0 ? rich.totalPages : 1;
+  if (result.totalPages == remotePages) {
+    result.pageNumber = std::min<int>(rich.pageNumber, result.totalPages - 1);
+    LOG_DBG("PM", "Rich position exact: spine=%d page=%d/%d", result.spineIndex, result.pageNumber,
+            result.totalPages);
+    return result;
+  }
+
+  if (rich.paragraphIndex.has_value()) {
+    const auto lutPage = tempSection.getPageForParagraphIndex(*rich.paragraphIndex);
+    if (lutPage.has_value()) {
+      result.paragraphIndex = *rich.paragraphIndex;
+      result.hasParagraphIndex = true;
+      result.pageNumber = std::min<int>(*lutPage, result.totalPages - 1);
+      LOG_DBG("PM", "Rich position para %u -> spine=%d page=%d/%d", *rich.paragraphIndex, result.spineIndex,
+              result.pageNumber, result.totalPages);
+      return result;
+    }
+  }
+
+  const float intra =
+      (remotePages > 1) ? static_cast<float>(rich.pageNumber) / static_cast<float>(remotePages - 1) : 0.0f;
+  result.pageNumber = std::max(
+      0, std::min(static_cast<int>(intra * static_cast<float>(result.totalPages - 1) + 0.5f), result.totalPages - 1));
+  LOG_DBG("PM", "Rich position scaled: spine=%d remote %u/%d -> page=%d/%d", result.spineIndex, rich.pageNumber,
+          remotePages, result.pageNumber, result.totalPages);
+  return result;
+}
+
 CrossPointPosition ProgressMapper::toCrossPoint(const std::shared_ptr<ReflowDocument>& document,
                                                 const KOReaderPosition& koPos, int currentSpineIndex,
-                                                int totalPagesInCurrentSpine) {
+                                                int totalPagesInCurrentSpine,
+                                                const PositionCoordinateSpace coordinateSpace) {
   CrossPointPosition result{};
   if (!document) return result;
+
+  KOReaderPosition mappedKoPos = koPos;
+  if (coordinateSpace == PositionCoordinateSpace::SourceDocument) {
+    int mappedSpineIndex = -1;
+    if (document->getFormat() != ReflowDocumentFormat::Epub ||
+        !mapSourceXPathToCurrent(std::static_pointer_cast<Epub>(document), mappedKoPos.xpath, mappedSpineIndex)) {
+      LOG_ERR("PM", "Cannot map source XPath into this optimized EPUB; re-optimize the EPUB");
+      result.valid = false;
+      return result;
+    }
+  }
 
   const size_t bookSize = document->getDocumentSize();
   if (bookSize == 0) return result;

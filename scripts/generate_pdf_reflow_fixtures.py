@@ -2412,6 +2412,15 @@ def make_page_tree_geometry() -> Fixture:
     return Fixture(pdf.render()[0], "")
 
 
+def make_page_tree_many_annotations() -> Fixture:
+    pdf = ClassicPdf()
+    pdf.add(1, b"<< /Type /Catalog /Pages 2 0 R >>")
+    references = b" ".join(f"{number} 0 R".encode("ascii") for number in range(10, 67))
+    pdf.add(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 200 100] >>")
+    pdf.add(3, b"<< /Type /Page /Parent 2 0 R /Annots [" + references + b"] >>")
+    return Fixture(pdf.render()[0], "")
+
+
 def make_page_tree_bad_geometry(kind: str) -> Fixture:
     geometry = {
         "media_box": b"/MediaBox [0 0 200 /Bad]",
@@ -2531,6 +2540,7 @@ def build_fixtures() -> dict[str, Fixture]:
         "encrypted": make_encrypted(),
         "page_tree_inherited": make_page_tree_inherited(),
         "page_tree_geometry": make_page_tree_geometry(),
+        "page_tree_many_annotations": make_page_tree_many_annotations(),
         "page_tree_bad_media_box": make_page_tree_bad_geometry("media_box"),
         "page_tree_bad_crop_box": make_page_tree_bad_geometry("crop_box"),
         "page_tree_bad_rotate": make_page_tree_bad_geometry("rotate"),

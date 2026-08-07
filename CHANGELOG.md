@@ -1,3 +1,12 @@
+## [v1.5.0.1] - 2026-08-07
+
+### Fixed
+
+- PDFs with many links now spool excess link annotations to the SD card instead of failing preparation or consuming more RAM.
+- Dense PDF pages, large font dictionaries, malformed optional artwork, and recursive Form objects now fall back safely instead of closing the whole document.
+- Hidden OCR text layers and separately positioned words now reflow with readable spacing and accurate word-count progress.
+- Large identity CMaps no longer fail when they contain unused UTF-16 surrogate ranges.
+
 ## [v1.5.0] - 2026-07-31
 
 ### Added

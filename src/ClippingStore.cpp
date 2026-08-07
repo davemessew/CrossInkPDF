@@ -19,6 +19,8 @@ namespace {
 constexpr uint8_t LEGACY_VERSION = 1;
 constexpr uint8_t VERSION = 2;
 constexpr size_t INITIAL_CLIPPING_RESERVE = 4;
+constexpr size_t TEXT_COPY_BUFFER_SIZE = 128;
+constexpr uint16_t PDF_CLIPPING_MAX_PER_BOOK = 64;
 constexpr char CLIPPINGS_DIR[] = "/.crosspoint/clippings";
 constexpr char PDF_TRANSACTION_TEMP_SUFFIX[] = ".tmp";
 constexpr char PDF_TRANSACTION_BACKUP_SUFFIX[] = ".bak";
@@ -124,7 +126,7 @@ bool mergePdfClippings(std::vector<Clipping>& destination, const std::vector<Cli
              existing.paragraphIndex == clipping.paragraphIndex;
     });
     if (duplicate) continue;
-    if (destination.size() >= CLIPPING_MAX_PER_BOOK) {
+    if (destination.size() >= PDF_CLIPPING_MAX_PER_BOOK) {
       LOG_ERR("CLIP", "PDF clipping limit reached while merging migration");
       return false;
     }
@@ -269,7 +271,7 @@ bool mergeAuthoritativeClippings(std::vector<Clipping>& destination, const std::
       *found = clipping;
       continue;
     }
-    if (destination.size() >= CLIPPING_MAX_PER_BOOK) {
+    if (destination.size() >= PDF_CLIPPING_MAX_PER_BOOK) {
       LOG_ERR("CLIP", "Clipping limit reached while copying moved-book state");
       return false;
     }
@@ -350,8 +352,8 @@ ClippingStore::AddResult ClippingStore::addPdfClipping(const uint16_t spineIndex
                   [itemId](const Clipping& clipping) { return clipping.paragraphIndex == itemId; })) {
     return AddResult::SaveFailed;
   }
-  if (clippings.size() >= CLIPPING_MAX_PER_BOOK) {
-    LOG_ERR("CLIP", "PDF clipping limit (%u) reached", CLIPPING_MAX_PER_BOOK);
+  if (clippings.size() >= PDF_CLIPPING_MAX_PER_BOOK) {
+    LOG_ERR("CLIP", "PDF clipping limit (%u) reached", PDF_CLIPPING_MAX_PER_BOOK);
     return AddResult::LimitReached;
   }
   if (storeFilePath.empty()) {
@@ -442,6 +444,10 @@ bool ClippingStore::readClippingText(const size_t index, std::string& out) const
 
 bool ClippingStore::readClippingText(const Clipping& clipping, std::string& out) const {
   out.clear();
+  if (isPdfStorePath(storeFilePath)) {
+    out = clipping.text;
+    return true;
+  }
   if (clipping.textLength == 0) return true;
   if (storeFilePath.empty()) return false;
 
@@ -513,7 +519,8 @@ bool ClippingStore::readFromFile(const std::string& path, std::vector<Clipping>&
     return false;
   }
 
-  if (count > CLIPPING_MAX_PER_BOOK) {
+  const uint16_t clippingLimit = isPdfStorePath(path) ? PDF_CLIPPING_MAX_PER_BOOK : CLIPPING_MAX_PER_BOOK;
+  if (count > clippingLimit) {
     LOG_ERR("CLIP", "Clipping count %u exceeds max, file may be corrupt: %s", count, path.c_str());
     f.close();
     return false;
@@ -538,6 +545,18 @@ bool ClippingStore::readFromFile(const std::string& path, std::vector<Clipping>&
       return false;
     }
     clipping.chapterTitle[sizeof(clipping.chapterTitle) - 1] = '\0';
+    if (isPdfStorePath(path)) {
+      if (!serialization::tryReadString(f, clipping.text)) {
+        f.close();
+        LOG_ERR("CLIP", "PDF clipping file truncated at text, record %u: %s", i, path.c_str());
+        return false;
+      }
+      if (clipping.text.size() > CLIPPING_TEXT_MAX) {
+        clipping.text.resize(CLIPPING_TEXT_MAX);
+      }
+      out.push_back(std::move(clipping));
+      continue;
+    }
     if (version == LEGACY_VERSION) {
       uint32_t textLen = 0;
       if (!serialization::tryReadPod(f, textLen)) {
@@ -706,7 +725,7 @@ bool ClippingStore::writeToFile(const std::string* replacementText, const size_t
 bool ClippingStore::writeMigrationPayload(void* const fileContext) const {
   if (fileContext == nullptr) return false;
   auto& file = *static_cast<FsFile*>(fileContext);
-  const uint16_t count = static_cast<uint16_t>(std::min<size_t>(clippings.size(), CLIPPING_MAX_PER_BOOK));
+  const uint16_t count = static_cast<uint16_t>(std::min<size_t>(clippings.size(), PDF_CLIPPING_MAX_PER_BOOK));
   bool wrote = serialization::tryWritePod(file, VERSION) && serialization::tryWritePod(file, count) &&
                serialization::tryWriteString(file, bookTitle) && serialization::tryWriteString(file, bookAuthor) &&
                serialization::tryWriteString(file, bookFilePath);
@@ -763,7 +782,7 @@ bool ClippingStore::writePdfTransaction(const Clipping* const appended, const si
   }
 
   const size_t logicalCount = pdfClippingCount(clippings, appended, removeIndex, clear);
-  if (logicalCount > CLIPPING_MAX_PER_BOOK) {
+  if (logicalCount > PDF_CLIPPING_MAX_PER_BOOK) {
     LOG_ERR("CLIP", "PDF clipping transaction count exceeds limit: %u", static_cast<unsigned>(logicalCount));
     if (!file.close()) {
       LOG_ERR("CLIP", "Failed to close rejected PDF clipping transaction: %s", temporaryPath.c_str());
@@ -1179,32 +1198,9 @@ bool ClippingStore::migrateLegacyForFilePath(const std::string& oldFilePath, con
     return false;
   }
 
-  const std::string newStorePath = storeFilePathForBook(newFilePath, bookType);
-  if (oldStorePath == newStorePath) {
-    return true;
-  }
-
-  const std::string backupPath = newStorePath + ".bak";
-  const bool hasDestination = Storage.exists(newStorePath.c_str());
-  if (hasDestination) {
-    if (Storage.exists(backupPath.c_str()) && !Storage.remove(backupPath.c_str())) {
-      LOG_ERR("CLIP", "Failed to remove stale clipping migration backup: %s", backupPath.c_str());
-      return false;
-    }
-    if (!Storage.rename(newStorePath.c_str(), backupPath.c_str())) {
-      LOG_ERR("CLIP", "Failed to back up destination clippings: %s", newStorePath.c_str());
-      return false;
-    }
-  }
-  if (!Storage.rename(oldStorePath.c_str(), newStorePath.c_str())) {
-    LOG_ERR("CLIP", "Failed to rename migrated clippings: %s -> %s", oldStorePath.c_str(), newStorePath.c_str());
-    if (hasDestination && !Storage.rename(backupPath.c_str(), newStorePath.c_str())) {
-      LOG_ERR("CLIP", "Failed to restore destination clipping backup: %s", backupPath.c_str());
-    }
+  if (oldStorePath != newStorePath && !Storage.remove(oldStorePath.c_str())) {
+    LOG_ERR("CLIP", "Failed to remove migrated clipping source: %s", oldStorePath.c_str());
     return false;
-  }
-  if (hasDestination && Storage.exists(backupPath.c_str())) {
-    Storage.remove(backupPath.c_str());
   }
   return true;
 }

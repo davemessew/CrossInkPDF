@@ -6,6 +6,7 @@
 #include <limits>
 
 #include "PdfCacheFormat.h"
+#include "PdfEncoding.h"
 #include "PdfIo.h"
 #include "PdfSemanticWriter.h"
 #include "PdfUnicode.h"
@@ -16,29 +17,8 @@ constexpr uint8_t kMagic[] = {'X', 'P', 'O', 'L'};
 constexpr size_t kHeaderBytes = 16;
 constexpr size_t kCrcBytes = 4;
 
-void putU16(uint8_t* output, const uint16_t value) {
-  output[0] = static_cast<uint8_t>(value);
-  output[1] = static_cast<uint8_t>(value >> 8U);
-}
-
-void putU32(uint8_t* output, const uint32_t value) {
-  output[0] = static_cast<uint8_t>(value);
-  output[1] = static_cast<uint8_t>(value >> 8U);
-  output[2] = static_cast<uint8_t>(value >> 16U);
-  output[3] = static_cast<uint8_t>(value >> 24U);
-}
-
-uint16_t getU16(const uint8_t* input) {
-  return static_cast<uint16_t>(input[0]) | static_cast<uint16_t>(static_cast<uint16_t>(input[1]) << 8U);
-}
-
-uint32_t getU32(const uint8_t* input) {
-  return static_cast<uint32_t>(input[0]) | (static_cast<uint32_t>(input[1]) << 8U) |
-         (static_cast<uint32_t>(input[2]) << 16U) | (static_cast<uint32_t>(input[3]) << 24U);
-}
-
-PdfStatus copyBoundedUtf8(const uint8_t* const source, const size_t length, char* const output, const size_t capacity,
-                          uint8_t* const outputLength) {
+PdfStatus copyBoundedUtf8(const uint8_t* const source, const size_t length, char* const output,
+                          const size_t capacity, uint8_t* const outputLength) {
   if ((source == nullptr && length != 0) || output == nullptr || outputLength == nullptr || capacity < 2) {
     return PdfStatus::failure(PdfError::InvalidArgument);
   }
@@ -61,6 +41,71 @@ PdfStatus copyBoundedUtf8(const uint8_t* const source, const size_t length, char
   std::memcpy(output, source, accepted);
   output[accepted] = '\0';
   *outputLength = static_cast<uint8_t>(accepted);
+  return PdfStatus::success();
+}
+
+void putU16(uint8_t* output, const uint16_t value) {
+  output[0] = static_cast<uint8_t>(value);
+  output[1] = static_cast<uint8_t>(value >> 8U);
+}
+
+void putU32(uint8_t* output, const uint32_t value) {
+  output[0] = static_cast<uint8_t>(value);
+  output[1] = static_cast<uint8_t>(value >> 8U);
+  output[2] = static_cast<uint8_t>(value >> 16U);
+  output[3] = static_cast<uint8_t>(value >> 24U);
+}
+
+uint16_t getU16(const uint8_t* input) {
+  return static_cast<uint16_t>(input[0]) | static_cast<uint16_t>(static_cast<uint16_t>(input[1]) << 8U);
+}
+
+uint32_t getU32(const uint8_t* input) {
+  return static_cast<uint32_t>(input[0]) | (static_cast<uint32_t>(input[1]) << 8U) |
+         (static_cast<uint32_t>(input[2]) << 16U) | (static_cast<uint32_t>(input[3]) << 24U);
+}
+
+struct BoundedTextSink {
+  char* output = nullptr;
+  size_t capacity = 0;
+  size_t length = 0;
+  bool full = false;
+};
+
+PdfStatus writeBoundedText(void* const context, const uint8_t* const source, const size_t requested,
+                           size_t* const bytesWritten) {
+  if (context == nullptr || (source == nullptr && requested != 0) || bytesWritten == nullptr) {
+    return PdfStatus::failure(PdfError::InvalidArgument);
+  }
+  auto& sink = *static_cast<BoundedTextSink*>(context);
+  if (!sink.full && requested < sink.capacity - sink.length) {
+    std::memcpy(sink.output + sink.length, source, requested);
+    sink.length += requested;
+  } else {
+    sink.full = true;
+  }
+  *bytesWritten = requested;
+  return PdfStatus::success();
+}
+
+PdfStatus decodeArenaText(const PdfObjectArena& arena, const PdfValue& value, char* const output,
+                          const size_t capacity, uint8_t* const outputLength) {
+  if ((value.kind != PdfValueKind::Name && value.kind != PdfValueKind::String) || output == nullptr ||
+      outputLength == nullptr || capacity < 2 || value.textOffset > arena.textLength ||
+      value.textLength > arena.textLength - value.textOffset) {
+    return PdfStatus::failure(PdfError::Malformed);
+  }
+  BoundedTextSink sink{output, capacity, 0, false};
+  const PdfStatus status = pdfDecodePdfTextString(
+      arena.text + value.textOffset, value.textLength, {&sink, writeBoundedText});
+  if (!status) {
+    return status;
+  }
+  if (sink.length == 0) {
+    return PdfStatus::failure(PdfError::Malformed);
+  }
+  output[sink.length] = '\0';
+  *outputLength = static_cast<uint8_t>(sink.length);
   return PdfStatus::success();
 }
 
@@ -191,11 +236,7 @@ const PdfValue* valueAt(const PdfObjectArena& arena, const uint16_t index) {
 
 PdfStatus copyArenaText(const PdfObjectArena& arena, const PdfValue& value, char* const output, const size_t capacity,
                         uint8_t* const outputLength) {
-  if ((value.kind != PdfValueKind::Name && value.kind != PdfValueKind::String) || value.textOffset > arena.textLength ||
-      value.textLength > arena.textLength - value.textOffset) {
-    return PdfStatus::failure(PdfError::Malformed);
-  }
-  return copyBoundedUtf8(arena.text + value.textOffset, value.textLength, output, capacity, outputLength);
+  return decodeArenaText(arena, value, output, capacity, outputLength);
 }
 
 bool referenceForKey(const PdfObjectArena& arena, const uint16_t dictionaryIndex, const char* const key,
@@ -532,7 +573,27 @@ PdfStatus pdfReadNamedDestinations(const PdfObjectArena& arena, const uint16_t r
   }
   uint16_t namesIndex = PDF_INVALID_INDEX;
   if (!pdfDictionaryFind(arena, rootIndex, "Names", &namesIndex)) {
-    return PdfStatus::failure(PdfError::Unsupported);
+    uint16_t entryIndex = root->firstLink;
+    for (uint16_t ordinal = 0; ordinal < root->count; ++ordinal) {
+      if (entryIndex >= arena.dictionaryCount) {
+        return PdfStatus::failure(PdfError::Malformed, ordinal);
+      }
+      const PdfDictionaryEntry& entry = arena.dictionaryEntries[entryIndex];
+      if (entry.valueIndex >= arena.valueCount || entry.keyOffset > arena.textLength ||
+          entry.keyLength > arena.textLength - entry.keyOffset) {
+        return PdfStatus::failure(PdfError::Malformed, ordinal);
+      }
+      PdfRawDestination destination{};
+      PdfStatus status = parseRawDestination(arena, entry.valueIndex, &destination);
+      if (status) {
+        status = destinations->add(arena.text + entry.keyOffset, entry.keyLength, destination);
+      }
+      if (!status) {
+        return status;
+      }
+      entryIndex = entry.next;
+    }
+    return root->count == 0 ? PdfStatus::failure(PdfError::Unsupported) : PdfStatus::success();
   }
   const PdfValue* const names = valueAt(arena, namesIndex);
   if (names == nullptr || names->kind != PdfValueKind::Array || names->count == 0 || (names->count & 1U) != 0) {
@@ -710,10 +771,16 @@ PdfStatus pdfApplyInfoMetadata(const PdfObjectArena& arena, const uint16_t rootI
         value->textLength > arena.textLength - value->textOffset) {
       return PdfStatus::failure(PdfError::Malformed);
     }
-    const PdfStatus status =
-        std::strcmp(key, "Title") == 0
-            ? metadata->setTitle(PdfMetadataOrigin::Info, arena.text + value->textOffset, value->textLength)
-            : metadata->setAuthor(PdfMetadataOrigin::Info, arena.text + value->textOffset, value->textLength);
+    char decoded[PdfMetadataLimits::TitleBytes]{};
+    uint8_t decodedLength = 0;
+    PdfStatus status = decodeArenaText(arena, *value, decoded, sizeof(decoded), &decodedLength);
+    if (status) {
+      status = std::strcmp(key, "Title") == 0
+                   ? metadata->setTitle(PdfMetadataOrigin::Info,
+                                        reinterpret_cast<const uint8_t*>(decoded), decodedLength)
+                   : metadata->setAuthor(PdfMetadataOrigin::Info,
+                                         reinterpret_cast<const uint8_t*>(decoded), decodedLength);
+    }
     if (!status) {
       return status;
     }

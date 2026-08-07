@@ -1,4 +1,5 @@
 #pragma once
+#include <Epub.h>
 #include <Epub/FootnoteEntry.h>
 #include <Epub/Section.h>
 #include <ReflowDocument.h>
@@ -56,6 +57,8 @@ class EpubReaderActivity final : public Activity {
 
  private:
   std::shared_ptr<ReflowDocument> document;
+  // Non-owning shared view used only by EPUB-specific compatibility paths.
+  std::shared_ptr<Epub> epub;
   std::unique_ptr<Section> section = nullptr;
   int currentSpineIndex = 0;
   int nextPageNumber = 0;
@@ -90,6 +93,9 @@ class EpubReaderActivity final : public Activity {
   uint16_t cachedPageParagraphIndex = UINT16_MAX;
   uint16_t cachedPageParagraphOffset = 0;
   uint16_t cachedPageParagraphSpan = 0;
+  std::atomic<uint8_t> pendingHeapShapeReaderRedrawStages{0};
+  static constexpr uint8_t HEAP_SHAPE_REDRAW_CLIP = 1U << 0;
+  static constexpr uint8_t HEAP_SHAPE_REDRAW_DICT = 1U << 1;
   struct PdfReaderSessionState;
   // The complete PDF-only state, including its 128 fixed saved-item records,
   // is allocated once on PDF entry. Ordinary EPUB readers carry only this
@@ -213,6 +219,8 @@ class EpubReaderActivity final : public Activity {
   // unbuilt page after a confirmed low-memory partial-build abort.
   bool lowMemoryPartialRestartAttempted = false;
   bool backgroundBuildPausedForLowMemory = false;
+  static constexpr int BUILD_WINDOW_AHEAD = 5;
+  static constexpr int PARTIAL_REBUILD_START_MARGIN = 15;
   std::atomic<bool> sectionBuildCancelRequested{false};
   std::atomic<bool> goHomeAfterBuildCancel{false};
 
@@ -232,6 +240,14 @@ class EpubReaderActivity final : public Activity {
   bool shouldUseFootnotePreview(int targetSpineIndex, const std::string& anchor) const;
   std::string footnotePreviewCacheSuffix(EpubRenderMode renderMode, const std::string& anchor) const;
   void clearFootnotePreviewState();
+  void silentIndexNextChapterIfNeeded(uint16_t viewportWidth, uint16_t viewportHeight);
+  static constexpr int BUILD_PAGES_PER_CHUNK = 8;
+  static constexpr int BACKGROUND_BUILD_PAGES_PER_TICK = 2;
+  static constexpr int BUILD_POPUP_PAGE_THRESHOLD = 20;
+  static constexpr size_t BUILD_POPUP_BYTE_THRESHOLD = 96 * 1024;
+  static constexpr unsigned long BUILD_POPUP_DEADLINE_MS = 1000;
+  bool buildPopupPending = false;
+  void showBuildPopup();
   bool captureSavedPosition(SavedPosition& savedPosition);
   void applySavedNavigationPosition(const SavedPosition& savedPosition);
   // Remap the cached relative reading position once the section's real page count is known
@@ -366,6 +382,12 @@ class EpubReaderActivity final : public Activity {
   bool skipLoopDelay() override { return sectionBuildWantsTick() && !backgroundBuildPausedForLowMemory; }
   bool isReaderActivity() const override { return true; }
   bool canSnapshotForSleepOverlay() const override { return true; }
+  bool handlesReaderPowerSettingsOverride() const override { return true; }
+  bool openReaderSettingsMenu() override {
+    if (!document) return false;
+    openReaderMenu();
+    return true;
+  }
   std::string getCurrentBookPath() const override { return document ? document->getPath() : std::string{}; }
   void setAutoPageTurnIntervalSeconds(uint16_t seconds);
   uint16_t getAutoPageTurnIntervalSeconds() const;

@@ -98,7 +98,8 @@ void PdfLexer::reset(const uint64_t offset) {
   inlineBytesScanned_ = 0;
 }
 
-PdfStepResult PdfLexer::next(PdfToken& token, PdfWorkBudget& budget) {
+PdfStepResult PdfLexer::next(PdfToken& token, PdfWorkBudget& budget, uint8_t* const stringBuffer,
+                             const size_t stringBufferSize) {
   token = {};
   if (!source_.valid() || sourceBuffer_ == nullptr || sourceBufferSize_ == 0 ||
       sourceBufferSize_ > PdfLimits::SourceBufferBytes) {
@@ -290,7 +291,7 @@ PdfStepResult PdfLexer::next(PdfToken& token, PdfWorkBudget& budget) {
           return PdfStepResult::failure(PdfStatus::failure(PdfError::LimitExceeded, position_ - 1));
         }
         ++literalDepth_;
-        if (!append(byte, status)) {
+        if (!appendString(byte, stringBuffer, stringBufferSize, status)) {
           operationCharged_ = false;
           return PdfStepResult::failure(status);
         }
@@ -301,13 +302,13 @@ PdfStepResult PdfLexer::next(PdfToken& token, PdfWorkBudget& budget) {
         if (literalDepth_ == 0) {
           return finish(token, PdfTokenKind::String);
         }
-        if (!append(byte, status)) {
+        if (!appendString(byte, stringBuffer, stringBufferSize, status)) {
           operationCharged_ = false;
           return PdfStepResult::failure(status);
         }
         continue;
       }
-      if (!append(byte, status)) {
+      if (!appendString(byte, stringBuffer, stringBufferSize, status)) {
         operationCharged_ = false;
         return PdfStepResult::failure(status);
       }
@@ -365,7 +366,7 @@ PdfStepResult PdfLexer::next(PdfToken& token, PdfWorkBudget& budget) {
           }
           break;
       }
-      if (!append(decoded, status)) {
+      if (!appendString(decoded, stringBuffer, stringBufferSize, status)) {
         operationCharged_ = false;
         return PdfStepResult::failure(status);
       }
@@ -382,7 +383,7 @@ PdfStepResult PdfLexer::next(PdfToken& token, PdfWorkBudget& budget) {
           continue;
         }
       }
-      if (!append(octalValue_, status)) {
+      if (!appendString(octalValue_, stringBuffer, stringBufferSize, status)) {
         operationCharged_ = false;
         return PdfStepResult::failure(status);
       }
@@ -402,7 +403,7 @@ PdfStepResult PdfLexer::next(PdfToken& token, PdfWorkBudget& budget) {
       if (byte == '>') {
         consume();
         if (hasHexNibble_) {
-          if (!append(static_cast<uint8_t>(hexNibble_ << 4), status)) {
+          if (!appendString(static_cast<uint8_t>(hexNibble_ << 4), stringBuffer, stringBufferSize, status)) {
             operationCharged_ = false;
             return PdfStepResult::failure(status);
           }
@@ -421,7 +422,7 @@ PdfStepResult PdfLexer::next(PdfToken& token, PdfWorkBudget& budget) {
         hasHexNibble_ = true;
         continue;
       }
-      if (!append(static_cast<uint8_t>((hexNibble_ << 4) | value), status)) {
+      if (!appendString(static_cast<uint8_t>((hexNibble_ << 4) | value), stringBuffer, stringBufferSize, status)) {
         operationCharged_ = false;
         return PdfStepResult::failure(status);
       }
@@ -582,6 +583,20 @@ bool PdfLexer::append(const uint8_t byte, PdfStatus& status) {
     return false;
   }
   pendingToken_.bytes[pendingToken_.length++] = static_cast<char>(byte);
+  return true;
+}
+
+bool PdfLexer::appendString(const uint8_t byte, uint8_t* const stringBuffer, const size_t stringBufferSize,
+                            PdfStatus& status) {
+  if (stringBuffer == nullptr) {
+    return append(byte, status);
+  }
+  pendingToken_.reserved[0] = 1;
+  if (pendingToken_.length < stringBufferSize) {
+    stringBuffer[pendingToken_.length++] = byte;
+  } else {
+    pendingToken_.reserved[1] = 1;
+  }
   return true;
 }
 

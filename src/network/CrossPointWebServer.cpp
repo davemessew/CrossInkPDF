@@ -78,6 +78,84 @@ uint8_t enumRawValueForDisplayIndex(const SettingInfo& setting, uint8_t displayI
   return setting.enumRawValues[displayIndex];
 }
 
+// Streams the font catalog in bounded pieces instead of keeping two complete
+// JSON copies in the fragmented network heap.
+class FontListJsonWriter {
+ public:
+  explicit FontListJsonWriter(WebServer& server) : server_(server) {}
+
+  void append(const char* text) { append(text, strlen(text)); }
+
+  void append(const char* text, size_t textLength) {
+    while (textLength > 0) {
+      if (length_ == sizeof(buffer_)) flush();
+      const size_t copyLength = std::min(textLength, sizeof(buffer_) - length_);
+      memcpy(buffer_ + length_, text, copyLength);
+      length_ += copyLength;
+      text += copyLength;
+      textLength -= copyLength;
+    }
+  }
+
+  void appendUnsigned(const unsigned long value) {
+    char number[16];
+    const int length = snprintf(number, sizeof(number), "%lu", value);
+    append(number, static_cast<size_t>(length));
+  }
+
+  void appendJsonString(const char* value) {
+    append("\"");
+    for (const unsigned char* p = reinterpret_cast<const unsigned char*>(value); *p; ++p) {
+      switch (*p) {
+        case '\"':
+          append("\\\"");
+          break;
+        case '\\':
+          append("\\\\");
+          break;
+        case '\b':
+          append("\\b");
+          break;
+        case '\f':
+          append("\\f");
+          break;
+        case '\n':
+          append("\\n");
+          break;
+        case '\r':
+          append("\\r");
+          break;
+        case '\t':
+          append("\\t");
+          break;
+        default:
+          if (*p < 0x20) {
+            static constexpr char HEX_DIGITS[] = "0123456789ABCDEF";
+            const char escaped[] = {'\\', 'u', '0', '0', HEX_DIGITS[*p >> 4], HEX_DIGITS[*p & 0x0F]};
+            append(escaped, sizeof(escaped));
+          } else {
+            append(reinterpret_cast<const char*>(p), 1);
+          }
+          break;
+      }
+    }
+    append("\"");
+  }
+
+  void flush() {
+    if (length_ == 0) return;
+    esp_task_wdt_reset();
+    server_.sendContent(buffer_, length_);
+    length_ = 0;
+  }
+
+ private:
+  static constexpr size_t BUFFER_SIZE = 192;
+  WebServer& server_;
+  char buffer_[BUFFER_SIZE];
+  size_t length_ = 0;
+};
+
 // Legacy WebSocket uploads keep their independent file handle. PDF uploads use
 // the shared atomic transaction in CrossPointWebServer::upload so a PDF can
 // never overlap another transport.
@@ -897,18 +975,12 @@ static BookUpload::AtomicUploadStatus flushUploadBuffer(CrossPointWebServer::Upl
   const bool pdfUpload = isPdfUploadTarget(state.fileName);
   BookUpload::AtomicUploadStatus status = BookUpload::AtomicUploadStatus::Ok;
   if (pdfUpload) {
-    const unsigned long writeStart = millis();
     const BookUpload::AtomicUploadIo io = atomicUploadIo(state.file);
     status = BookUpload::write(state.transaction, io, state.buffer.data(), state.bufferPos);
-    totalWriteTime += millis() - writeStart;
-    writeCount++;
   } else {
     if (!state.file) return BookUpload::AtomicUploadStatus::Ok;
     esp_task_wdt_reset();
-    const unsigned long writeStart = millis();
     const size_t written = state.file.write(state.buffer.data(), state.bufferPos);
-    totalWriteTime += millis() - writeStart;
-    writeCount++;
     esp_task_wdt_reset();
     if (written != state.bufferPos) {
       LOG_DBG("WEB", "[UPLOAD] Buffer flush failed: expected %d, wrote %d", state.bufferPos, written);
@@ -1085,8 +1157,6 @@ void CrossPointWebServer::handleUpload(UploadState& state) const {
         const float avgKbps = (elapsed > 0) ? (state.size / 1024.0) / (elapsed / 1000.0) : 0;
         LOG_DBG("WEB", "[UPLOAD] Complete: %s (%d bytes in %lu ms, avg %.1f KB/s)", state.fileName.c_str(), state.size,
                 elapsed, avgKbps);
-        LOG_DBG("WEB", "[UPLOAD] Diagnostics: %d writes, total write time: %lu ms (%.1f%%)", writeCount, totalWriteTime,
-                writePercent);
       }
     }
   } else if (upload.status == UPLOAD_FILE_ABORTED) {

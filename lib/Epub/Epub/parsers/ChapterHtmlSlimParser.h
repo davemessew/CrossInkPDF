@@ -326,6 +326,7 @@ class ChapterHtmlSlimParser {
       const int fontId, const float lineCompression, const bool extraParagraphSpacing, const bool forceParagraphIndents,
       const uint8_t paragraphAlignment, const uint16_t viewportWidth, const uint16_t viewportHeight,
       const bool hyphenationEnabled, const bool bionicReadingEnabled, const bool guideReadingEnabled,
+      const uint8_t wordSpacing,
       std::function<void(std::unique_ptr<Page>, uint16_t, uint16_t)> completePageFn, const bool embeddedStyle,
       const std::string& contentBase, const std::string& imageBasePath, const uint8_t imageRendering = 0,
       std::vector<std::string> tocAnchors = {}, const std::function<void()>& popupFn = nullptr,
@@ -347,6 +348,7 @@ class ChapterHtmlSlimParser {
         hyphenationEnabled(hyphenationEnabled),
         bionicReadingEnabled(bionicReadingEnabled),
         guideReadingEnabled(guideReadingEnabled),
+        wordSpacing(wordSpacing > 4 ? 4 : wordSpacing),
         completePageFn(std::move(completePageFn)),
         paginationHooks_(paginationHooks),
         popupFn(popupFn),
@@ -363,25 +365,18 @@ class ChapterHtmlSlimParser {
 
   ~ChapterHtmlSlimParser();
   bool parseAndBuildPages();
+  bool beginParse();
+  ParseStatus parseStep();
+  bool finishParse();
+  void abortParse();
+  void releaseInputFile();
+  void addLineToPage(std::shared_ptr<TextBlock> line);
   const std::vector<std::pair<std::string, uint16_t>>& getAnchors() const { return anchorData; }
   bool wasLowMemoryFallbackTriggered() const { return lowMemoryImageFallback; }
   bool wasLowMemoryAbortTriggered() const { return lowMemoryAbort; }
 #ifdef SIMULATOR
   static void setSimulatorFault(const ChapterHtmlSlimParserSimulatorFault fault) { simulatorFault_ = fault; }
 #endif
-
- private:
-  enum class ParseStatus { More, Done, Error };
-  bool beginParse();
-  ParseStatus parseStep();
-  bool finishParse();  // flush the trailing page and tear down; returns true
-  void abortParse();   // tear down without flushing (error / abandon)
-  void releaseInputFile();
-
-  void addLineToPage(std::shared_ptr<TextBlock> line);
-  const std::vector<std::pair<std::string, uint16_t>>& getAnchors() const { return anchorData; }
-  bool wasLowMemoryFallbackTriggered() const { return lowMemoryImageFallback; }
-  bool wasLowMemoryAbortTriggered() const { return lowMemoryAbort; }
 
   // Byte progress of the in-flight parse, used to estimate a still-building section's total page
   // count (a giant single-spine book never fully lays out, so its real count is unknown). Valid

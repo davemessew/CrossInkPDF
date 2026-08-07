@@ -8,6 +8,7 @@
 #endif
 
 struct RecentBook;
+class Epub;
 
 // Helpers for loading and displaying recent-book reading progress.
 // Progress values are percentages in the 0-100 range; negative means unknown.

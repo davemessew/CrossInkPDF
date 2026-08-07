@@ -111,6 +111,7 @@ enum class PdfPreparationPhase : uint8_t {
   DiscoverForms,
   PrepareFormContent,
   BeginPage,
+  PreparePageLinks,
   PrepareNavigationRecords,
 };
 
@@ -529,6 +530,13 @@ class PdfPreparation {
     Complete,
   };
 
+  enum class PendingSectionFinishStage : uint8_t {
+    Idle,
+    Append,
+    Close,
+    Update,
+  };
+
   struct MemoryRecordContext {
     uint8_t* bytes = nullptr;
     size_t recordSize = 0;
@@ -598,6 +606,8 @@ class PdfPreparation {
   void releaseWorkspaces();
   bool allocateNextWorkspace();
   PdfStatus initializeParserStorage();
+  PdfStatus configureDefaultParserArena();
+  PdfStatus configureNavigationParserArena();
   PdfStatus beginXrefSpool();
   PdfStepResult stepSortXref(PdfWorkBudget& budget);
   PdfStepResult stepResolverObjectStoreWriter(PdfWorkBudget& budget);
@@ -617,10 +627,16 @@ class PdfPreparation {
   PdfStatus finishPreparedPageSpool();
   PdfStatus sealPreparedPageSpool();
   PdfStatus loadPageRecord(uint32_t index);
+  PdfStatus loadAnnotationOverflowBatch(uint16_t count);
+  PdfStatus appendResolvedLink(const void* record, size_t recordSize);
+  PdfStatus finishResolvedLinkSpool();
+  PdfStepResult stepPreparePageLinks(PdfWorkBudget& budget);
   PdfStatus readPreparedPageRecord(uint16_t index, PreparedSectionRecord* record);
   PdfStatus writePreparedPageRecord(const PreparedSectionRecord& record);
   PdfStatus rewritePreparedPageRecord(PdfWorkBudget& budget, uint16_t index, const PreparedSectionRecord& record);
   PdfStatus formatPageSpoolPath(bool prepared, char* output, size_t capacity) const;
+  PdfStatus formatAnnotationOverflowSpoolPath(char* output, size_t capacity) const;
+  PdfStatus formatResolvedLinkSpoolPath(char* output, size_t capacity) const;
   PdfStatus formatTraversalSpoolPath(char* output, size_t capacity) const;
   void abortPageSpools();
   PdfStatus readCacheSetupBytes(PdfWorkBudget& budget, uint64_t offset, uint8_t* destination, size_t length);
@@ -676,6 +692,7 @@ class PdfPreparation {
   PdfStatus readXmpMetadata();
   PdfStatus resolveDestination(const PdfRawDestination& raw, PdfResolvedDestination* destination);
   PdfStatus beginCurrentPageImages();
+  PdfStatus skipCurrentUnreadablePage();
   PdfStatus finishImageResolution();
   PdfStatus finishAuxiliaryImageResolution();
   PdfStatus continueImageDescriptorResolution();
@@ -736,7 +753,7 @@ class PdfPreparation {
   void clearPendingObservedCodes();
   void commitPendingObservedCodes();
   bool observedJournalSpillPending() const;
-  PdfStatus beginObservedJournalSpill(const PdfToken& retryToken);
+  PdfStatus beginObservedJournalSpill(const PdfToken* retryToken = nullptr);
   PdfStepResult stepObservedJournalSpill(PdfWorkBudget& budget);
   uint8_t* preparedNavigationSpillBytes(size_t offset, size_t* contiguousBytes);
   bool preparedContentRuntimeConstructed() const;
@@ -756,6 +773,7 @@ class PdfPreparation {
   PdfStatus formatInternalLink(uint16_t sourcePageIndex, int16_t x, int16_t y, char* href, size_t capacity,
                                size_t* hrefLength) const;
   PdfStepResult stepOpenSection(PdfWorkBudget& budget);
+  PdfStepResult stepFinishPendingSection(PdfWorkBudget& budget);
   PdfStepResult emitSection(PdfWorkBudget& budget);
   PdfStepResult stepCloseSection(PdfWorkBudget& budget);
   PdfStatus beginNavigationRecords();
@@ -815,6 +833,8 @@ class PdfPreparation {
   std::optional<PdfPageTreeWalker> pageWalker_;
   PdfFixedRecordSpool xrefSpools_[2]{};
   PdfFixedRecordSpool pageSpool_{};
+  PdfFixedRecordSpool annotationOverflowSpool_{};
+  PdfFixedRecordSpool resolvedLinkSpool_{};
   PdfFixedRecordSpool preparedPageSpool_{};
   PdfMutableRecordSpool traversalSpool_{};
   XrefSortStage xrefSortStage_ = XrefSortStage::Idle;
@@ -869,13 +889,26 @@ class PdfPreparation {
   uint16_t explicitOutlineCount_ = 0;
   uint16_t outlinePendingCount_ = 0;
   uint16_t sectionBoundaryCount_ = 0;
+  bool pendingSectionBoundary_ = false;
   uint16_t outlineVisitedCount_ = 0;
   bool synthesizedOutline_ = false;
   int16_t currentOutlineParent_ = -1;
   uint8_t currentOutlineParentLevel_ = 0;
   uint8_t outlineBatchCount_ = 0;
   uint16_t currentAnnotationPage_ = 0;
+  uint16_t currentPageOverflowAnnotationIndex_ = 0;
+  uint32_t currentAnnotationOverflowOrdinal_ = 0;
+  uint32_t resolvedLinkCount_ = 0;
+  uint32_t currentResolvedLinkOrdinal_ = 0;
   uint8_t currentAnnotationIndex_ = 0;
+  uint8_t currentAnnotationOverflowBatchIndex_ = 0;
+  uint8_t currentAnnotationOverflowBatchCount_ = 0;
+  uint16_t currentPageLinkBlockIndex_ = 0;
+  uint8_t currentPageLinkBatchIndex_ = 0;
+  uint8_t currentPageLinkBatchCount_ = 0;
+  bool resolvedLinksSpilled_ = false;
+  bool resolvedLinkSpoolFinished_ = false;
+  bool currentPageLinkFinalizing_ = false;
   uint8_t navigationStage_ = 0;
   NavigationTask navigationTask_ = NavigationTask::None;
   ImageResolveTask imageResolveTask_ = ImageResolveTask::None;
@@ -960,6 +993,8 @@ class PdfPreparation {
   bool sectionOpenPrepared_ = false;
   bool sectionClosePrepared_ = false;
   bool sectionCloseNewSection_ = false;
+  bool pendingSectionFinish_ = false;
+  PendingSectionFinishStage pendingSectionFinishStage_ = PendingSectionFinishStage::Idle;
   bool rasterRuntimeActive_ = false;
   bool maskDecodeRuntimeActive_ = false;
   bool maskCompositeRuntimeActive_ = false;
@@ -1093,8 +1128,8 @@ class PdfPreparation {
 };
 
 #if UINTPTR_MAX == UINT32_MAX
-static_assert(sizeof(PdfPreparation) <= 12992,
-              "PdfPreparation must retain the JPEG preview workspace overlay RAM saving");
+static_assert(sizeof(PdfPreparation) <= 13120,
+              "PDF preparation control state must stay bounded with SD-backed link spools");
 #endif
 
 static_assert(sizeof(PdfCoverCandidateSource) <= 16, "cover discovery must retain only small object references");

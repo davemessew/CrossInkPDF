@@ -25,9 +25,9 @@ struct ClipWordStyle {
 
 class ClipSelectionActivity final : public Activity {
  public:
-  ClipSelectionActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, std::vector<WordRef> words, int fontId,
+  ClipSelectionActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, ClipWordStore wordStore, int fontId,
                         Section& section, int startPageInSection, int marginTop, int marginLeft,
-                        PdfPixelCacheRenderWorkspace* pdfRenderWorkspace);
+                        PdfPixelCacheRenderWorkspace* pdfRenderWorkspace = nullptr);
 
   void onEnter() override;
   void onExit() override;

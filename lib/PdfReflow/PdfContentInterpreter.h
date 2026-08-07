@@ -165,6 +165,7 @@ class PdfContentInterpreter {
   PdfStatus processMarkedContentOperator(const PdfToken& token);
   PdfStatus processXObjectOperator(const PdfToken& token);
   PdfStatus enterForm(const PdfContentXObject& form);
+  PdfStatus abandonCurrentForm();
   PdfStatus leaveFormOrAdvanceSource(bool* complete);
   PdfStatus showString(const uint8_t* source, size_t length);
   PdfStatus showArray(const PdfContentOperand& array);
@@ -175,6 +176,7 @@ class PdfContentInterpreter {
   PdfStatus appendImage(const PdfContentXObject& image, bool inlineImage);
   PdfStatus pushOperand(const PdfContentOperand& operand);
   PdfStatus pushTextOperand(PdfContentOperandKind kind, const uint8_t* text, size_t length);
+  const uint8_t* tokenText(const PdfToken& token) const;
   PdfStatus pushNumberOperand(const PdfToken& token);
   PdfStatus pushMarkedContent(const PdfContentOperand* actualText, bool suppress);
   bool markedContentSuppressed() const;
@@ -241,4 +243,5 @@ class PdfContentInterpreter {
   PdfRectangle currentPathRectangle_{};
   bool currentPathRectangleValid_ = false;
   bool currentPathUnrepresentable_ = false;
+  bool textCapacityReached_ = false;
 };

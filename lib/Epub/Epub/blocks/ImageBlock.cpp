@@ -222,6 +222,40 @@ void clampCachedRowsToLandscapeStrip(const GfxRenderer& renderer, const int imag
   if (rowEnd > stripRowEnd) rowEnd = stripRowEnd;
 }
 
+bool readValidCacheHeader(FsFile& cacheFile, const int expectedWidth, const int expectedHeight, uint16_t& cachedWidth,
+                          uint16_t& cachedHeight) {
+  if (cacheFile.read(&cachedWidth, 2) != 2 || cacheFile.read(&cachedHeight, 2) != 2) return false;
+  if (abs(cachedWidth - expectedWidth) > 1 || abs(cachedHeight - expectedHeight) > 1) return false;
+  const size_t bytesPerRow = (cachedWidth + 3U) / 4U;
+  return cacheFile.size() >= 4U + bytesPerRow * cachedHeight;
+}
+
+constexpr size_t MAX_SESSION_IMAGE_FAILURES = 16;
+uint64_t failedImageHashes[MAX_SESSION_IMAGE_FAILURES]{};
+size_t failedImageCount = 0;
+
+uint64_t imagePathHash(const std::string& path) {
+  uint64_t hash = 14695981039346656037ULL;
+  for (const char c : path) {
+    hash ^= static_cast<uint8_t>(c);
+    hash *= 1099511628211ULL;
+  }
+  return hash;
+}
+
+bool imageFailedThisSession(const std::string& path) {
+  const uint64_t hash = imagePathHash(path);
+  for (size_t index = 0; index < failedImageCount; ++index) {
+    if (failedImageHashes[index] == hash) return true;
+  }
+  return false;
+}
+
+void rememberImageFailure(const std::string& path) {
+  if (failedImageCount == MAX_SESSION_IMAGE_FAILURES || imageFailedThisSession(path)) return;
+  failedImageHashes[failedImageCount++] = imagePathHash(path);
+}
+
 #if defined(CROSSINK_ENABLE_PDF) && CROSSINK_ENABLE_PDF
 PDF_IMAGE_BLOCK_NOINLINE bool renderScaledPdfCache(GfxRenderer& renderer, FsFile& cacheFile,
                                                    const uint16_t cachedWidth, const uint16_t cachedHeight,
@@ -551,10 +585,33 @@ PDF_IMAGE_BLOCK_NOINLINE bool renderFromCache(GfxRenderer& renderer, const std::
 
 }  // namespace
 
-void ImageBlock::render(GfxRenderer& renderer, const int x, const int y) { render(renderer, x, y, nullptr); }
+bool ImageBlock::hasValidCache() const {
+  const std::string cachePath = getCachePath(imagePath);
+  FsFile cacheFile;
+  if (!Storage.openFileForRead("IMG", cachePath, cacheFile)) return false;
+  uint16_t cachedWidth = 0;
+  uint16_t cachedHeight = 0;
+  const bool valid = readValidCacheHeader(cacheFile, width, height, cachedWidth, cachedHeight);
+  cacheFile.close();
+  return valid;
+}
+
+bool ImageBlock::needsDecode() const { return !imageFailedThisSession(imagePath) && !hasValidCache(); }
+
+void ImageBlock::clearSessionRenderFailures() { failedImageCount = 0; }
+
+void ImageBlock::renderPlaceholder(GfxRenderer& renderer, const int x, const int y,
+                                   const bool foregroundBlack) const {
+  renderer.fillRect(x, y, width, height, foregroundBlack);
+  if (width > 2 && height > 2) renderer.fillRect(x + 1, y + 1, width - 2, height - 2, !foregroundBlack);
+}
+
+void ImageBlock::render(GfxRenderer& renderer, const int x, const int y, const bool foregroundBlack) {
+  render(renderer, x, y, foregroundBlack, nullptr);
+}
 
 void ImageBlock::render(GfxRenderer& renderer, const int x, const int y,
-                        PdfPixelCacheRenderWorkspace* const pdfWorkspace) {
+                        const bool foregroundBlack, PdfPixelCacheRenderWorkspace* const pdfWorkspace) {
   // The font-prewarm scan pass only accumulates glyphs; an image contributes
   // none, and its DirectPixelWriter output bypasses the renderer's scan-mode
   // suppression, so it would otherwise do a full (discarded) cache render every

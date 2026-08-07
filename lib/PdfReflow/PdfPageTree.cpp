@@ -125,10 +125,12 @@ PdfPageTreeWalker::PdfPageTreeWalker(PdfObjectResolver& resolver, PdfObjectArena
                                      const PdfFixedRecordStore traversalStore, const PageFn pageFn, void* pageContext,
                                      const TraversalAccessFn traversalAccess, void* traversalContext,
                                      PdfPageInfo* const pageWorkspace,
+                                     const PdfFixedRecordStore annotationOverflowStore,
                                      const uint32_t maxPages)
     : resolver_(resolver),
       arena_(arena),
       traversalStore_(traversalStore),
+      annotationOverflowStore_(annotationOverflowStore),
       pageFn_(pageFn),
       pageContext_(pageContext),
       traversalAccess_(traversalAccess),
@@ -158,8 +160,11 @@ PdfStatus PdfPageTreeWalker::begin(const PdfObjectReference rootPages) {
   childReference_ = {};
   processingStackTop_ = UINT32_MAX;
   ancestorOrdinal_ = UINT32_MAX;
+  overflowAnnotationRecordCount_ = 0;
   kidsValueIndex_ = PDF_INVALID_INDEX;
+  annotationsValueIndex_ = PDF_INVALID_INDEX;
   kidsRemaining_ = 0;
+  annotationOrdinal_ = 0;
   ancestorVisited_ = 0;
   processStage_ = ProcessStage::Idle;
   phase_ = Phase::Initialize;
@@ -441,22 +446,22 @@ PdfStepResult PdfPageTreeWalker::processResolvedNode(PdfWorkBudget& budget) {
       }
 
       if (pdfDictionaryFind(arena_, resolved.rootIndex, "Annots", &valueIndex)) {
-        if (valueIndex >= arena_.valueCount || arena_.values[valueIndex].kind != PdfValueKind::Array ||
-            arena_.values[valueIndex].count > PdfLimits::MaxLinkAnnotationsPerPage) {
-          return fail(PdfStatus::failure(PdfError::LimitExceeded, current_.reference.objectNumber));
+        if (valueIndex >= arena_.valueCount) {
+          return fail(PdfStatus::failure(PdfError::Malformed, current_.reference.objectNumber));
         }
-        for (uint16_t ordinal = 0; ordinal < arena_.values[valueIndex].count; ++ordinal) {
-          uint16_t annotationIndex = PDF_INVALID_INDEX;
-          if (!pdfArrayAt(arena_, valueIndex, ordinal, &annotationIndex) || annotationIndex >= arena_.valueCount) {
-            return fail(PdfStatus::failure(PdfError::Malformed, current_.reference.objectNumber));
-          }
-          const PdfValue& annotation = arena_.values[annotationIndex];
-          if (annotation.kind == PdfValueKind::Reference) {
-            page.annotations[page.annotationCount++] = {annotation.objectNumber, annotation.generation};
-          }
+        if (arena_.values[valueIndex].kind == PdfValueKind::Array) {
+          annotationsValueIndex_ = valueIndex;
+          annotationOrdinal_ = 0;
+          processStage_ = arena_.values[valueIndex].count == 0 ? ProcessStage::EmitPage
+                                                               : ProcessStage::LoadAnnotation;
+        } else if (arena_.values[valueIndex].kind == PdfValueKind::Reference) {
+          processStage_ = ProcessStage::EmitPage;
+        } else {
+          return fail(PdfStatus::failure(PdfError::Malformed, current_.reference.objectNumber));
         }
+      } else {
+        processStage_ = ProcessStage::EmitPage;
       }
-      processStage_ = ProcessStage::EmitPage;
     } else {
       return fail(PdfStatus::failure(PdfError::Malformed, current_.reference.objectNumber));
     }
@@ -534,6 +539,55 @@ PdfStepResult PdfPageTreeWalker::processResolvedNode(PdfWorkBudget& budget) {
       // Mutable record writes perform a seek plus a write. Yield after one
       // child so a slow-card slice cannot start another two-operation write
       // after already spending time acquiring traversal ownership.
+      return PdfStepResult::paused();
+    }
+
+    if (processStage_ == ProcessStage::LoadAnnotation) {
+      if (annotationsValueIndex_ >= arena_.valueCount ||
+          arena_.values[annotationsValueIndex_].kind != PdfValueKind::Array) {
+        return fail(PdfStatus::failure(PdfError::Malformed, current_.reference.objectNumber));
+      }
+      const uint16_t annotationCount = arena_.values[annotationsValueIndex_].count;
+      if (annotationOrdinal_ >= annotationCount) {
+        processStage_ = ProcessStage::EmitPage;
+        continue;
+      }
+      if (budget.cancelRequested()) {
+        return fail(PdfStatus::failure(PdfError::Cancelled, current_.reference.objectNumber));
+      }
+      if (budget.stopRequested() || budget.operationsRemaining == 0 ||
+          budget.bytesRemaining < sizeof(PdfObjectReference)) {
+        return PdfStepResult::paused();
+      }
+      --budget.operationsRemaining;
+      budget.bytesRemaining -= sizeof(PdfObjectReference);
+      uint16_t annotationIndex = PDF_INVALID_INDEX;
+      if (!pdfArrayAt(arena_, annotationsValueIndex_, annotationOrdinal_++, &annotationIndex) ||
+          annotationIndex >= arena_.valueCount) {
+        return fail(PdfStatus::failure(PdfError::Malformed, current_.reference.objectNumber));
+      }
+      const PdfValue& annotation = arena_.values[annotationIndex];
+      if (annotation.kind != PdfValueKind::Reference) {
+        continue;
+      }
+      PdfPageInfo& page = *pageWorkspace_;
+      const PdfObjectReference reference{annotation.objectNumber, annotation.generation};
+      if (page.annotationCount < PdfLimits::MaxLinkAnnotationsPerPage) {
+        page.annotations[page.annotationCount++] = reference;
+        continue;
+      }
+      if (!annotationOverflowStore_.valid() || page.overflowAnnotationCount == UINT16_MAX ||
+          overflowAnnotationRecordCount_ >= annotationOverflowStore_.capacity) {
+        return fail(PdfStatus::failure(PdfError::InsufficientStorage, overflowAnnotationRecordCount_));
+      }
+      const PdfStatus status =
+          pdfWriteRecord(annotationOverflowStore_, overflowAnnotationRecordCount_, &reference);
+      if (!status) {
+        return fail(status);
+      }
+      ++overflowAnnotationRecordCount_;
+      ++page.overflowAnnotationCount;
+      // At most one SD write is issued in a public slice.
       return PdfStepResult::paused();
     }
 

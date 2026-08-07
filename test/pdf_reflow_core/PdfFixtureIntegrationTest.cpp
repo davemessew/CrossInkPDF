@@ -129,7 +129,7 @@ TEST(PdfFixtureIntegrationTest, ResolvesCatalogPageTreeAndEmitsExactlyHelloPdf) 
                            workspace.traversalStorage.store(),
                            captureFirstPage, &workspace,
                            setTraversalAccess, &workspace,
-                           &workspace.firstPage, PdfLimits::MaxPages);
+                           &workspace.firstPage, {}, PdfLimits::MaxPages);
   ASSERT_TRUE(walker.begin({pages.objectNumber, pages.generation}).ok());
   ASSERT_TRUE(runPageTree(walker).complete());
   ASSERT_EQ(workspace.pageCount, 1u);

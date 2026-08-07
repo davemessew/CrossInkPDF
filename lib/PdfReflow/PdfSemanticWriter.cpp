@@ -293,11 +293,31 @@ PdfStatus PdfSemanticWriter::writeText(const uint8_t* const text, const size_t l
   if (!blockOpen_ || (text == nullptr && length != 0)) {
     return fail(PdfStatus::failure(PdfError::InvalidArgument));
   }
-  PdfStatus status = wordCounter_.consume(text, length);
-  if (!status.ok()) {
-    return fail(status);
+  size_t offset = 0;
+  size_t spanStart = 0;
+  while (offset < length) {
+    const size_t scalarStart = offset;
+    uint32_t scalar = 0;
+    PdfStatus status = pdfDecodeUtf8Scalar(text, length, &offset, &scalar);
+    if (!status.ok()) {
+      return fail(status);
+    }
+    if (isXmlScalar(scalar)) {
+      continue;
+    }
+    status = wordCounter_.consume(text + spanStart, scalarStart - spanStart);
+    if (status.ok()) {
+      status = appendEscaped(text + spanStart, scalarStart - spanStart, false);
+    }
+    if (!status.ok()) {
+      return fail(status);
+    }
+    spanStart = offset;
   }
-  status = appendEscaped(text, length, false);
+  PdfStatus status = wordCounter_.consume(text + spanStart, length - spanStart);
+  if (status.ok()) {
+    status = appendEscaped(text + spanStart, length - spanStart, false);
+  }
   return status.ok() ? status : fail(status);
 }
 

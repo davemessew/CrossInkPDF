@@ -168,6 +168,15 @@ class Epub : public ReflowDocument {
   bool resolveLocationPercentToSpineProgress(int percent, int& spineIndex, float& spineProgress) const;
   bool resolveReferencePage(int currentSpineIndex, float currentSpineRead, uint32_t& currentPage,
                             uint32_t& pageCount) const override;
+  bool resolveChapterGroupRange(int currentSpineIndex, int& firstSpineIndex, int& lastSpineIndex) const;
+  bool hasChapterGroups() const { return locationChapterGroupCount > 0; }
+  bool hasSourceSpineMap() const { return sourceSpineMapCount > 0; }
+  bool requiresSourceSpineMap() const { return (hasChapterGroups() || sourceSpineMapDeclared) && !hasSourceSpineMap(); }
+  bool getSourceSpineMapEntry(int currentSpineIndex, SourceSpineMapEntry& entry) const;
+  const SourceChildRange* getSourceChildRange(const SourceSpineMapEntry& entry, size_t ordinal) const;
+  bool findCurrentSpineForSource(int sourceIndex, uint8_t containerDepth, const char* childName,
+                                 uint16_t sourceSiblingIndex, int& currentSpineIndex,
+                                 uint16_t& currentSiblingIndex) const;
   CssParser* getCssParser() const override { return cssParser.get(); }
   int resolveHrefToSpineIndex(const std::string& href) const;
 

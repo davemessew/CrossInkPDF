@@ -342,7 +342,7 @@ FixtureTextResult interpretFontFixture(const char* filename) {
   const PdfValue pages = workspace.arena.values[pagesIndex];
   PdfPageTreeWalker walker(resolver, workspace.arena, workspace.traversalStorage.store(), FixtureWorkspace::capturePage,
                            &workspace, FixtureWorkspace::setTraversalAccess, &workspace, &workspace.page,
-                           PdfLimits::MaxPages);
+                           {}, PdfLimits::MaxPages);
   status = walker.begin({pages.objectNumber, pages.generation});
   if (!status.ok() || !(result = runPageTree(walker)).complete()) {
     return fixtureFailure(status.ok() ? result.status : status);

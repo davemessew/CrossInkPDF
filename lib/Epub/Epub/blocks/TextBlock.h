@@ -42,8 +42,10 @@ class TextBlock final : public Block {
  public:
   static constexpr uint8_t WORD_FLAG_BACKGROUND_BLACK = 0x01;
   static constexpr uint8_t WORD_FLAG_INSERTED_HYPHEN = 0x02;
-  // Layout-only semantic flags are emitted only for PDF reflow pages. EPUB
-  // callers leave them unset, preserving their v44 serialized bytes.
+  // EPUB link IDs and PDF semantic layout flags are mode-exclusive. EPUB
+  // never emits the semantic flags; PDF pages do not encode EPUB link IDs.
+  static constexpr uint8_t WORD_FLAG_LINK_ID_SHIFT = 2;
+  static constexpr uint8_t WORD_FLAG_LINK_ID_MASK = 0xFC;
   static constexpr uint8_t WORD_FLAG_SEMANTIC_ATTACHES = 0x04;
   static constexpr uint8_t WORD_FLAG_SEMANTIC_SPLIT_CONTINUATION = 0x08;
 

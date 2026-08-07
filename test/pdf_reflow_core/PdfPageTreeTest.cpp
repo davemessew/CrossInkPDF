@@ -34,6 +34,7 @@ struct PageTreeHarness {
   PdfTestRecordStore xrefStorage{sizeof(PdfXrefEntry), 256};
   PdfXrefTable xref{xrefStorage.store()};
   PdfTestRecordStore traversalStorage{sizeof(PdfPageTreeRecord), 256};
+  PdfTestRecordStore annotationOverflowStorage{sizeof(PdfObjectReference), 256};
   PdfPageInfo pageScratch{};
   std::vector<PdfPageInfo> pages;
   bool sourceOpen = true;
@@ -119,7 +120,7 @@ PdfStepResult walkFixture(const char* fixture, PageTreeHarness& harness,
   PdfPageTreeWalker walker(resolver, harness.arena,
                            harness.traversalStorage.store(), capturePage,
                            &harness, setTraversalAccess, &harness,
-                           &harness.pageScratch, maxPages);
+                           &harness.pageScratch, harness.annotationOverflowStorage.store(), maxPages);
   status = walker.begin({pages.objectNumber, pages.generation});
   if (!status.ok()) {
     return PdfStepResult::failure(status);
@@ -172,6 +173,26 @@ TEST(PdfPageTreeTest, PreservesOrderInheritedResourcesAndSingleOrArrayContents) 
   EXPECT_EQ(harness.pages[1].viewYMin, 0);
   EXPECT_TRUE(harness.pages[1].hasResources);
   EXPECT_EQ(harness.pages[1].resourceReference, (PdfObjectReference{10, 0}));
+}
+
+TEST(PdfPageTreeTest, SpoolsAnnotationsBeyondInlinePageCapacity) {
+  PageTreeHarness harness;
+
+  const PdfStepResult result = walkFixture("page_tree_many_annotations.pdf", harness);
+
+  ASSERT_TRUE(result.complete());
+  ASSERT_EQ(harness.pages.size(), 1U);
+  const PdfPageInfo& page = harness.pages[0];
+  ASSERT_EQ(page.annotationCount, PdfLimits::MaxLinkAnnotationsPerPage);
+  EXPECT_EQ(page.overflowAnnotationCount, 41U);
+  for (uint8_t index = 0; index < page.annotationCount; ++index) {
+    EXPECT_EQ(page.annotations[index], (PdfObjectReference{static_cast<uint32_t>(10U + index), 0}));
+  }
+  for (uint32_t index = 0; index < page.overflowAnnotationCount; ++index) {
+    PdfObjectReference reference{};
+    ASSERT_TRUE(pdfReadRecord(harness.annotationOverflowStorage.store(), index, &reference));
+    EXPECT_EQ(reference, (PdfObjectReference{static_cast<uint32_t>(26U + index), 0}));
+  }
 }
 
 TEST(PdfPageTreeTest,

@@ -56,6 +56,8 @@ class PdfPageModel {
   PdfStatus reset();
   PdfStatus beginTextRun(const PdfTextRun& run);
   PdfStatus appendText(const uint8_t* text, size_t length);
+  PdfStatus beginOverflowTextRun(const PdfTextRun& run, uint16_t* runIndex);
+  PdfStatus appendOverflowText(const uint8_t* text, size_t length);
   PdfStatus expandTextRunBounds(uint16_t runIndex, int32_t x, int32_t y);
   PdfStatus setTextRunBaselineEnd(uint16_t runIndex, int32_t x, int32_t y);
   PdfStatus finishTextRun();
@@ -68,6 +70,7 @@ class PdfPageModel {
   const PdfTextRun* runs() const { return workspace_.runs; }
   const PdfTextRun* pendingTextRun() const { return runPending_ ? workspace_.runs + runCount_ : nullptr; }
   uint16_t runCount() const { return runCount_; }
+  uint16_t runCapacity() const { return workspace_.runCapacity; }
   const PdfImagePlacement* images() const { return workspace_.images; }
   uint16_t imageCount() const { return imageCount_; }
   PdfPageWarning warnings() const { return warnings_; }

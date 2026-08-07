@@ -14,6 +14,8 @@
 class Page;
 class GfxRenderer;
 class TextBlock;
+class ChapterHtmlSlimParser;
+class CssParser;
 
 struct SectionBuildOptions {
   const char* previewAnchor = nullptr;
@@ -28,12 +30,53 @@ class Section {
   GfxRenderer& renderer;
   std::string filePath;
   HalFile file;
+
+  struct PageLutEntry {
+    uint32_t fileOffset;
+    uint16_t paragraphIndex;
+    uint16_t listItemIndex;
+  };
+
+  struct BuildContext {
+    std::unique_ptr<ChapterHtmlSlimParser> parser;
+    std::unique_ptr<PageLutEntry[]> lut;
+    uint16_t lutCapacity = 0;
+    uint16_t lutCount = 0;
+    std::string parsePath;
+    std::string contentBase;
+    std::string imageBasePath;
+    std::string htmlPath;
+    std::string tmpHtmlPath;
+    std::string tmpSectionPath;
+    bool reusedHtml = false;
+    bool pageCompletionFailed = false;
+    CssParser* cssParser = nullptr;
+    uint32_t bytesConsumed = 0;
+    uint32_t totalBytes = 0;
+    float smoothedEstimate = 0;
+    uint32_t smoothedAtConsumed = 0;
+  };
+
+  std::unique_ptr<BuildContext> build_;
+  bool buildComplete_ = false;
+  bool lastImagesWereSuppressed_ = false;
+  bool lastLayoutAbortedForLowMemory_ = false;
+  uint16_t builtPageCount_ = 0;
+  bool partial_ = false;
+  uint16_t partialPageCount_ = 0;
+  uint32_t partialBytesConsumed_ = 0;
+  uint32_t partialTotalBytes_ = 0;
+  std::string activeBuildTmpSectionPath_;
+
   struct PdfPageBuildContext;
-  bool writeSectionFileHeader(int fontId, float lineCompression, bool extraParagraphSpacing, bool forceParagraphIndents,
-                              uint8_t paragraphAlignment, uint16_t viewportWidth, uint16_t viewportHeight,
-                              bool hyphenationEnabled, bool embeddedStyle, uint8_t imageRendering,
-                              bool bionicReadingEnabled, bool guideReadingEnabled, EpubRenderMode renderMode);
+  bool writeSectionFileHeader(const ReaderRenderSpec& spec);
   uint32_t onPageComplete(std::unique_ptr<Page> page);
+  bool ensureBuildFileOpen();
+  bool finalizeBuild();
+  bool commitBuildFile(uint8_t version, uint32_t bytesConsumed, uint32_t totalBytes);
+  std::string binTmpPath() const { return filePath + ".part"; }
+  std::unique_ptr<Page> loadPageAt(int page) const;
+  std::unique_ptr<Page> loadPageDuringBuild(int page);
   bool usesPdfWordIndex() const;
   static void completePdfPage(void* context, std::unique_ptr<Page> page, uint16_t paragraphIndex,
                               uint16_t listItemIndex);

@@ -76,9 +76,13 @@ void PageImage::render(GfxRenderer& renderer, const int fontId, const int xOffse
 void PageImage::render(GfxRenderer& renderer, const int fontId, const int xOffset, const int yOffset,
                        const bool foregroundBlack, PdfPixelCacheRenderWorkspace* const pdfWorkspace) {
   (void)fontId;
-  (void)foregroundBlack;
   // Images don't use fontId or text rendering
-  imageBlock->render(renderer, xPos + xOffset, yPos + yOffset, pdfWorkspace);
+  imageBlock->render(renderer, xPos + xOffset, yPos + yOffset, foregroundBlack, pdfWorkspace);
+}
+
+void PageImage::renderPlaceholder(GfxRenderer& renderer, const int xOffset, const int yOffset,
+                                  const bool foregroundBlack) const {
+  imageBlock->renderPlaceholder(renderer, xPos + xOffset, yPos + yOffset, foregroundBlack);
 }
 
 bool PageImage::serialize(FsFile& file) {

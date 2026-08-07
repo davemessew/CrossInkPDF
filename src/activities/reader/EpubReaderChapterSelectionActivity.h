@@ -1,7 +1,7 @@
 #pragma once
+
 #include <ReflowDocument.h>
 
-#include <atomic>
 #include <memory>
 
 #include "activities/Activity.h"
@@ -12,19 +12,7 @@ class EpubReaderChapterSelectionActivity final : public Activity {
   ButtonNavigator buttonNavigator;
   int currentSpineIndex = 0;
   int selectorIndex = 0;
-  freeink::ui::GfxRendererTarget uiTarget;
-  UiApp app;
-  std::atomic<bool> uiReady{false};
-  int visibleRows = 1;
-  int topIndex = 0;
-  bool initialViewportPending = true;
 
-  static void chapterScreen(UiApp::ScreenType& screen, void* user);
-  static void onRowEvent(const freeink::ui::ActionEvent& event, void* user);
-  void buildChapterScreen(UiApp::ScreenType& screen);
-  void selectChapter();
-
-  // Total TOC items count
   int getTotalItems() const;
 
  public:

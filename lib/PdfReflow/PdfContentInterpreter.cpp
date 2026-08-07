@@ -59,10 +59,7 @@ bool parseFixed(const PdfToken& token, int32_t* value) {
   if (negative) {
     raw = -raw;
   }
-  if (raw < INT32_MIN || raw > INT32_MAX) {
-    return false;
-  }
-  *value = static_cast<int32_t>(raw);
+  *value = static_cast<int32_t>(std::clamp<int64_t>(raw, INT32_MIN, INT32_MAX));
   return true;
 }
 
@@ -262,6 +259,7 @@ PdfStatus PdfContentInterpreter::begin(const PdfByteSource* const contentSources
   dictionaryCapturingActualText_ = false;
   dictionaryHasActualText_ = false;
   inlineDictionary_ = false;
+  textCapacityReached_ = false;
   resetCurrentPath();
   return PdfStatus::success();
 }
@@ -321,7 +319,9 @@ PdfStepResult PdfContentInterpreter::step(PdfWorkBudget& budget) {
     }
 
     PdfToken token;
-    const PdfStepResult tokenResult = lexer_.next(token, budget);
+    uint8_t* const stringBuffer = workspace_.scratchText + scratchTextLength_;
+    const size_t stringCapacity = workspace_.scratchTextCapacity - scratchTextLength_;
+    const PdfStepResult tokenResult = lexer_.next(token, budget, stringBuffer, stringCapacity);
     if (tokenResult.yielded()) {
       return tokenResult;
     }
@@ -342,6 +342,14 @@ PdfStepResult PdfContentInterpreter::step(PdfWorkBudget& budget) {
     }
     const PdfStatus status = handleToken(token);
     if (!status.ok()) {
+      if (status.error == PdfError::LimitExceeded && formDepth_ != 0) {
+        pageModel_->addWarning(PdfPageWarning::VectorArtOmitted);
+        const PdfStatus abandonStatus = abandonCurrentForm();
+        if (!abandonStatus) {
+          return fail(abandonStatus);
+        }
+        continue;
+      }
       return fail(status);
     }
   }
@@ -356,9 +364,25 @@ PdfStatus PdfContentInterpreter::copyScratch(const uint8_t* const source, const 
     return failStatus(PdfError::LimitExceeded);
   }
   *offset = scratchTextLength_;
-  std::memcpy(workspace_.scratchText + scratchTextLength_, source, length);
+  if (source != workspace_.scratchText + scratchTextLength_) {
+    std::memcpy(workspace_.scratchText + scratchTextLength_, source, length);
+  }
   scratchTextLength_ += static_cast<uint16_t>(length);
   return PdfStatus::success();
+}
+
+const uint8_t* PdfContentInterpreter::tokenText(const PdfToken& token) const {
+  if (token.reserved[1] != 0) {
+    return nullptr;
+  }
+  if (token.reserved[0] == 0) {
+    return reinterpret_cast<const uint8_t*>(token.bytes);
+  }
+  if (workspace_.scratchText == nullptr || scratchTextLength_ > workspace_.scratchTextCapacity ||
+      token.length > workspace_.scratchTextCapacity - scratchTextLength_) {
+    return nullptr;
+  }
+  return workspace_.scratchText + scratchTextLength_;
 }
 
 PdfStatus PdfContentInterpreter::pushOperand(const PdfContentOperand& operand) {
@@ -406,9 +430,11 @@ PdfStatus PdfContentInterpreter::handleArrayToken(const PdfToken& token) {
     arrayOpen_ = false;
     return pushOperand(operand);
   }
-  if (token.kind == PdfTokenKind::ArrayBegin || token.kind == PdfTokenKind::DictionaryBegin ||
-      arrayItemCount_ >= workspace_.arrayItemCapacity) {
+  if (token.kind == PdfTokenKind::ArrayBegin || token.kind == PdfTokenKind::DictionaryBegin) {
     return failStatus(PdfError::LimitExceeded);
+  }
+  if (arrayItemCount_ >= workspace_.arrayItemCapacity) {
+    return PdfStatus::success();
   }
   PdfContentArrayItem item;
   if (token.kind == PdfTokenKind::Integer || token.kind == PdfTokenKind::Real) {
@@ -419,9 +445,13 @@ PdfStatus PdfContentInterpreter::handleArrayToken(const PdfToken& token) {
   } else if (token.kind == PdfTokenKind::String || token.kind == PdfTokenKind::HexString) {
     item.kind = PdfContentOperandKind::String;
     item.textLength = static_cast<uint16_t>(token.length);
-    const PdfStatus status = copyScratch(reinterpret_cast<const uint8_t*>(token.bytes), token.length, &item.textOffset);
+    const PdfStatus status = copyScratch(tokenText(token), token.length, &item.textOffset);
     if (!status.ok()) {
-      return status;
+      if (status.error != PdfError::LimitExceeded) {
+        return status;
+      }
+      item.textOffset = scratchTextLength_;
+      item.textLength = 0;
     }
   } else {
     return failStatus(PdfError::Malformed);
@@ -471,8 +501,7 @@ PdfStatus PdfContentInterpreter::handleDictionaryToken(const PdfToken& token) {
       return failStatus(PdfError::Malformed);
     }
     dictionaryActualTextLength_ = static_cast<uint16_t>(token.length);
-    const PdfStatus status =
-        copyScratch(reinterpret_cast<const uint8_t*>(token.bytes), token.length, &dictionaryActualTextOffset_);
+    const PdfStatus status = copyScratch(tokenText(token), token.length, &dictionaryActualTextOffset_);
     if (!status.ok()) {
       return status;
     }
@@ -535,9 +564,11 @@ PdfStatus PdfContentInterpreter::handleToken(const PdfToken& token) {
     case PdfTokenKind::Name:
       return pushTextOperand(PdfContentOperandKind::Name, reinterpret_cast<const uint8_t*>(token.bytes), token.length);
     case PdfTokenKind::String:
-    case PdfTokenKind::HexString:
-      return pushTextOperand(PdfContentOperandKind::String, reinterpret_cast<const uint8_t*>(token.bytes),
-                             token.length);
+    case PdfTokenKind::HexString: {
+      const uint8_t* const text = tokenText(token);
+      return text != nullptr ? pushTextOperand(PdfContentOperandKind::String, text, token.length)
+                             : failStatus(PdfError::LimitExceeded);
+    }
     case PdfTokenKind::ArrayBegin:
       arrayOpen_ = true;
       arrayStart_ = arrayItemCount_;
@@ -664,7 +695,10 @@ PdfStatus PdfContentInterpreter::processTextOperator(const PdfToken& token) {
     text_.fontSize.raw = workspace_.operands[1].number;
     return PdfStatus::success();
   }
-  if (!text_.active) {
+  const bool textStateOperator = tokenEquals(token, "Tc") || tokenEquals(token, "Tw") ||
+                                 tokenEquals(token, "Tz") || tokenEquals(token, "TL") ||
+                                 tokenEquals(token, "Ts") || tokenEquals(token, "Tr");
+  if (!text_.active && !textStateOperator) {
     return failStatus(PdfError::Malformed);
   }
   if (tokenEquals(token, "Tm")) {
@@ -1085,7 +1119,13 @@ PdfStatus PdfContentInterpreter::processXObjectOperator(const PdfToken& token) {
   if (!status.ok()) {
     return status;
   }
-  return object.kind == PdfContentXObjectKind::Form ? enterForm(object) : appendImage(object, false);
+  if (object.kind == PdfContentXObjectKind::Image && (object.pixelWidth == 0 || object.pixelHeight == 0)) {
+    pageModel_->addWarning(PdfPageWarning::OptionalImageOmitted);
+    return PdfStatus::success();
+  }
+  const PdfStatus objectStatus =
+      object.kind == PdfContentXObjectKind::Form ? enterForm(object) : appendImage(object, false);
+  return objectStatus;
 }
 
 PdfStatus PdfContentInterpreter::enterForm(const PdfContentXObject& form) {
@@ -1140,6 +1180,31 @@ PdfStatus PdfContentInterpreter::enterForm(const PdfContentXObject& form) {
   }
   text_ = {};
   resetCurrentPath();
+  return PdfStatus::success();
+}
+
+PdfStatus PdfContentInterpreter::abandonCurrentForm() {
+  if (formDepth_ == 0) {
+    return failStatus(PdfError::InvalidArgument);
+  }
+  pageModel_->abortTextRun();
+  clearOperands();
+  arrayOpen_ = false;
+  dictionaryDepth_ = 0;
+  dictionaryCapturingActualText_ = false;
+  dictionaryHasActualText_ = false;
+  inlineDictionary_ = false;
+  --formDepth_;
+  const FormFrame& frame = formStack_[formDepth_];
+  currentSource_ = frame.source;
+  resources_ = frame.resources;
+  graphics_ = frame.graphics;
+  text_ = frame.text;
+  markedTextLength_ = frame.markedTextLength;
+  graphicsDepth_ = frame.graphicsDepth;
+  markedDepth_ = frame.markedDepth;
+  topLevelSourceIndex_ = frame.topLevelSourceIndex;
+  lexer_.setSource(currentSource_, frame.resumeOffset);
   return PdfStatus::success();
 }
 
@@ -1322,6 +1387,11 @@ PdfStatus PdfContentInterpreter::emitActualText(MarkedContentFrame& frame) {
   }
   run.sourceOrder = sourceOrder_++;
   const uint16_t runIndex = pageModel_->runCount();
+  if (runIndex >= pageModel_->runCapacity()) {
+    textCapacityReached_ = true;
+    frame.runIndex = UINT16_MAX;
+    return PdfStatus::success();
+  }
   PdfStatus status = pageModel_->beginTextRun(run);
   if (!status.ok()) {
     return status;
@@ -1350,8 +1420,7 @@ PdfStatus PdfContentInterpreter::finishSemanticTextRun() {
       !graphics_.hasClip ||
       (run->xMax > graphics_.clip.xMin && run->xMin < graphics_.clip.xMax && run->yMax > graphics_.clip.yMin &&
        run->yMin < graphics_.clip.yMax);
-  if (!readableArea || !intersectsPage || !graphics_.clipRepresentable || !graphics_.visibilityRepresentable ||
-      !intersectsClip) {
+  if (!readableArea || !intersectsPage || !graphics_.clipRepresentable || !intersectsClip) {
     pageModel_->abortTextRun();
     return PdfStatus::success();
   }
@@ -1373,37 +1442,77 @@ PdfStatus PdfContentInterpreter::emitDecodedText(const uint8_t* const source, co
     return runStatus;
   }
   run.sourceOrder = sourceOrder_++;
-  const uint16_t runIndex = pageModel_->runCount();
-  PdfStatus status = pageModel_->beginTextRun(run);
+  uint16_t runIndex = pageModel_->runCount();
+  const bool overflow = runIndex >= pageModel_->runCapacity();
+  PdfStatus status = overflow ? pageModel_->beginOverflowTextRun(run, &runIndex) : pageModel_->beginTextRun(run);
   if (!status.ok()) {
+    if (overflow && status.error == PdfError::LimitExceeded) {
+      textCapacityReached_ = true;
+      return advanceVisualText(source, length);
+    }
     return status;
   }
   size_t offset = 0;
   while (offset < length) {
-    PdfDecodedGlyph glyph;
+    PdfDecodedGlyph glyph{};
     status = text_.font->decodeNext(source + offset, length - offset, &glyph);
+    if (!status && status.error == PdfError::UnsupportedEncoding) {
+      glyph.sourceLength = static_cast<uint8_t>(std::min<size_t>(text_.font->cid() ? 2U : 1U, length - offset));
+      glyph.sourceCode = 0;
+      for (uint8_t index = 0; index < glyph.sourceLength; ++index) {
+        glyph.sourceCode = (glyph.sourceCode << 8U) | source[offset + index];
+      }
+      glyph.unicode.bytes[0] = 0xEF;
+      glyph.unicode.bytes[1] = 0xBF;
+      glyph.unicode.bytes[2] = 0xBD;
+      glyph.unicode.length = 3;
+      glyph.width = 500;
+      status = PdfStatus::success();
+    }
     if (!status.ok() || glyph.sourceLength == 0 || glyph.sourceLength > length - offset) {
-      pageModel_->abortTextRun();
+      if (!overflow) {
+        pageModel_->abortTextRun();
+      }
       return status.ok() ? failStatus(PdfError::Malformed) : status;
     }
-    status = pageModel_->appendText(glyph.unicode.bytes, glyph.unicode.length);
+    status = overflow ? pageModel_->appendOverflowText(glyph.unicode.bytes, glyph.unicode.length)
+                      : pageModel_->appendText(glyph.unicode.bytes, glyph.unicode.length);
     if (!status.ok()) {
-      pageModel_->abortTextRun();
+      if (overflow && status.error == PdfError::LimitExceeded) {
+        textCapacityReached_ = true;
+        status = advanceVisualText(source + offset, length - offset);
+        if (!status) {
+          return status;
+        }
+        break;
+      }
+      if (!overflow && status.error == PdfError::LimitExceeded) {
+        pageModel_->abortTextRun();
+        textCapacityReached_ = true;
+        return advanceVisualText(source + offset, length - offset);
+      }
+      if (!overflow) {
+        pageModel_->abortTextRun();
+      }
       return status;
     }
     status = advanceGlyph(glyph);
     if (!status.ok()) {
-      pageModel_->abortTextRun();
+      if (!overflow) {
+        pageModel_->abortTextRun();
+      }
       return status;
     }
     offset += glyph.sourceLength;
   }
   status = expandRunGeometry(runIndex);
   if (!status.ok()) {
-    pageModel_->abortTextRun();
+    if (!overflow) {
+      pageModel_->abortTextRun();
+    }
     return status;
   }
-  return finishSemanticTextRun();
+  return overflow ? PdfStatus::success() : finishSemanticTextRun();
 }
 
 PdfStatus PdfContentInterpreter::advanceVisualText(const uint8_t* const source, const size_t length) {
@@ -1433,10 +1542,13 @@ PdfStatus PdfContentInterpreter::showString(const uint8_t* const source, const s
   if (length == 0) {
     return PdfStatus::success();
   }
+  if (textCapacityReached_) {
+    return advanceVisualText(source, length);
+  }
   if (text_.renderMode >= 4) {
     text_.clipPending = true;
   }
-  if (text_.renderMode == 7 || markedContentSuppressed() || !graphics_.visibilityRepresentable) {
+  if (text_.renderMode == 7 || markedContentSuppressed()) {
     return advanceVisualText(source, length);
   }
   MarkedContentFrame* actual = nullptr;
@@ -1455,9 +1567,9 @@ PdfStatus PdfContentInterpreter::showString(const uint8_t* const source, const s
       PdfStatus status = advanceVisualText(source, length);
       if (status.ok() && actual->runIndex != UINT16_MAX) {
         status = expandRunGeometry(actual->runIndex);
-      }
-      if (status.ok()) {
-        status = finishSemanticTextRun();
+        if (status.ok()) {
+          status = finishSemanticTextRun();
+        }
       }
       if (!status.ok()) {
         return status;

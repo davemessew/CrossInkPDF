@@ -319,6 +319,10 @@ PdfStatus PdfPreparedContentResources::resolveFont(void* const context, const ui
   if (resources.parent_ != nullptr && resources.parent_->resolveFont != nullptr) {
     return resources.parent_->resolveFont(resources.parent_->context, name, length, font);
   }
+  if (resources.fontCount_ != 0) {
+    *font = resources.fonts_[resources.fontCount_ - 1U].font;
+    return PdfStatus::success();
+  }
   return PdfStatus::failure(PdfError::UnsupportedEncoding);
 }
 

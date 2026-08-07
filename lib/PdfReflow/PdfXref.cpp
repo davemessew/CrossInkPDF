@@ -38,12 +38,20 @@ bool parseUnsigned(const PdfToken& token, uint64_t* value) {
 
 bool findLastStartXref(const uint8_t* bytes, const size_t length, uint64_t* offset) {
   constexpr char MARKER[] = "startxref";
-  constexpr char EOF_MARKER[] = "%%EOF\n";
-  if (bytes == nullptr || offset == nullptr || length < sizeof(EOF_MARKER) - 1 ||
-      std::memcmp(bytes + length - (sizeof(EOF_MARKER) - 1), EOF_MARKER, sizeof(EOF_MARKER) - 1) != 0) {
+  constexpr char EOF_MARKER[] = "%%EOF";
+  if (bytes == nullptr || offset == nullptr) {
     return false;
   }
-  for (size_t candidate = length - (sizeof(EOF_MARKER) - 1); candidate-- > 0;) {
+  size_t eof = length;
+  while (eof != 0 && (bytes[eof - 1U] == 0 || bytes[eof - 1U] == ' ' || bytes[eof - 1U] == '\t' ||
+                      bytes[eof - 1U] == '\n' || bytes[eof - 1U] == '\f' || bytes[eof - 1U] == '\r')) {
+    --eof;
+  }
+  if (eof < sizeof(EOF_MARKER) - 1U ||
+      std::memcmp(bytes + eof - (sizeof(EOF_MARKER) - 1U), EOF_MARKER, sizeof(EOF_MARKER) - 1U) != 0) {
+    return false;
+  }
+  for (size_t candidate = eof - (sizeof(EOF_MARKER) - 1U); candidate-- > 0;) {
     if (candidate + sizeof(MARKER) - 1 > length || std::memcmp(bytes + candidate, MARKER, sizeof(MARKER) - 1) != 0) {
       continue;
     }

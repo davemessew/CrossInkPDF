@@ -243,6 +243,9 @@ void EpubReaderClippingListActivity::deleteSelectedClipping() {
     removed = deleteCallback(deleteContext, clippings[selectedIndex].paragraphIndex);
   }
   if (!removed) return;
+  if (deleteCallback != nullptr && selectedIndex < static_cast<int>(clippings.size())) {
+    clippings.erase(clippings.begin() + selectedIndex);
+  }
 
   detailMode = false;
   detailText.clear();

@@ -42,6 +42,21 @@ constexpr size_t INDEX_THRESHOLD = 200;
 constexpr uint32_t FILE_BROWSER_APPEND_MIN_FREE_AFTER_ALLOC = 48U * 1024U;
 constexpr uint32_t FILE_BROWSER_APPEND_MIN_MAX_ALLOC_AFTER_ALLOC = 16U * 1024U;
 
+void drawListScrollIndicator(fui::DrawTarget& target, const fui::Rect& rect, const size_t totalEntries,
+                             const int visibleRows, const int topIndex, const int width, const uint8_t side,
+                             const int inset) {
+  if (totalEntries <= static_cast<size_t>(visibleRows) || visibleRows <= 0 || width <= 0) return;
+  const int trackX = side == 1 ? rect.x + inset : rect.right() - width - inset;
+  const fui::Rect track{static_cast<int16_t>(trackX), rect.y, static_cast<int16_t>(width), rect.height};
+  target.fill(track, fui::Paint::dither(fui::Color::LightGray));
+  const int thumbHeight = std::max(12, static_cast<int>((static_cast<int32_t>(rect.height) * visibleRows) /
+                                                        static_cast<int32_t>(totalEntries)));
+  const int scrollRange = static_cast<int>(totalEntries) - visibleRows;
+  const int thumbY = track.y + ((track.height - thumbHeight) * std::max(0, topIndex)) / scrollRange;
+  target.fill(fui::Rect{track.x, static_cast<int16_t>(thumbY), track.width, static_cast<int16_t>(thumbHeight)},
+              fui::Paint::solid(fui::Color::Black));
+}
+
 bool usesTwoLineFileBrowserRows() {
   return SETTINGS.fileBrowserDisplay == CrossPointSettings::FILE_BROWSER_DISPLAY_2_LINES;
 }
@@ -1277,9 +1292,9 @@ void FileBrowserActivity::buildListScreen(UiApp::ScreenType& screen) {
   props.valueInset = 8;               // air between the extension and the row edge
   props.topIndex = 0;
   screen.list(props);
-  fui::drawListScrollIndicator(screen.target(), listRect, totalEntries, visibleRows, topIndex,
-                               screen.theme().listScrollWidth, screen.theme().listScrollSide,
-                               screen.theme().listScrollInset);
+  drawListScrollIndicator(screen.target(), listRect, totalEntries, visibleRows, topIndex,
+                          screen.theme().listScrollWidth, screen.theme().listScrollSide,
+                          screen.theme().listScrollInset);
 }
 
 void FileBrowserActivity::render(RenderLock&&) {

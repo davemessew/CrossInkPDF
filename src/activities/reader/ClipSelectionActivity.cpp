@@ -25,7 +25,7 @@ bool hasEmSpace(const char* text) { return text[0] == '\xe2' && text[1] == '\x80
 }  // namespace
 
 ClipSelectionActivity::ClipSelectionActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
-                                             std::vector<WordRef> words, const int fontId, Section& section,
+                                             ClipWordStore wordStore, const int fontId, Section& section,
                                              const int startPageInSection, const int marginTop, const int marginLeft,
                                              PdfPixelCacheRenderWorkspace* const pdfRenderWorkspace)
     : Activity("ClipSelection", renderer, mappedInput),

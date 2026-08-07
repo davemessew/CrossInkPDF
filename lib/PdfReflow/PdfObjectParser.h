@@ -29,6 +29,9 @@ struct PdfObjectReference {
 };
 
 struct PdfValue {
+  int64_t integerValue = 0;
+  uint32_t objectNumber = 0;
+  int32_t fixedValue = 0;
   PdfValueKind kind = PdfValueKind::Null;
   bool booleanValue = false;
   uint16_t firstLink = PDF_INVALID_INDEX;
@@ -37,10 +40,9 @@ struct PdfValue {
   uint16_t textOffset = 0;
   uint16_t textLength = 0;
   uint16_t generation = 0;
-  uint32_t objectNumber = 0;
-  int64_t integerValue = 0;
-  int32_t fixedValue = 0;
 };
+
+static_assert(sizeof(PdfValue) == 32);
 
 struct PdfDictionaryEntry {
   uint16_t next = PDF_INVALID_INDEX;
@@ -83,6 +85,10 @@ class PdfObjectParser {
   void begin();
   PdfStepResult step(PdfWorkBudget& budget);
   uint16_t rootIndex() const { return rootIndex_; }
+  void setStringTokenBuffer(uint8_t* buffer, size_t capacity) {
+    stringTokenBuffer_ = buffer;
+    stringTokenCapacity_ = capacity;
+  }
 
  private:
   struct Frame {
@@ -113,4 +119,8 @@ class PdfObjectParser {
   uint8_t pendingIntegerStage_ = 0;
   bool complete_ = false;
   bool failed_ = false;
+  bool skipPieceInfoValue_ = false;
+  uint8_t skipDepth_ = 0;
+  uint8_t* stringTokenBuffer_ = nullptr;
+  size_t stringTokenCapacity_ = 0;
 };

@@ -347,7 +347,7 @@ PdfStatus PdfCMap::addRecord(const PdfCMapRecord& record) {
                        (key >= previousRecordKey_ &&
                         (record.sourceLength != static_cast<uint8_t>(previousRecordKey_ >> 32) ||
                          record.sourceFirst > previousRecordLast_));
-  if ((!ordered || !recordsSorted_) && mappingCount_ >= workspace_.recordCapacity) {
+  if (!observingRecords() && (!ordered || !recordsSorted_) && mappingCount_ >= workspace_.recordCapacity) {
     // An unsorted SD-backed map would require a linear record scan for every glyph.
     return PdfStatus::failure(PdfError::LimitExceeded, mappingCount_);
   }
@@ -402,6 +402,13 @@ PdfStatus PdfCMap::addExact(const uint32_t sourceCode, const uint8_t sourceLengt
 
 PdfStatus PdfCMap::addSequential(const uint32_t first, const uint32_t last, const uint8_t sourceLength,
                                  const uint8_t* const destination, const size_t destinationLength) {
+  if (destination != nullptr && destinationLength == 2) {
+    const uint16_t firstCodeUnit = static_cast<uint16_t>(destination[0]) << 8U | destination[1];
+    const uint64_t lastCodeUnit = static_cast<uint64_t>(firstCodeUnit) + last - first;
+    if (firstCodeUnit >= 0xD800U && lastCodeUnit <= 0xDFFFU) {
+      return PdfStatus::success();
+    }
+  }
   uint32_t scalar = 0;
   const PdfStatus decodeStatus = pdfDecodeSingleUtf16BeScalar(destination, destinationLength, &scalar);
   const uint64_t count = static_cast<uint64_t>(last) - first + 1;

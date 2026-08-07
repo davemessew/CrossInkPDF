@@ -100,6 +100,8 @@ inline esp_sleep_wakeup_cause_t esp_sleep_get_wakeup_cause() { return ESP_SLEEP_
 #include "images/LoadingIcon.h"
 #include "util/ButtonNavigator.h"
 #include "util/BookMoveUtils.h"
+#include "util/Dictionary.h"
+#include "util/DictionaryRegistry.h"
 #include "util/PdfDeleteUtils.h"
 #include "util/ScreenshotUtil.h"
 

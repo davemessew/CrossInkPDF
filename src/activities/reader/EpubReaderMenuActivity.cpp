@@ -12,6 +12,9 @@
 #include "CrossPointSettings.h"
 #include "EpubReaderClippingListActivity.h"
 #include "MappedInputManager.h"
+#include "ReaderUtils.h"
+#include "components/TouchHeaderBackButton.h"
+#include "components/TouchRegistry.h"
 #include "ReflowCapabilityPolicy.h"
 #include "components/UITheme.h"
 #include "components/UIThemeTokens.h"
@@ -182,8 +185,8 @@ EpubReaderMenuActivity::EpubReaderMenuActivity(
     ReaderOptionsActivity::GlobalSettingsEditCallback endGlobalSettingsEditCallback, void* endGlobalSettingsEditContext,
     const ReflowCapabilitySet documentCapabilities)
     : Activity("EpubReaderMenu", renderer, mappedInput),
-      menuItems(buildMenuItems(hasFootnotes, hasBookmarks, hasClippings, isCurrentPageBookmarked, isBookCompleted,
-                               showReadingPaceReset, documentCapabilities)),
+      menuItems(buildMenuItems(hasFootnotes, hasDictionary, hasBookmarks, hasClippings, isCurrentPageBookmarked,
+                               isBookCompleted, showReadingPaceReset, documentCapabilities)),
       title(title),
       pendingOrientation(currentOrientation),
       currentPage(currentPage),
@@ -204,8 +207,8 @@ EpubReaderMenuActivity::EpubReaderMenuActivity(
       app(uiTarget, uiTarget.deviceContext()) {}
 
 EpubReaderMenuActivity::TabMenuItems EpubReaderMenuActivity::buildMenuItems(
-    bool hasFootnotes, bool hasBookmarks, bool hasClippings, bool isCurrentPageBookmarked, bool isBookCompleted,
-    bool showReadingPaceReset, ReflowCapabilitySet documentCapabilities) {
+    bool hasFootnotes, bool hasDictionary, bool hasBookmarks, bool hasClippings, bool isCurrentPageBookmarked,
+    bool isBookCompleted, bool showReadingPaceReset, ReflowCapabilitySet documentCapabilities) {
   TabMenuItems items;
   auto& mainItems = items[MAIN_TAB_INDEX];
   auto& bookmarkItems = items[BOOKMARKS_TAB_INDEX];

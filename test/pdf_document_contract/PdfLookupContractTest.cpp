@@ -1024,7 +1024,7 @@ TEST(PdfResolverSourceAccessContract, PageTreeReassertsXrefAfterTraversalEvictsD
   PdfTestRecordStore traversal(sizeof(PdfPageTreeRecord), 8);
   PdfPageInfo pageWorkspace{};
   PdfPageTreeWalker walker(resolver, harness.arena, traversal.store(), ResolverHarness::capturePage, &harness,
-                           ResolverHarness::setTraversalAccess, &harness, &pageWorkspace, 1);
+                           ResolverHarness::setTraversalAccess, &harness, &pageWorkspace, {}, 1);
 
   ASSERT_TRUE(walker.begin({2, 0}).ok());
   PdfStepResult result = PdfStepResult::paused();

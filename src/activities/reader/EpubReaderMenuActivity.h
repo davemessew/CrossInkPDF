@@ -89,7 +89,7 @@ class EpubReaderMenuActivity final : public Activity {
   static constexpr size_t TOUCH_ICON_COUNT = MENU_TAB_COUNT + 1;
   using TabMenuItems = std::array<std::vector<MenuItem>, MENU_TAB_COUNT>;
 
-  static TabMenuItems buildMenuItems(bool hasFootnotes, bool hasBookmarks, bool hasClippings,
+  static TabMenuItems buildMenuItems(bool hasFootnotes, bool hasDictionary, bool hasBookmarks, bool hasClippings,
                                      bool isCurrentPageBookmarked, bool isBookCompleted, bool showReadingPaceReset,
                                      ReflowCapabilitySet documentCapabilities);
   [[nodiscard]] const std::vector<MenuItem>& activeMenuItems() const;

@@ -24,6 +24,9 @@ struct Clipping {
   uint32_t textOffset = 0;
   uint16_t textLength = 0;
   char chapterTitle[CLIPPING_CHAPTER_TITLE_MAX] = {};
+  // PDF mutations use transactional rewrites and therefore retain their
+  // bounded text while the PDF is open. EPUB text remains SD-backed.
+  std::string text;
 };
 
 struct ClippedBookEntry {
@@ -100,7 +103,7 @@ class ClippingStore {
 
   bool readFromFile();
   bool readFromFile(const std::string& path, std::vector<Clipping>& out) const;
-  bool writeToFile() const;
+  bool writeToFile(const std::string* replacementText = nullptr, size_t replacementIndex = SIZE_MAX);
   bool writeMigrationPayload(void* fileContext) const;
   bool writePdfTransaction(const Clipping* appended, size_t removeIndex, bool clear) const;
   bool verifyPdfTransaction(const std::string& path, const Clipping* appended, size_t removeIndex, bool clear) const;

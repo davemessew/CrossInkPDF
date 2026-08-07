@@ -33,6 +33,7 @@ struct PdfPageInfo {
   uint16_t pageWidth = 0;
   uint16_t pageHeight = 0;
   uint16_t rotation = 0;
+  uint16_t overflowAnnotationCount = 0;
   uint8_t contentCount = 0;
   uint8_t annotationCount = 0;
   bool hasResources = false;
@@ -51,7 +52,7 @@ class PdfPageTreeWalker {
 
   PdfPageTreeWalker(PdfObjectResolver& resolver, PdfObjectArena& arena, PdfFixedRecordStore traversalStore,
                     PageFn pageFn, void* pageContext, TraversalAccessFn traversalAccess, void* traversalContext,
-                    PdfPageInfo* pageWorkspace,
+                    PdfPageInfo* pageWorkspace, PdfFixedRecordStore annotationOverflowStore = {},
                     uint32_t maxPages = PdfLimits::MaxPages);
 
   PdfStatus begin(PdfObjectReference rootPages);
@@ -77,6 +78,7 @@ class PdfPageTreeWalker {
     LoadChild,
     CheckAncestor,
     WriteChild,
+    LoadAnnotation,
     EmitPage,
     Complete,
   };
@@ -89,6 +91,7 @@ class PdfPageTreeWalker {
   PdfObjectResolver& resolver_;
   PdfObjectArena& arena_;
   PdfFixedRecordStore traversalStore_{};
+  PdfFixedRecordStore annotationOverflowStore_{};
   PageFn pageFn_ = nullptr;
   void* pageContext_ = nullptr;
   TraversalAccessFn traversalAccess_ = nullptr;
@@ -102,8 +105,11 @@ class PdfPageTreeWalker {
   uint32_t declaredRootCount_ = 0;
   uint32_t processingStackTop_ = UINT32_MAX;
   uint32_t ancestorOrdinal_ = UINT32_MAX;
+  uint32_t overflowAnnotationRecordCount_ = 0;
   uint16_t kidsValueIndex_ = PDF_INVALID_INDEX;
+  uint16_t annotationsValueIndex_ = PDF_INVALID_INDEX;
   uint16_t kidsRemaining_ = 0;
+  uint16_t annotationOrdinal_ = 0;
   uint16_t ancestorVisited_ = 0;
   bool hasDeclaredRootCount_ = false;
   bool pageCaptured_ = false;

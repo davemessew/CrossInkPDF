@@ -37,6 +37,7 @@ class PdfObjectResolver {
                     size_t sourceBufferSize, PdfObjectArena& arena, PdfObjectResolverWorkspace workspace = {});
 
   PdfStatus begin(PdfObjectReference reference);
+  void setStringTokenBuffer(uint8_t* buffer, size_t capacity) { parser_.setStringTokenBuffer(buffer, capacity); }
   PdfStepResult step(PdfWorkBudget& budget);
   const PdfResolvedObject& result() const { return result_; }
   uint64_t currentStreamBytes() const;

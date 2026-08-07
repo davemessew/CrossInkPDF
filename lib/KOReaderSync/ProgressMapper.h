@@ -7,6 +7,9 @@
 
 #include "KOReaderSyncClient.h"
 
+class Epub;
+class GfxRenderer;
+
 /**
  * CrossPoint position representation.
  */
@@ -55,7 +58,9 @@ class ProgressMapper {
    * @param pos CrossPoint position
    * @return KOReader position
    */
-  static KOReaderPosition toKOReader(const std::shared_ptr<ReflowDocument>& document, const CrossPointPosition& pos);
+  static KOReaderPosition toKOReader(
+      const std::shared_ptr<ReflowDocument>& document, const CrossPointPosition& pos,
+      PositionCoordinateSpace coordinateSpace = PositionCoordinateSpace::CurrentDocument);
 
   /**
    * Convert KOReader position to CrossPoint format.
@@ -69,8 +74,13 @@ class ProgressMapper {
    * @param totalPagesInCurrentSpine Total pages in the current spine item (for density estimation)
    * @return CrossPoint position
    */
-  static CrossPointPosition toCrossPoint(const std::shared_ptr<ReflowDocument>& document, const KOReaderPosition& koPos,
-                                         int currentSpineIndex = -1, int totalPagesInCurrentSpine = 0);
+  static CrossPointPosition toCrossPoint(
+      const std::shared_ptr<ReflowDocument>& document, const KOReaderPosition& koPos, int currentSpineIndex = -1,
+      int totalPagesInCurrentSpine = 0,
+      PositionCoordinateSpace coordinateSpace = PositionCoordinateSpace::CurrentDocument);
+
+  static std::optional<CrossPointPosition> fromRichPosition(const std::shared_ptr<Epub>& epub,
+                                                            const KOReaderRichPosition& rich, GfxRenderer& renderer);
 
  private:
   /**

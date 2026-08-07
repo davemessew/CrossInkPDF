@@ -177,6 +177,8 @@ void PdfObjectParser::begin() {
   pendingIntegerStage_ = 0;
   complete_ = false;
   failed_ = false;
+  skipPieceInfoValue_ = false;
+  skipDepth_ = 0;
 }
 
 PdfStatus PdfObjectParser::addValue(const PdfValue& value, uint16_t* valueIndex) {
@@ -196,7 +198,12 @@ PdfStatus PdfObjectParser::copyText(const PdfToken& token, uint16_t* offset, uin
   *offset = arena_.textLength;
   *length = static_cast<uint16_t>(token.length);
   if (token.length != 0) {
-    std::memcpy(arena_.text + arena_.textLength, token.bytes, token.length);
+    const uint8_t* const source = token.reserved[0] != 0 ? stringTokenBuffer_
+                                                         : reinterpret_cast<const uint8_t*>(token.bytes);
+    if (source == nullptr || (token.reserved[0] != 0 && token.length > stringTokenCapacity_)) {
+      return PdfStatus::failure(PdfError::Malformed, lexer_.tokenOffset());
+    }
+    std::memcpy(arena_.text + arena_.textLength, source, token.length);
   }
   arena_.textLength = static_cast<uint16_t>(arena_.textLength + token.length);
   return PdfStatus::success();
@@ -389,6 +396,10 @@ PdfStatus PdfObjectParser::handleToken(const PdfToken& token) {
     const PdfStatus status = copyText(token, &frame.pendingKeyOffset, &frame.pendingKeyLength);
     if (status.ok()) {
       frame.expectingKey = false;
+      if (frame.pendingKeyLength == 9 &&
+          std::memcmp(arena_.text + frame.pendingKeyOffset, "PieceInfo", 9) == 0) {
+        skipPieceInfoValue_ = true;
+      }
     }
     return status;
   }
@@ -405,12 +416,41 @@ PdfStepResult PdfObjectParser::step(PdfWorkBudget& budget) {
 
   while (true) {
     PdfToken token;
-    const PdfStepResult lexResult = lexer_.next(token, budget);
+    const PdfStepResult lexResult = lexer_.next(token, budget, stringTokenBuffer_, stringTokenCapacity_);
     if (!lexResult.complete()) {
       if (lexResult.failed()) {
         failed_ = true;
       }
       return lexResult;
+    }
+
+    if (skipPieceInfoValue_) {
+      if (skipDepth_ == 0) {
+        if (token.kind != PdfTokenKind::DictionaryBegin && token.kind != PdfTokenKind::ArrayBegin) {
+          failed_ = true;
+          return PdfStepResult::failure(PdfStatus::failure(PdfError::Malformed, lexer_.tokenOffset()));
+        }
+        skipDepth_ = 1;
+        continue;
+      }
+      if (token.kind == PdfTokenKind::DictionaryBegin || token.kind == PdfTokenKind::ArrayBegin) {
+        if (skipDepth_ == UINT8_MAX) {
+          failed_ = true;
+          return PdfStepResult::failure(PdfStatus::failure(PdfError::LimitExceeded, lexer_.tokenOffset()));
+        }
+        ++skipDepth_;
+      } else if (token.kind == PdfTokenKind::DictionaryEnd || token.kind == PdfTokenKind::ArrayEnd) {
+        --skipDepth_;
+        if (skipDepth_ == 0) {
+          skipPieceInfoValue_ = false;
+          if (depth_ == 0 || !frames_[depth_ - 1].dictionary) {
+            failed_ = true;
+            return PdfStepResult::failure(PdfStatus::failure(PdfError::Malformed, lexer_.tokenOffset()));
+          }
+          frames_[depth_ - 1].expectingKey = true;
+        }
+      }
+      continue;
     }
 
     PdfStatus status;

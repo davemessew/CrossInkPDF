@@ -12,7 +12,8 @@ class PdfLexer {
 
   void setSource(const PdfByteSource& source, uint64_t offset = 0);
   void reset(uint64_t offset = 0);
-  PdfStepResult next(PdfToken& token, PdfWorkBudget& budget);
+  PdfStepResult next(PdfToken& token, PdfWorkBudget& budget, uint8_t* stringBuffer = nullptr,
+                     size_t stringBufferSize = 0);
   PdfStepResult skipInlineImageData(PdfWorkBudget& budget);
   bool unread(const PdfToken& token);
 
@@ -54,6 +55,7 @@ class PdfLexer {
   ByteResult peek(uint8_t& byte, PdfWorkBudget& budget, PdfStatus& status);
   void consume();
   bool append(uint8_t byte, PdfStatus& status);
+  bool appendString(uint8_t byte, uint8_t* stringBuffer, size_t stringBufferSize, PdfStatus& status);
   PdfStepResult finish(PdfToken& token, PdfTokenKind kind);
   void startToken(uint64_t offset);
 

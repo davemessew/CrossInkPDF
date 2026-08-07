@@ -356,7 +356,8 @@ this fixed PDRP layout:
 - `[237]` annotation count
 - `[238]` resource flags (`bit0=resources present`,
   `bit1=resource dictionary is indirect`)
-- `[239]` reserved zero
+- `[239]` annotation-overflow marker (`0` means the fixed record is complete;
+  `1` makes discovery resume restart because excess references are session-only)
 - `[240-243]` record CRC-32 over bytes `[0-239]`
 
 Every object reference occupies six bytes: a little-endian `uint32_t` object
