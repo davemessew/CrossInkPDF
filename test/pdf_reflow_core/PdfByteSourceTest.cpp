@@ -104,8 +104,9 @@ TEST(PdfCheckedMathTest, RejectsOverflowAndTransformsFixedPoint) {
 }
 
 TEST(PdfLimitsTest, ProductionBoundsMatchApprovedEnvelope) {
-  EXPECT_EQ(PdfLimits::MaxIndirectObjects, 100000u);
-  EXPECT_EQ(PdfLimits::MaxPages, 5000u);
+  EXPECT_EQ(PdfLimits::MaxIndirectObjectNumber, 8'388'607u);
+  EXPECT_EQ(PdfLimits::MaxXrefRecords, PdfLimits::MaxIndirectObjectNumber + 1U);
+  EXPECT_EQ(PdfLimits::MaxPages, static_cast<uint32_t>(UINT16_MAX));
   EXPECT_EQ(PdfLimits::MaxOperatorsPerPage, 250000u);
   EXPECT_EQ(PdfLimits::MaxOperatorsPerDocument, 10000000u);
   EXPECT_EQ(PdfLimits::MaxFormDepth, 16u);
@@ -114,7 +115,6 @@ TEST(PdfLimitsTest, ProductionBoundsMatchApprovedEnvelope) {
   EXPECT_EQ(PdfLimits::MaxFiltersPerStream, 4u);
   EXPECT_EQ(PdfLimits::MaxXrefFieldBytes, 8u);
   EXPECT_EQ(PdfLimits::MaxXrefEntryBytes, 24u);
-  EXPECT_EQ(PdfLimits::MaxXrefIndexPairs, 64u);
   EXPECT_EQ(PdfLimits::XrefMergeEntries, 64u);
   EXPECT_EQ(PdfLimits::MaxImagePixels, 16000000u);
   EXPECT_EQ(PdfLimits::MaxDecodedImageRowBytes, 8192u);

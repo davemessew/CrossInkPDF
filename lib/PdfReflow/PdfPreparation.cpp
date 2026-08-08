@@ -19,17 +19,19 @@ namespace {
 // Leave three milliseconds of headroom for public-call overhead and sink
 // callbacks that may complete a bounded row write before control returns.
 constexpr uint32_t kSliceMilliseconds = 5;
-constexpr uint32_t kSliceOperations = 32;
+// The time guard below remains the hard responsiveness limit. A larger
+// operation allowance avoids hundreds of thousands of needless scheduler
+// round-trips while parsing operator-heavy pages.
+constexpr uint32_t kSliceOperations = 256;
 // Decoder output can expand into row-oriented cache writes. Keeping the input
 // allowance below the public 4 KiB ceiling prevents one decoded slice from
 // emitting more than one 4 KiB aggregate output chunk.
 constexpr size_t kSliceBytes = 3U * 1024U;
-constexpr uint64_t kSectionByteLimit = 1024ULL * 1024ULL;
 constexpr uint16_t kArenaValueCount = 184;
 constexpr uint16_t kArenaDictionaryCount = 128;
 constexpr uint16_t kArenaArrayCount = 136;
 constexpr uint16_t kArenaTextBytes = 736;
-constexpr uint16_t kNavigationArenaDictionaryCount = 256;
+constexpr uint16_t kNavigationArenaDictionaryCount = 384;
 constexpr size_t kNavigationArenaDictionaryBytes =
     kNavigationArenaDictionaryCount * sizeof(PdfDictionaryEntry);
 constexpr uint16_t kNavigationStringTokenBytes = 256;
@@ -40,12 +42,18 @@ constexpr uint16_t kNavigationArenaArrayCount =
 constexpr uint16_t kNavigationArenaTextBytes =
     static_cast<uint16_t>(PdfLimits::PageTextBytes - kNavigationArenaDictionaryBytes - kNavigationStringTokenBytes);
 constexpr uint32_t kXrefRecordCount = 256;
-constexpr uint32_t kMaximumXrefRecords = PdfLimits::MaxIndirectObjects + 1U;
-constexpr size_t kXrefSeenObjectBytes = (kMaximumXrefRecords + 7U) / 8U;
-constexpr size_t kXrefSeenObjectTailBytes = kXrefSeenObjectBytes - PdfLimits::PageRunBytes;
+constexpr uint32_t kMaximumXrefRecords = PdfLimits::MaxXrefRecords;
+constexpr uint8_t kXrefSortInputBatchRecords = 25;
+constexpr uint8_t kXrefSortOutputBatchRecords = 35;
+constexpr uint8_t kXrefSortBatchRecords =
+    2U * kXrefSortInputBatchRecords + kXrefSortOutputBatchRecords;
+static_assert(static_cast<size_t>(kXrefSortBatchRecords) * sizeof(PdfXrefEntry) <=
+              PdfLimits::OperandOrderHistogramBytes);
 constexpr uint32_t kTraversalRecordCount = 64;
 constexpr uint32_t kMaximumAnnotationOverflowRecords =
     PdfLimits::MaxPages * (static_cast<uint32_t>(UINT16_MAX) - PdfLimits::MaxLinkAnnotationsPerPage);
+constexpr uint32_t kMaximumContentOverflowRecords =
+    PdfLimits::MaxPages * (static_cast<uint32_t>(UINT16_MAX) - PdfLimits::MaxContentStreamsPerPage);
 constexpr uint16_t kPreparationOutlineLimit = 32;
 constexpr uint16_t kOutlineWriteBatchLimit = PdfLimits::SourceBufferBytes / sizeof(PdfOutlineEntry);
 static_assert(kOutlineWriteBatchLimit > 0 && kOutlineWriteBatchLimit < kPreparationOutlineLimit);
@@ -89,10 +97,6 @@ constexpr uint32_t kPreparedContentStoreReader = 2;
 constexpr uint32_t kPreparedContentStoreCreated = 3;
 constexpr uint8_t kContentRuntimeInvalid = UINT8_MAX - 1U;
 constexpr uint8_t kContentInterpreterActive = UINT8_MAX;
-static_assert(PdfLimits::PageRunBytes < kXrefSeenObjectBytes,
-              "xref newest-object filter primary span must leave a bounded tail");
-static_assert(kXrefSeenObjectTailBytes <= PdfLimits::OperandOrderHistogramBytes,
-              "xref newest-object filter tail must fit the phase-disjoint operand workspace");
 constexpr size_t kMaskSpoolWorkspaceOffset = 8192;
 
 constexpr size_t alignOverlay(const size_t offset, const size_t alignment) {
@@ -127,6 +131,7 @@ enum class PreparedFontDescriptorState : uint8_t {
 
 struct PreparedFontDescriptor {
   uint64_t source = 0;
+  PdfObjectReference reference{};
   uint32_t length = 0;
   char name[PdfPreparedContentResources::MaxNameBytes]{};
   PdfStreamFilter filters[PdfLimits::MaxFiltersPerStream]{};
@@ -137,7 +142,7 @@ struct PreparedFontDescriptor {
   uint8_t scopeIndex = 0;
 };
 
-static_assert(sizeof(PreparedFontDescriptor) == 56);
+static_assert(sizeof(PreparedFontDescriptor) == 64);
 
 enum class PreparedFontStage : uint8_t {
   Idle,
@@ -256,20 +261,29 @@ struct PreparedLink {
 static_assert(sizeof(PreparedLink) == 12);
 
 enum class NavigationRecordStage : uint8_t {
-  ReadOutline,
+  OpenOutlineBatch,
+  ReadOutlineBatch,
+  CloseOutlineBatch,
+  OpenSectionBatch,
   ReadSection,
-  WriteOutline,
   UpdateSection,
+  CloseSectionBatch,
+  OpenOutlineWriteBatch,
+  WriteOutlineBatch,
+  CloseOutlineWriteBatch,
   FinishMetadata,
   SealPageSpool,
   Complete,
 };
 
 struct NavigationRecordRuntime {
-  PdfOutlineEntry entry{};
   uint16_t outlineIndex = 0;
   uint16_t sectionIndex = 0;
-  NavigationRecordStage stage = NavigationRecordStage::ReadOutline;
+  uint16_t sectionSearchFirst = 0;
+  uint16_t sectionSearchLast = 0;
+  uint8_t batchCount = 0;
+  uint8_t batchIndex = 0;
+  NavigationRecordStage stage = NavigationRecordStage::OpenOutlineBatch;
 };
 
 struct PreparedImageCandidate {
@@ -658,43 +672,64 @@ constexpr size_t kCheckpointBytes = 96;
 constexpr size_t kPageResumeRecordBytes = 512;
 constexpr size_t kPageResumeRecordCrcOffset = kPageResumeRecordBytes - sizeof(uint32_t);
 constexpr uint16_t kPageResumeRecordVersion = 2;
-constexpr size_t kDiscoveryHeaderBytes = 192;
+constexpr size_t kDiscoveryHeaderBytes = 336;
 constexpr size_t kDiscoveryXrefRecordBytes = 24;
-constexpr size_t kDiscoveryPageRecordBytes = 248;
+constexpr size_t kDiscoveryPageRecordBytes = 256;
 constexpr size_t kDiscoveryOverflowRecordBytes = 12;
+constexpr size_t kDiscoveryContentOverflowRecordBytes = 20;
 constexpr uint32_t kResumeXrefBatchRecords = 64;
 static_assert(kResumeXrefBatchRecords * (kDiscoveryXrefRecordBytes + sizeof(PdfXrefEntry)) <= kSliceBytes);
 static_assert(kResumeXrefBatchRecords * sizeof(PdfXrefEntry) <= PdfLimits::PageRunBytes);
+constexpr uint16_t kResumePageBatchRecords = 5;
+static_assert(kResumePageBatchRecords * (kDiscoveryPageRecordBytes + sizeof(PdfPageInfo)) <= kSliceBytes);
+static_assert(kResumePageBatchRecords * sizeof(PdfPageInfo) <= PdfLimits::PageRunBytes);
+static_assert(kResumePageBatchRecords * kDiscoveryPageRecordBytes <= PdfLimits::PageTextBytes);
+constexpr uint16_t kResumeOverflowBatchRecords = 128;
+static_assert(kResumeOverflowBatchRecords * (kDiscoveryOverflowRecordBytes + sizeof(PdfObjectReference)) <=
+              kSliceBytes);
+static_assert(kResumeOverflowBatchRecords * sizeof(PdfObjectReference) <= PdfLimits::PageRunBytes);
+static_assert(kResumeOverflowBatchRecords * kDiscoveryOverflowRecordBytes <= PdfLimits::PageTextBytes);
+constexpr uint16_t kResumeContentOverflowBatchRecords = 80;
+static_assert(kResumeContentOverflowBatchRecords *
+                  (kDiscoveryContentOverflowRecordBytes + sizeof(PdfPageContentOverflowRecord)) <=
+              kSliceBytes);
+static_assert(kResumeContentOverflowBatchRecords * sizeof(PdfPageContentOverflowRecord) <=
+              PdfLimits::PageRunBytes);
+static_assert(kResumeContentOverflowBatchRecords * kDiscoveryContentOverflowRecordBytes <=
+              PdfLimits::PageTextBytes);
 constexpr size_t kDiscoveryTrailerBytes = 72;
 constexpr size_t kDiscoveryHeaderCrcOffset = kDiscoveryHeaderBytes - sizeof(uint32_t);
 constexpr size_t kDiscoveryXrefRecordCrcOffset = kDiscoveryXrefRecordBytes - sizeof(uint32_t);
 constexpr size_t kDiscoveryPageRecordCrcOffset = kDiscoveryPageRecordBytes - sizeof(uint32_t);
 constexpr size_t kDiscoveryOverflowRecordCrcOffset = kDiscoveryOverflowRecordBytes - sizeof(uint32_t);
+constexpr size_t kDiscoveryContentOverflowRecordCrcOffset =
+    kDiscoveryContentOverflowRecordBytes - sizeof(uint32_t);
 constexpr size_t kDiscoveryTrailerCrcOffset = kDiscoveryTrailerBytes - sizeof(uint32_t);
-constexpr uint16_t kDiscoveryVersion = 2;
+constexpr uint16_t kDiscoveryVersion = 5;
+constexpr size_t kDiscoverySecurityIdentifierLengthOffset = 198;
+constexpr size_t kDiscoverySecurityIdentifierOffset = 199;
+static_assert(kDiscoverySecurityIdentifierOffset + PdfSecurityTrailer::FileIdentifierCapacity <=
+              kDiscoveryHeaderCrcOffset);
 constexpr uint8_t kDiscoveryCatalogPages = 1U << 0U;
 constexpr uint8_t kDiscoveryCatalogOutlines = 1U << 1U;
 constexpr uint8_t kDiscoveryCatalogNamedDestinations = 1U << 2U;
 constexpr uint8_t kDiscoveryCatalogPageLabels = 1U << 3U;
 constexpr uint8_t kDiscoveryCatalogMetadata = 1U << 4U;
 constexpr size_t kEmitSectionsResumeControlBytes = 256;
-constexpr uint16_t kEmitSectionsResumeControlVersion = 1;
+constexpr uint16_t kEmitSectionsResumeControlVersion = 2;
 constexpr uint8_t kEmitSectionsResumeFlagCoverSelected = 1U << 0U;
 constexpr uint8_t kEmitSectionsResumeFlagCoverAvailable = 1U << 1U;
 constexpr uint8_t kEmitSectionsResumeFlagCoverJpeg = 1U << 2U;
-constexpr uint64_t kMaximumDiscoveryResumeBytes =
-    kDiscoveryHeaderBytes + static_cast<uint64_t>(kMaximumXrefRecords) * kDiscoveryXrefRecordBytes +
-    static_cast<uint64_t>(PdfLimits::MaxPages) * kDiscoveryPageRecordBytes +
-    static_cast<uint64_t>(kMaximumAnnotationOverflowRecords) * kDiscoveryOverflowRecordBytes +
-    kDiscoveryTrailerBytes;
-constexpr uint64_t kMaximumResumeJournalBytes =
-    kMaximumDiscoveryResumeBytes + static_cast<uint64_t>(PdfLimits::MaxPages) * kPageResumeRecordBytes;
+constexpr uint8_t kEmitSectionsResumeFlagEncryptedSource = 1U << 3U;
+// PdfBuildCheckpoint persists journalBytes as an unsigned 24-bit value. Keep
+// validation aligned with that durable representation instead of advertising
+// an unreachable multi-gigabyte journal ceiling.
+constexpr uint64_t kMaximumResumeJournalBytes = 0x00ffffffU;
 // A cancelled append can leave at most one uncommitted fixed-size page record
 // after checkpoint.journalBytes. The committed prefix remains authoritative.
 constexpr uint64_t kMaximumResumeJournalPhysicalBytes = kMaximumResumeJournalBytes + kPageResumeRecordBytes;
 
-static_assert(kMaximumResumeJournalPhysicalBytes <= UINT32_MAX,
-              "resume journal size must remain representable by checkpoint.journalBytes");
+static_assert(kMaximumResumeJournalPhysicalBytes <= UINT32_MAX);
 
 static_assert(sizeof(PdfJpegPreview) <= PdfLimits::DecoderOutputBytes,
               "JPEG preview state must fit the phase-disjoint decoder output workspace");
@@ -768,11 +803,14 @@ uint64_t readLe64Prep(const uint8_t* const input) {
   return value;
 }
 
-uint32_t discoveryEncodedBytes(const uint32_t xrefCount, const uint16_t pageCount, const uint32_t overflowCount) {
-  return static_cast<uint32_t>(kDiscoveryHeaderBytes + static_cast<uint64_t>(xrefCount) * kDiscoveryXrefRecordBytes +
-                               static_cast<uint64_t>(pageCount) * kDiscoveryPageRecordBytes +
-                               static_cast<uint64_t>(overflowCount) * kDiscoveryOverflowRecordBytes +
-                               kDiscoveryTrailerBytes);
+uint64_t discoveryEncodedBytes(const uint32_t xrefCount, const uint16_t pageCount,
+                               const uint32_t annotationOverflowCount,
+                               const uint32_t contentOverflowCount) {
+  return kDiscoveryHeaderBytes + static_cast<uint64_t>(xrefCount) * kDiscoveryXrefRecordBytes +
+         static_cast<uint64_t>(pageCount) * kDiscoveryPageRecordBytes +
+         static_cast<uint64_t>(annotationOverflowCount) * kDiscoveryOverflowRecordBytes +
+         static_cast<uint64_t>(contentOverflowCount) * kDiscoveryContentOverflowRecordBytes +
+         kDiscoveryTrailerBytes;
 }
 
 void encodeDiscoveryReference(const PdfObjectReference reference, uint8_t* const output) {
@@ -788,7 +826,7 @@ bool discoveryReferenceEncodingValid(const PdfObjectReference reference, const b
   if (reference.objectNumber == 0) {
     return allowNull && reference.generation == 0;
   }
-  return reference.objectNumber <= PdfLimits::MaxIndirectObjects;
+  return reference.objectNumber <= PdfLimits::MaxIndirectObjectNumber;
 }
 
 bool bytesAreZero(const uint8_t* const input, const size_t length) {
@@ -1378,10 +1416,9 @@ PdfStatus closeDurableWriter(const PdfCacheIo& io, PdfCacheHandle* const handle)
   if (handle == nullptr || !handle->valid()) {
     return PdfStatus::failure(PdfError::InvalidArgument);
   }
-  PdfStatus status = io.flush(io.context, *handle);
-  if (status) {
-    status = io.sync(io.context, *handle);
-  }
+  // The HAL flush callback delegates to the same underlying sync operation,
+  // but cannot report failure. Keep the status-bearing durability gate.
+  const PdfStatus status = io.sync(io.context, *handle);
   const PdfStatus closeStatus = io.close(io.context, handle);
   return status ? closeStatus : status;
 }
@@ -1842,11 +1879,13 @@ PdfStatus PdfPreparation::begin(const PdfPreparationConfig& config) {
   sourceIdentity_ = {};
   sourceContext_ = {};
   arena_ = {};
+  security_.reset();
   xrefRecords_ = {};
   traversalRecords_ = {};
   xrefSortStage_ = XrefSortStage::Idle;
   xrefSortRoot_ = {};
   xrefSortInfo_ = {};
+  xrefSortSecurity_ = {};
   xrefSortLeft_ = {};
   xrefSortRight_ = {};
   xrefSortTotal_ = 0;
@@ -1854,6 +1893,10 @@ PdfStatus PdfPreparation::begin(const PdfPreparationConfig& config) {
   xrefSortRunStart_ = 0;
   xrefSortRunCount_ = 0;
   xrefSortBufferIndex_ = 0;
+  xrefSortLeftBatchIndex_ = 0;
+  xrefSortLeftBatchCount_ = 0;
+  xrefSortRightBatchIndex_ = 0;
+  xrefSortRightBatchCount_ = 0;
   xrefSortPairStart_ = 0;
   xrefSortMiddle_ = 0;
   xrefSortEnd_ = 0;
@@ -1864,10 +1907,13 @@ PdfStatus PdfPreparation::begin(const PdfPreparationConfig& config) {
   xrefSortPreviousObject_ = 0;
   xrefSortInput_ = 0;
   xrefSortOutput_ = 1;
+  xrefAppendSpool_ = 0;
   xrefFinalSpool_ = 0xff;
   xrefSortHasInfo_ = false;
+  xrefSortHasSecurity_ = false;
   xrefSortLeftLoaded_ = false;
   xrefSortRightLoaded_ = false;
+  xrefSortResumeParsing_ = false;
   xrefSortPreviousValid_ = false;
   xrefSortCompacting_ = false;
   xrefSortFastPath_ = false;
@@ -1904,11 +1950,18 @@ PdfStatus PdfPreparation::begin(const PdfPreparationConfig& config) {
   currentAnnotationPage_ = 0;
   currentPageOverflowAnnotationIndex_ = 0;
   currentAnnotationOverflowOrdinal_ = 0;
+  currentContentOverflowOrdinal_ = 0;
+  resumeContentOverflowCount_ = 0;
   resolvedLinkCount_ = 0;
   currentResolvedLinkOrdinal_ = 0;
+  nextResolvedLinkSourcePage_ = UINT16_MAX;
   currentAnnotationIndex_ = 0;
   currentAnnotationOverflowBatchIndex_ = 0;
   currentAnnotationOverflowBatchCount_ = 0;
+  currentContentBatchCount_ = 0;
+  contentOverflowLoadCount_ = 0;
+  contentOverflowLoadStage_ = ContentOverflowLoadStage::Idle;
+  currentPageContentOrdinal_ = 0;
   currentPageLinkBlockIndex_ = 0;
   currentPageLinkBatchIndex_ = 0;
   currentPageLinkBatchCount_ = 0;
@@ -1935,6 +1988,7 @@ PdfStatus PdfPreparation::begin(const PdfPreparationConfig& config) {
   currentPageLinkFinalizing_ = false;
   imageCacheStage_ = ImageCacheStage::Idle;
   imageCacheRange_ = {};
+  imageCacheSource_ = {};
   inlineCapturedJpeg_ = {};
   imageCacheOffset_ = 0;
   rasterIdentityScanIndex_ = 0;
@@ -1988,8 +2042,11 @@ PdfStatus PdfPreparation::begin(const PdfPreparationConfig& config) {
   formReachabilityIndex_ = 0;
   formAppendCandidateIndex_ = UINT8_MAX;
   contentAppendActive_ = false;
+  contentOverflowSequenceActive_ = false;
+  contentOverflowAppendActive_ = false;
   transcriptLength_ = 0;
   nextAnchorOrdinal_ = 0;
+  currentSectionFirstSourcePage_ = 0;
   currentSectionFirstWord_ = 0;
   currentSectionFirstAnchor_ = 0;
   cumulativeSectionBytes_ = 0;
@@ -1997,6 +2054,7 @@ PdfStatus PdfPreparation::begin(const PdfPreparationConfig& config) {
   metadataEncodeBytes_ = 0;
   xmpStreamOffset_ = 0;
   xmpStreamLength_ = 0;
+  xmpStreamReference_ = {};
   coverCandidateSourceCount_ = 0;
   expandedRequiredBytes_ = 0;
   for (auto& source : coverCandidateSources_) {
@@ -2030,6 +2088,7 @@ PdfStatus PdfPreparation::begin(const PdfPreparationConfig& config) {
   emitSectionsResumeReady_ = false;
   resumeAfterEmitSections_ = false;
   emitSectionsResumeValidated_ = false;
+  resumeSecurityRequired_ = false;
   resumeAfterPage_ = false;
   resumeControlStage_ = ResumeControlStage::Idle;
   resumeRecordRestoreStage_ = ResumeRecordRestoreStage::Idle;
@@ -2040,6 +2099,7 @@ PdfStatus PdfPreparation::begin(const PdfPreparationConfig& config) {
   resumeJournalScanOffset_ = 0;
   resumeJournalPhysicalBytes_ = 0;
   resumePageValidationOffset_ = 0;
+  resumeContentOverflowCount_ = 0;
   resumePageValidationCrc32_ = 0;
   resumeJournalRecordSequence_ = 0;
   resumeJournalScanSequence_ = 0;
@@ -2190,7 +2250,8 @@ PdfStatus PdfPreparation::encodeEmitSectionsResumeControl(uint8_t* const output,
   output[16] = static_cast<uint8_t>(durableResumePhase_);
   output[17] = static_cast<uint8_t>((coverImageFingerprintSelected_ ? kEmitSectionsResumeFlagCoverSelected : 0U) |
                                     (coverImageRecordAvailable_ ? kEmitSectionsResumeFlagCoverAvailable : 0U) |
-                                    (coverImageSourceJpeg_ ? kEmitSectionsResumeFlagCoverJpeg : 0U));
+                                    (coverImageSourceJpeg_ ? kEmitSectionsResumeFlagCoverJpeg : 0U) |
+                                    (security_.active() ? kEmitSectionsResumeFlagEncryptedSource : 0U));
   output[18] = imageBuildSpool_.recordCount();
   output[19] = retainedImageFileCount_;
   writeLe16Bmp(output + 20, sectionCount_);
@@ -2219,7 +2280,8 @@ PdfStatus PdfPreparation::decodeEmitSectionsResumeControl(const uint8_t* const i
   const uint32_t storedCrc = readLe32Prep(input + kEmitSectionsResumeControlBytes - sizeof(uint32_t));
   const uint8_t flags = input[17];
   const uint8_t knownFlags =
-      kEmitSectionsResumeFlagCoverSelected | kEmitSectionsResumeFlagCoverAvailable | kEmitSectionsResumeFlagCoverJpeg;
+      kEmitSectionsResumeFlagCoverSelected | kEmitSectionsResumeFlagCoverAvailable |
+      kEmitSectionsResumeFlagCoverJpeg | kEmitSectionsResumeFlagEncryptedSource;
   const PdfBuildCheckpoint& checkpoint = checkpointSelection_.checkpoint;
   if (std::memcmp(input, magic, sizeof(magic)) != 0 || readLe16Prep(input + 4) != kEmitSectionsResumeControlVersion ||
       readLe16Prep(input + 6) != kEmitSectionsResumeControlBytes || readLe32Prep(input + 8) != checkpoint.sequence ||
@@ -2237,9 +2299,13 @@ PdfStatus PdfPreparation::decodeEmitSectionsResumeControl(const uint8_t* const i
   const bool coverSelected = (flags & kEmitSectionsResumeFlagCoverSelected) != 0;
   const bool coverAvailable = (flags & kEmitSectionsResumeFlagCoverAvailable) != 0;
   const bool coverJpeg = (flags & kEmitSectionsResumeFlagCoverJpeg) != 0;
+  const bool encryptedSource = (flags & kEmitSectionsResumeFlagEncryptedSource) != 0;
   const uint8_t deferredCount = input[18];
   const uint8_t resumeImageIndex = input[212];
-  if (deferredCount > PDF_IMAGE_BUILD_SPOOL_MAX_RECORDS || (coverAvailable && !coverSelected) ||
+  if (deferredCount > PDF_IMAGE_BUILD_SPOOL_MAX_RECORDS ||
+      (encryptedSource && deferredCount != 0 &&
+       checkpoint.journalBytes < kDiscoveryHeaderBytes + kDiscoveryTrailerBytes) ||
+      (coverAvailable && !coverSelected) ||
       (coverJpeg && !coverAvailable) ||
       (checkpoint.resumePhase == PdfBuildResumePhase::AfterImage
            ? resumeImageIndex == 0 || resumeImageIndex >= deferredCount || resumeImageIndex > checkpoint.emittedImages
@@ -2277,6 +2343,7 @@ PdfStatus PdfPreparation::decodeEmitSectionsResumeControl(const uint8_t* const i
   coverImageFingerprintSelected_ = coverSelected;
   coverImageRecordAvailable_ = coverAvailable;
   coverImageSourceJpeg_ = coverJpeg;
+  resumeSecurityRequired_ = encryptedSource && deferredCount != 0;
   coverImageContentHash_ = readLe64Prep(input + 24);
   coverImageSourceCrc32_ = readLe32Prep(input + 32);
   if (!coverSelected && (coverImageContentHash_ != 0 || coverImageSourceCrc32_ != 0)) {
@@ -2518,7 +2585,14 @@ PdfStepResult PdfPreparation::cancel() {
     return pause();
   }
   if (cancelStage_ == CancelStage::PrepareEmitSectionsResume) {
-    PdfStatus status = closeSource();
+    PdfStatus status =
+        traversalSpool_.isOpen() ? traversalSpool_.closeSession() : PdfStatus::success();
+    if (status && preparedPageSpool_.isOpen()) {
+      status = preparedPageSpoolWriting_ ? finishPreparedPageSpool() : preparedPageSpool_.close();
+    }
+    if (status) {
+      status = closeSource();
+    }
     if (status && imageFileSpool_.writing()) {
       status = imageFileSpool_.closeWrite();
     }
@@ -2874,6 +2948,7 @@ bool PdfPreparation::cancelledGenerationReady() const {
     case CacheSetupStage::ValidateResumeDiscoveryCatalog:
     case CacheSetupStage::ValidateResumeDiscoveryPages:
     case CacheSetupStage::ValidateResumeDiscoveryOverflow:
+    case CacheSetupStage::ValidateResumeDiscoveryContentOverflow:
     case CacheSetupStage::ValidateResumeDiscoveryPage:
     case CacheSetupStage::ValidateResumeDiscoveryTrailer:
     case CacheSetupStage::RestoreResumeDiscoveryHeader:
@@ -2925,6 +3000,7 @@ bool PdfPreparation::cancelledGenerationReady() const {
     case CacheSetupStage::OpenResumeImageFileWriter:
     case CacheSetupStage::CopyResumeImageFileRecords:
     case CacheSetupStage::ReopenSource:
+    case CacheSetupStage::ResolveResumeSecurity:
     case CacheSetupStage::Complete:
       return true;
   }
@@ -3560,6 +3636,12 @@ void PdfPreparation::abortPreparedContentStore() {
   formReachabilityIndex_ = 0;
   formAppendCandidateIndex_ = UINT8_MAX;
   contentAppendActive_ = false;
+  contentOverflowSequenceActive_ = false;
+  contentOverflowAppendActive_ = false;
+  currentContentBatchCount_ = 0;
+  contentOverflowLoadCount_ = 0;
+  contentOverflowLoadStage_ = ContentOverflowLoadStage::Idle;
+  currentPageContentOrdinal_ = 0;
 }
 
 void PdfPreparation::abortResolverObjectStore() {
@@ -3932,8 +4014,8 @@ PdfStatus PdfPreparation::initializeParserStorage() {
   static_assert(PreparedContentOverlay::NativeDictionaryBytes == PdfLimits::UzlibDictionaryBytes);
   static_assert(PreparedContentOverlay::NativeDecoderOutputBytes == PdfLimits::DecoderOutputBytes);
   static_assert(PreparedContentOverlay::NativePageRunBytes == PdfLimits::PageRunBytes);
-  static_assert(sizeof(NavigationWorkspace) == 14568);
-  static_assert(sizeof(PdfContentInterpreter) == 5600);
+  static_assert(sizeof(NavigationWorkspace) == 14592);
+  static_assert(sizeof(PdfContentInterpreter) == 5632);
   static_assert(sizeof(PdfFontMap) == 88);
   static_assert(sizeof(PdfDecodedGlyph) == 28);
   static_assert(sizeof(PdfImagePlacement) == 40);
@@ -3956,13 +4038,13 @@ PdfStatus PdfPreparation::initializeParserStorage() {
   constexpr size_t dictionaryResourceScopesOffset = PreparedContentOverlay::DictionaryResourceScopes;
   constexpr size_t dictionaryEnd = PreparedContentOverlay::DictionaryEnd;
   static_assert(dictionaryNavigationOffset == 0);
-  static_assert(dictionaryInterpreterOffset == 14568);
-  static_assert(dictionaryFontsOffset == 20168);
-  static_assert(dictionaryGlyphsOffset == 21576);
-  static_assert(dictionaryImagesOffset == 28744);
-  static_assert(dictionaryPageOffset == 29064);
-  static_assert(dictionaryResourceScopesOffset == 29104);
-  static_assert(dictionaryEnd == 30056);
+  static_assert(dictionaryInterpreterOffset == 14592);
+  static_assert(dictionaryFontsOffset == 20224);
+  static_assert(dictionaryGlyphsOffset == 21632);
+  static_assert(dictionaryImagesOffset == 28800);
+  static_assert(dictionaryPageOffset == 29120);
+  static_assert(dictionaryResourceScopesOffset == 29160);
+  static_assert(dictionaryEnd == 30112);
   static_assert(dictionaryEnd <= PdfLimits::UzlibDictionaryBytes);
 
   constexpr size_t decoderRangesOffset = PreparedContentOverlay::DecoderRanges;
@@ -4079,6 +4161,8 @@ void PdfPreparation::abortXrefSpools() {
     }
   }
   xrefFinalSpool_ = 0xff;
+  xrefAppendSpool_ = 0;
+  xrefSortResumeParsing_ = false;
   xrefSortStage_ = XrefSortStage::Idle;
 }
 
@@ -4101,6 +4185,16 @@ PdfStatus PdfPreparation::formatAnnotationOverflowSpoolPath(char* const output, 
                                    static_cast<unsigned long>(generation_));
   return length > 0 && static_cast<size_t>(length) < capacity ? PdfStatus::success()
                                                               : PdfStatus::failure(PdfError::LimitExceeded);
+}
+
+PdfStatus PdfPreparation::formatContentOverflowSpoolPath(char* const output, const size_t capacity) const {
+  if (output == nullptr || capacity == 0 || cacheRoot_[0] == '\0') {
+    return PdfStatus::failure(PdfError::InvalidArgument);
+  }
+  const int length = std::snprintf(output, capacity, "%s/gen_%lu/build.content-overflow", cacheRoot_,
+                                   static_cast<unsigned long>(generation_));
+  return length > 0 && static_cast<size_t>(length) < capacity ? PdfStatus::success()
+                                                               : PdfStatus::failure(PdfError::LimitExceeded);
 }
 
 PdfStatus PdfPreparation::formatResolvedLinkSpoolPath(char* const output, const size_t capacity) const {
@@ -4126,6 +4220,7 @@ PdfStatus PdfPreparation::formatTraversalSpoolPath(char* const output, const siz
 void PdfPreparation::abortPageSpools() {
   pageSpool_.abortClose();
   annotationOverflowSpool_.abortClose();
+  contentOverflowSpool_.abortClose();
   resolvedLinkSpool_.abortClose();
   preparedPageSpool_.abortClose();
   traversalSpool_.abortClose();
@@ -4145,6 +4240,9 @@ void PdfPreparation::abortPageSpools() {
   if (formatAnnotationOverflowSpoolPath(path, sizeof(path))) {
     (void)config_.io.remove(config_.io.context, path, false);
   }
+  if (formatContentOverflowSpoolPath(path, sizeof(path))) {
+    (void)config_.io.remove(config_.io.context, path, false);
+  }
   if (formatResolvedLinkSpoolPath(path, sizeof(path))) {
     (void)config_.io.remove(config_.io.context, path, false);
   }
@@ -4154,14 +4252,18 @@ void PdfPreparation::abortPageSpools() {
 }
 
 PdfStatus PdfPreparation::beginPageSpools() {
-  if (!config_.io.valid() || pageSpool_.isOpen() || annotationOverflowSpool_.isOpen() || resolvedLinkSpool_.isOpen() ||
-      preparedPageSpool_.isOpen()) {
+  if (!config_.io.valid() || pageSpool_.isOpen() || annotationOverflowSpool_.isOpen() ||
+      contentOverflowSpool_.isOpen() || resolvedLinkSpool_.isOpen() || preparedPageSpool_.isOpen()) {
     return PdfStatus::failure(PdfError::InvalidArgument);
   }
   PdfStatus status = pageSpool_.configure(&config_.io, sizeof(PdfPageInfo), PdfLimits::MaxPages);
   if (status) {
     status = annotationOverflowSpool_.configure(&config_.io, sizeof(PdfObjectReference),
                                                 kMaximumAnnotationOverflowRecords);
+  }
+  if (status) {
+    status = contentOverflowSpool_.configure(&config_.io, sizeof(PdfPageContentOverflowRecord),
+                                             kMaximumContentOverflowRecords);
   }
   if (status) {
     status = resolvedLinkSpool_.configure(&config_.io, sizeof(PreparedLink), kMaximumResolvedLinkRecords);
@@ -4181,6 +4283,12 @@ PdfStatus PdfPreparation::beginPageSpools() {
   }
   if (status) {
     status = annotationOverflowSpool_.open(path, PdfCacheOpenMode::WriteTruncate);
+  }
+  if (status) {
+    status = formatContentOverflowSpoolPath(path, sizeof(path));
+  }
+  if (status) {
+    status = contentOverflowSpool_.open(path, PdfCacheOpenMode::WriteTruncate);
   }
   if (!status) {
     abortPageSpools();
@@ -4223,13 +4331,16 @@ PdfStatus PdfPreparation::resumePreparedPageSpool() {
 }
 
 PdfStatus PdfPreparation::finishPageDiscoverySpool() {
-  if (!pageSpool_.isOpen() || !annotationOverflowSpool_.isOpen() ||
+  if (!pageSpool_.isOpen() || !annotationOverflowSpool_.isOpen() || !contentOverflowSpool_.isOpen() ||
       pageSpool_.recordCount() != pageCount_ || preparedPageSpool_.isOpen()) {
     return PdfStatus::failure(PdfError::InvalidArgument, pageCount_);
   }
   // This is a session spool, not a committed cache artifact. The HAL's checked
   // close synchronizes SdFat before the file is reopened for reading.
   PdfStatus status = annotationOverflowSpool_.close();
+  if (status) {
+    status = contentOverflowSpool_.close();
+  }
   if (status) {
     status = pageSpool_.close();
   }
@@ -4298,7 +4409,24 @@ PdfStatus PdfPreparation::loadPageRecord(const uint32_t index) {
   }
   const bool sourceWasOpen = sourceHandle_.valid();
   const bool xrefWasOpen = xrefFinalSpool_ < std::size(xrefSpools_) && xrefSpools_[xrefFinalSpool_].isOpen();
-  PdfStatus status = sourceWasOpen ? closeSource() : PdfStatus::success();
+  const bool objectStoreWasOpen = navigationSpoolStage_ == NavigationSpoolStage::ObjectStore &&
+                                  navigationSpoolHandle_.valid();
+  PdfStatus status = PdfStatus::success();
+  if (objectStoreWasOpen) {
+    if (!resolver_.has_value()) {
+      return PdfStatus::failure(PdfError::InvalidArgument, index);
+    }
+    // A compressed lookup may leave its temporary object-store reader
+    // selected. Invalidate that selection before borrowing the one SD reader
+    // for the page spool; the resolver will reassert its reader on demand.
+    resolver_->invalidateSourceAccess();
+    status = switchResolverSourceAccess(PdfObjectResolverReader::Source);
+    if (status) {
+      status = closeSource();
+    }
+  } else if (sourceWasOpen) {
+    status = closeSource();
+  }
   if (status && xrefWasOpen) {
     status = xrefSpools_[xrefFinalSpool_].close();
   }
@@ -4341,7 +4469,21 @@ PdfStatus PdfPreparation::loadAnnotationOverflowBatch(const uint16_t count) {
   const uint32_t totalRecords = annotationOverflowSpool_.recordCount();
   const bool sourceWasOpen = sourceHandle_.valid();
   const bool xrefWasOpen = xrefFinalSpool_ < std::size(xrefSpools_) && xrefSpools_[xrefFinalSpool_].isOpen();
-  PdfStatus status = sourceWasOpen ? closeSource() : PdfStatus::success();
+  const bool objectStoreWasOpen = navigationSpoolStage_ == NavigationSpoolStage::ObjectStore &&
+                                  navigationSpoolHandle_.valid();
+  PdfStatus status = PdfStatus::success();
+  if (objectStoreWasOpen) {
+    if (!resolver_.has_value()) {
+      return PdfStatus::failure(PdfError::InvalidArgument, currentAnnotationOverflowOrdinal_);
+    }
+    resolver_->invalidateSourceAccess();
+    status = switchResolverSourceAccess(PdfObjectResolverReader::Source);
+    if (status) {
+      status = closeSource();
+    }
+  } else if (sourceWasOpen) {
+    status = closeSource();
+  }
   if (status && xrefWasOpen) {
     status = xrefSpools_[xrefFinalSpool_].close();
   }
@@ -4374,6 +4516,130 @@ PdfStatus PdfPreparation::loadAnnotationOverflowBatch(const uint16_t count) {
     currentAnnotationOverflowBatchCount_ = static_cast<uint8_t>(count);
   }
   return status;
+}
+
+PdfStepResult PdfPreparation::stepLoadContentOverflowBatch(PdfWorkBudget& budget, const uint8_t count) {
+  if (navigation_ == nullptr || !runRecords_ || !resolver_.has_value() || count == 0 ||
+      count > PdfLimits::MaxContentStreamsPerPage || !contentOverflowSequenceActive_ || !sourceWindow_) {
+    return PdfStepResult::failure(PdfStatus::failure(PdfError::InvalidArgument, currentContentOverflowOrdinal_));
+  }
+  auto* const runtime = reinterpret_cast<PreparedContentRuntime*>(runRecords_.get());
+  const PdfPageInfo& page = runtime->page;
+  const uint32_t totalContentCount = static_cast<uint32_t>(page.contentCount) + page.overflowContentCount;
+  if (page.pageIndex != currentPageIndex_ || page.overflowContentCount == 0 ||
+      currentPageContentOrdinal_ < page.contentCount || currentPageContentOrdinal_ >= totalContentCount ||
+      count > totalContentCount - currentPageContentOrdinal_ ||
+      currentContentOverflowOrdinal_ > contentOverflowSpool_.recordCount() ||
+      count > contentOverflowSpool_.recordCount() - currentContentOverflowOrdinal_) {
+    return PdfStepResult::failure(PdfStatus::failure(PdfError::Malformed, currentContentOverflowOrdinal_));
+  }
+  const uint32_t expectedOverflowOrdinal =
+      page.contentOverflowStart + currentPageContentOrdinal_ - page.contentCount;
+  if (currentContentOverflowOrdinal_ != expectedOverflowOrdinal) {
+    return PdfStepResult::failure(PdfStatus::failure(PdfError::Malformed, currentContentOverflowOrdinal_));
+  }
+
+  if (contentOverflowLoadStage_ == ContentOverflowLoadStage::Idle) {
+    contentOverflowLoadCount_ = count;
+    resolver_->invalidateSourceAccess();
+    if (navigationSpoolStage_ == NavigationSpoolStage::ObjectStore && navigationSpoolHandle_.valid()) {
+      if (navigationSpoolCrc32_ != kPreparedContentStoreReader) {
+        return PdfStepResult::failure(PdfStatus::failure(PdfError::InvalidArgument));
+      }
+      if (!budget.consumeOperation()) {
+        return PdfStepResult::paused();
+      }
+      const PdfStatus status = config_.io.close(config_.io.context, &navigationSpoolHandle_);
+      if (!status) {
+        return PdfStepResult::failure(status);
+      }
+      navigationSpoolCrc32_ = kPreparedContentStoreCreated;
+    } else if (sourceHandle_.valid()) {
+      if (!budget.consumeOperation()) {
+        return PdfStepResult::paused();
+      }
+      const PdfStatus status = closeSource();
+      if (!status) {
+        return PdfStepResult::failure(status);
+      }
+    } else if (xrefFinalSpool_ < std::size(xrefSpools_) && xrefSpools_[xrefFinalSpool_].isOpen()) {
+      if (!budget.consumeOperation()) {
+        return PdfStepResult::paused();
+      }
+      const PdfStatus status = xrefSpools_[xrefFinalSpool_].close();
+      if (!status) {
+        return PdfStepResult::failure(status);
+      }
+    }
+    contentOverflowLoadStage_ = ContentOverflowLoadStage::Open;
+    return PdfStepResult::paused();
+  }
+  if (contentOverflowLoadCount_ != count) {
+    return PdfStepResult::failure(PdfStatus::failure(PdfError::InvalidArgument, count));
+  }
+
+  if (contentOverflowLoadStage_ == ContentOverflowLoadStage::Open) {
+    if (!budget.consumeOperation()) {
+      return PdfStepResult::paused();
+    }
+    char path[PDF_CACHE_PATH_CAPACITY]{};
+    PdfStatus status = formatContentOverflowSpoolPath(path, sizeof(path));
+    if (status) {
+      status = contentOverflowSpool_.open(path, PdfCacheOpenMode::Read, contentOverflowSpool_.recordCount());
+    }
+    if (!status) {
+      return PdfStepResult::failure(status);
+    }
+    contentOverflowLoadStage_ = ContentOverflowLoadStage::Read;
+    return PdfStepResult::paused();
+  }
+
+  if (contentOverflowLoadStage_ == ContentOverflowLoadStage::Read) {
+    const size_t bytes = static_cast<size_t>(count) * sizeof(PdfPageContentOverflowRecord);
+    if (budget.bytesRemaining < bytes || !budget.consumeOperation()) {
+      return PdfStepResult::paused();
+    }
+    (void)budget.takeBytes(bytes);
+    auto* const records = reinterpret_cast<PdfPageContentOverflowRecord*>(sourceWindow_.get());
+    PdfStatus status = contentOverflowSpool_.readRecords(currentContentOverflowOrdinal_, records, count);
+    for (uint8_t index = 0; status && index < count; ++index) {
+      const PdfPageContentOverflowRecord& record = records[index];
+      const uint16_t expectedSourceOrdinal = static_cast<uint16_t>(currentPageContentOrdinal_ + index);
+      if (record.pageIndex != currentPageIndex_ || record.ordinal != expectedSourceOrdinal || record.reserved != 0 ||
+          record.reference.objectNumber == 0 || record.reference.objectNumber > PdfLimits::MaxIndirectObjectNumber) {
+        status = PdfStatus::failure(PdfError::Malformed, currentContentOverflowOrdinal_ + index);
+      } else {
+        navigation_->pageScratch.contents[index] = record.reference;
+      }
+    }
+    if (!status) {
+      return PdfStepResult::failure(status);
+    }
+    contentOverflowLoadStage_ = ContentOverflowLoadStage::Close;
+    return PdfStepResult::paused();
+  }
+
+  if (contentOverflowLoadStage_ != ContentOverflowLoadStage::Close || !budget.consumeOperation()) {
+    return PdfStepResult::paused();
+  }
+  PdfStatus status = contentOverflowSpool_.close();
+  if (!status) {
+    return PdfStepResult::failure(status);
+  }
+  for (uint8_t index = 0; index < count; ++index) {
+    runtime->ranges[index] = {};
+    runtime->streams[index] = {};
+  }
+  runtime->decodeStreamCount = 0;
+  runtime->requiresNavigationSpill = false;
+  currentContentOverflowOrdinal_ += count;
+  currentContentBatchCount_ = count;
+  currentContentIndex_ = 0;
+  contentOverflowAppendActive_ = true;
+  contentOverflowLoadCount_ = 0;
+  contentOverflowLoadStage_ = ContentOverflowLoadStage::Idle;
+  status = resolver_->begin(navigation_->pageScratch.contents[0]);
+  return status ? PdfStepResult::completed() : PdfStepResult::failure(status);
 }
 
 PdfStatus PdfPreparation::appendResolvedLink(const void* const record, const size_t recordSize) {
@@ -4563,12 +4829,28 @@ PdfStatus PdfPreparation::rewritePreparedPageRecord(PdfWorkBudget& budget, const
   return status;
 }
 
-PdfStatus PdfPreparation::beginXrefSpool() {
+PdfStatus PdfPreparation::beginXrefSpool(const uint32_t knownRecordCapacity) {
   if (!config_.io.valid() || xrefParser_.has_value()) {
     return PdfStatus::failure(PdfError::InvalidArgument);
   }
+  uint64_t capacity64 = knownRecordCapacity;
+  constexpr uint64_t bytesPerStagedRecord = 2ULL * sizeof(PdfXrefEntry);
+  if (capacity64 == 0) {
+    uint64_t usedCacheBytes = 0;
+    if (!pdfCheckedAdd(cacheBudget_.requiredBytes, cacheBudget_.optionalBytes, &usedCacheBytes)) {
+      return PdfStatus::failure(PdfError::LimitExceeded);
+    }
+    const uint64_t availableBytes =
+        usedCacheBytes < cacheBudget_.limit ? cacheBudget_.limit - usedCacheBytes : 0;
+    capacity64 =
+        std::min<uint64_t>(PdfLimits::MaxXrefStagingRecords, availableBytes / bytesPerStagedRecord);
+  }
+  if (capacity64 == 0) {
+    return PdfStatus::failure(PdfError::InsufficientStorage, bytesPerStagedRecord);
+  }
+  const uint32_t recordCapacity = static_cast<uint32_t>(capacity64);
   for (PdfFixedRecordSpool& spool : xrefSpools_) {
-    PdfStatus status = spool.configure(&config_.io, sizeof(PdfXrefEntry), kMaximumXrefRecords);
+    PdfStatus status = spool.configure(&config_.io, sizeof(PdfXrefEntry), recordCapacity);
     if (!status) {
       return status;
     }
@@ -4584,16 +4866,42 @@ PdfStatus PdfPreparation::beginXrefSpool() {
   }
   xref_.reset();
   xref_.emplace(xrefSpools_[0].store());
+  xrefAppendSpool_ = 0;
   xrefFinalSpool_ = 0xff;
   xrefSortStage_ = XrefSortStage::Idle;
+  xrefSortResumeParsing_ = false;
   return PdfStatus::success();
 }
 
-uint64_t PdfPreparation::resolverObjectStoreCapacity() const {
-  if (expandedRequiredBytes_ >= PdfLimits::MaxExpandedRequiredStreamBytes) {
-    return 0;
+PdfStatus PdfPreparation::resumeXrefAfterCompaction() {
+  if (!xref_.has_value() || !xrefParser_.has_value() || !xrefParser_->compactionRequested() ||
+      xrefFinalSpool_ >= std::size(xrefSpools_) || xref_->entryCount() == 0) {
+    return PdfStatus::failure(PdfError::InvalidArgument);
   }
-  const uint64_t expandedRemaining = PdfLimits::MaxExpandedRequiredStreamBytes - expandedRequiredBytes_;
+  xrefAppendSpool_ = xrefFinalSpool_;
+  char path[PDF_CACHE_PATH_CAPACITY]{};
+  PdfStatus status = formatXrefSpoolPath(xrefAppendSpool_, path, sizeof(path));
+  if (status) {
+    status = xrefSpools_[xrefAppendSpool_].openForAppend(path, xref_->entryCount());
+  }
+  if (status) {
+    status = reopenSource();
+  }
+  if (status) {
+    status = xref_->configureNewestObjectFilter(runRecords_.get(), PdfLimits::PageRunBytes, operandScratch_.get(),
+                                                PdfLimits::OperandOrderHistogramBytes);
+  }
+  if (status) {
+    status = xrefParser_->resumeAfterCompaction();
+  }
+  if (status) {
+    xrefSortStage_ = XrefSortStage::Idle;
+    xrefSortResumeParsing_ = false;
+  }
+  return status;
+}
+
+uint64_t PdfPreparation::resolverObjectStoreCapacity() const {
   const uint64_t used = cacheBudget_.requiredBytes + cacheBudget_.optionalBytes;
   const uint64_t cacheRemaining = used < cacheBudget_.limit ? cacheBudget_.limit - used : 0;
   uint64_t physicalRemaining = UINT64_MAX;
@@ -4606,7 +4914,7 @@ uint64_t PdfPreparation::resolverObjectStoreCapacity() const {
     }
     physicalRemaining = cacheCapacity_.free.value > reserve ? cacheCapacity_.free.value - reserve : 0;
   }
-  return std::min({expandedRemaining, cacheRemaining, physicalRemaining});
+  return std::min({PdfLimits::MaxExpandedRequiredStreamBytes, cacheRemaining, physicalRemaining});
 }
 
 PdfStatus PdfPreparation::resetResolverWorkspace() {
@@ -4614,6 +4922,12 @@ PdfStatus PdfPreparation::resetResolverWorkspace() {
       navigation_ == nullptr || inlineNavigationSpillStage_ != InlineNavigationSpillStage::None ||
       inlineNavigationSpoolHandle_.valid() || inlineNavigationSpoolPath_[0] != '\0') {
     return PdfStatus::failure(PdfError::InvalidArgument);
+  }
+  if (resolver_.has_value()) {
+    const PdfStatus accountStatus = accountResolverStreamBytes();
+    if (!accountStatus) {
+      return accountStatus;
+    }
   }
   resolver_.reset();
   abortResolverObjectStore();
@@ -4629,7 +4943,8 @@ PdfStatus PdfPreparation::resetResolverWorkspace() {
                            readPreparedContentStore, writePreparedContentStore};
   const PdfStreamDecodeLimits limits{storeCapacity, PdfLimits::MaxExpansionRatio};
   resolver_.emplace(source(), *xref_, sourceWindow_.get(), PdfLimits::SourceBufferBytes, arena_,
-                    PdfObjectResolverWorkspace{&*inlineImageDecoder_, store, this, setResolverSourceAccess, limits});
+                    PdfObjectResolverWorkspace{&*inlineImageDecoder_, store, this, setResolverSourceAccess, limits,
+                                               security_.active() ? &security_ : nullptr});
   if (arena_.values == reinterpret_cast<PdfValue*>(runRecords_.get())) {
     resolver_->setStringTokenBuffer(pageText_.get() + kNavigationArenaDictionaryBytes + kNavigationArenaTextBytes,
                                     kNavigationStringTokenBytes);
@@ -4642,10 +4957,9 @@ PdfStatus PdfPreparation::accountResolverStreamBytes() {
     return PdfStatus::failure(PdfError::InvalidArgument);
   }
   const uint64_t completed = resolver_->takeCompletedStreamBytes();
-  if (completed > PdfLimits::MaxExpandedRequiredStreamBytes - expandedRequiredBytes_) {
-    return PdfStatus::failure(PdfError::LimitExceeded, expandedRequiredBytes_);
+  if (completed > PdfLimits::MaxExpandedRequiredStreamBytes) {
+    return PdfStatus::failure(PdfError::LimitExceeded, completed);
   }
-  expandedRequiredBytes_ += static_cast<uint32_t>(completed);
   return PdfStatus::success();
 }
 
@@ -5008,18 +5322,23 @@ PdfStepResult PdfPreparation::stepSortXref(PdfWorkBudget& budget) {
   if (!xref_.has_value() || !operandScratch_) {
     return PdfStepResult::failure(PdfStatus::failure(PdfError::InvalidArgument));
   }
-  auto consumeRecordIo = [&budget]() {
-    if (budget.bytesRemaining < sizeof(PdfXrefEntry) || !budget.consumeOperation()) {
+  auto consumeRecordIo = [&budget](const uint32_t count) {
+    const size_t bytes = static_cast<size_t>(count) * sizeof(PdfXrefEntry);
+    if (count == 0 || budget.bytesRemaining < bytes || !budget.consumeOperation()) {
       return false;
     }
-    (void)budget.takeBytes(sizeof(PdfXrefEntry));
+    (void)budget.takeBytes(bytes);
     return true;
   };
   auto* const buffer = reinterpret_cast<PdfXrefEntry*>(operandScratch_.get());
+  auto* const leftBatch = buffer;
+  auto* const rightBatch = leftBatch + kXrefSortInputBatchRecords;
+  auto* const outputBatch = rightBatch + kXrefSortInputBatchRecords;
 
   if (xrefSortStage_ == XrefSortStage::Idle) {
     xrefSortTotal_ = xref_->entryCount();
     xrefSortHasInfo_ = xref_->info(&xrefSortInfo_);
+    xrefSortHasSecurity_ = xref_->security(&xrefSortSecurity_);
     xrefSortFastPath_ = xref_->recordsAlreadySortedUnique();
     if (xrefSortTotal_ == 0 || xrefSortTotal_ > kMaximumXrefRecords ||
         !xref_->root(&xrefSortRoot_) || xrefSortRoot_.objectNumber == 0) {
@@ -5028,13 +5347,19 @@ PdfStepResult PdfPreparation::stepSortXref(PdfWorkBudget& budget) {
     // Parsing is complete. Detach before operandScratch_ and runRecords_ are
     // reused so a later table reset cannot clear another phase's live state.
     xref_->detachNewestObjectFilter();
-    xrefParser_.reset();
+    if (!xrefSortResumeParsing_) {
+      xrefParser_.reset();
+    }
     xrefSortRunLength_ = PdfLimits::XrefMergeEntries;
     xrefSortRunStart_ = 0;
     xrefSortRunCount_ = std::min<uint32_t>(xrefSortRunLength_, xrefSortTotal_);
     xrefSortBufferIndex_ = 0;
-    xrefSortInput_ = 0;
-    xrefSortOutput_ = 1;
+    xrefSortLeftBatchIndex_ = 0;
+    xrefSortLeftBatchCount_ = 0;
+    xrefSortRightBatchIndex_ = 0;
+    xrefSortRightBatchCount_ = 0;
+    xrefSortInput_ = xrefAppendSpool_;
+    xrefSortOutput_ = static_cast<uint8_t>(1U - xrefSortInput_);
     xrefSortCompacting_ = false;
     xrefSortStage_ = XrefSortStage::CloseSource;
     return PdfStepResult::paused();
@@ -5057,9 +5382,9 @@ PdfStepResult PdfPreparation::stepSortXref(PdfWorkBudget& budget) {
     }
     // Xref runs are session spools. Checked close synchronizes SdFat and is
     // the only durability boundary needed before reopening for reads.
-    const PdfStatus status = xrefSpools_[0].close();
+    const PdfStatus status = xrefSpools_[xrefAppendSpool_].close();
     if (xrefSortFastPath_) {
-      xrefFinalSpool_ = 0;
+      xrefFinalSpool_ = xrefAppendSpool_;
       xrefSortUniqueCount_ = xrefSortTotal_;
       xrefSortStage_ = XrefSortStage::Adopt;
     } else {
@@ -5072,28 +5397,29 @@ PdfStepResult PdfPreparation::stepSortXref(PdfWorkBudget& budget) {
       return PdfStepResult::paused();
     }
     char path[PDF_CACHE_PATH_CAPACITY]{};
-    PdfStatus status = formatXrefSpoolPath(xrefSortStage_ == XrefSortStage::OpenInitialInput ? 0 : 1, path,
-                                           sizeof(path));
+    const uint8_t spoolIndex = xrefSortStage_ == XrefSortStage::OpenInitialInput ? xrefSortInput_ : xrefSortOutput_;
+    PdfStatus status = formatXrefSpoolPath(spoolIndex, path, sizeof(path));
     if (status && xrefSortStage_ == XrefSortStage::OpenInitialInput) {
-      status = xrefSpools_[0].open(path, PdfCacheOpenMode::Read, xrefSortTotal_);
+      status = xrefSpools_[xrefSortInput_].open(path, PdfCacheOpenMode::Read, xrefSortTotal_);
       xrefSortStage_ = XrefSortStage::OpenInitialOutput;
     } else if (status) {
-      status = xrefSpools_[1].open(path, PdfCacheOpenMode::WriteTruncate);
+      status = xrefSpools_[xrefSortOutput_].open(path, PdfCacheOpenMode::WriteTruncate);
       xrefSortStage_ = XrefSortStage::InitialLoad;
     }
     return status ? PdfStepResult::paused() : PdfStepResult::failure(status);
   }
   if (xrefSortStage_ == XrefSortStage::InitialLoad) {
     while (xrefSortBufferIndex_ < xrefSortRunCount_) {
-      if (budget.stopRequested() || !consumeRecordIo()) {
+      const uint32_t count = xrefSortRunCount_ - xrefSortBufferIndex_;
+      if (budget.stopRequested() || !consumeRecordIo(count)) {
         return PdfStepResult::paused();
       }
-      const PdfStatus status = pdfReadRecord(xrefSpools_[0].store(), xrefSortRunStart_ + xrefSortBufferIndex_,
-                                             &buffer[xrefSortBufferIndex_]);
+      const PdfStatus status = xrefSpools_[xrefSortInput_].readRecords(
+          xrefSortRunStart_ + xrefSortBufferIndex_, &buffer[xrefSortBufferIndex_], count);
       if (!status) {
         return PdfStepResult::failure(status);
       }
-      ++xrefSortBufferIndex_;
+      xrefSortBufferIndex_ += count;
     }
     stableSortPreparationXrefRun(buffer, xrefSortRunCount_);
     xrefSortBufferIndex_ = 0;
@@ -5102,15 +5428,16 @@ PdfStepResult PdfPreparation::stepSortXref(PdfWorkBudget& budget) {
   }
   if (xrefSortStage_ == XrefSortStage::InitialWrite) {
     while (xrefSortBufferIndex_ < xrefSortRunCount_) {
-      if (budget.stopRequested() || !consumeRecordIo()) {
+      const uint32_t count = xrefSortRunCount_ - xrefSortBufferIndex_;
+      if (budget.stopRequested() || !consumeRecordIo(count)) {
         return PdfStepResult::paused();
       }
-      const PdfStatus status = pdfWriteRecord(xrefSpools_[1].store(), xrefSortRunStart_ + xrefSortBufferIndex_,
-                                              &buffer[xrefSortBufferIndex_]);
+      const PdfStatus status =
+          xrefSpools_[xrefSortOutput_].appendRecords(&buffer[xrefSortBufferIndex_], count);
       if (!status) {
         return PdfStepResult::failure(status);
       }
-      ++xrefSortBufferIndex_;
+      xrefSortBufferIndex_ += count;
     }
     xrefSortRunStart_ += xrefSortRunCount_;
     if (xrefSortRunStart_ < xrefSortTotal_) {
@@ -5186,12 +5513,18 @@ PdfStepResult PdfPreparation::stepSortXref(PdfWorkBudget& budget) {
       xrefSortLeftIndex_ = xrefSortPairStart_;
       xrefSortRightIndex_ = xrefSortMiddle_;
       xrefSortDestination_ = xrefSortPairStart_;
-      xrefSortLeftLoaded_ = false;
-      xrefSortRightLoaded_ = false;
+      xrefSortLeftBatchIndex_ = 0;
+      xrefSortLeftBatchCount_ = 0;
+      xrefSortRightBatchIndex_ = 0;
+      xrefSortRightBatchCount_ = 0;
+      xrefSortBufferIndex_ = 0;
       xrefSortStage_ = XrefSortStage::Merge;
     } else if (xrefSortStage_ == XrefSortStage::OpenCompactInput) {
       xrefSortStage_ = XrefSortStage::OpenCompactOutput;
     } else {
+      xrefSortLeftBatchIndex_ = 0;
+      xrefSortLeftBatchCount_ = 0;
+      xrefSortBufferIndex_ = 0;
       xrefSortStage_ = XrefSortStage::Compact;
     }
     return PdfStepResult::paused();
@@ -5199,6 +5532,19 @@ PdfStepResult PdfPreparation::stepSortXref(PdfWorkBudget& budget) {
 
   if (xrefSortStage_ == XrefSortStage::Merge) {
     while (!budget.stopRequested()) {
+      if (xrefSortBufferIndex_ == kXrefSortOutputBatchRecords ||
+          (xrefSortDestination_ >= xrefSortEnd_ && xrefSortBufferIndex_ != 0)) {
+        if (!consumeRecordIo(xrefSortBufferIndex_)) {
+          return PdfStepResult::paused();
+        }
+        const PdfStatus status =
+            xrefSpools_[xrefSortOutput_].appendRecords(outputBatch, xrefSortBufferIndex_);
+        if (!status) {
+          return PdfStepResult::failure(status);
+        }
+        xrefSortBufferIndex_ = 0;
+        continue;
+      }
       if (xrefSortDestination_ >= xrefSortEnd_) {
         xrefSortPairStart_ = xrefSortEnd_;
         if (xrefSortPairStart_ >= xrefSortTotal_) {
@@ -5211,89 +5557,100 @@ PdfStepResult PdfPreparation::stepSortXref(PdfWorkBudget& budget) {
         xrefSortLeftIndex_ = xrefSortPairStart_;
         xrefSortRightIndex_ = xrefSortMiddle_;
         xrefSortDestination_ = xrefSortPairStart_;
-        xrefSortLeftLoaded_ = false;
-        xrefSortRightLoaded_ = false;
+        xrefSortLeftBatchIndex_ = 0;
+        xrefSortLeftBatchCount_ = 0;
+        xrefSortRightBatchIndex_ = 0;
+        xrefSortRightBatchCount_ = 0;
       }
-      if (!xrefSortLeftLoaded_ && xrefSortLeftIndex_ < xrefSortMiddle_) {
-        if (!consumeRecordIo()) {
+      if (xrefSortLeftBatchIndex_ >= xrefSortLeftBatchCount_ && xrefSortLeftIndex_ < xrefSortMiddle_) {
+        const uint32_t count = std::min<uint32_t>(kXrefSortInputBatchRecords,
+                                                  xrefSortMiddle_ - xrefSortLeftIndex_);
+        if (!consumeRecordIo(count)) {
           return PdfStepResult::paused();
         }
         const PdfStatus status =
-            pdfReadRecord(xrefSpools_[xrefSortInput_].store(), xrefSortLeftIndex_, &xrefSortLeft_);
+            xrefSpools_[xrefSortInput_].readRecords(xrefSortLeftIndex_, leftBatch, count);
         if (!status) {
           return PdfStepResult::failure(status);
         }
-        xrefSortLeftLoaded_ = true;
+        xrefSortLeftIndex_ += count;
+        xrefSortLeftBatchIndex_ = 0;
+        xrefSortLeftBatchCount_ = static_cast<uint8_t>(count);
       }
-      if (!xrefSortRightLoaded_ && xrefSortRightIndex_ < xrefSortEnd_) {
-        if (!consumeRecordIo()) {
+      if (xrefSortRightBatchIndex_ >= xrefSortRightBatchCount_ && xrefSortRightIndex_ < xrefSortEnd_) {
+        const uint32_t count =
+            std::min<uint32_t>(kXrefSortInputBatchRecords, xrefSortEnd_ - xrefSortRightIndex_);
+        if (!consumeRecordIo(count)) {
           return PdfStepResult::paused();
         }
         const PdfStatus status =
-            pdfReadRecord(xrefSpools_[xrefSortInput_].store(), xrefSortRightIndex_, &xrefSortRight_);
+            xrefSpools_[xrefSortInput_].readRecords(xrefSortRightIndex_, rightBatch, count);
         if (!status) {
           return PdfStepResult::failure(status);
         }
-        xrefSortRightLoaded_ = true;
+        xrefSortRightIndex_ += count;
+        xrefSortRightBatchIndex_ = 0;
+        xrefSortRightBatchCount_ = static_cast<uint8_t>(count);
       }
-      if (!consumeRecordIo()) {
-        return PdfStepResult::paused();
+      const bool haveLeft = xrefSortLeftBatchIndex_ < xrefSortLeftBatchCount_;
+      const bool haveRight = xrefSortRightBatchIndex_ < xrefSortRightBatchCount_;
+      if (!haveLeft && !haveRight) {
+        return PdfStepResult::failure(PdfStatus::failure(PdfError::Malformed, xrefSortDestination_));
       }
-      const bool takeLeft = xrefSortLeftLoaded_ &&
-                            (!xrefSortRightLoaded_ || xrefSortLeft_.objectNumber <= xrefSortRight_.objectNumber);
-      const PdfXrefEntry& selected = takeLeft ? xrefSortLeft_ : xrefSortRight_;
-      const PdfStatus status =
-          pdfWriteRecord(xrefSpools_[xrefSortOutput_].store(), xrefSortDestination_, &selected);
-      if (!status) {
-        return PdfStepResult::failure(status);
-      }
+      const bool takeLeft = haveLeft &&
+                            (!haveRight || leftBatch[xrefSortLeftBatchIndex_].objectNumber <=
+                                               rightBatch[xrefSortRightBatchIndex_].objectNumber);
+      outputBatch[xrefSortBufferIndex_++] =
+          takeLeft ? leftBatch[xrefSortLeftBatchIndex_++] : rightBatch[xrefSortRightBatchIndex_++];
       ++xrefSortDestination_;
-      if (takeLeft) {
-        xrefSortLeftLoaded_ = false;
-        ++xrefSortLeftIndex_;
-      } else {
-        xrefSortRightLoaded_ = false;
-        ++xrefSortRightIndex_;
-      }
     }
     return PdfStepResult::paused();
   }
 
   if (xrefSortStage_ == XrefSortStage::Compact) {
     while (!budget.stopRequested()) {
-      if (!xrefSortLeftLoaded_) {
+      if (xrefSortBufferIndex_ == kXrefSortOutputBatchRecords ||
+          (xrefSortLeftIndex_ >= xrefSortTotal_ &&
+           xrefSortLeftBatchIndex_ >= xrefSortLeftBatchCount_ && xrefSortBufferIndex_ != 0)) {
+        if (!consumeRecordIo(xrefSortBufferIndex_)) {
+          return PdfStepResult::paused();
+        }
+        const PdfStatus status =
+            xrefSpools_[xrefSortOutput_].appendRecords(outputBatch, xrefSortBufferIndex_);
+        if (!status) {
+          return PdfStepResult::failure(status);
+        }
+        xrefSortBufferIndex_ = 0;
+        continue;
+      }
+      if (xrefSortLeftBatchIndex_ >= xrefSortLeftBatchCount_) {
         if (xrefSortLeftIndex_ >= xrefSortTotal_) {
           xrefFinalSpool_ = xrefSortOutput_;
           xrefSortCompacting_ = true;
           xrefSortStage_ = XrefSortStage::ClosePassInput;
           return PdfStepResult::paused();
         }
-        if (!consumeRecordIo()) {
+        const uint32_t count =
+            std::min<uint32_t>(kXrefSortInputBatchRecords, xrefSortTotal_ - xrefSortLeftIndex_);
+        if (!consumeRecordIo(count)) {
           return PdfStepResult::paused();
         }
         const PdfStatus status =
-            pdfReadRecord(xrefSpools_[xrefSortInput_].store(), xrefSortLeftIndex_, &xrefSortLeft_);
+            xrefSpools_[xrefSortInput_].readRecords(xrefSortLeftIndex_, leftBatch, count);
         if (!status) {
           return PdfStepResult::failure(status);
         }
-        ++xrefSortLeftIndex_;
-        xrefSortLeftLoaded_ = true;
+        xrefSortLeftIndex_ += count;
+        xrefSortLeftBatchIndex_ = 0;
+        xrefSortLeftBatchCount_ = static_cast<uint8_t>(count);
       }
-      if (xrefSortPreviousValid_ && xrefSortLeft_.objectNumber == xrefSortPreviousObject_) {
-        xrefSortLeftLoaded_ = false;
+      const PdfXrefEntry& entry = leftBatch[xrefSortLeftBatchIndex_++];
+      if (xrefSortPreviousValid_ && entry.objectNumber == xrefSortPreviousObject_) {
         continue;
       }
-      if (!consumeRecordIo()) {
-        return PdfStepResult::paused();
-      }
-      const PdfStatus status =
-          pdfWriteRecord(xrefSpools_[xrefSortOutput_].store(), xrefSortUniqueCount_, &xrefSortLeft_);
-      if (!status) {
-        return PdfStepResult::failure(status);
-      }
-      xrefSortPreviousObject_ = xrefSortLeft_.objectNumber;
+      outputBatch[xrefSortBufferIndex_++] = entry;
+      xrefSortPreviousObject_ = entry.objectNumber;
       xrefSortPreviousValid_ = true;
-      xrefSortLeftLoaded_ = false;
       ++xrefSortUniqueCount_;
     }
     return PdfStepResult::paused();
@@ -5303,13 +5660,29 @@ PdfStepResult PdfPreparation::stepSortXref(PdfWorkBudget& budget) {
     if (xrefFinalSpool_ >= std::size(xrefSpools_) || xrefSortUniqueCount_ == 0) {
       return PdfStepResult::failure(PdfStatus::failure(PdfError::Malformed, xrefSortUniqueCount_));
     }
-    xref_.reset();
-    xref_.emplace(xrefSpools_[xrefFinalSpool_].store());
-    xref_->setRoot(xrefSortRoot_);
-    if (xrefSortHasInfo_) {
-      xref_->setInfo(xrefSortInfo_);
+    PdfStatus status = PdfStatus::success();
+    if (xrefSortResumeParsing_) {
+      if (!xrefSortFastPath_) {
+        if (!xrefSortPreviousValid_) {
+          return PdfStepResult::failure(PdfStatus::failure(PdfError::Malformed, xrefSortUniqueCount_));
+        }
+        status = xref_->adoptCompactedRecords(xrefSpools_[xrefFinalSpool_].store(), xrefSortUniqueCount_,
+                                              xrefSortPreviousObject_);
+      }
+    } else {
+      xref_.reset();
+      xref_.emplace(xrefSpools_[xrefFinalSpool_].store());
+      xref_->setRoot(xrefSortRoot_);
+      if (xrefSortHasInfo_) {
+        xref_->setInfo(xrefSortInfo_);
+      }
+      if (xrefSortHasSecurity_) {
+        status = xref_->setSecurity(xrefSortSecurity_);
+      }
+      if (status) {
+        status = xref_->adoptSortedRecords(xrefSortUniqueCount_);
+      }
     }
-    const PdfStatus status = xref_->adoptSortedRecords(xrefSortUniqueCount_);
     if (!status) {
       return PdfStepResult::failure(status);
     }
@@ -5365,7 +5738,11 @@ void PdfPreparation::rejectResumeState() {
   manifestRecordsMaterialized_ = false;
   emitSectionsResumeValidated_ = false;
   resumeAfterEmitSections_ = false;
+  resumeSecurityRequired_ = false;
   resumeAfterPage_ = false;
+  security_.reset();
+  xrefSortHasSecurity_ = false;
+  xrefSortSecurity_ = {};
   resumeControlStage_ = ResumeControlStage::Idle;
   resumeRecordRestoreStage_ = ResumeRecordRestoreStage::Idle;
   resumePointStage_ = ResumePointStage::Idle;
@@ -5378,6 +5755,7 @@ void PdfPreparation::rejectResumeState() {
   resumeJournalScanOffset_ = 0;
   resumeJournalPhysicalBytes_ = 0;
   resumePageValidationOffset_ = 0;
+  resumeContentOverflowCount_ = 0;
   resumePageValidationCrc32_ = 0;
   resumeJournalRecordSequence_ = 0;
   resumeJournalScanSequence_ = 0;
@@ -5543,10 +5921,9 @@ PdfStatus PdfPreparation::encodePageResumeRecord(uint8_t* const output, const si
 }
 
 PdfStatus PdfPreparation::decodePageResumeRecord(const uint8_t* const input, const size_t length,
-                                                 const uint32_t expectedSequence, const uint32_t expectedPage) {
-  if (input == nullptr || length != kPageResumeRecordBytes || navigation_ == nullptr || expectedPage == 0 ||
-      expectedPage > PdfLimits::MaxPages || expectedPage != currentPageIndex_ + 1U) {
-    return PdfStatus::failure(PdfError::InvalidArgument, expectedPage);
+                                                 const uint32_t expectedSequence) {
+  if (input == nullptr || length != kPageResumeRecordBytes || navigation_ == nullptr) {
+    return PdfStatus::failure(PdfError::InvalidArgument);
   }
   const uint8_t flags = input[17];
   const uint32_t recordSequence = readLe32Prep(input + 8);
@@ -5580,8 +5957,9 @@ PdfStatus PdfPreparation::decodePageResumeRecord(const uint8_t* const input, con
       sourceIdentity_.modificationTime.known != ((flags & 1U) != 0) ||
       sourceIdentity_.modificationTime.value != readLe64Prep(input + 28) ||
       sourceIdentity_.headFingerprint != readLe64Prep(input + 36) ||
-      sourceIdentity_.tailFingerprint != readLe64Prep(input + 44) || completedPage != expectedPage ||
-      recordSectionCount == 0 || recordSectionCount > PdfMetadataLimits::MaxSections ||
+      sourceIdentity_.tailFingerprint != readLe64Prep(input + 44) || completedPage == 0 ||
+      completedPage > pageCount_ || completedPage <= currentPageIndex_ || recordSectionCount == 0 ||
+      recordSectionCount > PdfMetadataLimits::MaxSections || recordSectionCount > completedPage ||
       (recordSectionCount != sectionCount_ && recordSectionCount != static_cast<uint16_t>(sectionCount_ + 1U)) ||
       pageFirstSection != static_cast<uint16_t>(recordSectionCount - 1U) || recordImageCount != 0 ||
       recordImageBytes != 0 || lastVerifiedObject == 0 || pageWidth == 0 || pageHeight == 0 ||
@@ -5590,7 +5968,7 @@ PdfStatus PdfPreparation::decodePageResumeRecord(const uint8_t* const input, con
       recordExpandedRequiredBytes < expandedRequiredBytes_ ||
       recordExpandedRequiredBytes > PdfLimits::MaxExpandedRequiredStreamBytes ||
       pageFirstAnchor != nextAnchorOrdinal_) {
-    return PdfStatus::failure(PdfError::Malformed, expectedPage);
+    return PdfStatus::failure(PdfError::Malformed, completedPage);
   }
 
   resetInPlace(sectionRecord_);
@@ -5606,23 +5984,28 @@ PdfStatus PdfPreparation::decodePageResumeRecord(const uint8_t* const input, con
       std::memcmp(sectionRecord_.path, sectionPath_, static_cast<size_t>(prefixLength)) != 0 ||
       std::strstr(sectionRecord_.path, "/sections/") == nullptr ||
       !pdfValidateCacheRelativePath(sectionRecord_.path, sectionRecord_.pathLength)) {
-    return PdfStatus::failure(PdfError::Malformed, expectedPage);
+    return PdfStatus::failure(PdfError::Malformed, completedPage);
   }
 
   const bool newSection = recordSectionCount == static_cast<uint16_t>(sectionCount_ + 1U);
   if (newSection) {
+    if (sectionCount_ != 0) {
+      if (!preparedPageSpool_.isOpen() || !preparedPageSpoolWriting_ ||
+          preparedPageSpool_.recordCount() + 1U != sectionCount_) {
+        return PdfStatus::failure(PdfError::Malformed, completedPage);
+      }
+      const PdfStatus writeStatus = writePreparedPageRecord(navigation_->preparedPageScratch);
+      if (!writeStatus) {
+        return writeStatus;
+      }
+    }
     resetInPlace(navigation_->preparedPageScratch);
     navigation_->preparedPageScratch.firstSourcePage = completedPage - 1U;
   } else {
-    const PdfStatus readStatus =
-        readPreparedPageRecord(static_cast<uint16_t>(recordSectionCount - 1U), &navigation_->preparedPageScratch);
-    if (!readStatus) {
-      return readStatus;
-    }
     if (navigation_->preparedPageScratch.file.pathLength != sectionRecord_.pathLength ||
         std::memcmp(navigation_->preparedPageScratch.file.path, sectionRecord_.path, sectionRecord_.pathLength) != 0 ||
         cumulativeSectionBytes_ < navigation_->preparedPageScratch.file.size) {
-      return PdfStatus::failure(PdfError::Malformed, expectedPage);
+      return PdfStatus::failure(PdfError::Malformed, completedPage);
     }
   }
   PdfMetadataSection& section = navigation_->preparedPageScratch.section;
@@ -5644,29 +6027,16 @@ PdfStatus PdfPreparation::decodePageResumeRecord(const uint8_t* const input, con
       section.firstWordOrdinal != expectedFirstWord || section.firstAnchorOrdinal != expectedFirstAnchor ||
       section.wordCount > UINT32_MAX - section.firstWordOrdinal ||
       section.firstWordOrdinal + section.wordCount != recordWords || recordNextAnchor <= pageFirstAnchor) {
-    return PdfStatus::failure(PdfError::Malformed, expectedPage);
+    return PdfStatus::failure(PdfError::Malformed, completedPage);
   }
 
   navigation_->preparedPageScratch.file = sectionRecord_;
   navigation_->preparedPageScratch.lastSourcePageExclusive = completedPage;
-  PdfStatus appendStatus = PdfStatus::success();
-  if (newSection) {
-    if (preparedPageSpoolUpdating_) {
-      appendStatus = resumePreparedPageSpool();
-    }
-    if (appendStatus) {
-      appendStatus = writePreparedPageRecord(navigation_->preparedPageScratch);
-    }
-  } else {
-    PdfWorkBudget recordBudget{2U, sizeof(PreparedSectionRecord)};
-    appendStatus = rewritePreparedPageRecord(recordBudget, static_cast<uint16_t>(recordSectionCount - 1U),
-                                             navigation_->preparedPageScratch);
-  }
-  if (!appendStatus) {
-    return appendStatus;
-  }
   sectionCount_ = recordSectionCount;
   currentPageIndex_ = completedPage;
+  currentSectionFirstSourcePage_ = navigation_->preparedPageScratch.firstSourcePage;
+  currentSectionFirstWord_ = navigation_->preparedPageScratch.section.firstWordOrdinal;
+  currentSectionFirstAnchor_ = navigation_->preparedPageScratch.section.firstAnchorOrdinal;
   totalWords_ = recordWords;
   nextAnchorOrdinal_ = recordNextAnchor;
   cumulativeSectionBytes_ = recordSectionBytes;
@@ -5758,6 +6128,12 @@ PdfStatus PdfPreparation::encodeDiscoveryHeader(uint8_t* const output, const siz
   PdfObjectReference info{};
   const bool hasInfo = xref_->info(&info);
   const uint32_t overflowCount = annotationOverflowSpool_.recordCount();
+  const uint32_t contentOverflowCount = contentOverflowSpool_.recordCount();
+  const uint64_t totalBytes = discoveryEncodedBytes(xref_->entryCount(), static_cast<uint16_t>(pageCount_),
+                                                    overflowCount, contentOverflowCount);
+  if (totalBytes > kMaximumResumeJournalBytes) {
+    return PdfStatus::failure(PdfError::InsufficientStorage, totalBytes);
+  }
   if (!xref_->root(&root) || root.objectNumber == 0) {
     return PdfStatus::failure(PdfError::Malformed);
   }
@@ -5771,8 +6147,7 @@ PdfStatus PdfPreparation::encodeDiscoveryHeader(uint8_t* const output, const siz
   std::memcpy(output, "PDRH", 4);
   writeLe16Bmp(output + 4, kDiscoveryVersion);
   writeLe16Bmp(output + 6, static_cast<uint16_t>(kDiscoveryHeaderBytes));
-  writeLe32Bmp(output + 8,
-               discoveryEncodedBytes(xref_->entryCount(), static_cast<uint16_t>(pageCount_), overflowCount));
+  writeLe32Bmp(output + 8, static_cast<uint32_t>(totalBytes));
   writeLe32Bmp(output + 12, generation_);
   output[16] = sourceIdentity_.modificationTime.known ? 1U : 0U;
   output[17] = hasInfo ? 1U : 0U;
@@ -5796,6 +6171,21 @@ PdfStatus PdfPreparation::encodeDiscoveryHeader(uint8_t* const output, const siz
   encodeDiscoveryReference(catalogNavigation_.metadata, output + 100);
   std::memcpy(output + 106, catalogNavigation_.language, catalogNavigation_.languageLength);
   writeLe32Bmp(output + 180, overflowCount);
+  PdfSecurityTrailer securityTrailer{};
+  const bool encrypted = xref_->security(&securityTrailer);
+  output[184] = encrypted ? 1U : 0U;
+  writeLe32Bmp(output + 186, contentOverflowCount);
+  writeLe16Bmp(output + 190, static_cast<uint16_t>(kDiscoveryContentOverflowRecordBytes));
+  encodeDiscoveryReference(securityTrailer.encryptionReference, output + 192);
+  if (encrypted) {
+    if (securityTrailer.fileIdentifierLength == 0 ||
+        securityTrailer.fileIdentifierLength > sizeof(securityTrailer.fileIdentifier)) {
+      return PdfStatus::failure(PdfError::Encrypted, securityTrailer.encryptionReference.objectNumber);
+    }
+    output[kDiscoverySecurityIdentifierLengthOffset] = securityTrailer.fileIdentifierLength;
+    std::memcpy(output + kDiscoverySecurityIdentifierOffset, securityTrailer.fileIdentifier,
+                securityTrailer.fileIdentifierLength);
+  }
   writeLe32Bmp(output + kDiscoveryHeaderCrcOffset, pdfCacheCrc32(output, kDiscoveryHeaderCrcOffset));
   return PdfStatus::success();
 }
@@ -5813,6 +6203,9 @@ PdfStatus PdfPreparation::decodeDiscoveryHeader(const uint8_t* const input, cons
   const uint32_t xrefCount = readLe32Prep(input + 52);
   const uint16_t recordPageCount = readLe16Prep(input + 56);
   const uint32_t overflowCount = readLe32Prep(input + 180);
+  const uint32_t contentOverflowCount = readLe32Prep(input + 186);
+  const uint8_t securityFlags = input[184];
+  const uint8_t fileIdentifierLength = input[kDiscoverySecurityIdentifierLengthOffset];
   const PdfObjectReference root = decodeDiscoveryReference(input + 64);
   const PdfObjectReference info = decodeDiscoveryReference(input + 70);
   const PdfObjectReference pages = decodeDiscoveryReference(input + 76);
@@ -5820,9 +6213,22 @@ PdfStatus PdfPreparation::decodeDiscoveryHeader(const uint8_t* const input, cons
   const PdfObjectReference namedDestinations = decodeDiscoveryReference(input + 88);
   const PdfObjectReference pageLabels = decodeDiscoveryReference(input + 94);
   const PdfObjectReference metadata = decodeDiscoveryReference(input + 100);
+  const PdfObjectReference encryptionReference = decodeDiscoveryReference(input + 192);
   const uint32_t storedCrc = readLe32Prep(input + kDiscoveryHeaderCrcOffset);
-  const uint32_t expectedTotal = discoveryEncodedBytes(xrefCount, recordPageCount, overflowCount);
+  const uint64_t expectedTotal =
+      discoveryEncodedBytes(xrefCount, recordPageCount, overflowCount, contentOverflowCount);
   const PdfBuildCheckpoint& checkpoint = checkpointSelection_.checkpoint;
+  const uint64_t pageResumeBytes = checkpoint.journalBytes >= totalBytes
+                                       ? static_cast<uint64_t>(checkpoint.journalBytes) - totalBytes
+                                       : UINT64_MAX;
+  const uint64_t pageResumeRecords =
+      pageResumeBytes == UINT64_MAX ? UINT64_MAX : pageResumeBytes / kPageResumeRecordBytes;
+  const bool journalLayoutValid =
+      checkpoint.resumePhase == PdfBuildResumePhase::AfterDiscovery
+          ? pageResumeBytes == 0
+          : checkpoint.resumePhase == PdfBuildResumePhase::AfterPage && pageResumeBytes != 0 &&
+                pageResumeBytes % kPageResumeRecordBytes == 0 &&
+                pageResumeRecords <= checkpoint.lastVerifiedPage;
   if (std::memcmp(input, "PDRH", 4) != 0 || readLe16Prep(input + 4) != kDiscoveryVersion ||
       readLe16Prep(input + 6) != kDiscoveryHeaderBytes ||
       storedCrc != pdfCacheCrc32(input, kDiscoveryHeaderCrcOffset) || sourceFlags > 1U || infoFlags > 1U ||
@@ -5831,13 +6237,10 @@ PdfStatus PdfPreparation::decodeDiscoveryHeader(const uint8_t* const input, cons
       xrefCount > kMaximumXrefRecords ||
       recordPageCount == 0 || recordPageCount > PdfLimits::MaxPages ||
       overflowCount > kMaximumAnnotationOverflowRecords ||
+      contentOverflowCount > kMaximumContentOverflowRecords || expectedTotal > kMaximumResumeJournalBytes ||
       readLe16Prep(input + 58) != kDiscoveryXrefRecordBytes || readLe16Prep(input + 60) != kDiscoveryPageRecordBytes ||
       readLe16Prep(input + 62) != kDiscoveryTrailerBytes || totalBytes != expectedTotal ||
-      totalBytes > resumeJournalPhysicalBytes_ ||
-      checkpoint.journalBytes !=
-          totalBytes + (checkpoint.resumePhase == PdfBuildResumePhase::AfterDiscovery
-                            ? 0U
-                            : static_cast<uint64_t>(checkpoint.lastVerifiedPage) * kPageResumeRecordBytes) ||
+      totalBytes > resumeJournalPhysicalBytes_ || !journalLayoutValid ||
       checkpoint.lastVerifiedPage > recordPageCount || recordGeneration != checkpoint.generation ||
       sourceIdentity_.size != readLe64Prep(input + 20) ||
       sourceIdentity_.modificationTime.known != (sourceFlags != 0) ||
@@ -5853,7 +6256,18 @@ PdfStatus PdfPreparation::decodeDiscoveryHeader(const uint8_t* const input, cons
       ((catalogFlags & kDiscoveryCatalogPageLabels) == 0) != (pageLabels.objectNumber == 0) ||
       ((catalogFlags & kDiscoveryCatalogMetadata) == 0) != (metadata.objectNumber == 0) ||
       !bytesAreZero(input + 106 + languageLength, 180 - 106 - languageLength) ||
-      !bytesAreZero(input + 184, kDiscoveryHeaderCrcOffset - 184)) {
+      securityFlags > 1U || input[185] != 0 ||
+      readLe16Prep(input + 190) != kDiscoveryContentOverflowRecordBytes ||
+      (securityFlags == 0 &&
+       (encryptionReference.objectNumber != 0 || fileIdentifierLength != 0 ||
+        !bytesAreZero(input + kDiscoverySecurityIdentifierOffset,
+                      kDiscoveryHeaderCrcOffset - kDiscoverySecurityIdentifierOffset))) ||
+      (securityFlags != 0 &&
+       (!discoveryReferenceEncodingValid(encryptionReference, false) || fileIdentifierLength == 0 ||
+        fileIdentifierLength > PdfSecurityTrailer::FileIdentifierCapacity ||
+        !bytesAreZero(input + kDiscoverySecurityIdentifierOffset + fileIdentifierLength,
+                      kDiscoveryHeaderCrcOffset - kDiscoverySecurityIdentifierOffset -
+                          fileIdentifierLength)))) {
     return PdfStatus::failure(PdfError::Malformed);
   }
 
@@ -5864,6 +6278,7 @@ PdfStatus PdfPreparation::decodeDiscoveryHeader(const uint8_t* const input, cons
   // has finished, so retain the overflow count here without growing the
   // fixed preparation control state.
   resumePageValidationOffset_ = overflowCount;
+  resumeContentOverflowCount_ = contentOverflowCount;
   if (!restore) {
     return PdfStatus::success();
   }
@@ -5871,6 +6286,16 @@ PdfStatus PdfPreparation::decodeDiscoveryHeader(const uint8_t* const input, cons
   // generation rather than the default generation zero used before setup
   // selection completes.
   generation_ = recordGeneration;
+  xrefSortHasSecurity_ = securityFlags != 0;
+  resumeSecurityRequired_ = xrefSortHasSecurity_;
+  xrefSortSecurity_ = {};
+  if (xrefSortHasSecurity_) {
+    xrefSortSecurity_.encrypted = true;
+    xrefSortSecurity_.encryptionReference = encryptionReference;
+    xrefSortSecurity_.fileIdentifierLength = fileIdentifierLength;
+    std::memcpy(xrefSortSecurity_.fileIdentifier, input + kDiscoverySecurityIdentifierOffset,
+                fileIdentifierLength);
+  }
   activeNavigationReference_ = root;
   infoReference_ = info;
   hasInfoReference_ = infoFlags != 0;
@@ -5890,21 +6315,15 @@ PdfStatus PdfPreparation::decodeDiscoveryHeader(const uint8_t* const input, cons
   pageCount_ = 0;
   coverCandidateSourceCount_ = 0;
   currentAnnotationOverflowOrdinal_ = 0;
+  currentContentOverflowOrdinal_ = 0;
   return pdfApplyCatalogMetadata(catalogNavigation_, &metadataBuilder_);
 }
 
-PdfStatus PdfPreparation::encodeDiscoveryXrefRecord(const uint32_t ordinal, uint8_t* const output,
-                                                    const size_t capacity) {
+PdfStatus PdfPreparation::encodeDiscoveryXrefRecord(const uint32_t ordinal, const PdfXrefEntry& entry,
+                                                    uint8_t* const output, const size_t capacity) const {
   if (output == nullptr || capacity < kDiscoveryXrefRecordBytes || !xref_.has_value() || !xref_->finalized() ||
       ordinal >= xref_->entryCount()) {
     return PdfStatus::failure(PdfError::InvalidArgument, ordinal);
-  }
-  PdfXrefEntry entry{};
-  PdfStatus status = xrefFinalSpool_ < std::size(xrefSpools_)
-                         ? pdfReadRecord(xrefSpools_[xrefFinalSpool_].store(), ordinal, &entry)
-                         : pdfReadRecord(recordStore(xrefRecords_), ordinal, &entry);
-  if (!status) {
-    return status;
   }
   std::memset(output, 0, kDiscoveryXrefRecordBytes);
   writeLe32Bmp(output, entry.objectNumber);
@@ -5929,12 +6348,13 @@ PdfStatus PdfPreparation::decodeDiscoveryXrefRecord(const uint8_t* const input, 
   const uint32_t objectStreamIndex = readLe32Prep(input + 16);
   if (input[7] != 0 || type > static_cast<uint8_t>(PdfXrefEntryType::Compressed) ||
       readLe32Prep(input + kDiscoveryXrefRecordCrcOffset) != pdfCacheCrc32(input, kDiscoveryXrefRecordCrcOffset) ||
-      objectNumber > PdfLimits::MaxIndirectObjects || (ordinal != 0 && objectNumber <= resumeValidationCrc32_) ||
+      objectNumber > PdfLimits::MaxIndirectObjectNumber ||
+      (ordinal != 0 && objectNumber <= resumeValidationCrc32_) ||
       (type == static_cast<uint8_t>(PdfXrefEntryType::Uncompressed) && offset >= sourceIdentity_.size) ||
       (type != static_cast<uint8_t>(PdfXrefEntryType::Compressed) && objectStreamIndex != 0) ||
       (type == static_cast<uint8_t>(PdfXrefEntryType::Compressed) &&
-       (generation != 0 || offset > PdfLimits::MaxIndirectObjects ||
-        objectStreamIndex >= PdfLimits::MaxIndirectObjects || offset == objectNumber))) {
+       (generation != 0 || offset > PdfLimits::MaxIndirectObjectNumber ||
+        objectStreamIndex >= PdfLimits::MaxXrefRecords || offset == objectNumber))) {
     return PdfStatus::failure(PdfError::Malformed, ordinal);
   }
   if (entry != nullptr) {
@@ -5948,19 +6368,18 @@ PdfStatus PdfPreparation::decodeDiscoveryXrefRecord(const uint8_t* const input, 
   return PdfStatus::success();
 }
 
-PdfStatus PdfPreparation::encodeDiscoveryPageRecord(const uint16_t ordinal, uint8_t* const output,
-                                                    const size_t capacity) {
+PdfStatus PdfPreparation::encodeDiscoveryPageRecord(const uint16_t ordinal, const PdfPageInfo& page,
+                                                    uint8_t* const output, const size_t capacity) const {
   if (output == nullptr || capacity < kDiscoveryPageRecordBytes || navigation_ == nullptr || ordinal >= pageCount_) {
     return PdfStatus::failure(PdfError::InvalidArgument, ordinal);
   }
-  PdfStatus loadStatus = loadPageRecord(ordinal);
-  if (!loadStatus) {
-    return loadStatus;
-  }
-  const PdfPageInfo& page = navigation_->pageScratch;
   if (page.pageReference.objectNumber == 0 || page.pageIndex != ordinal || page.pageWidth == 0 ||
       page.pageHeight == 0 || page.contentCount > PdfLimits::MaxContentStreamsPerPage ||
-      page.annotationCount > PdfLimits::MaxLinkAnnotationsPerPage) {
+      page.annotationCount > PdfLimits::MaxLinkAnnotationsPerPage ||
+      (page.overflowContentCount != 0 && page.contentCount != PdfLimits::MaxContentStreamsPerPage) ||
+      page.overflowContentCount > UINT16_MAX - PdfLimits::MaxContentStreamsPerPage ||
+      page.contentOverflowStart > contentOverflowSpool_.recordCount() ||
+      page.overflowContentCount > contentOverflowSpool_.recordCount() - page.contentOverflowStart) {
     return PdfStatus::failure(PdfError::Malformed, ordinal);
   }
   std::memset(output, 0, kDiscoveryPageRecordBytes);
@@ -5989,6 +6408,8 @@ PdfStatus PdfPreparation::encodeDiscoveryPageRecord(const uint16_t ordinal, uint
   output[237] = page.annotationCount;
   output[238] = (page.hasResources ? 1U : 0U) | (page.resourcesIndirect ? 2U : 0U);
   writeLe16Bmp(output + 239, page.overflowAnnotationCount);
+  writeLe16Bmp(output + 241, page.overflowContentCount);
+  writeLe32Bmp(output + 244, page.contentOverflowStart);
   writeLe32Bmp(output + kDiscoveryPageRecordCrcOffset, pdfCacheCrc32(output, kDiscoveryPageRecordCrcOffset));
   return PdfStatus::success();
 }
@@ -6002,6 +6423,8 @@ PdfStatus PdfPreparation::decodeDiscoveryPageRecord(const uint8_t* const input, 
   const uint8_t annotationCount = input[237];
   const uint8_t flags = input[238];
   const uint16_t overflowAnnotationCount = readLe16Prep(input + 239);
+  const uint16_t overflowContentCount = readLe16Prep(input + 241);
+  const uint32_t contentOverflowStart = readLe32Prep(input + 244);
   const uint16_t rotation = readLe16Prep(input + 234);
   const PdfObjectReference pageReference = decodeDiscoveryReference(input + 8);
   const PdfObjectReference resourceOwner = decodeDiscoveryReference(input + 14);
@@ -6013,7 +6436,12 @@ PdfStatus PdfPreparation::decodeDiscoveryPageRecord(const uint8_t* const input, 
       readLe16Prep(input + 230) == 0 || readLe16Prep(input + 232) == 0 ||
       (rotation != 0 && rotation != 90 && rotation != 180 && rotation != 270) ||
       contentCount > PdfLimits::MaxContentStreamsPerPage || annotationCount > PdfLimits::MaxLinkAnnotationsPerPage ||
-      (flags & ~3U) != 0 || !bytesAreZero(input + 241, 3) || ((flags & 2U) != 0 && (flags & 1U) == 0) ||
+      (overflowContentCount != 0 && contentCount != PdfLimits::MaxContentStreamsPerPage) ||
+      overflowContentCount > UINT16_MAX - PdfLimits::MaxContentStreamsPerPage ||
+      contentOverflowStart > resumeContentOverflowCount_ ||
+      overflowContentCount > resumeContentOverflowCount_ - contentOverflowStart ||
+      (flags & ~3U) != 0 || input[243] != 0 || !bytesAreZero(input + 248, 4) ||
+      ((flags & 2U) != 0 && (flags & 1U) == 0) ||
       ((flags & 1U) != 0 && ((flags & 2U) != 0 ? resourceReference.objectNumber : resourceOwner.objectNumber) == 0) ||
       readLe32Prep(input + kDiscoveryPageRecordCrcOffset) != pdfCacheCrc32(input, kDiscoveryPageRecordCrcOffset)) {
     return PdfStatus::failure(PdfError::Malformed, ordinal);
@@ -6064,21 +6492,19 @@ PdfStatus PdfPreparation::decodeDiscoveryPageRecord(const uint8_t* const input, 
   page->contentCount = contentCount;
   page->annotationCount = annotationCount;
   page->overflowAnnotationCount = overflowAnnotationCount;
+  page->contentOverflowStart = contentOverflowStart;
+  page->overflowContentCount = overflowContentCount;
   page->hasResources = (flags & 1U) != 0;
   page->resourcesIndirect = (flags & 2U) != 0;
   return PdfStatus::success();
 }
 
-PdfStatus PdfPreparation::encodeDiscoveryOverflowRecord(const uint32_t ordinal, uint8_t* const output,
-                                                        const size_t capacity) {
+PdfStatus PdfPreparation::encodeDiscoveryOverflowRecord(const uint32_t ordinal,
+                                                        const PdfObjectReference reference, uint8_t* const output,
+                                                        const size_t capacity) const {
   if (output == nullptr || capacity < kDiscoveryOverflowRecordBytes || !annotationOverflowSpool_.isOpen() ||
       ordinal >= annotationOverflowSpool_.recordCount()) {
     return PdfStatus::failure(PdfError::InvalidArgument, ordinal);
-  }
-  PdfObjectReference reference{};
-  PdfStatus status = pdfReadRecord(annotationOverflowSpool_.store(), ordinal, &reference);
-  if (!status) {
-    return status;
   }
   if (!discoveryReferenceEncodingValid(reference, false)) {
     return PdfStatus::failure(PdfError::Malformed, ordinal);
@@ -6107,6 +6533,50 @@ PdfStatus PdfPreparation::decodeDiscoveryOverflowRecord(const uint8_t* const inp
   return PdfStatus::success();
 }
 
+PdfStatus PdfPreparation::encodeDiscoveryContentOverflowRecord(
+    const uint32_t ordinal, const PdfPageContentOverflowRecord& record, uint8_t* const output,
+    const size_t capacity) const {
+  if (output == nullptr || capacity < kDiscoveryContentOverflowRecordBytes || !contentOverflowSpool_.isOpen() ||
+      ordinal >= contentOverflowSpool_.recordCount()) {
+    return PdfStatus::failure(PdfError::InvalidArgument, ordinal);
+  }
+  if (record.pageIndex >= pageCount_ || record.ordinal < PdfLimits::MaxContentStreamsPerPage ||
+      record.reserved != 0 || !discoveryReferenceEncodingValid(record.reference, false)) {
+    return PdfStatus::failure(PdfError::Malformed, ordinal);
+  }
+  std::memset(output, 0, kDiscoveryContentOverflowRecordBytes);
+  writeLe32Bmp(output, record.pageIndex);
+  writeLe16Bmp(output + 4, record.ordinal);
+  writeLe16Bmp(output + 6, record.reserved);
+  encodeDiscoveryReference(record.reference, output + 8);
+  writeLe32Bmp(output + kDiscoveryContentOverflowRecordCrcOffset,
+               pdfCacheCrc32(output, kDiscoveryContentOverflowRecordCrcOffset));
+  return PdfStatus::success();
+}
+
+PdfStatus PdfPreparation::decodeDiscoveryContentOverflowRecord(
+    const uint8_t* const input, const size_t length, const uint32_t ordinal,
+    PdfPageContentOverflowRecord* const record) const {
+  if (input == nullptr || length != kDiscoveryContentOverflowRecordBytes || record == nullptr ||
+      ordinal >= resumeContentOverflowCount_) {
+    return PdfStatus::failure(PdfError::InvalidArgument, ordinal);
+  }
+  PdfPageContentOverflowRecord decoded{};
+  decoded.pageIndex = readLe32Prep(input);
+  decoded.ordinal = readLe16Prep(input + 4);
+  decoded.reserved = readLe16Prep(input + 6);
+  decoded.reference = decodeDiscoveryReference(input + 8);
+  if (decoded.pageIndex >= resumePageValidationIndex_ ||
+      decoded.ordinal < PdfLimits::MaxContentStreamsPerPage || decoded.reserved != 0 ||
+      !discoveryReferenceEncodingValid(decoded.reference, false) || !bytesAreZero(input + 14, 2) ||
+      readLe32Prep(input + kDiscoveryContentOverflowRecordCrcOffset) !=
+          pdfCacheCrc32(input, kDiscoveryContentOverflowRecordCrcOffset)) {
+    return PdfStatus::failure(PdfError::Malformed, ordinal);
+  }
+  *record = decoded;
+  return PdfStatus::success();
+}
+
 PdfStatus PdfPreparation::encodeDiscoveryTrailer(uint8_t* const output, const size_t capacity) const {
   if (output == nullptr || capacity < kDiscoveryTrailerBytes || !xref_.has_value() || !xref_->finalized() ||
       xref_->entryCount() == 0 || pageCount_ == 0) {
@@ -6116,13 +6586,19 @@ PdfStatus PdfPreparation::encodeDiscoveryTrailer(uint8_t* const output, const si
   std::memcpy(output, "PDRT", 4);
   writeLe16Bmp(output + 4, kDiscoveryVersion);
   writeLe16Bmp(output + 6, static_cast<uint16_t>(kDiscoveryTrailerBytes));
-  writeLe32Bmp(output + 8, discoveryEncodedBytes(xref_->entryCount(), static_cast<uint16_t>(pageCount_),
-                                                 annotationOverflowSpool_.recordCount()));
+  const uint64_t totalBytes = discoveryEncodedBytes(
+      xref_->entryCount(), static_cast<uint16_t>(pageCount_), annotationOverflowSpool_.recordCount(),
+      contentOverflowSpool_.recordCount());
+  if (totalBytes > kMaximumResumeJournalBytes) {
+    return PdfStatus::failure(PdfError::InsufficientStorage, totalBytes);
+  }
+  writeLe32Bmp(output + 8, static_cast<uint32_t>(totalBytes));
   writeLe32Bmp(output + 12, generation_);
   writeLe32Bmp(output + 16, xref_->entryCount());
   writeLe16Bmp(output + 20, static_cast<uint16_t>(pageCount_));
   writeLe16Bmp(output + 22, static_cast<uint16_t>(kDiscoveryXrefRecordBytes));
   writeLe16Bmp(output + 24, static_cast<uint16_t>(kDiscoveryPageRecordBytes));
+  writeLe16Bmp(output + 26, static_cast<uint16_t>(kDiscoveryContentOverflowRecordBytes));
   writeLe32Bmp(output + 28, cacheSetupCrc32_);
   writeLe64(output + 32, cacheSetupDecodedLedger_);
   writeLe64(output + 40, sourceIdentity_.headFingerprint);
@@ -6142,7 +6618,8 @@ PdfStatus PdfPreparation::decodeDiscoveryTrailer(const uint8_t* const input, con
       readLe32Prep(input + 12) != checkpointSelection_.checkpoint.generation ||
       readLe32Prep(input + 16) != cacheSetupDecodedFileBytes_ ||
       readLe16Prep(input + 20) != resumePageValidationIndex_ || readLe16Prep(input + 22) != kDiscoveryXrefRecordBytes ||
-      readLe16Prep(input + 24) != kDiscoveryPageRecordBytes || readLe16Prep(input + 26) != 0 ||
+      readLe16Prep(input + 24) != kDiscoveryPageRecordBytes ||
+      readLe16Prep(input + 26) != kDiscoveryContentOverflowRecordBytes ||
       readLe32Prep(input + 28) != cacheSetupCrc32_ || readLe64Prep(input + 32) != cacheSetupDecodedLedger_ ||
       readLe64Prep(input + 40) != sourceIdentity_.headFingerprint ||
       readLe64Prep(input + 48) != sourceIdentity_.tailFingerprint || readLe64Prep(input + 56) != sourceIdentity_.size ||
@@ -6162,7 +6639,7 @@ PdfStatus PdfPreparation::beginDiscoveryXrefRestore() {
   pageWalker_.reset();
   xrefParser_.reset();
   xref_.reset();
-  PdfStatus status = beginXrefSpool();
+  PdfStatus status = beginXrefSpool(static_cast<uint32_t>(cacheSetupDecodedFileBytes_));
   if (!status) {
     return status;
   }
@@ -6170,7 +6647,12 @@ PdfStatus PdfPreparation::beginDiscoveryXrefRestore() {
   if (hasInfoReference_) {
     xref_->setInfo(infoReference_);
   }
-  status = beginPageSpools();
+  if (xrefSortHasSecurity_) {
+    status = xref_->setSecurity(xrefSortSecurity_);
+  }
+  if (status) {
+    status = beginPageSpools();
+  }
   if (!status) {
     abortXrefSpools();
   }
@@ -6182,7 +6664,8 @@ PdfStatus PdfPreparation::finishDiscoveryXrefRestore() {
       xrefSpools_[0].recordCount() != cacheSetupDecodedFileBytes_ || !pageSpool_.isOpen() ||
       pageSpool_.recordCount() != pageCount_ || pageCount_ != resumePageValidationIndex_ ||
       !annotationOverflowSpool_.isOpen() ||
-      annotationOverflowSpool_.recordCount() != static_cast<uint32_t>(resumePageValidationOffset_)) {
+      annotationOverflowSpool_.recordCount() != static_cast<uint32_t>(resumePageValidationOffset_) ||
+      !contentOverflowSpool_.isOpen() || contentOverflowSpool_.recordCount() != resumeContentOverflowCount_) {
     return PdfStatus::failure(PdfError::InvalidArgument);
   }
   // The restored xref is a session spool. Checked close provides the required
@@ -6196,7 +6679,12 @@ PdfStatus PdfPreparation::finishDiscoveryXrefRestore() {
     if (hasInfoReference_) {
       xref_->setInfo(infoReference_);
     }
-    status = xref_->adoptSortedRecords(static_cast<uint32_t>(cacheSetupDecodedFileBytes_));
+    if (xrefSortHasSecurity_) {
+      status = xref_->setSecurity(xrefSortSecurity_);
+    }
+    if (status) {
+      status = xref_->adoptSortedRecords(static_cast<uint32_t>(cacheSetupDecodedFileBytes_));
+    }
   }
   if (status) {
     status = switchResolverSourceAccess(PdfObjectResolverReader::Xref);
@@ -6928,6 +7416,13 @@ PdfStepResult PdfPreparation::stepSetupDiscoveryRestore(PdfWorkBudget& budget) {
                static_cast<uint32_t>(resumePageValidationOffset_) - currentAnnotationOverflowOrdinal_)) {
         status = PdfStatus::failure(PdfError::Malformed, cacheSetupRecordIndex_);
       }
+      if (status &&
+          (navigation_->pageScratch.contentOverflowStart != currentContentOverflowOrdinal_ ||
+           currentContentOverflowOrdinal_ > resumeContentOverflowCount_ ||
+           navigation_->pageScratch.overflowContentCount >
+               resumeContentOverflowCount_ - currentContentOverflowOrdinal_)) {
+        status = PdfStatus::failure(PdfError::Malformed, cacheSetupRecordIndex_);
+      }
       if (status) {
         status = appendDiscoveryPage(navigation_->pageScratch);
       }
@@ -6942,21 +7437,32 @@ PdfStepResult PdfPreparation::stepSetupDiscoveryRestore(PdfWorkBudget& budget) {
       cacheSetupDecodedLedger_ = pdfCacheFnv64(sourceWindow_.get(), kDiscoveryPageRecordBytes, cacheSetupDecodedLedger_);
       cacheSetupOffset_ += kDiscoveryPageRecordBytes;
       currentAnnotationOverflowOrdinal_ += navigation_->pageScratch.overflowAnnotationCount;
+      currentContentOverflowOrdinal_ += navigation_->pageScratch.overflowContentCount;
       ++cacheSetupRecordIndex_;
     }
-    if (currentAnnotationOverflowOrdinal_ != static_cast<uint32_t>(resumePageValidationOffset_)) {
+    if (currentAnnotationOverflowOrdinal_ != static_cast<uint32_t>(resumePageValidationOffset_) ||
+        currentContentOverflowOrdinal_ != resumeContentOverflowCount_) {
       rejectResumeState();
       return PdfStepResult::paused();
     }
+    currentAnnotationPage_ = 0;
+    currentPageContentOrdinal_ = 0;
+    currentContentBatchCount_ = 0;
     cacheSetupRecordIndex_ = 0;
-    cacheSetupStage_ = resumePageValidationOffset_ == 0 ? CacheSetupStage::ValidateResumeDiscoveryTrailer
-                                                        : CacheSetupStage::ValidateResumeDiscoveryOverflow;
+    cacheSetupStage_ = resumePageValidationOffset_ == 0
+                           ? (resumeContentOverflowCount_ == 0
+                                  ? CacheSetupStage::ValidateResumeDiscoveryTrailer
+                                  : CacheSetupStage::ValidateResumeDiscoveryContentOverflow)
+                           : CacheSetupStage::ValidateResumeDiscoveryOverflow;
     return PdfStepResult::paused();
   }
 
   if (cacheSetupStage_ == CacheSetupStage::ValidateResumeDiscoveryOverflow) {
     if (cacheSetupRecordIndex_ >= resumePageValidationOffset_) {
-      cacheSetupStage_ = CacheSetupStage::ValidateResumeDiscoveryTrailer;
+      cacheSetupRecordIndex_ = 0;
+      cacheSetupStage_ = resumeContentOverflowCount_ == 0
+                             ? CacheSetupStage::ValidateResumeDiscoveryTrailer
+                             : CacheSetupStage::ValidateResumeDiscoveryContentOverflow;
       return PdfStepResult::paused();
     }
     constexpr size_t kOverflowIoBytes = kDiscoveryOverflowRecordBytes + sizeof(PdfObjectReference);
@@ -6988,6 +7494,97 @@ PdfStepResult PdfPreparation::stepSetupDiscoveryRestore(PdfWorkBudget& budget) {
         pdfCacheFnv64(sourceWindow_.get(), kDiscoveryOverflowRecordBytes, cacheSetupDecodedLedger_);
     cacheSetupOffset_ += kDiscoveryOverflowRecordBytes;
     ++cacheSetupRecordIndex_;
+    return PdfStepResult::paused();
+  }
+
+  if (cacheSetupStage_ == CacheSetupStage::ValidateResumeDiscoveryContentOverflow) {
+    if (cacheSetupRecordIndex_ >= resumeContentOverflowCount_) {
+      if (currentContentBatchCount_ != 0) {
+        rejectResumeState();
+        return PdfStepResult::paused();
+      }
+      cacheSetupStage_ = CacheSetupStage::ValidateResumeDiscoveryTrailer;
+      return PdfStepResult::paused();
+    }
+    if (currentContentBatchCount_ == 0) {
+      if (currentAnnotationPage_ >= resumePageValidationIndex_) {
+        rejectResumeState();
+        return PdfStepResult::paused();
+      }
+      const uint64_t pageRecordOffset =
+          kDiscoveryHeaderBytes + cacheSetupDecodedFileBytes_ * kDiscoveryXrefRecordBytes +
+          static_cast<uint64_t>(currentAnnotationPage_) * kDiscoveryPageRecordBytes;
+      PdfStatus pageStatus =
+          readCacheSetupBytes(budget, pageRecordOffset, pageText_.get(), kDiscoveryPageRecordBytes);
+      if (!pageStatus && pageStatus.error == PdfError::BudgetExhausted) {
+        return pauseForBudget();
+      }
+      if (pageStatus) {
+        pageStatus = decodeDiscoveryPageRecord(pageText_.get(), kDiscoveryPageRecordBytes,
+                                               currentAnnotationPage_, &navigation_->pageScratch);
+      }
+      if (pageStatus && navigation_->pageScratch.contentOverflowStart != cacheSetupRecordIndex_) {
+        pageStatus = PdfStatus::failure(PdfError::Malformed, cacheSetupRecordIndex_);
+      }
+      if (!pageStatus) {
+        if (pageStatus.error == PdfError::IoFailure) {
+          return PdfStepResult::failure(pageStatus);
+        }
+        rejectResumeState();
+        return PdfStepResult::paused();
+      }
+      if (navigation_->pageScratch.overflowContentCount == 0) {
+        ++currentAnnotationPage_;
+        return PdfStepResult::paused();
+      }
+      currentPageContentOrdinal_ = navigation_->pageScratch.contentCount;
+      currentContentBatchCount_ = 1;
+      return PdfStepResult::paused();
+    }
+    constexpr size_t kOverflowIoBytes =
+        kDiscoveryContentOverflowRecordBytes + sizeof(PdfPageContentOverflowRecord);
+    if (budget.operationsRemaining < 2U || budget.bytesRemaining < kOverflowIoBytes ||
+        !budget.consumeOperation()) {
+      return pauseForBudget();
+    }
+    PdfStatus status = readCacheSetupBytes(budget, cacheSetupOffset_, sourceWindow_.get(),
+                                           kDiscoveryContentOverflowRecordBytes);
+    PdfPageContentOverflowRecord record{};
+    if (status) {
+      status = decodeDiscoveryContentOverflowRecord(sourceWindow_.get(),
+                                                     kDiscoveryContentOverflowRecordBytes,
+                                                     cacheSetupRecordIndex_, &record);
+    }
+    if (status &&
+        (record.pageIndex != currentAnnotationPage_ || record.ordinal != currentPageContentOrdinal_)) {
+      status = PdfStatus::failure(PdfError::Malformed, cacheSetupRecordIndex_);
+    }
+    if (status) {
+      (void)budget.takeBytes(sizeof(PdfPageContentOverflowRecord));
+      status = pdfWriteRecord(contentOverflowSpool_.store(), cacheSetupRecordIndex_, &record);
+    }
+    if (!status) {
+      if (status.error == PdfError::IoFailure || status.error == PdfError::InsufficientStorage) {
+        return PdfStepResult::failure(status);
+      }
+      rejectResumeState();
+      return PdfStepResult::paused();
+    }
+    cacheSetupCrc32_ =
+        pdfCacheCrc32(sourceWindow_.get(), kDiscoveryContentOverflowRecordBytes, cacheSetupCrc32_);
+    cacheSetupDecodedLedger_ =
+        pdfCacheFnv64(sourceWindow_.get(), kDiscoveryContentOverflowRecordBytes,
+                      cacheSetupDecodedLedger_);
+    cacheSetupOffset_ += kDiscoveryContentOverflowRecordBytes;
+    ++cacheSetupRecordIndex_;
+    ++currentPageContentOrdinal_;
+    const uint32_t pageContentEnd =
+        static_cast<uint32_t>(navigation_->pageScratch.contentCount) +
+        navigation_->pageScratch.overflowContentCount;
+    if (currentPageContentOrdinal_ == pageContentEnd) {
+      ++currentAnnotationPage_;
+      currentContentBatchCount_ = 0;
+    }
     return PdfStepResult::paused();
   }
 
@@ -7183,12 +7780,19 @@ PdfStepResult PdfPreparation::stepSetupDiscoveryRestore(PdfWorkBudget& budget) {
       rejectResumeState();
       return PdfStepResult::paused();
     }
-    if (budget.operationsRemaining < 2U || !budget.consumeOperation() || !budget.consumeOperation()) {
+    const bool productSecurityRestore = resumeSecurityRequired_ && emitSectionsResumeValidated_;
+    const uint32_t requiredOperations = productSecurityRestore ? 1U : 2U;
+    if (budget.operationsRemaining < requiredOperations) {
       return pauseForBudget();
     }
+    budget.operationsRemaining -= requiredOperations;
     PdfStatus status = PdfStatus::success();
     if (xrefFinalSpool_ < std::size(xrefSpools_) && xrefSpools_[xrefFinalSpool_].isOpen()) {
       status = xrefSpools_[xrefFinalSpool_].close();
+    }
+    if (status && productSecurityRestore) {
+      cacheSetupStage_ = CacheSetupStage::SelectGeneration;
+      return PdfStepResult::paused();
     }
     if (status) {
       status = config_.io.open(config_.io.context, resumeJournalPath_, PdfCacheOpenMode::Read, &cacheSetupHandle_);
@@ -7213,6 +7817,26 @@ PdfStepResult PdfPreparation::stepSetupDiscoveryRestore(PdfWorkBudget& budget) {
 
   if (cacheSetupStage_ == CacheSetupStage::ReadResumeJournalRecord) {
     if (resumeJournalScanOffset_ >= resumeJournalCommittedBytes_) {
+      if (sectionCount_ != 0 && preparedPageSpool_.recordCount() < sectionCount_) {
+        if (!preparedPageSpool_.isOpen() || !preparedPageSpoolWriting_ ||
+            preparedPageSpool_.recordCount() + 1U != sectionCount_) {
+          rejectResumeState();
+          return PdfStepResult::paused();
+        }
+        if (budget.bytesRemaining < sizeof(PreparedSectionRecord) || !budget.consumeOperation()) {
+          return pauseForBudget();
+        }
+        (void)budget.takeBytes(sizeof(PreparedSectionRecord));
+        const PdfStatus status = writePreparedPageRecord(navigation_->preparedPageScratch);
+        if (!status) {
+          if (status.error == PdfError::IoFailure) {
+            return PdfStepResult::failure(status);
+          }
+          rejectResumeState();
+          return PdfStepResult::paused();
+        }
+        return PdfStepResult::paused();
+      }
       cacheSetupStage_ = CacheSetupStage::CloseResumeJournal;
       return PdfStepResult::paused();
     }
@@ -7221,9 +7845,8 @@ PdfStepResult PdfPreparation::stepSetupDiscoveryRestore(PdfWorkBudget& budget) {
       return pauseForBudget();
     }
     if (status) {
-      status = decodePageResumeRecord(
-          pageText_.get(), kPageResumeRecordBytes, resumeJournalScanSequence_ + 1U,
-          static_cast<uint32_t>((resumeJournalScanOffset_ - cacheSetupFileSize_) / kPageResumeRecordBytes) + 1U);
+      status = decodePageResumeRecord(pageText_.get(), kPageResumeRecordBytes,
+                                      resumeJournalScanSequence_ + 1U);
     }
     if (!status) {
       if (status.error == PdfError::IoFailure) {
@@ -8094,6 +8717,22 @@ PdfStepResult PdfPreparation::stepSetupGeneration(PdfWorkBudget& budget) {
   const auto pauseForBudget = []() { return PdfStepResult::paused(); };
 
   if (cacheSetupStage_ == CacheSetupStage::SelectGeneration) {
+    if (resumeSecurityRequired_ && emitSectionsResumeValidated_ &&
+        (!xref_.has_value() || !xref_->finalized())) {
+      const PdfBuildCheckpoint& checkpoint = checkpointSelection_.checkpoint;
+      const int pathLength = std::snprintf(resumeJournalPath_, sizeof(resumeJournalPath_),
+                                           "%s/gen_%lu/resume.journal", cacheRoot_,
+                                           static_cast<unsigned long>(checkpoint.generation));
+      if (pathLength <= 0 || static_cast<size_t>(pathLength) >= sizeof(resumeJournalPath_)) {
+        return PdfStepResult::failure(PdfStatus::failure(PdfError::LimitExceeded));
+      }
+      resumeJournalCommittedBytes_ = checkpoint.journalBytes;
+      resumeJournalScanOffset_ = 0;
+      resumeJournalScanSequence_ = 0;
+      cacheSetupDecodedLedger_ = 0;
+      cacheSetupStage_ = CacheSetupStage::OpenResumeJournal;
+      return PdfStepResult::paused();
+    }
     static_assert(sizeof(PdfCacheGenerationList) <= PdfLimits::SourceBufferBytes);
     auto* const generations = reinterpret_cast<PdfCacheGenerationList*>(sourceWindow_.get());
     if (!cacheGenerationsListed_) {
@@ -8372,7 +9011,7 @@ PdfStepResult PdfPreparation::stepSetupOutputs(PdfWorkBudget& budget) {
     if (status) {
       status = reopenSource();
     }
-    if (status && resumeAfterPage_) {
+    if (status && (resumeAfterPage_ || resumeSecurityRequired_)) {
       if (!xref_.has_value() || !xref_->finalized() || pageCount_ == 0) {
         status = PdfStatus::failure(PdfError::Malformed);
       } else {
@@ -8380,7 +9019,15 @@ PdfStepResult PdfPreparation::stepSetupOutputs(PdfWorkBudget& budget) {
         if (status) {
           status = resetResolverWorkspace();
         }
-        if (status) {
+        if (status && resumeSecurityRequired_) {
+          PdfSecurityTrailer trailer{};
+          if (!xref_->security(&trailer)) {
+            status = PdfStatus::failure(PdfError::Encrypted);
+          } else {
+            security_.reset();
+            status = resolver_->begin(trailer.encryptionReference);
+          }
+        } else if (status && resumeAfterPage_) {
           status = beginNavigationDiscovery();
         }
       }
@@ -8388,6 +9035,36 @@ PdfStepResult PdfPreparation::stepSetupOutputs(PdfWorkBudget& budget) {
     if (!status) {
       return PdfStepResult::failure(status);
     }
+    if (resumeSecurityRequired_) {
+      cacheSetupStage_ = CacheSetupStage::ResolveResumeSecurity;
+      return PdfStepResult::paused();
+    }
+    cacheSetupStage_ = CacheSetupStage::Complete;
+    return PdfStepResult::completed();
+  }
+
+  if (cacheSetupStage_ == CacheSetupStage::ResolveResumeSecurity) {
+    if (!resolver_.has_value() || !xref_.has_value()) {
+      return PdfStepResult::failure(PdfStatus::failure(PdfError::Encrypted));
+    }
+    const PdfStepResult result = resolver_->step(budget);
+    if (!result.complete()) {
+      return result;
+    }
+    PdfSecurityTrailer trailer{};
+    PdfStatus status = xref_->security(&trailer) && resolver_->result().reference == trailer.encryptionReference
+                           ? security_.initializeEmptyPassword(arena_, resolver_->result().rootIndex, trailer)
+                           : PdfStatus::failure(PdfError::Encrypted);
+    if (status) {
+      status = resetResolverWorkspace();
+    }
+    if (status && resumeAfterPage_) {
+      status = beginNavigationDiscovery();
+    }
+    if (!status) {
+      return PdfStepResult::failure(status);
+    }
+    resumeSecurityRequired_ = false;
     cacheSetupStage_ = CacheSetupStage::Complete;
     return PdfStepResult::completed();
   }
@@ -8606,7 +9283,7 @@ PdfStatus PdfPreparation::startXref() {
   // parser finishes. Keeping the filter out of the inflate dictionary preserves
   // future xref-stream decoding, and no framebuffer or extra heap is needed.
   status = xref_->configureNewestObjectFilter(runRecords_.get(), PdfLimits::PageRunBytes, operandScratch_.get(),
-                                               kXrefSeenObjectTailBytes);
+                                               PdfLimits::OperandOrderHistogramBytes);
   if (!status) {
     xrefParser_.reset();
     return status;
@@ -8632,6 +9309,28 @@ PdfStatus PdfPreparation::finishXref() {
   }
   status = configureNavigationParserArena();
   if (status) {
+    status = resetResolverWorkspace();
+  }
+  PdfSecurityTrailer security{};
+  const PdfObjectReference first = xref_->security(&security) ? security.encryptionReference : root;
+  return status ? resolver_->begin(first) : status;
+}
+
+PdfStatus PdfPreparation::finishSecurity() {
+  if (!xref_.has_value() || !resolver_.has_value()) {
+    return PdfStatus::failure(PdfError::InvalidArgument);
+  }
+  PdfSecurityTrailer trailer{};
+  PdfObjectReference root{};
+  if (!xref_->security(&trailer) || !xref_->root(&root) ||
+      resolver_->result().reference != trailer.encryptionReference) {
+    return PdfStatus::failure(PdfError::Encrypted, trailer.encryptionReference.objectNumber);
+  }
+  PdfStatus status =
+      security_.initializeEmptyPassword(arena_, resolver_->result().rootIndex, trailer);
+  if (status) {
+    // Rebuild once so every later resolver receives the now-active security
+    // context. The plaintext Encrypt dictionary has already been consumed.
     status = resetResolverWorkspace();
   }
   return status ? resolver_->begin(root) : status;
@@ -8668,7 +9367,8 @@ PdfStatus PdfPreparation::finishCatalog() {
     return status;
   }
   pageWalker_.emplace(*resolver_, arena_, traversalSpool_.store(), capturePage, this, setPageTraversalAccess, this,
-                      &navigation_->pageScratch, annotationOverflowSpool_.store());
+                      &navigation_->pageScratch, annotationOverflowSpool_.store(), PdfLimits::MaxPages,
+                      contentOverflowSpool_.store());
   return pageWalker_->begin(catalogNavigation_.pages);
 }
 
@@ -8729,6 +9429,7 @@ PdfStatus PdfPreparation::beginNavigationDiscovery() {
   currentAnnotationOverflowBatchCount_ = 0;
   resolvedLinkCount_ = 0;
   currentResolvedLinkOrdinal_ = 0;
+  nextResolvedLinkSourcePage_ = UINT16_MAX;
   resolvedLinksSpilled_ = false;
   resolvedLinkSpoolFinished_ = false;
   navigation_->linkCount = 0;
@@ -9005,7 +9706,9 @@ PdfStepResult PdfPreparation::stepStartNextNavigationObject(PdfWorkBudget& budge
             }
             if (insert == sectionBoundaryCount_ || boundaries[insert] != page) {
               if (sectionBoundaryCount_ >= PdfOutlineLimits::MaxEntries) {
-                return PdfStepResult::failure(PdfStatus::failure(PdfError::LimitExceeded, page));
+                warningFlags_ |= kWarningOptionalImageOmitted;
+                ++currentAnnotationPage_;
+                return PdfStepResult::paused();
               }
               std::move_backward(boundaries + insert, boundaries + sectionBoundaryCount_,
                                  boundaries + sectionBoundaryCount_ + 1U);
@@ -9199,10 +9902,12 @@ PdfStatus PdfPreparation::finishNavigationObject() {
         warningFlags_ |= kWarningOptionalImageOmitted;
         xmpStreamOffset_ = 0;
         xmpStreamLength_ = 0;
+        xmpStreamReference_ = {};
         break;
       }
       xmpStreamOffset_ = resolved.streamOffset;
       xmpStreamLength_ = resolved.streamLength;
+      xmpStreamReference_ = resolved.reference;
       return PdfStatus::success();
     case NavigationTask::NamedDestinations:
       status = pdfReadNamedDestinations(arena_, resolved.rootIndex, &*namedDestinations_);
@@ -9237,7 +9942,9 @@ PdfStatus PdfPreparation::finishNavigationObject() {
         }
       }
       if (outlineVisitedCount_ >= PdfOutlineLimits::MaxEntries) {
-        return PdfStatus::failure(PdfError::LimitExceeded, activeNavigationReference_.objectNumber);
+        outlinePendingCount_ = 0;
+        warningFlags_ |= kWarningOptionalImageOmitted;
+        break;
       }
       if (outlineVisitedCount_ < kPreparationOutlineLimit) {
         navigation_->phaseScratch.discovery.outlineSeen[outlineVisitedCount_] = activeNavigationReference_;
@@ -9253,44 +9960,48 @@ PdfStatus PdfPreparation::finishNavigationObject() {
       const PdfStatus destinationStatus = resolveDestination(node.destination, &destination);
       int16_t childParent = currentOutlineParent_;
       uint8_t childParentLevel = currentOutlineParentLevel_;
-      if (destinationStatus) {
-        if (explicitOutlineCount_ >= PdfOutlineLimits::MaxEntries ||
-            outlineBatchCount_ >= kPreparationOutlineLimit) {
-          return PdfStatus::failure(PdfError::LimitExceeded, activeNavigationReference_.objectNumber);
-        }
+      if (destinationStatus && explicitOutlineCount_ < PdfOutlineLimits::MaxEntries) {
         const uint8_t level = currentOutlineParent_ < 0 ? 1U : static_cast<uint8_t>(currentOutlineParentLevel_ + 1U);
-        if (level == 0 || level > PdfOutlineLimits::MaxDepth || node.titleLength > PdfOutlineLimits::TitleBytes) {
-          return PdfStatus::failure(PdfError::LimitExceeded, activeNavigationReference_.objectNumber);
-        }
-        PdfOutlineEntry& entry = navigation_->outlineEntries[outlineBatchCount_++];
-        resetInPlace(entry);
-        entry.sourceReference = activeNavigationReference_;
-        entry.parentIndex = currentOutlineParent_;
-        entry.sourcePageIndex = destination.sourcePageIndex;
-        entry.level = level;
-        entry.titleLength = node.titleLength;
-        std::memcpy(entry.title, node.title, node.titleLength);
-        childParent = static_cast<int16_t>(explicitOutlineCount_++);
-        childParentLevel = level;
-        if (outlineBatchCount_ == kOutlineWriteBatchLimit) {
-          status = flushOutlineBatch();
-          if (!status) {
-            break;
+        if (level == 0 || level > PdfOutlineLimits::MaxDepth ||
+            node.titleLength >= PdfOutlineLimits::TitleBytes ||
+            outlineBatchCount_ >= kPreparationOutlineLimit) {
+          warningFlags_ |= kWarningOptionalImageOmitted;
+        } else {
+          PdfOutlineEntry& entry = navigation_->outlineEntries[outlineBatchCount_++];
+          resetInPlace(entry);
+          entry.sourceReference = activeNavigationReference_;
+          entry.parentIndex = currentOutlineParent_;
+          entry.sourcePageIndex = destination.sourcePageIndex;
+          entry.level = level;
+          entry.titleLength = node.titleLength;
+          std::memcpy(entry.title, node.title, node.titleLength);
+          childParent = static_cast<int16_t>(explicitOutlineCount_++);
+          childParentLevel = level;
+          if (outlineBatchCount_ == kOutlineWriteBatchLimit) {
+            status = flushOutlineBatch();
+            if (!status) {
+              break;
+            }
           }
         }
-      }
-      const uint16_t needed = static_cast<uint16_t>((node.hasNext ? 1 : 0) + (node.hasFirstChild ? 1 : 0));
-      if (outlinePendingCount_ > kPreparationOutlineLimit - needed) {
-        return PdfStatus::failure(PdfError::LimitExceeded, activeNavigationReference_.objectNumber);
+      } else if (destinationStatus) {
+        warningFlags_ |= kWarningOptionalImageOmitted;
       }
       if (node.hasNext) {
-        navigation_->phaseScratch.discovery.outlinePending[outlinePendingCount_++] = {node.next,
-                                                                                     currentOutlineParent_,
-                                                                                     currentOutlineParentLevel_};
+        if (outlinePendingCount_ < kPreparationOutlineLimit) {
+          navigation_->phaseScratch.discovery.outlinePending[outlinePendingCount_++] = {
+              node.next, currentOutlineParent_, currentOutlineParentLevel_};
+        } else {
+          warningFlags_ |= kWarningOptionalImageOmitted;
+        }
       }
       if (node.hasFirstChild) {
-        navigation_->phaseScratch.discovery.outlinePending[outlinePendingCount_++] = {
-            node.firstChild, childParent, childParentLevel};
+        if (outlinePendingCount_ < kPreparationOutlineLimit) {
+          navigation_->phaseScratch.discovery.outlinePending[outlinePendingCount_++] = {
+              node.firstChild, childParent, childParentLevel};
+        } else {
+          warningFlags_ |= kWarningOptionalImageOmitted;
+        }
       }
       break;
     }
@@ -9334,9 +10045,17 @@ PdfStatus PdfPreparation::readXmpMetadata() {
   if (!decoderOutput_ || xmpStreamLength_ > PdfLimits::DecoderOutputBytes) {
     return PdfStatus::failure(PdfError::LimitExceeded, xmpStreamLength_);
   }
+  PdfByteRange range{};
+  PdfStatus status = pdfInitializeByteRange(source(), xmpStreamOffset_, xmpStreamLength_, &range);
+  PdfByteSource xmpSource = status ? pdfByteRangeSource(range) : PdfByteSource{};
+  if (status && security_.active()) {
+    status = security_.openStream(xmpSource, xmpStreamReference_, &xmpSource);
+  }
   size_t bytesRead = 0;
-  PdfStatus status = source().readAt(source().context, xmpStreamOffset_, decoderOutput_.get(),
-                                     static_cast<size_t>(xmpStreamLength_), &bytesRead);
+  if (status) {
+    status = xmpSource.readAt(xmpSource.context, 0, decoderOutput_.get(),
+                              static_cast<size_t>(xmpStreamLength_), &bytesRead);
+  }
   if (!status) {
     return status;
   }
@@ -9356,6 +10075,7 @@ PdfStatus PdfPreparation::beginCurrentPageImages() {
     return PdfStatus::failure(PdfError::InvalidArgument, currentPageIndex_);
   }
   imageResolveTask_ = ImageResolveTask::None;
+  resolver_->setSkipUnusedPageResources(false);
   imageCandidateCount_ = 0;
   xObjectCandidateCount_ = 0;
   formScopeCount_ = 0;
@@ -9400,6 +10120,7 @@ PdfStatus PdfPreparation::beginCurrentPageImages() {
     return PdfStatus::failure(PdfError::Malformed, currentPageIndex_);
   }
   imageResolveTask_ = ImageResolveTask::ResourceOwner;
+  resolver_->setSkipUnusedPageResources(true);
   return resolver_->begin(reference);
 }
 
@@ -9728,6 +10449,7 @@ PdfStatus PdfPreparation::finishImageResolution() {
         return status;
       }
       descriptor.source = resolved.streamOffset;
+      descriptor.reference = resolved.reference;
       descriptor.length = static_cast<uint32_t>(resolved.streamLength);
       descriptor.state = PreparedFontDescriptorState::Stream;
       ++runtime->fontResolveIndex;
@@ -10044,9 +10766,11 @@ PdfStatus PdfPreparation::finishResolvedImageColorSpace(const bool indexedBase) 
       !pdfArrayAt(arena_, resolved.rootIndex, 2, &highIndex) ||
       !pdfArrayAt(arena_, resolved.rootIndex, 3, &paletteIndex) || familyIndex >= arena_.valueCount ||
       baseIndex >= arena_.valueCount || highIndex >= arena_.valueCount || paletteIndex >= arena_.valueCount ||
-      arena_.values[familyIndex].kind != PdfValueKind::Name ||
-      !pdfTextEquals(arena_, arena_.values[familyIndex], "Indexed")) {
+      arena_.values[familyIndex].kind != PdfValueKind::Name) {
     return PdfStatus::failure(PdfError::Malformed, resolved.rootIndex);
+  }
+  if (!pdfTextEquals(arena_, arena_.values[familyIndex], "Indexed")) {
+    return PdfStatus::failure(PdfError::UnsupportedEncoding, resolved.rootIndex);
   }
   const PdfValue& high = arena_.values[highIndex];
   if (high.kind != PdfValueKind::Integer || high.integerValue < 0 || high.integerValue > 255) {
@@ -10125,9 +10849,17 @@ PdfStatus PdfPreparation::finishResolvedImagePalette() {
     if (pdfDictionaryFind(arena_, resolved.rootIndex, "Filter", &filterIndex) || resolved.streamLength < required) {
       return PdfStatus::failure(PdfError::UnsupportedEncoding, resolved.rootIndex);
     }
+    PdfByteRange range{};
+    status = pdfInitializeByteRange(source(), resolved.streamOffset, resolved.streamLength, &range);
+    PdfByteSource paletteSource = status ? pdfByteRangeSource(range) : PdfByteSource{};
+    if (status && security_.active()) {
+      status = security_.openStream(paletteSource, resolved.reference, &paletteSource);
+    }
     size_t bytesRead = 0;
-    status = source().readAt(source().context, resolved.streamOffset,
-                             const_cast<uint8_t*>(descriptor.parameters.palette), required, &bytesRead);
+    if (status) {
+      status = paletteSource.readAt(paletteSource.context, 0,
+                                    const_cast<uint8_t*>(descriptor.parameters.palette), required, &bytesRead);
+    }
     if (status && bytesRead != required) {
       status = PdfStatus::failure(PdfError::UnexpectedEof, resolved.streamOffset + bytesRead);
     }
@@ -10255,6 +10987,12 @@ PdfStepResult PdfPreparation::cacheCurrentPageImage(PdfWorkBudget& budget) {
       if (status) {
         status = pdfInitializeByteRange(source(), candidate.streamOffset, candidate.streamLength, &imageCacheRange_);
       }
+      if (status) {
+        imageCacheSource_ = pdfByteRangeSource(imageCacheRange_);
+      }
+      if (status && security_.active()) {
+        status = security_.openStream(imageCacheSource_, candidate.reference, &imageCacheSource_);
+      }
       if (!status) {
         return PdfStepResult::failure(status);
       }
@@ -10274,9 +11012,8 @@ PdfStepResult PdfPreparation::cacheCurrentPageImage(PdfWorkBudget& budget) {
         return PdfStepResult::paused();
       }
       size_t bytesRead = 0;
-      PdfByteSource encoded = pdfByteRangeSource(imageCacheRange_);
-      const PdfStatus status =
-          encoded.readAt(encoded.context, imageCacheOffset_, sourceWindow_.get(), requested, &bytesRead);
+      const PdfStatus status = imageCacheSource_.readAt(imageCacheSource_.context, imageCacheOffset_,
+                                                        sourceWindow_.get(), requested, &bytesRead);
       if (!status || bytesRead == 0 || bytesRead > requested) {
         return PdfStepResult::failure(status ? PdfStatus::failure(PdfError::UnexpectedEof, imageCacheOffset_) : status);
       }
@@ -10287,8 +11024,14 @@ PdfStepResult PdfPreparation::cacheCurrentPageImage(PdfWorkBudget& budget) {
 
     if (imageCacheStage_ == ImageCacheStage::RasterPrimary && candidate.hasAuxiliary) {
       hashPreparedRasterAuxiliaryContract(candidate);
-      const PdfStatus status = pdfInitializeByteRange(source(), candidate.auxiliaryStreamOffset,
-                                                      candidate.auxiliaryStreamLength, &imageCacheRange_);
+      PdfStatus status = pdfInitializeByteRange(source(), candidate.auxiliaryStreamOffset,
+                                                candidate.auxiliaryStreamLength, &imageCacheRange_);
+      if (status) {
+        imageCacheSource_ = pdfByteRangeSource(imageCacheRange_);
+      }
+      if (status && security_.active()) {
+        status = security_.openStream(imageCacheSource_, candidate.auxiliaryReference, &imageCacheSource_);
+      }
       if (!status) {
         return PdfStepResult::failure(status);
       }
@@ -10299,6 +11042,7 @@ PdfStepResult PdfPreparation::cacheCurrentPageImage(PdfWorkBudget& budget) {
 
     if (imageCacheStage_ == ImageCacheStage::RasterPrimary || imageCacheStage_ == ImageCacheStage::RasterAuxiliary) {
       imageCacheRange_ = {};
+      imageCacheSource_ = {};
       imageCacheOffset_ = 0;
       rasterIdentityScanIndex_ = 0;
       imageCacheStage_ = ImageCacheStage::RasterIdentity;
@@ -10358,14 +11102,21 @@ PdfStepResult PdfPreparation::cacheCurrentPageImage(PdfWorkBudget& budget) {
     } else {
       status = pdfInitializeByteRange(source(), candidate.streamOffset, candidate.streamLength, &imageCacheRange_);
       if (status) {
+        imageCacheSource_ = pdfByteRangeSource(imageCacheRange_);
+      }
+      if (status && security_.active()) {
+        status = security_.openStream(imageCacheSource_, candidate.reference, &imageCacheSource_);
+      }
+      if (status) {
         status = navigation_->imageCache.beginJpeg(
-            pdfByteRangeSource(imageCacheRange_), static_cast<uint16_t>(candidate.width),
+            imageCacheSource_, static_cast<uint16_t>(candidate.width),
             static_cast<uint16_t>(candidate.height), &cached, &navigation_->imageCacheRuntime);
       }
     }
     if (!status) {
       cacheBudget_.optionalOmitted = true;
       imageCacheRange_ = {};
+      imageCacheSource_ = {};
       if (candidate.jpegCaptured) {
         (void)navigation_->imageCache.discardCapturedJpeg(static_cast<uint8_t>(currentPageImageCandidate_));
         candidate.jpegCaptured = false;
@@ -10384,6 +11135,7 @@ PdfStepResult PdfPreparation::cacheCurrentPageImage(PdfWorkBudget& budget) {
   }
   imageCacheStage_ = ImageCacheStage::Idle;
   imageCacheRange_ = {};
+  imageCacheSource_ = {};
   candidate.jpegCaptured = false;
   if (cacheResult.failed()) {
     cacheBudget_.optionalOmitted = true;
@@ -10429,6 +11181,8 @@ PdfStatus PdfPreparation::appendDeferredImageRecord(const uint8_t candidateIndex
     return PdfStatus::failure(PdfError::Malformed, candidateIndex);
   }
   resetInPlace(activeRasterCandidate_);
+  activeRasterCandidate_.reference = candidate.reference;
+  activeRasterCandidate_.auxiliaryReference = candidate.auxiliaryReference;
   activeRasterCandidate_.streamOffset = candidate.streamOffset;
   activeRasterCandidate_.streamLength = candidate.streamLength;
   activeRasterCandidate_.contentHash = candidate.contentHash;
@@ -10814,9 +11568,13 @@ PdfStatus PdfPreparation::beginUnmaskedRaster(const PdfDeferredImageRecord& cand
   if (status) {
     status = pdfInitializeByteRange(source(), candidate.streamOffset, candidate.streamLength, &runtime->encodedRange);
   }
+  PdfByteSource encoded = status ? pdfByteRangeSource(runtime->encodedRange) : PdfByteSource{};
+  if (status && security_.active()) {
+    status = security_.openStream(encoded, candidate.reference, &encoded);
+  }
   if (status) {
-    status = runtime->decoder.begin(pdfByteRangeSource(runtime->encodedRange), runtime->extractor.decodedSink(),
-                                    candidate.filters, candidate.filterCount, {}, false);
+    status = runtime->decoder.begin(encoded, runtime->extractor.decodedSink(), candidate.filters,
+                                    candidate.filterCount, {}, false);
   }
   if (!status) {
     if (runtime->writer.open) {
@@ -10873,9 +11631,13 @@ PdfStatus PdfPreparation::beginMaskedRaster(const PdfDeferredImageRecord& candid
   if (status) {
     status = pdfInitializeByteRange(source(), candidate.streamOffset, candidate.streamLength, &runtime->encodedRange);
   }
+  PdfByteSource encoded = status ? pdfByteRangeSource(runtime->encodedRange) : PdfByteSource{};
+  if (status && security_.active()) {
+    status = security_.openStream(encoded, candidate.reference, &encoded);
+  }
   if (status) {
-    status = runtime->decoder.begin(pdfByteRangeSource(runtime->encodedRange), runtime->extractor.decodedSink(),
-                                    candidate.filters, candidate.filterCount, {}, false);
+    status = runtime->decoder.begin(encoded, runtime->extractor.decodedSink(), candidate.filters,
+                                    candidate.filterCount, {}, false);
   }
   if (!status) {
     runtime->~RasterRuntime();
@@ -11022,9 +11784,13 @@ PdfStatus PdfPreparation::beginActiveMask(const PdfDeferredImageRecord& candidat
     status = pdfInitializeByteRange(source(), candidate.auxiliaryStreamOffset, candidate.auxiliaryStreamLength,
                                     &maskRuntime->encodedRange);
   }
+  PdfByteSource encoded = status ? pdfByteRangeSource(maskRuntime->encodedRange) : PdfByteSource{};
+  if (status && security_.active()) {
+    status = security_.openStream(encoded, candidate.auxiliaryReference, &encoded);
+  }
   if (status) {
-    status = maskRuntime->decoder.begin(pdfByteRangeSource(maskRuntime->encodedRange), maskRuntime->plane.decodedSink(),
-                                        candidate.auxiliaryFilters, candidate.auxiliaryFilterCount, {}, false);
+    status = maskRuntime->decoder.begin(encoded, maskRuntime->plane.decodedSink(), candidate.auxiliaryFilters,
+                                        candidate.auxiliaryFilterCount, {}, false);
   }
   if (!status) {
     maskRuntime->~MaskDecodeRuntime();
@@ -11613,11 +12379,21 @@ PdfStatus PdfPreparation::beginCurrentPageContent() {
     return loadStatus;
   }
   const PdfPageInfo& page = navigation_->pageScratch;
-  if (page.contentCount == 0 || page.contentCount > PdfPreparedContentStreams::MaxSources) {
+  if (page.contentCount == 0 || page.contentCount > PdfPreparedContentStreams::MaxSources ||
+      (page.overflowContentCount != 0 && page.contentCount != PdfPreparedContentStreams::MaxSources) ||
+      page.contentOverflowStart > contentOverflowSpool_.recordCount() ||
+      page.overflowContentCount > contentOverflowSpool_.recordCount() - page.contentOverflowStart) {
     return PdfStatus::failure(page.contentCount == 0 ? PdfError::NoReadableText : PdfError::LimitExceeded,
                               page.contentCount);
   }
   currentContentIndex_ = 0;
+  currentContentBatchCount_ = page.contentCount;
+  contentOverflowLoadCount_ = 0;
+  contentOverflowLoadStage_ = ContentOverflowLoadStage::Idle;
+  currentPageContentOrdinal_ = 0;
+  currentContentOverflowOrdinal_ = page.contentOverflowStart;
+  contentOverflowSequenceActive_ = page.overflowContentCount != 0;
+  contentOverflowAppendActive_ = false;
   transcriptLength_ = 0;
   extractedBlockCount_ = 0;
   currentBlockIndex_ = 0;
@@ -11637,7 +12413,7 @@ PdfStatus PdfPreparation::beginCurrentPageContent() {
 
 PdfStatus PdfPreparation::finishContentObject() {
   if (!resolver_.has_value() || !resolver_->result().hasStream || navigation_ == nullptr || !runRecords_ ||
-      currentContentIndex_ >= navigation_->pageScratch.contentCount) {
+      currentContentBatchCount_ == 0 || currentContentIndex_ >= currentContentBatchCount_) {
     return PdfStatus::failure(PdfError::Malformed);
   }
   const PdfResolvedObject content = resolver_->result();
@@ -11651,6 +12427,8 @@ PdfStatus PdfPreparation::finishContentObject() {
   }
   PdfEncodedContentStream& stream = runtime->streams[currentContentIndex_];
   stream.source = pdfByteRangeSource(runtime->ranges[currentContentIndex_]);
+  stream.reference = content.reference;
+  stream.security = security_.active() ? &security_ : nullptr;
   status = pdfStreamFiltersFromDictionary(arena_, content.rootIndex, stream.filters, std::size(stream.filters),
                                           &stream.filterCount);
   if (!status) {
@@ -11660,15 +12438,16 @@ PdfStatus PdfPreparation::finishContentObject() {
       runtime->requiresNavigationSpill ||
       std::find(stream.filters, stream.filters + stream.filterCount, PdfStreamFilter::Flate) !=
           stream.filters + stream.filterCount;
-  runtime->usesDecodedStore = runtime->usesDecodedStore || stream.filterCount != 0;
+  runtime->usesDecodedStore = runtime->usesDecodedStore || stream.filterCount != 0 || security_.active();
 
   ++currentContentIndex_;
-  if (currentContentIndex_ < navigation_->pageScratch.contentCount) {
+  if (currentContentIndex_ < currentContentBatchCount_) {
     return resolver_->begin(navigation_->pageScratch.contents[currentContentIndex_]);
   }
-  runtime->preparedStreamCount = static_cast<uint8_t>(currentContentIndex_);
-  runtime->decodeStreamCount = runtime->preparedStreamCount;
-  runtime->usesDecodedStore = runtime->usesDecodedStore || formScopeCount_ != 0;
+  currentPageContentOrdinal_ = static_cast<uint16_t>(currentPageContentOrdinal_ + currentContentBatchCount_);
+  runtime->decodeStreamCount = currentContentBatchCount_;
+  runtime->preparedStreamCount = contentOverflowSequenceActive_ ? 1U : currentContentBatchCount_;
+  runtime->usesDecodedStore = runtime->usesDecodedStore || contentOverflowSequenceActive_ || formScopeCount_ != 0;
   status = accountResolverStreamBytes();
   if (!status) {
     return status;
@@ -11677,7 +12456,9 @@ PdfStatus PdfPreparation::finishContentObject() {
   // share one file-backed store. The content ranges and filter descriptors are
   // now self-contained, so retire that cache before the content decoder claims
   // the store. A later compressed reference is decoded again within the same
-  // global expanded-byte limit instead of retaining a second SD handle/path.
+  // per-live-stream limit instead of retaining a second SD handle/path. These
+  // temporary bytes are not charged to the document-wide persistent-output
+  // budget after the store is retired.
   status = resetResolverWorkspace();
   if (!status) {
     return status;
@@ -11685,11 +12466,50 @@ PdfStatus PdfPreparation::finishContentObject() {
   return beginPreparedContentDecode();
 }
 
+PdfStepResult PdfPreparation::prepareContentOverflowBatch(PdfWorkBudget& budget) {
+  if (!runRecords_ || navigation_ == nullptr || !resolver_.has_value() ||
+      !contentOverflowSequenceActive_ || navigationSpoolStage_ != NavigationSpoolStage::ContentStore) {
+    return PdfStepResult::failure(PdfStatus::failure(PdfError::InvalidArgument));
+  }
+  const auto* const runtime = reinterpret_cast<const PreparedContentRuntime*>(runRecords_.get());
+  const uint32_t totalContentCount =
+      static_cast<uint32_t>(runtime->page.contentCount) + runtime->page.overflowContentCount;
+  if (currentPageContentOrdinal_ < runtime->page.contentCount ||
+      currentPageContentOrdinal_ >= totalContentCount) {
+    return PdfStepResult::failure(
+        PdfStatus::failure(PdfError::Malformed, currentPageContentOrdinal_));
+  }
+  if (budget.cancelRequested()) {
+    return PdfStepResult::failure(PdfStatus::failure(PdfError::Cancelled, currentPageIndex_));
+  }
+  if (navigationSpoolHandle_.valid()) {
+    if (!budget.consumeOperation()) {
+      return PdfStepResult::paused();
+    }
+    const PdfStatus status = config_.io.close(config_.io.context, &navigationSpoolHandle_);
+    navigationSpoolCrc32_ = kPreparedContentStoreCreated;
+    return status ? PdfStepResult::paused() : PdfStepResult::failure(status);
+  }
+  const uint8_t count = static_cast<uint8_t>(std::min<uint32_t>(
+      PdfLimits::MaxContentStreamsPerPage, totalContentCount - currentPageContentOrdinal_));
+  const PdfStepResult load = stepLoadContentOverflowBatch(budget, count);
+  if (!load.complete()) {
+    return load;
+  }
+  setPhase(PdfPreparationPhase::ResolveContent, 70);
+  return PdfStepResult::completed();
+}
+
 PdfStatus PdfPreparation::beginPreparedContentDecode() {
+  const bool sequenceAppendState =
+      contentOverflowSequenceActive_ && contentOverflowAppendActive_ &&
+      navigationSpoolStage_ == NavigationSpoolStage::ContentStore && !navigationSpoolHandle_.valid() &&
+      navigationSpoolPath_[0] != '\0' && navigationSpoolReadCrc32_ != 0 && navigationSpoolOffset_ != 0;
+  const bool freshState = navigationSpoolStage_ == NavigationSpoolStage::None &&
+                          !navigationSpoolHandle_.valid() && navigationSpoolPath_[0] == '\0';
   if (!runRecords_ || !sourceWindow_ || !decoderOutput_ || !dictionary_ || navigation_ == nullptr ||
-      currentContentIndex_ == 0 || currentContentIndex_ != navigation_->pageScratch.contentCount ||
-      navigationSpoolStage_ != NavigationSpoolStage::None || navigationSpoolHandle_.valid() ||
-      navigationSpoolPath_[0] != '\0') {
+      currentContentIndex_ == 0 || currentContentIndex_ != currentContentBatchCount_ ||
+      (!freshState && !sequenceAppendState)) {
     return PdfStatus::failure(PdfError::InvalidArgument, currentContentIndex_);
   }
   auto* const runtime = reinterpret_cast<PreparedContentRuntime*>(runRecords_.get());
@@ -11709,6 +12529,10 @@ PdfStatus PdfPreparation::beginPreparedContentDecode() {
   }
   if (expandedRequiredBytes_ >= PdfLimits::MaxExpandedRequiredStreamBytes) {
     return PdfStatus::failure(PdfError::LimitExceeded, expandedRequiredBytes_);
+  }
+  if (sequenceAppendState) {
+    setPhase(PdfPreparationPhase::CheckContentCapacity, 70);
+    return PdfStatus::success();
   }
   const int pathLength =
       std::snprintf(navigationSpoolPath_, sizeof(navigationSpoolPath_), "%s/gen_%lu/build.content",
@@ -11743,12 +12567,12 @@ uint8_t* PdfPreparation::preparedNavigationSpillBytes(const size_t offset, size_
   static_assert(operandSpillOffset + operandSpillBytes <= PdfLimits::OperandOrderHistogramBytes);
 #if UINTPTR_MAX == UINT32_MAX
   static_assert(PdfLimits::PageTextBytes == 8192);
-  static_assert(sizeof(PreparedContentRuntime) == 5288);
-  static_assert(runtimeEnd == 5288);
-  static_assert(nativeRunTailBytes == 7000);
+  static_assert(sizeof(PreparedContentRuntime) == 5744);
+  static_assert(runtimeEnd == 5744);
+  static_assert(nativeRunTailBytes == 6544);
   static_assert(sizeof(PlacementWorkspace) == 508);
   static_assert(operandSpillOffset == 0);
-  static_assert(runTailBytes == 6376);
+  static_assert(runTailBytes == 6400);
   static_assert(operandSpillBytes == 0);
   static_assert(operandSpillOffset + operandSpillBytes == 0);
 #endif
@@ -11817,38 +12641,45 @@ PdfStepResult PdfPreparation::suspendContentNavigation(PdfWorkBudget& budget) {
 }
 
 PdfStepResult PdfPreparation::checkPreparedContentCapacity(PdfWorkBudget& budget) {
+  const bool sequenceAppend = contentOverflowSequenceActive_ && contentOverflowAppendActive_;
   if (!runRecords_ || !sourceWindow_ || !decoderOutput_ || !dictionary_ ||
       navigationSpoolStage_ != NavigationSpoolStage::ContentStore || navigationSpoolPath_[0] == '\0' ||
-      navigationSpoolHandle_.valid() || navigationSpoolReadCrc32_ != 0 ||
-      expandedRequiredBytes_ >= PdfLimits::MaxExpandedRequiredStreamBytes) {
+      navigationSpoolHandle_.valid() || expandedRequiredBytes_ >= PdfLimits::MaxExpandedRequiredStreamBytes ||
+      (sequenceAppend ? navigationSpoolReadCrc32_ == 0 || navigationSpoolOffset_ == 0 ||
+                            navigationSpoolOffset_ > navigationSpoolReadCrc32_
+                      : navigationSpoolReadCrc32_ != 0)) {
     return PdfStepResult::failure(PdfStatus::failure(PdfError::InvalidArgument));
   }
-  if (!budget.consumeOperation()) {
-    return PdfStepResult::paused();
-  }
-  PdfCacheCapacity capacity{};
-  const PdfStatus status = config_.io.capacity(config_.io.context, &capacity);
-  if (!status) {
-    return PdfStepResult::failure(status);
-  }
-
-  const uint64_t used = cacheBudget_.requiredBytes + cacheBudget_.optionalBytes;
-  const uint64_t cacheRemaining = used < cacheBudget_.limit ? cacheBudget_.limit - used : 0;
-  uint64_t physicalRemaining = UINT64_MAX;
-  if (capacity.free.known) {
-    uint64_t reserve = PDF_CACHE_MIN_FREE_RESERVE_BYTES;
-    if (capacity.total.known) {
-      const uint64_t fivePercent = capacity.total.value / 20U + (capacity.total.value % 20U != 0 ? 1U : 0U);
-      reserve = std::max(reserve, fivePercent);
+  if (!sequenceAppend) {
+    if (!budget.consumeOperation()) {
+      return PdfStepResult::paused();
     }
-    physicalRemaining = capacity.free.value > reserve ? capacity.free.value - reserve : 0;
+    PdfCacheCapacity capacity{};
+    const PdfStatus status = config_.io.capacity(config_.io.context, &capacity);
+    if (!status) {
+      return PdfStepResult::failure(status);
+    }
+
+    const uint64_t used = cacheBudget_.requiredBytes + cacheBudget_.optionalBytes;
+    const uint64_t cacheRemaining = used < cacheBudget_.limit ? cacheBudget_.limit - used : 0;
+    uint64_t physicalRemaining = UINT64_MAX;
+    if (capacity.free.known) {
+      uint64_t reserve = PDF_CACHE_MIN_FREE_RESERVE_BYTES;
+      if (capacity.total.known) {
+        const uint64_t fivePercent = capacity.total.value / 20U + (capacity.total.value % 20U != 0 ? 1U : 0U);
+        reserve = std::max(reserve, fivePercent);
+      }
+      physicalRemaining = capacity.free.value > reserve ? capacity.free.value - reserve : 0;
+    }
+    const uint64_t expandedRemaining = PdfLimits::MaxExpandedRequiredStreamBytes - expandedRequiredBytes_;
+    const uint64_t availableCapacity = std::min({expandedRemaining, cacheRemaining, physicalRemaining});
+    if (availableCapacity == 0 || availableCapacity > UINT32_MAX) {
+      return PdfStepResult::failure(PdfStatus::failure(PdfError::InsufficientStorage, expandedRequiredBytes_));
+    }
+    navigationSpoolReadCrc32_ = static_cast<uint32_t>(availableCapacity);
   }
-  const uint64_t expandedRemaining = PdfLimits::MaxExpandedRequiredStreamBytes - expandedRequiredBytes_;
-  const uint64_t storeCapacity = std::min({expandedRemaining, cacheRemaining, physicalRemaining});
-  if (storeCapacity == 0 || storeCapacity > UINT32_MAX) {
-    return PdfStepResult::failure(PdfStatus::failure(PdfError::InsufficientStorage, expandedRequiredBytes_));
-  }
-  navigationSpoolReadCrc32_ = static_cast<uint32_t>(storeCapacity);
+  const uint64_t storeCapacity = navigationSpoolReadCrc32_;
+  contentAppendOffset_ = sequenceAppend ? static_cast<uint32_t>(navigationSpoolOffset_) : 0;
   auto* const runtime = reinterpret_cast<PreparedContentRuntime*>(runRecords_.get());
   new (runtime->preparedStorage) PdfPreparedContentStreams(
       {sourceWindow_.get(), PdfLimits::SourceBufferBytes, decoderOutput_.get(), PdfLimits::DecoderOutputBytes,
@@ -11860,8 +12691,15 @@ PdfStepResult PdfPreparation::checkPreparedContentCapacity(PdfWorkBudget& budget
                            preparedContentStoreSize,
                            readPreparedContentStore,
                            writePreparedContentStore};
-  const PdfStatus beginStatus =
-      runtime->prepared()->begin(runtime->streams, runtime->decodeStreamCount, store);
+  PdfStatus beginStatus{};
+  if (contentOverflowSequenceActive_) {
+    beginStatus = sequenceAppend
+                      ? runtime->prepared()->beginSequenceAppend(runtime->streams, runtime->decodeStreamCount,
+                                                                  store, navigationSpoolOffset_)
+                      : runtime->prepared()->beginSequence(runtime->streams, runtime->decodeStreamCount, store);
+  } else {
+    beginStatus = runtime->prepared()->begin(runtime->streams, runtime->decodeStreamCount, store);
+  }
   if (!beginStatus) {
     abortPreparedContentStore();
     return PdfStepResult::failure(beginStatus);
@@ -11881,10 +12719,11 @@ PdfStepResult PdfPreparation::openPreparedContentStore(PdfWorkBudget& budget) {
     return PdfStepResult::paused();
   }
   PdfStatus status = config_.io.open(config_.io.context, navigationSpoolPath_,
-                                    contentAppendActive_ ? PdfCacheOpenMode::Write
-                                                        : PdfCacheOpenMode::WriteTruncate,
-                                    &navigationSpoolHandle_);
-  if (status && contentAppendActive_) {
+                                     contentAppendActive_ || contentOverflowAppendActive_
+                                         ? PdfCacheOpenMode::Write
+                                         : PdfCacheOpenMode::WriteTruncate,
+                                     &navigationSpoolHandle_);
+  if (status && (contentAppendActive_ || contentOverflowAppendActive_)) {
     status = pdfCacheSeek(config_.io, navigationSpoolHandle_, navigationSpoolOffset_);
   }
   if (!status) {
@@ -11917,6 +12756,53 @@ PdfStepResult PdfPreparation::decodePreparedContent(PdfWorkBudget& budget) {
   const PdfByteSource* const decodedSources = runtime->prepared()->sources();
   PdfStatus status = count == runtime->decodeStreamCount ? PdfStatus::success()
                                                          : PdfStatus::failure(PdfError::Malformed, count);
+  if (contentOverflowSequenceActive_) {
+    const uint64_t totalBytes = runtime->prepared()->decodedBytes();
+    const PdfByteSource sequenceSource = runtime->prepared()->sequenceSource();
+    const uint64_t previousBytes = contentOverflowAppendActive_ ? contentAppendOffset_ : 0;
+    if (status && (!sequenceSource.valid() || sequenceSource.size != totalBytes ||
+                   totalBytes != navigationSpoolOffset_ || totalBytes > UINT32_MAX ||
+                   previousBytes > totalBytes)) {
+      status = PdfStatus::failure(PdfError::Malformed, totalBytes);
+    }
+    const uint64_t appendedBytes = status ? totalBytes - previousBytes : 0;
+    const PdfByteSource storeSource{this, navigationSpoolOffset_, readPreparedContentStore};
+    if (status) {
+      status = pdfInitializeByteRange(storeSource, 0, totalBytes, &runtime->ranges[0]);
+    }
+    if (status && appendedBytes > PdfLimits::MaxExpandedRequiredStreamBytes - expandedRequiredBytes_) {
+      status = PdfStatus::failure(PdfError::LimitExceeded, expandedRequiredBytes_);
+    }
+    runtime->prepared()->~PdfPreparedContentStreams();
+    runtime->preparedConstructed = false;
+    if (!status) {
+      return PdfStepResult::failure(status);
+    }
+    expandedRequiredBytes_ += static_cast<uint32_t>(appendedBytes);
+
+    const uint32_t totalContentCount =
+        static_cast<uint32_t>(runtime->page.contentCount) + runtime->page.overflowContentCount;
+    if (currentPageContentOrdinal_ < totalContentCount) {
+      setPhase(runtime->requiresNavigationSpill ? PdfPreparationPhase::RestoreContentNavigation
+                                               : PdfPreparationPhase::ResolveContentOverflow,
+               70);
+      return PdfStepResult::completed();
+    }
+    if (currentPageContentOrdinal_ != totalContentCount || navigation_ == nullptr) {
+      return PdfStepResult::failure(
+          PdfStatus::failure(PdfError::Malformed, currentPageContentOrdinal_));
+    }
+    navigation_->pageScratch.contentCount = 1;
+    runtime->preparedStreamCount = 1;
+    currentContentIndex_ = 1;
+    contentAppendOffset_ = 0;
+    contentOverflowAppendActive_ = false;
+    contentOverflowSequenceActive_ = false;
+    setPhase(runtime->requiresNavigationSpill ? PdfPreparationPhase::RestoreContentNavigation
+                                             : PdfPreparationPhase::OpenDecodedContent,
+             70);
+    return PdfStepResult::completed();
+  }
   if (contentAppendActive_) {
     const uint64_t totalBytes = runtime->prepared()->decodedBytes();
     const uint64_t appendedBytes = count == 1 ? decodedSources[0].size : 0;
@@ -11970,7 +12856,7 @@ PdfStepResult PdfPreparation::decodePreparedContent(PdfWorkBudget& budget) {
 }
 
 PdfStepResult PdfPreparation::restoreContentNavigation(PdfWorkBudget& budget) {
-  if (!dictionary_ || navigationSpoolStage_ != NavigationSpoolStage::ContentStore ||
+  if (!dictionary_ || !runRecords_ || navigationSpoolStage_ != NavigationSpoolStage::ContentStore ||
       inlineNavigationSpillStage_ == InlineNavigationSpillStage::None) {
     return PdfStepResult::failure(PdfStatus::failure(PdfError::InvalidArgument));
   }
@@ -11996,7 +12882,13 @@ PdfStepResult PdfPreparation::restoreContentNavigation(PdfWorkBudget& budget) {
     navigation_ = reinterpret_cast<NavigationWorkspace*>(dictionary_.get());
     inlineNavigationSpoolOffset_ = 0;
     inlineNavigationSpillStage_ = InlineNavigationSpillStage::None;
-    setPhase(PdfPreparationPhase::OpenDecodedContent, 70);
+    const auto* const runtime = reinterpret_cast<const PreparedContentRuntime*>(runRecords_.get());
+    const uint32_t totalContentCount =
+        static_cast<uint32_t>(runtime->page.contentCount) + runtime->page.overflowContentCount;
+    setPhase(contentOverflowSequenceActive_ && currentPageContentOrdinal_ < totalContentCount
+                 ? PdfPreparationPhase::ResolveContentOverflow
+                 : PdfPreparationPhase::OpenDecodedContent,
+             70);
     return PdfStepResult::completed();
   }
   if (!budget.consumeOperation()) {
@@ -12305,6 +13197,8 @@ PdfStepResult PdfPreparation::prepareReachableForm(PdfWorkBudget& budget) {
   if (status) {
     runtime->streams[0] = {};
     runtime->streams[0].source = pdfByteRangeSource(contentRange_);
+    runtime->streams[0].reference = candidate.reference;
+    runtime->streams[0].security = security_.active() ? &security_ : nullptr;
     runtime->streams[0].filterCount = candidate.filterCount;
     std::copy_n(candidate.filters, candidate.filterCount, runtime->streams[0].filters);
     runtime->decodeStreamCount = 1;
@@ -12503,17 +13397,11 @@ PdfStepResult PdfPreparation::spoolFontNavigation(PdfWorkBudget& budget) {
     runtime->fileEnd += bytesWritten;
     return PdfStepResult::paused();
   }
-  if (!budget.consumeOperation()) {
-    return PdfStepResult::paused();
-  }
-  const PdfStatus status = closeDurableWriter(config_.io, &inlineNavigationSpoolHandle_);
-  if (!status) {
-    abortPreparedFontStore();
-    return PdfStepResult::failure(status);
-  }
+  // build.font is temporary until the page is committed. Keep its write
+  // handle across DecodeFonts so every decoded font can append to this same
+  // session, then perform one durable close before opening it for reads.
   navigation_ = nullptr;
   inlineNavigationSpoolOffset_ = 0;
-  inlineNavigationSpillStage_ = InlineNavigationSpillStage::FontSpilled;
   runtime->stage = PreparedFontStage::SelectDecode;
   setPhase(PdfPreparationPhase::DecodeFonts, 71);
   return PdfStepResult::completed();
@@ -12556,12 +13444,18 @@ PdfStepResult PdfPreparation::decodePreparedFonts(PdfWorkBudget& budget) {
         }
       }
       if (runtime->descriptorIndex != UINT8_MAX) {
-        runtime->stage = PreparedFontStage::CloseContentReader;
+        const bool readersAlreadyPrepared =
+            !(navigationSpoolStage_ == NavigationSpoolStage::ContentStore && navigationSpoolHandle_.valid()) &&
+            !(xrefFinalSpool_ < std::size(xrefSpools_) && xrefSpools_[xrefFinalSpool_].isOpen()) &&
+            sourceHandle_.valid();
+        runtime->stage = readersAlreadyPrepared ? PreparedFontStage::OpenWriter
+                                                 : PreparedFontStage::CloseContentReader;
         return PdfStepResult::paused();
       }
       ++runtime->currentFont;
     }
-    runtime->stage = PreparedFontStage::CloseContentReader;
+    runtime->stage = inlineNavigationSpoolHandle_.valid() ? PreparedFontStage::CloseWriter
+                                                          : PreparedFontStage::CloseContentReader;
     return PdfStepResult::paused();
   }
 
@@ -12613,22 +13507,28 @@ PdfStepResult PdfPreparation::decodePreparedFonts(PdfWorkBudget& budget) {
   }
 
   if (runtime->stage == PreparedFontStage::OpenWriter) {
-    if (inlineNavigationSpillStage_ != InlineNavigationSpillStage::FontSpilled ||
-        inlineNavigationSpoolHandle_.valid() || runtime->descriptorIndex >= content->fontCount) {
+    if (!sourceHandle_.valid() || runtime->descriptorIndex >= content->fontCount ||
+        (inlineNavigationSpoolHandle_.valid() &&
+         inlineNavigationSpillStage_ != InlineNavigationSpillStage::FontWriting) ||
+        (!inlineNavigationSpoolHandle_.valid() &&
+         inlineNavigationSpillStage_ != InlineNavigationSpillStage::FontSpilled)) {
       return PdfStepResult::failure(PdfStatus::failure(PdfError::InvalidArgument));
     }
-    if (budget.operationsRemaining < 2U) {
-      return PdfStepResult::paused();
-    }
-    (void)budget.consumeOperation();
-    PdfStatus status = config_.io.open(config_.io.context, inlineNavigationSpoolPath_, PdfCacheOpenMode::Write,
-                                       &inlineNavigationSpoolHandle_);
-    if (status) {
+    PdfStatus status = PdfStatus::success();
+    if (!inlineNavigationSpoolHandle_.valid()) {
+      if (budget.operationsRemaining < 2U) {
+        return PdfStepResult::paused();
+      }
       (void)budget.consumeOperation();
-      PdfCacheFileMetadata seek{};
-      seek.size = runtime->fileEnd;
-      seek.operation = PdfCacheMetadataOperation::Seek;
-      status = config_.io.metadata(config_.io.context, inlineNavigationSpoolHandle_, &seek);
+      status = config_.io.open(config_.io.context, inlineNavigationSpoolPath_, PdfCacheOpenMode::Write,
+                               &inlineNavigationSpoolHandle_);
+      if (status) {
+        (void)budget.consumeOperation();
+        PdfCacheFileMetadata seek{};
+        seek.size = runtime->fileEnd;
+        seek.operation = PdfCacheMetadataOperation::Seek;
+        status = config_.io.metadata(config_.io.context, inlineNavigationSpoolHandle_, &seek);
+      }
     }
     if (!status) {
       abortPreparedFontStore();
@@ -12650,9 +13550,15 @@ PdfStepResult PdfPreparation::decodePreparedFonts(PdfWorkBudget& budget) {
         sourceWindow_.get(), PdfLimits::SourceBufferBytes, decoderOutput_.get(), PdfLimits::DecoderOutputBytes,
         dictionary_.get(), PdfLimits::UzlibDictionaryBytes});
     const uint64_t expandedRemaining = PdfLimits::MaxExpandedRequiredStreamBytes - expandedRequiredBytes_;
-    status = inlineImageDecoder_->begin(pdfByteRangeSource(runtime->encoded), {this, writePreparedFontStore},
-                                        descriptor.filters, descriptor.filterCount,
-                                        {expandedRemaining, PdfLimits::MaxExpansionRatio}, true);
+    PdfByteSource encoded = pdfByteRangeSource(runtime->encoded);
+    if (status && security_.active()) {
+      status = security_.openStream(encoded, descriptor.reference, &encoded);
+    }
+    if (status) {
+      status = inlineImageDecoder_->begin(encoded, {this, writePreparedFontStore}, descriptor.filters,
+                                          descriptor.filterCount,
+                                          {expandedRemaining, PdfLimits::MaxExpansionRatio}, true);
+    }
     if (!status) {
       abortPreparedFontStore();
       return PdfStepResult::failure(status);
@@ -12679,11 +13585,18 @@ PdfStepResult PdfPreparation::decodePreparedFonts(PdfWorkBudget& budget) {
     expandedRequiredBytes_ += static_cast<uint32_t>(decodedBytes);
     runtime->decoded[runtime->currentFont].length = decodedBytes;
     inlineImageDecoder_.reset();
-    runtime->stage = PreparedFontStage::CloseWriter;
+    ++runtime->currentFont;
+    runtime->descriptorIndex = UINT8_MAX;
+    runtime->stage = PreparedFontStage::SelectDecode;
     return PdfStepResult::paused();
   }
 
   if (runtime->stage == PreparedFontStage::CloseWriter) {
+    if (!inlineNavigationSpoolHandle_.valid() ||
+        inlineNavigationSpillStage_ != InlineNavigationSpillStage::FontWriting ||
+        runtime->descriptorIndex != UINT8_MAX) {
+      return PdfStepResult::failure(PdfStatus::failure(PdfError::InvalidArgument));
+    }
     if (!budget.consumeOperation()) {
       return PdfStepResult::paused();
     }
@@ -12693,9 +13606,7 @@ PdfStepResult PdfPreparation::decodePreparedFonts(PdfWorkBudget& budget) {
       return PdfStepResult::failure(status);
     }
     inlineNavigationSpillStage_ = InlineNavigationSpillStage::FontSpilled;
-    ++runtime->currentFont;
-    runtime->descriptorIndex = UINT8_MAX;
-    runtime->stage = PreparedFontStage::SelectDecode;
+    runtime->stage = PreparedFontStage::CloseContentReader;
     return PdfStepResult::paused();
   }
 
@@ -12875,13 +13786,23 @@ PdfStepResult PdfPreparation::parsePreparedFonts(PdfWorkBudget& budget) {
     }
     PdfCMapCodeSpace codeSpaces[16]{};
     uint8_t codeSpaceCount = 0;
-    PdfStatus status = cmap->copyCodeSpaces(codeSpaces, std::size(codeSpaces), &codeSpaceCount);
+    const bool cid = runtime->descriptorIndex < content->fontCount &&
+                     content->fonts[runtime->descriptorIndex].cid;
+    PdfStatus status = PdfStatus::success();
+    if (cid) {
+      status = cmap->copyCodeSpaces(codeSpaces, std::size(codeSpaces), &codeSpaceCount);
+    } else {
+      // Simple Type1 and TrueType font strings are byte-oriented even when a
+      // producer emits a misleading two-byte ToUnicode codespace. The
+      // codespace describes lookup keys; it must not merge adjacent bytes in
+      // the painted PDF string.
+      codeSpaces[0] = {0, 0xFFU, 1};
+      codeSpaceCount = 1;
+    }
     if (!status) {
       return PdfStepResult::failure(status);
     }
     if (codeSpaceCount == 0) {
-      const bool cid = runtime->descriptorIndex < content->fontCount &&
-                       content->fonts[runtime->descriptorIndex].cid;
       codeSpaces[0] = {0, cid ? 0xFFFFU : 0xFFU, static_cast<uint8_t>(cid ? 2U : 1U)};
       codeSpaceCount = 1;
     }
@@ -12902,123 +13823,128 @@ PdfStepResult PdfPreparation::parsePreparedFonts(PdfWorkBudget& budget) {
   }
 
   if (runtime->stage == PreparedFontStage::ReplayObservedJournal) {
-    if (runtime->width.firstCode == kObservedReplayNeedHeader) {
-      if (runtime->encoded.offset == runtime->encoded.length) {
-        runtime->currentFont = 0;
-        runtime->currentCode = 0;
-        runtime->spillCapacity = 0;
-        runtime->stage = PreparedFontStage::SelectParse;
-        return PdfStepResult::paused();
-      }
-      const uint64_t remaining = runtime->encoded.length - runtime->encoded.offset;
-      if (remaining < kObservedStringHeaderBytes) {
-        return PdfStepResult::failure(PdfStatus::failure(PdfError::Malformed, runtime->encoded.offset));
-      }
-      if (budget.bytesRemaining < kObservedStringHeaderBytes || !budget.consumeOperation()) {
-        return PdfStepResult::paused();
-      }
-      (void)budget.takeBytes(kObservedStringHeaderBytes);
-      if (content->observedJournal()->active) {
-        size_t bytesRead = 0;
-        PdfStatus status = config_.io.read(
-            config_.io.context, inlineNavigationSpoolHandle_,
-            sizeof(NavigationWorkspace) + runtime->encoded.offset, sourceWindow_.get(),
-            kObservedStringHeaderBytes, &bytesRead);
-        if (status && bytesRead != kObservedStringHeaderBytes) {
-          status = PdfStatus::failure(PdfError::UnexpectedEof,
-                                      sizeof(NavigationWorkspace) + runtime->encoded.offset + bytesRead);
-        }
-        if (!status) {
-          return PdfStepResult::failure(status);
-        }
-      } else {
-        std::memcpy(sourceWindow_.get(),
-                    pageText_.get() + kObservedStringJournalOffset + runtime->encoded.offset,
-                    kObservedStringHeaderBytes);
-      }
-      const uint8_t fontIndex = sourceWindow_[0];
-      const uint8_t length = sourceWindow_[1];
-      if (fontIndex >= content->observedFontCount || length == 0 ||
-          static_cast<uint64_t>(length) > remaining - kObservedStringHeaderBytes) {
-        return PdfStepResult::failure(PdfStatus::failure(PdfError::Malformed, runtime->encoded.offset));
-      }
-      runtime->width.width = fontIndex;
-      runtime->width.lastCode = length;
-      runtime->encoded.offset += kObservedStringHeaderBytes;
-      runtime->currentCode = 0;
-      runtime->width.firstCode = kObservedReplayNeedPayload;
-      return PdfStepResult::paused();
-    }
-
-    if (runtime->width.firstCode == kObservedReplayNeedPayload) {
-      const size_t length = runtime->width.lastCode;
-      if (budget.bytesRemaining < length || !budget.consumeOperation()) {
-        return PdfStepResult::paused();
-      }
-      (void)budget.takeBytes(length);
-      if (content->observedJournal()->active) {
-        size_t bytesRead = 0;
-        PdfStatus status = config_.io.read(config_.io.context, inlineNavigationSpoolHandle_,
-                                           sizeof(NavigationWorkspace) + runtime->encoded.offset,
-                                           sourceWindow_.get(), length, &bytesRead);
-        if (status && bytesRead != length) {
-          status = PdfStatus::failure(PdfError::UnexpectedEof,
-                                      sizeof(NavigationWorkspace) + runtime->encoded.offset + bytesRead);
-        }
-        if (!status) {
-          return PdfStepResult::failure(status);
-        }
-      } else {
-        std::memcpy(sourceWindow_.get(),
-                    pageText_.get() + kObservedStringJournalOffset + runtime->encoded.offset, length);
-      }
-      runtime->encoded.offset += length;
-      runtime->width.firstCode = kObservedReplayProcessPayload;
-      return PdfStepResult::paused();
-    }
-
-    if (runtime->width.firstCode == kObservedReplayProcessPayload) {
-      const uint8_t length = static_cast<uint8_t>(runtime->width.lastCode);
-      if (runtime->currentCode == 0) {
-        bool painted = false;
-        const PdfStatus status = observedJournalHasFont(
-            pageText_.get(), static_cast<uint8_t>(runtime->width.width), &painted);
-        if (!status) {
-          return PdfStepResult::failure(status);
-        }
-        if (!painted) {
-          runtime->width.firstCode = kObservedReplayNeedHeader;
+    // The replay state is already fully resumable. Consume the current slice
+    // instead of yielding after every header, payload, and decoded glyph.
+    while (!budget.stopRequested()) {
+      if (runtime->width.firstCode == kObservedReplayNeedHeader) {
+        if (runtime->encoded.offset == runtime->encoded.length) {
+          runtime->currentFont = 0;
+          runtime->currentCode = 0;
+          runtime->spillCapacity = 0;
+          runtime->stage = PreparedFontStage::SelectParse;
           return PdfStepResult::paused();
         }
+        const uint64_t remaining = runtime->encoded.length - runtime->encoded.offset;
+        if (remaining < kObservedStringHeaderBytes) {
+          return PdfStepResult::failure(PdfStatus::failure(PdfError::Malformed, runtime->encoded.offset));
+        }
+        if (budget.bytesRemaining < kObservedStringHeaderBytes || !budget.consumeOperation()) {
+          return PdfStepResult::paused();
+        }
+        (void)budget.takeBytes(kObservedStringHeaderBytes);
+        if (content->observedJournal()->active) {
+          size_t bytesRead = 0;
+          PdfStatus status = config_.io.read(
+              config_.io.context, inlineNavigationSpoolHandle_,
+              sizeof(NavigationWorkspace) + runtime->encoded.offset, sourceWindow_.get(),
+              kObservedStringHeaderBytes, &bytesRead);
+          if (status && bytesRead != kObservedStringHeaderBytes) {
+            status = PdfStatus::failure(PdfError::UnexpectedEof,
+                                        sizeof(NavigationWorkspace) + runtime->encoded.offset + bytesRead);
+          }
+          if (!status) {
+            return PdfStepResult::failure(status);
+          }
+        } else {
+          std::memcpy(sourceWindow_.get(),
+                      pageText_.get() + kObservedStringJournalOffset + runtime->encoded.offset,
+                      kObservedStringHeaderBytes);
+        }
+        const uint8_t fontIndex = sourceWindow_[0];
+        const uint8_t length = sourceWindow_[1];
+        if (fontIndex >= content->observedFontCount || length == 0 ||
+            static_cast<uint64_t>(length) > remaining - kObservedStringHeaderBytes) {
+          return PdfStepResult::failure(PdfStatus::failure(PdfError::Malformed, runtime->encoded.offset));
+        }
+        runtime->width.width = fontIndex;
+        runtime->width.lastCode = length;
+        runtime->encoded.offset += kObservedStringHeaderBytes;
+        runtime->currentCode = 0;
+        runtime->width.firstCode = kObservedReplayNeedPayload;
+        continue;
       }
-      if (runtime->currentCode >= length) {
-        runtime->width.firstCode = kObservedReplayNeedHeader;
-        return PdfStepResult::paused();
+
+      if (runtime->width.firstCode == kObservedReplayNeedPayload) {
+        const size_t length = runtime->width.lastCode;
+        if (budget.bytesRemaining < length || !budget.consumeOperation()) {
+          return PdfStepResult::paused();
+        }
+        (void)budget.takeBytes(length);
+        if (content->observedJournal()->active) {
+          size_t bytesRead = 0;
+          PdfStatus status = config_.io.read(config_.io.context, inlineNavigationSpoolHandle_,
+                                             sizeof(NavigationWorkspace) + runtime->encoded.offset,
+                                             sourceWindow_.get(), length, &bytesRead);
+          if (status && bytesRead != length) {
+            status = PdfStatus::failure(PdfError::UnexpectedEof,
+                                        sizeof(NavigationWorkspace) + runtime->encoded.offset + bytesRead);
+          }
+          if (!status) {
+            return PdfStepResult::failure(status);
+          }
+        } else {
+          std::memcpy(sourceWindow_.get(),
+                      pageText_.get() + kObservedStringJournalOffset + runtime->encoded.offset, length);
+        }
+        runtime->encoded.offset += length;
+        runtime->width.firstCode = kObservedReplayProcessPayload;
+        continue;
       }
-      uint32_t code = 0;
-      uint8_t codeLength = 0;
-      const PdfStatus decodeStatus = decodeObservedGlyphCode(
-          glyphWorkspace, static_cast<uint8_t>(runtime->width.width),
-          sourceWindow_.get() + runtime->currentCode, length - runtime->currentCode, &code, &codeLength);
-      if (!decodeStatus) {
-        return PdfStepResult::failure(decodeStatus);
+
+      if (runtime->width.firstCode == kObservedReplayProcessPayload) {
+        const uint8_t length = static_cast<uint8_t>(runtime->width.lastCode);
+        if (runtime->currentCode == 0) {
+          bool painted = false;
+          const PdfStatus status = observedJournalHasFont(
+              pageText_.get(), static_cast<uint8_t>(runtime->width.width), &painted);
+          if (!status) {
+            return PdfStepResult::failure(status);
+          }
+          if (!painted) {
+            runtime->width.firstCode = kObservedReplayNeedHeader;
+            continue;
+          }
+        }
+        if (runtime->currentCode >= length) {
+          runtime->width.firstCode = kObservedReplayNeedHeader;
+          continue;
+        }
+        uint32_t code = 0;
+        uint8_t codeLength = 0;
+        const PdfStatus decodeStatus = decodeObservedGlyphCode(
+            glyphWorkspace, static_cast<uint8_t>(runtime->width.width),
+            sourceWindow_.get() + runtime->currentCode, length - runtime->currentCode, &code, &codeLength);
+        if (!decodeStatus) {
+          return PdfStepResult::failure(decodeStatus);
+        }
+        if (budget.bytesRemaining < codeLength || !budget.consumeOperation()) {
+          return PdfStepResult::paused();
+        }
+        (void)budget.takeBytes(codeLength);
+        const PdfStatus addStatus = addObservedGlyphTuple(
+            glyphWorkspace, static_cast<uint8_t>(runtime->width.width), codeLength, code);
+        if (!addStatus && addStatus.error != PdfError::LimitExceeded) {
+          return PdfStepResult::failure(addStatus);
+        }
+        runtime->currentCode = static_cast<uint16_t>(runtime->currentCode + codeLength);
+        if (runtime->currentCode == length) {
+          runtime->width.firstCode = kObservedReplayNeedHeader;
+        }
+        continue;
       }
-      if (budget.bytesRemaining < codeLength || !budget.consumeOperation()) {
-        return PdfStepResult::paused();
-      }
-      (void)budget.takeBytes(codeLength);
-      const PdfStatus addStatus = addObservedGlyphTuple(
-          glyphWorkspace, static_cast<uint8_t>(runtime->width.width), codeLength, code);
-      if (!addStatus && addStatus.error != PdfError::LimitExceeded) {
-        return PdfStepResult::failure(addStatus);
-      }
-      runtime->currentCode = static_cast<uint16_t>(runtime->currentCode + codeLength);
-      if (runtime->currentCode == length) {
-        runtime->width.firstCode = kObservedReplayNeedHeader;
-      }
-      return PdfStepResult::paused();
+      return PdfStepResult::failure(PdfStatus::failure(PdfError::InvalidArgument, runtime->width.firstCode));
     }
-    return PdfStepResult::failure(PdfStatus::failure(PdfError::InvalidArgument, runtime->width.firstCode));
+    return PdfStepResult::paused();
   }
 
   if (runtime->stage == PreparedFontStage::SelectParse) {
@@ -13131,7 +14057,7 @@ PdfStepResult PdfPreparation::parsePreparedFonts(PdfWorkBudget& budget) {
   if (runtime->stage == PreparedFontStage::Materialize) {
     auto* const finalFont = reinterpret_cast<PdfFontMap*>(
         dictionary_.get() + dictionaryFontsOffset + static_cast<size_t>(runtime->currentFont) * sizeof(PdfFontMap));
-    if (runtime->currentCode != kObservedGlyphInvalid) {
+    while (runtime->currentCode != kObservedGlyphInvalid && !budget.stopRequested()) {
       if (runtime->currentCode >= glyphWorkspace->tupleCount) {
         return PdfStepResult::failure(PdfStatus::failure(PdfError::Malformed, runtime->currentCode));
       }
@@ -13142,6 +14068,7 @@ PdfStepResult PdfPreparation::parsePreparedFonts(PdfWorkBudget& budget) {
       if (runtime->decoded[runtime->currentFont].length != 0) {
         auto* const cmap = reinterpret_cast<PdfCMap*>(runtime->cmapStorage);
         auto* const records = observedMatchedRecords(glyphWorkspace);
+        bool tupleComplete = false;
         while (runtime->width.firstCode < runtime->spillCapacity && !budget.stopRequested()) {
           if (!budget.consumeOperation()) {
             return PdfStepResult::paused();
@@ -13164,16 +14091,24 @@ PdfStepResult PdfPreparation::parsePreparedFonts(PdfWorkBudget& budget) {
           if (!status && status.error == PdfError::UnsupportedEncoding) {
             runtime->currentCode = tuple.next;
             runtime->width.firstCode = 0;
-            return PdfStepResult::paused();
+            tupleComplete = true;
+            break;
           }
           if (!status) {
             return PdfStepResult::failure(status);
           }
           runtime->currentCode = tuple.next;
           runtime->width.firstCode = 0;
-          return PdfStepResult::paused();
+          tupleComplete = true;
+          break;
+        }
+        if (tupleComplete) {
+          continue;
         }
         if (runtime->width.firstCode < runtime->spillCapacity) {
+          return PdfStepResult::paused();
+        }
+        if (!budget.consumeOperation()) {
           return PdfStepResult::paused();
         }
         PdfDecodedGlyph fallback{};
@@ -13190,14 +14125,14 @@ PdfStepResult PdfPreparation::parsePreparedFonts(PdfWorkBudget& budget) {
         if (!status && status.error == PdfError::UnsupportedEncoding) {
           runtime->currentCode = tuple.next;
           runtime->width.firstCode = 0;
-          return PdfStepResult::paused();
+          continue;
         }
         if (!status) {
           return PdfStepResult::failure(status);
         }
         runtime->currentCode = tuple.next;
         runtime->width.firstCode = 0;
-        return PdfStepResult::paused();
+        continue;
       }
 
       if (budget.bytesRemaining < tuple.length || !budget.consumeOperation()) {
@@ -13227,6 +14162,8 @@ PdfStepResult PdfPreparation::parsePreparedFonts(PdfWorkBudget& budget) {
         return PdfStepResult::failure(status);
       }
       runtime->currentCode = tuple.next;
+    }
+    if (runtime->currentCode != kObservedGlyphInvalid || budget.stopRequested()) {
       return PdfStepResult::paused();
     }
     const uint16_t glyphs = finalFont->materializedGlyphCount();
@@ -13811,6 +14748,15 @@ PdfStepResult PdfPreparation::cleanupPreparedContentStore(PdfWorkBudget& budget)
   navigationSpoolCrc32_ = 0;
   navigationSpoolReadCrc32_ = 0;
   navigationSpoolStage_ = NavigationSpoolStage::None;
+  contentAppendOffset_ = 0;
+  contentAppendLength_ = 0;
+  contentAppendActive_ = false;
+  contentOverflowSequenceActive_ = false;
+  contentOverflowAppendActive_ = false;
+  currentContentBatchCount_ = 0;
+  contentOverflowLoadCount_ = 0;
+  contentOverflowLoadStage_ = ContentOverflowLoadStage::Idle;
+  currentPageContentOrdinal_ = 0;
   return PdfStepResult::paused();
 }
 
@@ -14583,6 +15529,16 @@ PdfStatus PdfPreparation::consumeInlineImageToken(const PdfToken& token) {
 PdfStatus PdfPreparation::retainInlineImage(const uint64_t dataOffset, const uint64_t dataLength) {
   if (navigation_ == nullptr || imageCandidateCount_ >= kPreparationPageImageLimit || dataLength == 0) {
     warningFlags_ |= kWarningOptionalImageOmitted;
+    return PdfStatus::success();
+  }
+  // Deferred raster decoding needs an indirect object reference so the source
+  // can be reopened after the page content store is retired. Inline raster
+  // bytes have no such reference; omit the optional image instead of emitting
+  // an XHTML tag that cannot be fulfilled later. Captured inline JPEGs remain
+  // supported because their bytes are copied into the cache immediately.
+  if (inlineImageSupported_ && !inlineImageJpeg_) {
+    warningFlags_ |= kWarningOptionalImageOmitted;
+    cacheBudget_.optionalOmitted = true;
     return PdfStatus::success();
   }
   PreparedImageCandidate& candidate = navigation_->imageCandidates[imageCandidateCount_];
@@ -15598,6 +16554,22 @@ PdfStatus PdfPreparation::formatCurrentSectionPath() {
   return PdfStatus::success();
 }
 
+PdfStatus PdfPreparation::restoreCurrentSectionScratch() {
+  if (navigation_ == nullptr || sectionCount_ == 0 || currentSectionFirstSourcePage_ >= currentPageIndex_ ||
+      sectionRecord_.size == 0 || sectionRecord_.size > UINT32_MAX || cumulativeSectionBytes_ > UINT32_MAX ||
+      totalWords_ < currentSectionFirstWord_ || nextAnchorOrdinal_ < currentSectionFirstAnchor_) {
+    return PdfStatus::failure(PdfError::InvalidArgument, currentPageIndex_);
+  }
+  navigation_->preparedPageScratch = {
+      {static_cast<uint32_t>(sectionRecord_.size), static_cast<uint32_t>(cumulativeSectionBytes_),
+       currentSectionFirstWord_, totalWords_ - currentSectionFirstWord_, currentSectionFirstAnchor_, -1, 0},
+      sectionRecord_,
+      currentSectionFirstSourcePage_,
+      currentPageIndex_,
+  };
+  return PdfStatus::success();
+}
+
 PdfStepResult PdfPreparation::stepOpenSection(PdfWorkBudget& budget) {
   if (transcriptLength_ == 0 || extractedBlockCount_ == 0 || navigation_ == nullptr) {
     return PdfStepResult::failure(PdfStatus::failure(PdfError::NoReadableText));
@@ -15605,13 +16577,15 @@ PdfStepResult PdfPreparation::stepOpenSection(PdfWorkBudget& budget) {
   if (budget.stopRequested() || !budget.consumeOperation()) {
     return PdfStepResult::paused();
   }
-  const bool newSection =
+  bool newSection =
       sectionCount_ == 0 || (currentPageIndex_ != 0 && (pendingSectionBoundary_ || isSectionBoundary(currentPageIndex_)));
+  if (newSection && sectionCount_ >= PdfMetadataLimits::MaxSections) {
+    newSection = false;
+    pendingSectionBoundary_ = false;
+    warningFlags_ |= kWarningOptionalImageOmitted;
+  }
   if (newSection && pendingSectionFinish_) {
     return stepFinishPendingSection(budget);
-  }
-  if (newSection && sectionCount_ >= PdfMetadataLimits::MaxSections) {
-    return PdfStepResult::failure(PdfStatus::failure(PdfError::LimitExceeded, sectionCount_));
   }
   if (!sectionOpenPrepared_) {
     PdfStatus status = PdfStatus::success();
@@ -15621,11 +16595,11 @@ PdfStepResult PdfPreparation::stepOpenSection(PdfWorkBudget& budget) {
       navigation_->preparedPageScratch.lastSourcePageExclusive = currentPageIndex_;
       status = formatCurrentSectionPath();
       currentPageFirstSection_ = sectionCount_;
+      currentSectionFirstSourcePage_ = currentPageIndex_;
       currentSectionFirstWord_ = totalWords_;
       currentSectionFirstAnchor_ = nextAnchorOrdinal_;
     } else {
-      status = readPreparedPageRecord(static_cast<uint16_t>(sectionCount_ - 1U),
-                                      &navigation_->preparedPageScratch);
+      status = restoreCurrentSectionScratch();
       if (status) {
         const PdfRequiredFileRecord& file = navigation_->preparedPageScratch.file;
         if (!copyPath(file.path, sectionRelativePath_, sizeof(sectionRelativePath_))) {
@@ -15652,7 +16626,7 @@ PdfStepResult PdfPreparation::stepOpenSection(PdfWorkBudget& budget) {
   const uint64_t used = cacheBudget_.requiredBytes + cacheBudget_.optionalBytes;
   const uint64_t baseSize = newSection ? 0 : navigation_->preparedPageScratch.file.size;
   const uint64_t remaining = used >= cacheBudget_.limit ? 0 : cacheBudget_.limit - used;
-  const uint64_t byteLimit = std::min<uint64_t>(kSectionByteLimit, baseSize + remaining);
+  const uint64_t byteLimit = baseSize + remaining;
   if (byteLimit <= baseSize) {
     return PdfStepResult::failure(PdfStatus::failure(PdfError::InsufficientStorage));
   }
@@ -15699,18 +16673,21 @@ PdfStepResult PdfPreparation::stepFinishPendingSection(PdfWorkBudget& budget) {
     if (!budget.consumeOperation()) {
       return PdfStepResult::paused();
     }
-    PdfStatus status = readPreparedPageRecord(static_cast<uint16_t>(sectionCount_ - 1U),
-                                              &navigation_->preparedPageScratch);
+    PdfStatus status = restoreCurrentSectionScratch();
     if (status && !copyPath(navigation_->preparedPageScratch.file.path, sectionRelativePath_,
                             sizeof(sectionRelativePath_))) {
       status = PdfStatus::failure(PdfError::InvalidOffset, sectionCount_ - 1U);
     }
     if (status) {
       const int length = std::snprintf(sectionPath_, sizeof(sectionPath_), "%s/%s", cacheRoot_, sectionRelativePath_);
-      status = length > 0 && static_cast<size_t>(length) < sizeof(sectionPath_)
-                   ? resumeTrackedWriter(config_.io, sectionPath_, navigation_->preparedPageScratch.file,
-                                         kSectionByteLimit, &outputWriter_)
-                   : PdfStatus::failure(PdfError::LimitExceeded, sectionCount_ - 1U);
+      const uint64_t used = cacheBudget_.requiredBytes + cacheBudget_.optionalBytes;
+      const uint64_t baseSize = navigation_->preparedPageScratch.file.size;
+      const uint64_t remaining = used >= cacheBudget_.limit ? 0 : cacheBudget_.limit - used;
+      const uint64_t byteLimit = baseSize + remaining;
+      status = length > 0 && static_cast<size_t>(length) < sizeof(sectionPath_) && byteLimit > baseSize
+                   ? resumeTrackedWriter(config_.io, sectionPath_, navigation_->preparedPageScratch.file, byteLimit,
+                                         &outputWriter_)
+                   : PdfStatus::failure(PdfError::InsufficientStorage, sectionCount_ - 1U);
     }
     if (!status) {
       return PdfStepResult::failure(status);
@@ -15817,21 +16794,28 @@ PdfStepResult PdfPreparation::stepPreparePageLinks(PdfWorkBudget& budget) {
     currentPageLinkFinalizing_ = true;
     return PdfStepResult::paused();
   }
+  if (nextResolvedLinkSourcePage_ != UINT16_MAX) {
+    if (nextResolvedLinkSourcePage_ > currentPageIndex_) {
+      currentPageLinkFinalizing_ = true;
+      return PdfStepResult::paused();
+    }
+    nextResolvedLinkSourcePage_ = UINT16_MAX;
+  }
 
-  constexpr uint32_t kLinkSpoolHandoffOperations = 4U;
+  constexpr uint32_t kLinkSpoolHandoffOperations = 5U;
   if (budget.stopRequested() || budget.operationsRemaining <= kLinkSpoolHandoffOperations ||
       budget.bytesRemaining < sizeof(PreparedLink)) {
     return PdfStepResult::paused();
   }
+  const uint32_t totalRecords = resolvedLinkSpool_.recordCount();
   const uint32_t readable = std::min<uint32_t>(
-      kResolvedLinkReadBatchLimit,
+      std::min<uint32_t>(kResolvedLinkReadBatchLimit, totalRecords - currentResolvedLinkOrdinal_),
       std::min<uint32_t>(budget.operationsRemaining - kLinkSpoolHandoffOperations,
                          static_cast<uint32_t>(budget.bytesRemaining / sizeof(PreparedLink))));
   if (readable == 0) {
     return PdfStepResult::paused();
   }
 
-  const uint32_t totalRecords = resolvedLinkSpool_.recordCount();
   const bool sourceWasOpen = sourceHandle_.valid();
   const bool xrefWasOpen = xrefFinalSpool_ < std::size(xrefSpools_) && xrefSpools_[xrefFinalSpool_].isOpen();
   PdfStatus status = sourceWasOpen ? closeSource() : PdfStatus::success();
@@ -15846,16 +16830,15 @@ PdfStepResult PdfPreparation::stepPreparePageLinks(PdfWorkBudget& budget) {
     status = resolvedLinkSpool_.open(path, PdfCacheOpenMode::Read, totalRecords);
   }
   budget.operationsRemaining -= kLinkSpoolHandoffOperations;
+  budget.bytesRemaining -= static_cast<size_t>(readable) * sizeof(PreparedLink);
+  if (status) {
+    status = resolvedLinkSpool_.readRecords(currentResolvedLinkOrdinal_, navigation_->links, readable);
+  }
   bool pageComplete = false;
-  for (uint32_t read = 0; status && read < readable && currentResolvedLinkOrdinal_ < totalRecords; ++read) {
-    PreparedLink link{};
-    status = pdfReadRecord(resolvedLinkSpool_.store(), currentResolvedLinkOrdinal_, &link);
-    if (!status) {
-      break;
-    }
-    --budget.operationsRemaining;
-    budget.bytesRemaining -= sizeof(PreparedLink);
+  for (uint32_t read = 0; status && read < readable; ++read) {
+    const PreparedLink link = navigation_->links[read];
     if (link.sourcePage > currentPageIndex_) {
+      nextResolvedLinkSourcePage_ = link.sourcePage;
       pageComplete = true;
       break;
     }
@@ -15939,6 +16922,8 @@ PdfStepResult PdfPreparation::emitSection(PdfWorkBudget& budget) {
   }
   auto* const blocks = reinterpret_cast<const ExtractedBlockRecord*>(decoderOutput_.get());
 
+  while (budget.consumeOperation()) {
+
   if (sectionEmitStage_ == SectionEmitStage::Idle) {
     char pageLabel[PdfSemanticWriterLimits::PublisherLabelBytes]{};
     size_t pageLabelLength = 0;
@@ -15966,13 +16951,13 @@ PdfStepResult PdfPreparation::emitSection(PdfWorkBudget& budget) {
     }
     sectionEmitEndBlock_ = extractedBlockCount_;
     sectionEmitStage_ = SectionEmitStage::BeginBlock;
-    return PdfStepResult::paused();
+    continue;
   }
 
   if (sectionEmitStage_ == SectionEmitStage::BeginBlock) {
     if (currentBlockIndex_ >= sectionEmitEndBlock_) {
       sectionEmitStage_ = SectionEmitStage::Finish;
-      return PdfStepResult::paused();
+      continue;
     }
     const ExtractedBlockRecord& record = blocks[currentBlockIndex_];
     const uint8_t* const text = pageText_.get() + record.textOffset;
@@ -16000,7 +16985,7 @@ PdfStepResult PdfPreparation::emitSection(PdfWorkBudget& budget) {
     }
     sectionEmitImageIndex_ = currentPageImageStart_;
     sectionEmitStage_ = SectionEmitStage::Images;
-    return PdfStepResult::paused();
+    continue;
   }
 
   if (sectionEmitStage_ == SectionEmitStage::Images) {
@@ -16057,6 +17042,9 @@ PdfStepResult PdfPreparation::emitSection(PdfWorkBudget& budget) {
                                                   static_cast<size_t>(hrefLength),
                                                   static_cast<uint16_t>(image.width),
                                                   static_cast<uint16_t>(image.height));
+      if (!status) {
+        return PdfStepResult::failure(status);
+      }
       if (status && image.raster) {
         status = semanticWriter_.flush();
         const uint64_t tagLength = outputWriter_.record.size - tagOffset;
@@ -16071,7 +17059,7 @@ PdfStepResult PdfPreparation::emitSection(PdfWorkBudget& budget) {
       return status ? PdfStepResult::paused() : PdfStepResult::failure(status);
     }
     sectionEmitStage_ = SectionEmitStage::EndBlock;
-    return PdfStepResult::paused();
+    continue;
   }
 
   if (sectionEmitStage_ == SectionEmitStage::EndBlock) {
@@ -16082,7 +17070,7 @@ PdfStepResult PdfPreparation::emitSection(PdfWorkBudget& budget) {
     ++nextAnchorOrdinal_;
     ++currentBlockIndex_;
     sectionEmitStage_ = SectionEmitStage::BeginBlock;
-    return PdfStepResult::paused();
+    continue;
   }
 
   if (sectionEmitStage_ == SectionEmitStage::Finish) {
@@ -16099,6 +17087,8 @@ PdfStepResult PdfPreparation::emitSection(PdfWorkBudget& budget) {
   }
 
   return PdfStepResult::failure(PdfStatus::failure(PdfError::InvalidArgument));
+  }
+  return PdfStepResult::paused();
 }
 
 PdfStepResult PdfPreparation::stepCloseSection(PdfWorkBudget& budget) {
@@ -16161,10 +17151,16 @@ PdfStepResult PdfPreparation::stepCloseSection(PdfWorkBudget& budget) {
       ++workCounters_.sectionsEmitted;
     }
   } else {
-    status = rewritePreparedPageRecord(budget, static_cast<uint16_t>(sectionCount_ - 1U),
-                                       navigation_->preparedPageScratch);
-    if (!status && status.error == PdfError::BudgetExhausted) {
-      return PdfStepResult::paused();
+    // The durable page journal carries the newest section state. Avoid
+    // reopening and rewriting the session spool for every page; resume replay
+    // rebuilds it, and uninterrupted preparation updates it when the section
+    // actually closes.
+    if (!pendingSectionFinish_) {
+      status = rewritePreparedPageRecord(budget, static_cast<uint16_t>(sectionCount_ - 1U),
+                                         navigation_->preparedPageScratch);
+      if (!status && status.error == PdfError::BudgetExhausted) {
+        return PdfStepResult::paused();
+      }
     }
   }
   if (!status) {
@@ -16189,7 +17185,21 @@ PdfStepResult PdfPreparation::stepPrepareNavigationRecords(PdfWorkBudget& budget
     return PdfStepResult::failure(PdfStatus::failure(PdfError::InvalidArgument));
   }
   auto& runtime = *reinterpret_cast<NavigationRecordRuntime*>(decoderOutput_.get());
-  if (runtime.stage == NavigationRecordStage::ReadOutline) {
+  const auto beginSectionSearch = [&runtime, this]() {
+    runtime.sectionSearchFirst = 0;
+    runtime.sectionSearchLast = static_cast<uint16_t>(sectionCount_ - 1U);
+  };
+  const auto advanceMappedEntry = [&runtime, &beginSectionSearch]() {
+    ++runtime.batchIndex;
+    if (runtime.batchIndex < runtime.batchCount) {
+      beginSectionSearch();
+      runtime.stage = NavigationRecordStage::ReadSection;
+    } else {
+      runtime.stage = NavigationRecordStage::CloseSectionBatch;
+    }
+  };
+
+  if (runtime.stage == NavigationRecordStage::OpenOutlineBatch) {
     if (runtime.outlineIndex >= explicitOutlineCount_) {
       runtime.stage = NavigationRecordStage::FinishMetadata;
       return PdfStepResult::paused();
@@ -16197,21 +17207,92 @@ PdfStepResult PdfPreparation::stepPrepareNavigationRecords(PdfWorkBudget& budget
     if (!budget.consumeOperation()) {
       return PdfStepResult::paused();
     }
-    const PdfStatus status = readNavigationRecord(runtime.outlineIndex, &runtime.entry);
+    const PdfStatus status = switchPageTraversalAccess(true);
     if (!status) {
       return PdfStepResult::failure(status);
     }
-    runtime.sectionIndex = 0;
-    if (runtime.entry.sourcePageIndex >= pageCount_) {
-      return PdfStepResult::failure(PdfStatus::failure(PdfError::InvalidOffset, runtime.entry.sourcePageIndex));
+    runtime.batchCount = static_cast<uint8_t>(
+        std::min<uint16_t>(kPreparationOutlineLimit, explicitOutlineCount_ - runtime.outlineIndex));
+    runtime.batchIndex = 0;
+    runtime.stage = NavigationRecordStage::ReadOutlineBatch;
+    return PdfStepResult::paused();
+  }
+  if (runtime.stage == NavigationRecordStage::ReadOutlineBatch) {
+    if (!traversalSpool_.isOpen() || runtime.batchCount == 0 || runtime.batchIndex > runtime.batchCount) {
+      return PdfStepResult::failure(PdfStatus::failure(PdfError::InvalidArgument, runtime.outlineIndex));
     }
+    const PdfFixedRecordStore store = traversalSpool_.store();
+    while (runtime.batchIndex < runtime.batchCount && !budget.stopRequested()) {
+      if (budget.bytesRemaining < sizeof(PdfOutlineEntry) || !budget.consumeOperation()) {
+        return PdfStepResult::paused();
+      }
+      (void)budget.takeBytes(sizeof(PdfOutlineEntry));
+      const uint32_t index = runtime.outlineIndex + runtime.batchIndex;
+      const PdfStatus status =
+          store.read(store.context, index, &navigation_->outlineEntries[runtime.batchIndex], sizeof(PdfOutlineEntry));
+      if (!status) {
+        return PdfStepResult::failure(status);
+      }
+      ++runtime.batchIndex;
+    }
+    if (runtime.batchIndex < runtime.batchCount) {
+      return PdfStepResult::paused();
+    }
+    runtime.stage = NavigationRecordStage::CloseOutlineBatch;
+    return PdfStepResult::paused();
+  }
+  if (runtime.stage == NavigationRecordStage::CloseOutlineBatch) {
+    if (!budget.consumeOperation()) {
+      return PdfStepResult::paused();
+    }
+    const PdfStatus status = switchPageTraversalAccess(false);
+    if (!status) {
+      return PdfStepResult::failure(status);
+    }
+    runtime.batchIndex = 0;
+    runtime.stage = NavigationRecordStage::OpenSectionBatch;
+    return PdfStepResult::paused();
+  }
+  if (runtime.stage == NavigationRecordStage::OpenSectionBatch) {
+    if (preparedPageSpoolWriting_) {
+      if (!budget.consumeOperation()) {
+        return PdfStepResult::paused();
+      }
+      const PdfStatus status = finishPreparedPageSpool();
+      return status ? PdfStepResult::paused() : PdfStepResult::failure(status);
+    }
+    if (!preparedPageSpoolUpdating_ || preparedPageSpool_.isOpen() || traversalSpool_.isOpen() ||
+        !budget.consumeOperation()) {
+      return preparedPageSpoolUpdating_ && !preparedPageSpool_.isOpen() && !traversalSpool_.isOpen()
+                 ? PdfStepResult::paused()
+                 : PdfStepResult::failure(PdfStatus::failure(PdfError::InvalidArgument, runtime.outlineIndex));
+    }
+    char path[PDF_CACHE_PATH_CAPACITY]{};
+    PdfStatus status = formatPageSpoolPath(true, path, sizeof(path));
+    if (status) {
+      status = preparedPageSpool_.openForUpdates(path, sectionCount_);
+    }
+    if (!status) {
+      return PdfStepResult::failure(status);
+    }
+    runtime.batchIndex = 0;
+    beginSectionSearch();
     runtime.stage = NavigationRecordStage::ReadSection;
     return PdfStepResult::paused();
   }
   if (runtime.stage == NavigationRecordStage::ReadSection) {
+    if (!preparedPageSpool_.isOpen() || runtime.batchIndex >= runtime.batchCount ||
+        runtime.sectionSearchFirst > runtime.sectionSearchLast || runtime.sectionSearchLast >= sectionCount_) {
+      const uint32_t target = runtime.batchIndex < runtime.batchCount
+                                  ? navigation_->outlineEntries[runtime.batchIndex].sourcePageIndex
+                                  : runtime.outlineIndex;
+      return PdfStepResult::failure(PdfStatus::failure(PdfError::InvalidOffset, target));
+    }
     if (!budget.consumeOperation() || !budget.takeBytes(sizeof(PreparedSectionRecord))) {
       return PdfStepResult::paused();
     }
+    runtime.sectionIndex = static_cast<uint16_t>(
+        runtime.sectionSearchFirst + (runtime.sectionSearchLast - runtime.sectionSearchFirst) / 2U);
     PdfStatus status = readPreparedPageRecord(runtime.sectionIndex, &navigation_->preparedPageScratch);
     if (!status) {
       return PdfStepResult::failure(status);
@@ -16220,49 +17301,123 @@ PdfStepResult PdfPreparation::stepPrepareNavigationRecords(PdfWorkBudget& budget
       return PdfStepResult::failure(
           PdfStatus::failure(PdfError::InvalidOffset, navigation_->preparedPageScratch.firstSourcePage));
     }
-    const uint32_t targetPage = runtime.entry.sourcePageIndex;
+    PdfOutlineEntry& entry = navigation_->outlineEntries[runtime.batchIndex];
+    if (entry.sourcePageIndex >= pageCount_) {
+      return PdfStepResult::failure(PdfStatus::failure(PdfError::InvalidOffset, entry.sourcePageIndex));
+    }
+    const uint32_t targetPage = entry.sourcePageIndex;
     const bool containsTarget = navigation_->preparedPageScratch.firstSourcePage <= targetPage &&
                                 targetPage < navigation_->preparedPageScratch.lastSourcePageExclusive;
     if (!containsTarget && targetPage >= navigation_->preparedPageScratch.lastSourcePageExclusive &&
-        runtime.sectionIndex + 1U < sectionCount_) {
-      ++runtime.sectionIndex;
+        runtime.sectionIndex < runtime.sectionSearchLast) {
+      runtime.sectionSearchFirst = static_cast<uint16_t>(runtime.sectionIndex + 1U);
       return PdfStepResult::paused();
     }
-    runtime.entry.sourcePageIndex = navigation_->preparedPageScratch.firstSourcePage;
-    runtime.entry.sectionIndex = runtime.sectionIndex;
-    runtime.entry.anchorOrdinal = navigation_->preparedPageScratch.section.firstAnchorOrdinal;
-    status = pdfFormatSemanticAnchor(runtime.entry.anchorOrdinal, runtime.entry.anchor);
-    if (!status) {
-      return PdfStepResult::failure(status);
-    }
-    runtime.stage = NavigationRecordStage::WriteOutline;
-    return PdfStepResult::paused();
-  }
-  if (runtime.stage == NavigationRecordStage::WriteOutline) {
-    if (!budget.consumeOperation()) {
+    if (!containsTarget && targetPage < navigation_->preparedPageScratch.firstSourcePage &&
+        runtime.sectionIndex > runtime.sectionSearchFirst) {
+      runtime.sectionSearchLast = runtime.sectionIndex;
       return PdfStepResult::paused();
     }
-    const PdfStatus status = writeNavigationRecord(runtime.outlineIndex, runtime.entry);
+    // An outline on an unreadable page maps to the next emitted section, while
+    // a target after the final emitted range maps to that final section. These
+    // are the same clamping semantics as the former forward scan.
+    entry.sourcePageIndex = navigation_->preparedPageScratch.firstSourcePage;
+    entry.sectionIndex = runtime.sectionIndex;
+    entry.anchorOrdinal = navigation_->preparedPageScratch.section.firstAnchorOrdinal;
+    status = pdfFormatSemanticAnchor(entry.anchorOrdinal, entry.anchor);
     if (!status) {
       return PdfStepResult::failure(status);
     }
     if (navigation_->preparedPageScratch.section.tocIndex < 0) {
-      navigation_->preparedPageScratch.section.tocIndex = static_cast<int16_t>(runtime.outlineIndex);
+      navigation_->preparedPageScratch.section.tocIndex =
+          static_cast<int16_t>(runtime.outlineIndex + runtime.batchIndex);
       runtime.stage = NavigationRecordStage::UpdateSection;
       return PdfStepResult::paused();
     }
-    ++runtime.outlineIndex;
-    runtime.stage = NavigationRecordStage::ReadOutline;
+    advanceMappedEntry();
     return PdfStepResult::paused();
   }
   if (runtime.stage == NavigationRecordStage::UpdateSection) {
-    const PdfStatus status =
-        rewritePreparedPageRecord(budget, runtime.sectionIndex, navigation_->preparedPageScratch);
-    if (!status) {
-      return status.error == PdfError::BudgetExhausted ? PdfStepResult::paused() : PdfStepResult::failure(status);
+    if (!preparedPageSpool_.isOpen() || budget.operationsRemaining < 2U ||
+        budget.bytesRemaining < sizeof(PreparedSectionRecord) || budget.stopRequested()) {
+      return preparedPageSpool_.isOpen() ? PdfStepResult::paused()
+                                         : PdfStepResult::failure(PdfStatus::failure(PdfError::InvalidArgument));
     }
-    ++runtime.outlineIndex;
-    runtime.stage = NavigationRecordStage::ReadOutline;
+    (void)budget.consumeOperation();
+    (void)budget.consumeOperation();
+    (void)budget.takeBytes(sizeof(PreparedSectionRecord));
+    const PdfStatus status = preparedPageSpool_.rewriteExisting(
+        runtime.sectionIndex, &navigation_->preparedPageScratch, sizeof(PreparedSectionRecord));
+    if (!status) {
+      return PdfStepResult::failure(status);
+    }
+    advanceMappedEntry();
+    return PdfStepResult::paused();
+  }
+  if (runtime.stage == NavigationRecordStage::CloseSectionBatch) {
+    if (!preparedPageSpool_.isOpen() || !budget.consumeOperation()) {
+      return preparedPageSpool_.isOpen() ? PdfStepResult::paused()
+                                         : PdfStepResult::failure(PdfStatus::failure(PdfError::InvalidArgument));
+    }
+    const PdfStatus status = preparedPageSpool_.close();
+    if (!status) {
+      return PdfStepResult::failure(status);
+    }
+    runtime.batchIndex = 0;
+    runtime.stage = NavigationRecordStage::OpenOutlineWriteBatch;
+    return PdfStepResult::paused();
+  }
+  if (runtime.stage == NavigationRecordStage::OpenOutlineWriteBatch) {
+    if (!budget.consumeOperation()) {
+      return PdfStepResult::paused();
+    }
+    const PdfStatus status = switchPageTraversalAccess(true);
+    if (!status) {
+      return PdfStepResult::failure(status);
+    }
+    runtime.batchIndex = 0;
+    runtime.stage = NavigationRecordStage::WriteOutlineBatch;
+    return PdfStepResult::paused();
+  }
+  if (runtime.stage == NavigationRecordStage::WriteOutlineBatch) {
+    if (!traversalSpool_.isOpen() || runtime.batchIndex > runtime.batchCount) {
+      return PdfStepResult::failure(PdfStatus::failure(PdfError::InvalidArgument, runtime.outlineIndex));
+    }
+    const PdfFixedRecordStore store = traversalSpool_.store();
+    while (runtime.batchIndex < runtime.batchCount && !budget.stopRequested()) {
+      if (budget.operationsRemaining < 2U || budget.bytesRemaining < sizeof(PdfOutlineEntry)) {
+        return PdfStepResult::paused();
+      }
+      (void)budget.consumeOperation();
+      (void)budget.consumeOperation();
+      (void)budget.takeBytes(sizeof(PdfOutlineEntry));
+      const uint32_t index = runtime.outlineIndex + runtime.batchIndex;
+      const PdfStatus status =
+          store.write(store.context, index, &navigation_->outlineEntries[runtime.batchIndex], sizeof(PdfOutlineEntry));
+      if (!status) {
+        return PdfStepResult::failure(status);
+      }
+      ++runtime.batchIndex;
+    }
+    if (runtime.batchIndex < runtime.batchCount) {
+      return PdfStepResult::paused();
+    }
+    runtime.stage = NavigationRecordStage::CloseOutlineWriteBatch;
+    return PdfStepResult::paused();
+  }
+  if (runtime.stage == NavigationRecordStage::CloseOutlineWriteBatch) {
+    if (!traversalSpool_.isOpen() || !budget.consumeOperation()) {
+      return traversalSpool_.isOpen() ? PdfStepResult::paused()
+                                      : PdfStepResult::failure(PdfStatus::failure(PdfError::InvalidArgument));
+    }
+    const PdfStatus status = switchPageTraversalAccess(false);
+    if (!status) {
+      return PdfStepResult::failure(status);
+    }
+    runtime.outlineIndex = static_cast<uint16_t>(runtime.outlineIndex + runtime.batchCount);
+    runtime.batchCount = 0;
+    runtime.batchIndex = 0;
+    runtime.stage = NavigationRecordStage::OpenOutlineBatch;
     return PdfStepResult::paused();
   }
   if (runtime.stage == NavigationRecordStage::FinishMetadata) {
@@ -17179,7 +18334,7 @@ PdfStepResult PdfPreparation::stepCommitManifest(PdfWorkBudget& budget, const bo
 }
 
 PdfStepResult PdfPreparation::stepCommitPageResume(PdfWorkBudget& budget) {
-  if (pageText_ == nullptr || navigation_ == nullptr || !config_.io.valid()) {
+  if (pageText_ == nullptr || runRecords_ == nullptr || navigation_ == nullptr || !config_.io.valid()) {
     return PdfStepResult::failure(PdfStatus::failure(PdfError::InvalidArgument));
   }
   const bool discoveryResume = phase_ == PdfPreparationPhase::CommitDiscoveryResume;
@@ -17200,7 +18355,8 @@ PdfStepResult PdfPreparation::stepCommitPageResume(PdfWorkBudget& budget) {
       status = finalizeDiscoveryXref();
       if (status) {
         cacheSetupFileSize_ = discoveryEncodedBytes(xref_->entryCount(), static_cast<uint16_t>(pageCount_),
-                                                    annotationOverflowSpool_.recordCount());
+                                                     annotationOverflowSpool_.recordCount(),
+                                                     contentOverflowSpool_.recordCount());
         cacheSetupOffset_ = 0;
         cacheSetupRecordIndex_ = 0;
         resumePageValidationIndex_ = 0;
@@ -17280,46 +18436,115 @@ PdfStepResult PdfPreparation::stepCommitPageResume(PdfWorkBudget& budget) {
       resumePointStage_ = ResumePointStage::WriteDiscoveryPages;
       return PdfStepResult::paused();
     }
-    if (budget.bytesRemaining < kDiscoveryXrefRecordBytes || !budget.consumeOperation()) {
+    const uint32_t recordsRemaining = xref_->entryCount() - cacheSetupRecordIndex_;
+    const size_t bytesPerRecord = sizeof(PdfXrefEntry) + kDiscoveryXrefRecordBytes;
+    const uint32_t recordsByBytes = static_cast<uint32_t>(budget.bytesRemaining / bytesPerRecord);
+    const uint32_t batchRecords = std::min({recordsRemaining, recordsByBytes, kResumeXrefBatchRecords});
+    if (batchRecords == 0 || budget.operationsRemaining < 2U || budget.stopRequested()) {
       return PdfStepResult::paused();
     }
-    (void)budget.takeBytes(kDiscoveryXrefRecordBytes);
-    const PdfStatus status =
-        encodeDiscoveryXrefRecord(cacheSetupRecordIndex_, sourceWindow_.get(), PdfLimits::SourceBufferBytes);
+    budget.operationsRemaining -= 2U;
+    const size_t inputBytes = static_cast<size_t>(batchRecords) * sizeof(PdfXrefEntry);
+    const size_t encodedBytes = static_cast<size_t>(batchRecords) * kDiscoveryXrefRecordBytes;
+    budget.bytesRemaining -= inputBytes + encodedBytes;
+    auto* const entries = reinterpret_cast<PdfXrefEntry*>(runRecords_.get());
+    PdfStatus status = PdfStatus::success();
+    if (xrefFinalSpool_ < std::size(xrefSpools_)) {
+      status = xrefSpools_[xrefFinalSpool_].readRecords(cacheSetupRecordIndex_, entries, batchRecords);
+    } else {
+      for (uint32_t index = 0; status && index < batchRecords; ++index) {
+        status = pdfReadRecord(recordStore(xrefRecords_), cacheSetupRecordIndex_ + index, &entries[index]);
+      }
+    }
+    for (uint32_t index = 0; status && index < batchRecords; ++index) {
+      status = encodeDiscoveryXrefRecord(cacheSetupRecordIndex_ + index, entries[index],
+                                         pageText_.get() + static_cast<size_t>(index) * kDiscoveryXrefRecordBytes,
+                                         PdfLimits::PageTextBytes -
+                                             static_cast<size_t>(index) * kDiscoveryXrefRecordBytes);
+    }
     if (!status) {
       return PdfStepResult::failure(status);
     }
-    const PdfStepResult result = writeResumeJournalBuffer(budget, sourceWindow_.get(), kDiscoveryXrefRecordBytes);
-    if (!result.complete()) {
-      return result;
+    size_t bytesWritten = 0;
+    status = config_.io.write(config_.io.context, resumeJournalHandle_, pageText_.get(), encodedBytes, &bytesWritten);
+    if (!status || bytesWritten != encodedBytes) {
+      return PdfStepResult::failure(status ? PdfStatus::failure(PdfError::IoFailure, bytesWritten) : status);
     }
-    cacheSetupCrc32_ = pdfCacheCrc32(sourceWindow_.get(), kDiscoveryXrefRecordBytes, cacheSetupCrc32_);
-    cacheSetupDecodedLedger_ = pdfCacheFnv64(sourceWindow_.get(), kDiscoveryXrefRecordBytes, cacheSetupDecodedLedger_);
-    cacheSetupOffset_ += kDiscoveryXrefRecordBytes;
-    ++cacheSetupRecordIndex_;
+    cacheSetupCrc32_ = pdfCacheCrc32(pageText_.get(), encodedBytes, cacheSetupCrc32_);
+    cacheSetupDecodedLedger_ = pdfCacheFnv64(pageText_.get(), encodedBytes, cacheSetupDecodedLedger_);
+    cacheSetupOffset_ += encodedBytes;
+    cacheSetupRecordIndex_ += batchRecords;
     return PdfStepResult::paused();
   }
   if (resumePointStage_ == ResumePointStage::WriteDiscoveryPages) {
+    if (!pageSpool_.isOpen()) {
+      if (xrefFinalSpool_ < std::size(xrefSpools_) && xrefSpools_[xrefFinalSpool_].isOpen()) {
+        if (!budget.consumeOperation()) {
+          return PdfStepResult::paused();
+        }
+        const PdfStatus status = xrefSpools_[xrefFinalSpool_].close();
+        if (status && resolver_.has_value()) {
+          resolver_->invalidateSourceAccess();
+        }
+        return status ? PdfStepResult::paused() : PdfStepResult::failure(status);
+      }
+      if (!budget.consumeOperation()) {
+        return PdfStepResult::paused();
+      }
+      char path[PDF_CACHE_PATH_CAPACITY]{};
+      PdfStatus status = formatPageSpoolPath(false, path, sizeof(path));
+      if (status) {
+        status = pageSpool_.open(path, PdfCacheOpenMode::Read, pageCount_);
+      }
+      return status ? PdfStepResult::paused() : PdfStepResult::failure(status);
+    }
     if (resumePageValidationIndex_ >= pageCount_) {
+      if (!budget.consumeOperation()) {
+        return PdfStepResult::paused();
+      }
+      const PdfStatus status = pageSpool_.close();
+      if (!status) {
+        return PdfStepResult::failure(status);
+      }
       cacheSetupRecordIndex_ = 0;
-      resumePointStage_ = annotationOverflowSpool_.recordCount() == 0
-                              ? ResumePointStage::WriteDiscoveryTrailer
-                              : ResumePointStage::WriteDiscoveryOverflow;
+      resumePointStage_ = annotationOverflowSpool_.recordCount() != 0
+                              ? ResumePointStage::WriteDiscoveryOverflow
+                              : contentOverflowSpool_.recordCount() != 0
+                                    ? ResumePointStage::WriteDiscoveryContentOverflow
+                                    : ResumePointStage::WriteDiscoveryTrailer;
       return PdfStepResult::paused();
     }
-    const PdfStatus status =
-        encodeDiscoveryPageRecord(resumePageValidationIndex_, sourceWindow_.get(), PdfLimits::SourceBufferBytes);
+    const uint16_t recordsRemaining = static_cast<uint16_t>(pageCount_ - resumePageValidationIndex_);
+    const size_t bytesPerRecord = sizeof(PdfPageInfo) + kDiscoveryPageRecordBytes;
+    const uint16_t recordsByBytes = static_cast<uint16_t>(budget.bytesRemaining / bytesPerRecord);
+    const uint16_t batchRecords = std::min({recordsRemaining, recordsByBytes, kResumePageBatchRecords});
+    if (batchRecords == 0 || budget.operationsRemaining < 2U || budget.stopRequested()) {
+      return PdfStepResult::paused();
+    }
+    budget.operationsRemaining -= 2U;
+    const size_t inputBytes = static_cast<size_t>(batchRecords) * sizeof(PdfPageInfo);
+    const size_t encodedBytes = static_cast<size_t>(batchRecords) * kDiscoveryPageRecordBytes;
+    budget.bytesRemaining -= inputBytes + encodedBytes;
+    auto* const pages = reinterpret_cast<PdfPageInfo*>(runRecords_.get());
+    PdfStatus status = pageSpool_.readRecords(resumePageValidationIndex_, pages, batchRecords);
+    for (uint16_t index = 0; status && index < batchRecords; ++index) {
+      status = encodeDiscoveryPageRecord(
+          static_cast<uint16_t>(resumePageValidationIndex_ + index), pages[index],
+          pageText_.get() + static_cast<size_t>(index) * kDiscoveryPageRecordBytes,
+          PdfLimits::PageTextBytes - static_cast<size_t>(index) * kDiscoveryPageRecordBytes);
+    }
     if (!status) {
       return PdfStepResult::failure(status);
     }
-    const PdfStepResult result = writeResumeJournalBuffer(budget, sourceWindow_.get(), kDiscoveryPageRecordBytes);
-    if (!result.complete()) {
-      return result;
+    size_t bytesWritten = 0;
+    status = config_.io.write(config_.io.context, resumeJournalHandle_, pageText_.get(), encodedBytes, &bytesWritten);
+    if (!status || bytesWritten != encodedBytes) {
+      return PdfStepResult::failure(status ? PdfStatus::failure(PdfError::IoFailure, bytesWritten) : status);
     }
-    cacheSetupCrc32_ = pdfCacheCrc32(sourceWindow_.get(), kDiscoveryPageRecordBytes, cacheSetupCrc32_);
-    cacheSetupDecodedLedger_ = pdfCacheFnv64(sourceWindow_.get(), kDiscoveryPageRecordBytes, cacheSetupDecodedLedger_);
-    cacheSetupOffset_ += kDiscoveryPageRecordBytes;
-    ++resumePageValidationIndex_;
+    cacheSetupCrc32_ = pdfCacheCrc32(pageText_.get(), encodedBytes, cacheSetupCrc32_);
+    cacheSetupDecodedLedger_ = pdfCacheFnv64(pageText_.get(), encodedBytes, cacheSetupDecodedLedger_);
+    cacheSetupOffset_ += encodedBytes;
+    resumePageValidationIndex_ = static_cast<uint16_t>(resumePageValidationIndex_ + batchRecords);
     return PdfStepResult::paused();
   }
   if (resumePointStage_ == ResumePointStage::WriteDiscoveryOverflow) {
@@ -17357,31 +18582,119 @@ PdfStepResult PdfPreparation::stepCommitPageResume(PdfWorkBudget& budget) {
       if (!status) {
         return PdfStepResult::failure(status);
       }
-      resumePointStage_ = ResumePointStage::WriteDiscoveryTrailer;
+      cacheSetupRecordIndex_ = 0;
+      resumePointStage_ = contentOverflowSpool_.recordCount() == 0
+                              ? ResumePointStage::WriteDiscoveryTrailer
+                              : ResumePointStage::WriteDiscoveryContentOverflow;
       return PdfStepResult::paused();
     }
-    constexpr size_t kOverflowIoBytes = sizeof(PdfObjectReference) + kDiscoveryOverflowRecordBytes;
-    if (budget.operationsRemaining < 2U || budget.bytesRemaining < kOverflowIoBytes ||
-        !budget.consumeOperation()) {
+    const uint32_t recordsRemaining = overflowCount - cacheSetupRecordIndex_;
+    const size_t bytesPerRecord = sizeof(PdfObjectReference) + kDiscoveryOverflowRecordBytes;
+    const uint32_t recordsByBytes = static_cast<uint32_t>(budget.bytesRemaining / bytesPerRecord);
+    const uint32_t batchRecords = std::min<uint32_t>(
+        std::min<uint32_t>(recordsRemaining, recordsByBytes), kResumeOverflowBatchRecords);
+    if (batchRecords == 0 || budget.operationsRemaining < 2U || budget.stopRequested()) {
       return PdfStepResult::paused();
     }
-    (void)budget.takeBytes(sizeof(PdfObjectReference));
-    const PdfStatus status =
-        encodeDiscoveryOverflowRecord(cacheSetupRecordIndex_, sourceWindow_.get(), PdfLimits::SourceBufferBytes);
+    budget.operationsRemaining -= 2U;
+    const size_t inputBytes = static_cast<size_t>(batchRecords) * sizeof(PdfObjectReference);
+    const size_t encodedBytes = static_cast<size_t>(batchRecords) * kDiscoveryOverflowRecordBytes;
+    budget.bytesRemaining -= inputBytes + encodedBytes;
+    auto* const references = reinterpret_cast<PdfObjectReference*>(runRecords_.get());
+    PdfStatus status =
+        annotationOverflowSpool_.readRecords(cacheSetupRecordIndex_, references, batchRecords);
+    for (uint32_t index = 0; status && index < batchRecords; ++index) {
+      status = encodeDiscoveryOverflowRecord(
+          cacheSetupRecordIndex_ + index, references[index],
+          pageText_.get() + static_cast<size_t>(index) * kDiscoveryOverflowRecordBytes,
+          PdfLimits::PageTextBytes - static_cast<size_t>(index) * kDiscoveryOverflowRecordBytes);
+    }
     if (!status) {
       return PdfStepResult::failure(status);
     }
-    const PdfStepResult result =
-        writeResumeJournalBuffer(budget, sourceWindow_.get(), kDiscoveryOverflowRecordBytes);
-    if (!result.complete()) {
-      return result;
+    size_t bytesWritten = 0;
+    status = config_.io.write(config_.io.context, resumeJournalHandle_, pageText_.get(), encodedBytes, &bytesWritten);
+    if (!status || bytesWritten != encodedBytes) {
+      return PdfStepResult::failure(status ? PdfStatus::failure(PdfError::IoFailure, bytesWritten) : status);
     }
-    cacheSetupCrc32_ =
-        pdfCacheCrc32(sourceWindow_.get(), kDiscoveryOverflowRecordBytes, cacheSetupCrc32_);
-    cacheSetupDecodedLedger_ =
-        pdfCacheFnv64(sourceWindow_.get(), kDiscoveryOverflowRecordBytes, cacheSetupDecodedLedger_);
-    cacheSetupOffset_ += kDiscoveryOverflowRecordBytes;
-    ++cacheSetupRecordIndex_;
+    cacheSetupCrc32_ = pdfCacheCrc32(pageText_.get(), encodedBytes, cacheSetupCrc32_);
+    cacheSetupDecodedLedger_ = pdfCacheFnv64(pageText_.get(), encodedBytes, cacheSetupDecodedLedger_);
+    cacheSetupOffset_ += encodedBytes;
+    cacheSetupRecordIndex_ += batchRecords;
+    return PdfStepResult::paused();
+  }
+  if (resumePointStage_ == ResumePointStage::WriteDiscoveryContentOverflow) {
+    const uint32_t overflowCount = contentOverflowSpool_.recordCount();
+    if (!contentOverflowSpool_.isOpen()) {
+      if (sourceHandle_.valid()) {
+        if (!budget.consumeOperation()) {
+          return PdfStepResult::paused();
+        }
+        const PdfStatus status = closeSource();
+        return status ? PdfStepResult::paused() : PdfStepResult::failure(status);
+      }
+      if (xrefFinalSpool_ < std::size(xrefSpools_) && xrefSpools_[xrefFinalSpool_].isOpen()) {
+        if (!budget.consumeOperation()) {
+          return PdfStepResult::paused();
+        }
+        const PdfStatus status = xrefSpools_[xrefFinalSpool_].close();
+        return status ? PdfStepResult::paused() : PdfStepResult::failure(status);
+      }
+      if (!budget.consumeOperation()) {
+        return PdfStepResult::paused();
+      }
+      char path[PDF_CACHE_PATH_CAPACITY]{};
+      PdfStatus status = formatContentOverflowSpoolPath(path, sizeof(path));
+      if (status) {
+        status = contentOverflowSpool_.open(path, PdfCacheOpenMode::Read, overflowCount);
+      }
+      return status ? PdfStepResult::paused() : PdfStepResult::failure(status);
+    }
+    if (cacheSetupRecordIndex_ >= overflowCount) {
+      if (!budget.consumeOperation()) {
+        return PdfStepResult::paused();
+      }
+      const PdfStatus status = contentOverflowSpool_.close();
+      if (!status) {
+        return PdfStepResult::failure(status);
+      }
+      resumePointStage_ = ResumePointStage::WriteDiscoveryTrailer;
+      return PdfStepResult::paused();
+    }
+    const uint32_t recordsRemaining = overflowCount - cacheSetupRecordIndex_;
+    const size_t bytesPerRecord =
+        sizeof(PdfPageContentOverflowRecord) + kDiscoveryContentOverflowRecordBytes;
+    const uint32_t recordsByBytes = static_cast<uint32_t>(budget.bytesRemaining / bytesPerRecord);
+    const uint32_t batchRecords = std::min<uint32_t>(
+        std::min<uint32_t>(recordsRemaining, recordsByBytes), kResumeContentOverflowBatchRecords);
+    if (batchRecords == 0 || budget.operationsRemaining < 2U || budget.stopRequested()) {
+      return PdfStepResult::paused();
+    }
+    budget.operationsRemaining -= 2U;
+    const size_t inputBytes = static_cast<size_t>(batchRecords) * sizeof(PdfPageContentOverflowRecord);
+    const size_t encodedBytes = static_cast<size_t>(batchRecords) * kDiscoveryContentOverflowRecordBytes;
+    budget.bytesRemaining -= inputBytes + encodedBytes;
+    auto* const records = reinterpret_cast<PdfPageContentOverflowRecord*>(runRecords_.get());
+    PdfStatus status = contentOverflowSpool_.readRecords(cacheSetupRecordIndex_, records, batchRecords);
+    for (uint32_t index = 0; status && index < batchRecords; ++index) {
+      status = encodeDiscoveryContentOverflowRecord(
+          cacheSetupRecordIndex_ + index, records[index],
+          pageText_.get() + static_cast<size_t>(index) * kDiscoveryContentOverflowRecordBytes,
+          PdfLimits::PageTextBytes - static_cast<size_t>(index) * kDiscoveryContentOverflowRecordBytes);
+    }
+    if (!status) {
+      return PdfStepResult::failure(status);
+    }
+    size_t bytesWritten = 0;
+    status = config_.io.write(config_.io.context, resumeJournalHandle_, pageText_.get(), encodedBytes,
+                              &bytesWritten);
+    if (!status || bytesWritten != encodedBytes) {
+      return PdfStepResult::failure(status ? PdfStatus::failure(PdfError::IoFailure, bytesWritten) : status);
+    }
+    cacheSetupCrc32_ = pdfCacheCrc32(pageText_.get(), encodedBytes, cacheSetupCrc32_);
+    cacheSetupDecodedLedger_ = pdfCacheFnv64(pageText_.get(), encodedBytes, cacheSetupDecodedLedger_);
+    cacheSetupOffset_ += encodedBytes;
+    cacheSetupRecordIndex_ += batchRecords;
     return PdfStepResult::paused();
   }
   if (resumePointStage_ == ResumePointStage::WriteDiscoveryTrailer) {
@@ -17570,7 +18883,8 @@ PdfStepResult PdfPreparation::stepCommitCheckpoint(PdfWorkBudget& budget, const 
           : committingPage ? static_cast<uint32_t>(resumeJournalCommittedBytes_ + kPageResumeRecordBytes +
                                                    (resumeJournalCommittedBytes_ == 0 ? cacheSetupFileSize_ : 0))
           : checkpoint.resumePhase == PdfBuildResumePhase::AfterImage ||
-                  checkpoint.resumePhase == PdfBuildResumePhase::AfterImageRepair
+                  checkpoint.resumePhase == PdfBuildResumePhase::AfterImageRepair ||
+                  (security_.active() && checkpoint.resumePhase == PdfBuildResumePhase::AfterEmitSections)
               ? static_cast<uint32_t>(resumeJournalCommittedBytes_)
               : 0;
       if (!committingDiscovery) {
@@ -17994,6 +19308,26 @@ PdfStepResult PdfPreparation::step() {
     }
 
     case PdfPreparationPhase::ParseXref: {
+      if (xrefParser_->compactionRequested()) {
+        if (!xrefSortResumeParsing_) {
+          if (xrefSortStage_ != XrefSortStage::Idle) {
+            return fail(PdfStatus::failure(PdfError::InvalidArgument));
+          }
+          xrefSortResumeParsing_ = true;
+        }
+        const PdfStepResult compact = stepSortXref(budget);
+        if (cancelRequested_) {
+          return cancel();
+        }
+        if (compact.failed()) {
+          return fail(compact.status);
+        }
+        if (compact.yielded()) {
+          return pause();
+        }
+        operation = resumeXrefAfterCompaction();
+        return operation ? pause() : fail(operation);
+      }
       ++workCounters_.xrefSteps;
       const PdfStepResult result = xrefParser_->step(budget);
       if (cancelRequested_) {
@@ -18026,6 +19360,28 @@ PdfStepResult PdfPreparation::step() {
         return pause();
       }
       operation = finishXref();
+      if (!operation) {
+        return fail(operation);
+      }
+      PdfSecurityTrailer security{};
+      setPhase(xref_->security(&security) ? PdfPreparationPhase::ResolveSecurity
+                                         : PdfPreparationPhase::ResolveCatalog,
+               xref_->security(&security) ? 32 : 35);
+      return pause();
+    }
+
+    case PdfPreparationPhase::ResolveSecurity: {
+      const PdfStepResult result = resolver_->step(budget);
+      if (cancelRequested_) {
+        return cancel();
+      }
+      if (result.failed()) {
+        return fail(result.status);
+      }
+      if (result.yielded()) {
+        return pause();
+      }
+      operation = finishSecurity();
       if (!operation) {
         return fail(operation);
       }
@@ -18111,10 +19467,9 @@ PdfStepResult PdfPreparation::step() {
           setPhase(PdfPreparationPhase::CloseSource, 90);
           return pause();
         }
-        resolver_.reset();
         operation = configureDefaultParserArena();
         if (operation) {
-          operation = resetResolverWorkspace();
+          resolver_->setStringTokenBuffer(nullptr, 0);
         }
         if (!operation) {
           return fail(operation);
@@ -18178,6 +19533,7 @@ PdfStepResult PdfPreparation::step() {
         return cancel();
       }
       if (result.failed()) {
+        resolver_->setSkipUnusedPageResources(false);
         if ((imageResolveTask_ == ImageResolveTask::FontObject ||
              imageResolveTask_ == ImageResolveTask::ToUnicodeObject) &&
             (result.status.error == PdfError::LimitExceeded || result.status.error == PdfError::Unsupported ||
@@ -18201,6 +19557,7 @@ PdfStepResult PdfPreparation::step() {
       if (result.yielded()) {
         return pause();
       }
+      resolver_->setSkipUnusedPageResources(false);
       operation = finishImageResolution();
       if (!operation) {
         if (imageResolveTask_ == ImageResolveTask::None && operation.error == PdfError::InvalidArgument) {
@@ -18237,6 +19594,17 @@ PdfStepResult PdfPreparation::step() {
           return operation ? pause() : fail(operation);
         }
         return fail(operation);
+      }
+      return pause();
+    }
+
+    case PdfPreparationPhase::ResolveContentOverflow: {
+      const PdfStepResult result = prepareContentOverflowBatch(budget);
+      if (cancelRequested_) {
+        return cancel();
+      }
+      if (result.failed()) {
+        return fail(result.status);
       }
       return pause();
     }

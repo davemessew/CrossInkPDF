@@ -33,6 +33,9 @@ class PdfFixedRecordSpool {
   // Appends a contiguous group in one storage write. `records` must contain
   // exactly `count * recordSize` bytes in fixed-record order.
   PdfStatus appendRecords(const void* records, uint32_t count);
+  // Reads a contiguous group in one storage operation. The destination must
+  // have room for exactly `count * recordSize` bytes.
+  PdfStatus readRecords(uint32_t ordinal, void* records, uint32_t count);
   PdfStatus rewriteExisting(uint32_t ordinal, const void* record, size_t recordSize);
   PdfStatus flush();
   PdfStatus sync();

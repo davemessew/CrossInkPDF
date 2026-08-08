@@ -126,11 +126,13 @@ PdfPageTreeWalker::PdfPageTreeWalker(PdfObjectResolver& resolver, PdfObjectArena
                                      const TraversalAccessFn traversalAccess, void* traversalContext,
                                      PdfPageInfo* const pageWorkspace,
                                      const PdfFixedRecordStore annotationOverflowStore,
-                                     const uint32_t maxPages)
+                                     const uint32_t maxPages,
+                                     const PdfFixedRecordStore contentOverflowStore)
     : resolver_(resolver),
       arena_(arena),
       traversalStore_(traversalStore),
       annotationOverflowStore_(annotationOverflowStore),
+      contentOverflowStore_(contentOverflowStore),
       pageFn_(pageFn),
       pageContext_(pageContext),
       traversalAccess_(traversalAccess),
@@ -161,9 +163,12 @@ PdfStatus PdfPageTreeWalker::begin(const PdfObjectReference rootPages) {
   processingStackTop_ = UINT32_MAX;
   ancestorOrdinal_ = UINT32_MAX;
   overflowAnnotationRecordCount_ = 0;
+  overflowContentRecordCount_ = 0;
   kidsValueIndex_ = PDF_INVALID_INDEX;
+  contentsValueIndex_ = PDF_INVALID_INDEX;
   annotationsValueIndex_ = PDF_INVALID_INDEX;
   kidsRemaining_ = 0;
+  contentOrdinal_ = 0;
   annotationOrdinal_ = 0;
   ancestorVisited_ = 0;
   processStage_ = ProcessStage::Idle;
@@ -211,26 +216,38 @@ PdfStepResult PdfPageTreeWalker::step(PdfWorkBudget& budget) {
         return fail(status);
       }
       recordCount_ = 1;
-      stackTop_ = 0;
-      phase_ = Phase::NeedNode;
-      // Do not begin a second SD-reader handoff in the same public slice. On
-      // slow cards the initialize open/write/close sequence can consume the
-      // full elapsed-time allowance even when abstract operations remain.
+      currentOrdinal_ = 0;
+      current_ = recordScratch_;
+      stackTop_ = UINT32_MAX;
+      const PdfStatus beginStatus = resolver_.begin(current_.reference);
+      if (!beginStatus.ok()) {
+        return fail(beginStatus);
+      }
+      phase_ = Phase::Resolving;
+      // The root record is already resident after initialization. Consume it
+      // directly instead of reopening the traversal spool to read it back.
       return PdfStepResult::paused();
     }
 
-    if (phase_ == Phase::NeedNode) {
+    if (phase_ == Phase::SelectNextNode) {
+      if (!traversalOpen_) {
+        return fail(PdfStatus::failure(PdfError::InvalidArgument, currentOrdinal_));
+      }
       if (stackTop_ == UINT32_MAX) {
+        const PdfStepResult closed = stepTraversalAccess(false, 1, budget);
+        if (!closed.complete()) {
+          return closed.failed() ? fail(closed.status) : closed;
+        }
         if (hasDeclaredRootCount_ && declaredRootCount_ != pageCount_) {
           return fail(PdfStatus::failure(PdfError::Malformed, pageCount_));
         }
         phase_ = Phase::Done;
+        pageCaptured_ = false;
         return PdfStepResult::completed();
       }
-      currentOrdinal_ = stackTop_;
-      constexpr uint32_t kSelectNodeOperations = 5;
+      constexpr uint32_t kSelectNodeOperations = 2;
       if (budget.cancelRequested()) {
-        return fail(PdfStatus::failure(PdfError::Cancelled, currentOrdinal_));
+        return fail(PdfStatus::failure(PdfError::Cancelled, stackTop_));
       }
       if (budget.stopRequested() || budget.operationsRemaining < kSelectNodeOperations ||
           budget.bytesRemaining < sizeof(PdfPageTreeRecord)) {
@@ -238,14 +255,12 @@ PdfStepResult PdfPageTreeWalker::step(PdfWorkBudget& budget) {
       }
       budget.operationsRemaining -= kSelectNodeOperations;
       budget.bytesRemaining -= sizeof(PdfPageTreeRecord);
-      resolver_.invalidateSourceAccess();
-      PdfStatus readStatus = traversalAccess_(traversalContext_, true);
-      if (readStatus) {
-        traversalOpen_ = true;
-        readStatus = pdfReadRecord(traversalStore_, currentOrdinal_, &current_);
+      currentOrdinal_ = stackTop_;
+      PdfStatus readStatus = pdfReadRecord(traversalStore_, currentOrdinal_, &current_);
+      const PdfStatus closeStatus = traversalAccess_(traversalContext_, false);
+      if (closeStatus) {
+        traversalOpen_ = false;
       }
-      const PdfStatus closeStatus = traversalOpen_ ? traversalAccess_(traversalContext_, false) : PdfStatus::success();
-      traversalOpen_ = false;
       if (readStatus && !closeStatus) {
         readStatus = closeStatus;
       }
@@ -258,8 +273,11 @@ PdfStepResult PdfPageTreeWalker::step(PdfWorkBudget& budget) {
         return fail(beginStatus);
       }
       phase_ = Phase::Resolving;
-      // Selecting a node already performs the traversal open/read/close
-      // handoff. Start xref/source resolution on the next public slice.
+      processStage_ = ProcessStage::Idle;
+      pageCaptured_ = false;
+      // Select the next node before releasing the traversal reader. Xref/source
+      // resolution still starts on the next public slice, preserving the
+      // single-reader handoff boundary without reopening the traversal spool.
       return PdfStepResult::paused();
     }
 
@@ -293,21 +311,7 @@ PdfStepResult PdfPageTreeWalker::step(PdfWorkBudget& budget) {
       if (!processed.complete()) {
         return processed.failed() ? fail(processed.status) : processed;
       }
-      phase_ = Phase::CloseTraversal;
-      continue;
-    }
-
-    if (phase_ == Phase::CloseTraversal) {
-      const PdfStepResult closed = stepTraversalAccess(false, 1, budget);
-      if (!closed.complete()) {
-        return closed.failed() ? fail(closed.status) : closed;
-      }
-      phase_ = Phase::NeedNode;
-      processStage_ = ProcessStage::Idle;
-      if (pageCaptured_) {
-        pageCaptured_ = false;
-        return PdfStepResult::paused();
-      }
+      phase_ = Phase::SelectNextNode;
       continue;
     }
 
@@ -412,11 +416,14 @@ PdfStepResult PdfPageTreeWalker::processResolvedNode(PdfWorkBudget& budget) {
       const PdfRectangle viewBox = effectivePageBox(current_);
       page.viewXMin = viewBox.xMin;
       page.viewYMin = viewBox.yMin;
+      page.contentOverflowStart = overflowContentRecordCount_;
       const PdfStatus geometryStatus = orientedPageExtent(current_, &page.pageWidth, &page.pageHeight);
       if (!geometryStatus) {
         return fail(geometryStatus);
       }
 
+      contentsValueIndex_ = PDF_INVALID_INDEX;
+      ProcessStage contentStage = ProcessStage::BeginAnnotations;
       if (pdfDictionaryFind(arena_, resolved.rootIndex, "Contents", &valueIndex)) {
         if (valueIndex >= arena_.valueCount) {
           return fail(PdfStatus::failure(PdfError::Malformed, current_.reference.objectNumber));
@@ -426,20 +433,9 @@ PdfStepResult PdfPageTreeWalker::processResolvedNode(PdfWorkBudget& budget) {
           page.contents[0] = {contents.objectNumber, contents.generation};
           page.contentCount = 1;
         } else if (contents.kind == PdfValueKind::Array) {
-          if (contents.count > PdfLimits::MaxContentStreamsPerPage) {
-            return fail(PdfStatus::failure(PdfError::LimitExceeded, current_.reference.objectNumber));
-          }
-          for (uint16_t ordinal = 0; ordinal < contents.count; ++ordinal) {
-            uint16_t contentIndex = PDF_INVALID_INDEX;
-            if (!pdfArrayAt(arena_, valueIndex, ordinal, &contentIndex) || contentIndex >= arena_.valueCount) {
-              return fail(PdfStatus::failure(PdfError::Malformed, current_.reference.objectNumber));
-            }
-            const PdfValue& content = arena_.values[contentIndex];
-            if (content.kind != PdfValueKind::Reference) {
-              return fail(PdfStatus::failure(PdfError::Malformed, current_.reference.objectNumber));
-            }
-            page.contents[page.contentCount++] = {content.objectNumber, content.generation};
-          }
+          contentsValueIndex_ = valueIndex;
+          contentOrdinal_ = 0;
+          contentStage = contents.count == 0 ? ProcessStage::BeginAnnotations : ProcessStage::LoadContent;
         } else {
           return fail(PdfStatus::failure(PdfError::Malformed, current_.reference.objectNumber));
         }
@@ -451,17 +447,16 @@ PdfStepResult PdfPageTreeWalker::processResolvedNode(PdfWorkBudget& budget) {
         }
         if (arena_.values[valueIndex].kind == PdfValueKind::Array) {
           annotationsValueIndex_ = valueIndex;
-          annotationOrdinal_ = 0;
-          processStage_ = arena_.values[valueIndex].count == 0 ? ProcessStage::EmitPage
-                                                               : ProcessStage::LoadAnnotation;
         } else if (arena_.values[valueIndex].kind == PdfValueKind::Reference) {
-          processStage_ = ProcessStage::EmitPage;
+          annotationsValueIndex_ = PDF_INVALID_INDEX;
         } else {
           return fail(PdfStatus::failure(PdfError::Malformed, current_.reference.objectNumber));
         }
       } else {
-        processStage_ = ProcessStage::EmitPage;
+        annotationsValueIndex_ = PDF_INVALID_INDEX;
       }
+      annotationOrdinal_ = 0;
+      processStage_ = contentStage;
     } else {
       return fail(PdfStatus::failure(PdfError::Malformed, current_.reference.objectNumber));
     }
@@ -608,6 +603,72 @@ PdfStepResult PdfPageTreeWalker::processResolvedNode(PdfWorkBudget& budget) {
       ++pageCount_;
       pageCaptured_ = true;
       processStage_ = ProcessStage::Complete;
+      continue;
+    }
+
+    if (processStage_ == ProcessStage::LoadContent) {
+      if (contentsValueIndex_ >= arena_.valueCount ||
+          arena_.values[contentsValueIndex_].kind != PdfValueKind::Array) {
+        return fail(PdfStatus::failure(PdfError::Malformed, current_.reference.objectNumber));
+      }
+      const uint16_t contentCount = arena_.values[contentsValueIndex_].count;
+      if (contentOrdinal_ >= contentCount) {
+        processStage_ = ProcessStage::BeginAnnotations;
+        continue;
+      }
+      const uint16_t ordinal = contentOrdinal_;
+      uint16_t contentIndex = PDF_INVALID_INDEX;
+      if (!pdfArrayAt(arena_, contentsValueIndex_, ordinal, &contentIndex) ||
+          contentIndex >= arena_.valueCount) {
+        return fail(PdfStatus::failure(PdfError::Malformed, current_.reference.objectNumber));
+      }
+      const PdfValue& content = arena_.values[contentIndex];
+      if (content.kind != PdfValueKind::Reference) {
+        return fail(PdfStatus::failure(PdfError::Malformed, current_.reference.objectNumber));
+      }
+      PdfPageInfo& page = *pageWorkspace_;
+      const PdfObjectReference reference{content.objectNumber, content.generation};
+      if (ordinal < PdfLimits::MaxContentStreamsPerPage) {
+        page.contents[page.contentCount++] = reference;
+        ++contentOrdinal_;
+        continue;
+      }
+      constexpr uint16_t kMaximumOverflowContentCount =
+          UINT16_MAX - PdfLimits::MaxContentStreamsPerPage;
+      if (!contentOverflowStore_.valid() ||
+          contentOverflowStore_.recordSize != sizeof(PdfPageContentOverflowRecord) ||
+          page.overflowContentCount >= kMaximumOverflowContentCount ||
+          overflowContentRecordCount_ >= contentOverflowStore_.capacity) {
+        return fail(PdfStatus::failure(PdfError::InsufficientStorage, overflowContentRecordCount_));
+      }
+      if (budget.cancelRequested()) {
+        return fail(PdfStatus::failure(PdfError::Cancelled, ordinal));
+      }
+      if (budget.stopRequested() || budget.operationsRemaining == 0 ||
+          budget.bytesRemaining < sizeof(PdfPageContentOverflowRecord)) {
+        return PdfStepResult::paused();
+      }
+      --budget.operationsRemaining;
+      budget.bytesRemaining -= sizeof(PdfPageContentOverflowRecord);
+      const PdfPageContentOverflowRecord record{page.pageIndex, ordinal, 0, reference};
+      const PdfStatus status = pdfWriteRecord(contentOverflowStore_, overflowContentRecordCount_, &record);
+      if (!status) {
+        return fail(status);
+      }
+      ++contentOrdinal_;
+      ++overflowContentRecordCount_;
+      ++page.overflowContentCount;
+      // At most one overflow-spool write is issued in a public slice.
+      return PdfStepResult::paused();
+    }
+
+    if (processStage_ == ProcessStage::BeginAnnotations) {
+      processStage_ =
+          annotationsValueIndex_ < arena_.valueCount &&
+                  arena_.values[annotationsValueIndex_].kind == PdfValueKind::Array &&
+                  arena_.values[annotationsValueIndex_].count != 0
+              ? ProcessStage::LoadAnnotation
+              : ProcessStage::EmitPage;
       continue;
     }
 

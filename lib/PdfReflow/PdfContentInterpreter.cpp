@@ -7,6 +7,9 @@
 
 namespace {
 
+constexpr uint64_t OPERATOR_PAGE_LIMIT = std::numeric_limits<uint64_t>::max();
+constexpr uint64_t OPERATOR_DOCUMENT_LIMIT = OPERATOR_PAGE_LIMIT - 1;
+
 bool tokenEquals(const PdfToken& token, const char* expected) {
   const size_t length = std::strlen(expected);
   return token.length == length && std::memcmp(token.bytes, expected, length) == 0;
@@ -342,6 +345,17 @@ PdfStepResult PdfContentInterpreter::step(PdfWorkBudget& budget) {
     }
     const PdfStatus status = handleToken(token);
     if (!status.ok()) {
+      if (status.error == PdfError::LimitExceeded &&
+          (status.offset == OPERATOR_PAGE_LIMIT || status.offset == OPERATOR_DOCUMENT_LIMIT)) {
+        pageModel_->abortTextRun();
+        pageModel_->addWarning(PdfPageWarning::VectorArtOmitted);
+        if (status.offset == OPERATOR_DOCUMENT_LIMIT && workspace_.documentOperatorCount != nullptr) {
+          *workspace_.documentOperatorCount = 0;
+        }
+        clearOperands();
+        phase_ = Phase::Done;
+        return PdfStepResult::completed();
+      }
       if (status.error == PdfError::LimitExceeded && formDepth_ != 0) {
         pageModel_->addWarning(PdfPageWarning::VectorArtOmitted);
         const PdfStatus abandonStatus = abandonCurrentForm();
@@ -611,11 +625,11 @@ PdfStatus PdfContentInterpreter::handleToken(const PdfToken& token) {
 
 PdfStatus PdfContentInterpreter::countOperator() {
   if (operatorCount_ >= PdfLimits::MaxOperatorsPerPage) {
-    return failStatus(PdfError::LimitExceeded);
+    return PdfStatus::failure(PdfError::LimitExceeded, OPERATOR_PAGE_LIMIT);
   }
   if (workspace_.documentOperatorCount != nullptr) {
     if (*workspace_.documentOperatorCount >= PdfLimits::MaxOperatorsPerDocument) {
-      return failStatus(PdfError::LimitExceeded);
+      return PdfStatus::failure(PdfError::LimitExceeded, OPERATOR_DOCUMENT_LIMIT);
     }
     ++*workspace_.documentOperatorCount;
   }
@@ -1134,11 +1148,13 @@ PdfStatus PdfContentInterpreter::enterForm(const PdfContentXObject& form) {
     return PdfStatus::success();
   }
   if (!form.content.valid() || formDepth_ >= PdfLimits::MaxFormDepth) {
-    return failStatus(PdfError::LimitExceeded);
+    pageModel_->addWarning(PdfPageWarning::VectorArtOmitted);
+    return PdfStatus::success();
   }
   for (uint8_t index = 0; index < formDepth_; ++index) {
     if (form.reference == formStack_[index].formReference) {
-      return failStatus(PdfError::Malformed);
+      pageModel_->addWarning(PdfPageWarning::VectorArtOmitted);
+      return PdfStatus::success();
     }
   }
   FormFrame& frame = formStack_[formDepth_];
@@ -1456,7 +1472,7 @@ PdfStatus PdfContentInterpreter::emitDecodedText(const uint8_t* const source, co
   while (offset < length) {
     PdfDecodedGlyph glyph{};
     status = text_.font->decodeNext(source + offset, length - offset, &glyph);
-    if (!status && status.error == PdfError::UnsupportedEncoding) {
+    if (!status && (status.error == PdfError::UnsupportedEncoding || status.error == PdfError::LimitExceeded)) {
       glyph.sourceLength = static_cast<uint8_t>(std::min<size_t>(text_.font->cid() ? 2U : 1U, length - offset));
       glyph.sourceCode = 0;
       for (uint8_t index = 0; index < glyph.sourceLength; ++index) {

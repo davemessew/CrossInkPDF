@@ -52,14 +52,33 @@ uint64_t readLe64(const uint8_t* input) {
   return value;
 }
 
+bool bytesAreZero(const uint8_t* const input, const size_t length) {
+  for (size_t index = 0; index < length; ++index) {
+    if (input[index] != 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool validRecord(const PdfDeferredImageRecord& record) {
   const uint64_t tagEnd = static_cast<uint64_t>(record.tagOffset) + record.tagLength;
-  return record.streamLength != 0 && record.width != 0 && record.height != 0 &&
+  return record.reference.objectNumber != 0 && record.streamLength != 0 && record.width != 0 && record.height != 0 &&
          record.filterCount <= PdfLimits::MaxFiltersPerStream &&
          record.auxiliaryFilterCount <= PdfLimits::MaxFiltersPerStream &&
          record.paletteBytes <= sizeof(record.palette) && record.tagLength != 0 && tagEnd <= UINT32_MAX &&
          (!record.hasAuxiliary ||
-          (record.auxiliaryStreamLength != 0 && record.auxiliaryWidth != 0 && record.auxiliaryHeight != 0));
+          (record.auxiliaryReference.objectNumber != 0 && record.auxiliaryStreamLength != 0 &&
+           record.auxiliaryWidth != 0 && record.auxiliaryHeight != 0));
+}
+
+void encodeReference(const PdfObjectReference reference, uint8_t* const output) {
+  writeLe32(output, reference.objectNumber);
+  writeLe16(output + 4, reference.generation);
+}
+
+PdfObjectReference decodeReference(const uint8_t* const input) {
+  return {readLe32(input), readLe16(input + 4)};
 }
 
 void encodeRecord(const PdfDeferredImageRecord& record, uint8_t* output) {
@@ -98,11 +117,15 @@ void encodeRecord(const PdfDeferredImageRecord& record, uint8_t* output) {
   writeLe16(output + 852, record.sectionIndex);
   writeLe16(output + 854, record.tagLength);
   writeLe32(output + 856, record.tagOffset);
+  encodeReference(record.reference, output + 860);
+  encodeReference(record.auxiliaryReference, output + 866);
   writeLe32(output + PDF_IMAGE_BUILD_RECORD_BYTES - 4U, pdfCacheCrc32(output, PDF_IMAGE_BUILD_RECORD_BYTES - 4U));
 }
 
 bool decodeRecord(const uint8_t* input, PdfDeferredImageRecord* record) {
-  if (readLe32(input + PDF_IMAGE_BUILD_RECORD_BYTES - 4U) != pdfCacheCrc32(input, PDF_IMAGE_BUILD_RECORD_BYTES - 4U)) {
+  if (readLe32(input + PDF_IMAGE_BUILD_RECORD_BYTES - 4U) !=
+          pdfCacheCrc32(input, PDF_IMAGE_BUILD_RECORD_BYTES - 4U) ||
+      !bytesAreZero(input + 872, 4)) {
     return false;
   }
   record->~PdfDeferredImageRecord();
@@ -145,11 +168,15 @@ bool decodeRecord(const uint8_t* input, PdfDeferredImageRecord* record) {
   record->sectionIndex = readLe16(input + 852);
   record->tagLength = readLe16(input + 854);
   record->tagOffset = readLe32(input + 856);
+  record->reference = decodeReference(input + 860);
+  record->auxiliaryReference = decodeReference(input + 866);
   return validRecord(*record);
 }
 
 bool validEncodedRecord(const uint8_t* input) {
-  if (readLe32(input + PDF_IMAGE_BUILD_RECORD_BYTES - 4U) != pdfCacheCrc32(input, PDF_IMAGE_BUILD_RECORD_BYTES - 4U)) {
+  if (readLe32(input + PDF_IMAGE_BUILD_RECORD_BYTES - 4U) !=
+          pdfCacheCrc32(input, PDF_IMAGE_BUILD_RECORD_BYTES - 4U) ||
+      !bytesAreZero(input + 872, 4)) {
     return false;
   }
   const uint8_t filterCount = input[64];
@@ -158,11 +185,16 @@ bool validEncodedRecord(const uint8_t* input) {
   const uint16_t paletteBytes = readLe16(input + 80);
   const uint16_t tagLength = readLe16(input + 854);
   const uint32_t tagOffset = readLe32(input + 856);
-  return readLe64(input + 8) != 0 && readLe32(input + 44) != 0 && readLe32(input + 48) != 0 &&
+  const PdfObjectReference reference = decodeReference(input + 860);
+  const PdfObjectReference auxiliaryReference = decodeReference(input + 866);
+  return reference.objectNumber != 0 && readLe64(input + 8) != 0 && readLe32(input + 44) != 0 &&
+         readLe32(input + 48) != 0 &&
          filterCount <= PdfLimits::MaxFiltersPerStream && auxiliaryFilterCount <= PdfLimits::MaxFiltersPerStream &&
          paletteBytes <= PDF_IMAGE_BUILD_PALETTE_BYTES && tagLength != 0 &&
          static_cast<uint64_t>(tagOffset) + tagLength <= UINT32_MAX &&
-         (!hasAuxiliary || (readLe64(input + 32) != 0 && readLe32(input + 52) != 0 && readLe32(input + 56) != 0));
+         (!hasAuxiliary ||
+          (auxiliaryReference.objectNumber != 0 && readLe64(input + 32) != 0 && readLe32(input + 52) != 0 &&
+           readLe32(input + 56) != 0));
 }
 
 bool validFileRecord(const PdfRequiredFileRecord& record) {

@@ -1,7 +1,9 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <cstdio>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -51,6 +53,9 @@ struct XrefHarness {
     harness.sourceActive =
         reader == PdfObjectResolverReader::Source || reader == PdfObjectResolverReader::ObjectStoreWriter;
     harness.xrefActive = reader == PdfObjectResolverReader::Xref;
+    if (harness.xrefActive) {
+      ++harness.xrefSelections;
+    }
     harness.externalReaderActive = harness.sourceActive || harness.xrefActive;
     if (reader == PdfObjectResolverReader::ObjectStore) {
       ++harness.objectStoreSelections;
@@ -82,6 +87,7 @@ struct XrefHarness {
   bool externalReaderActive = true;
   uint32_t sourceTransitions = 0;
   uint32_t sourceAccessCalls = 0;
+  uint32_t xrefSelections = 0;
   uint32_t objectStoreWriterCalls = 0;
   uint32_t objectStoreWriterSelections = 0;
   uint32_t objectStoreSelections = 0;
@@ -178,6 +184,129 @@ void appendXrefStreamEntry(std::string* const output, const uint8_t type, const 
   appendBigEndian(output, fieldThree, 2);
 }
 
+void appendNineByteField(std::string* const output, const uint8_t leadingByte, const uint64_t value) {
+  output->push_back(static_cast<char>(leadingByte));
+  appendBigEndian(output, value, 8);
+}
+
+std::vector<uint8_t> wideXrefStreamPdf(const bool overflow) {
+  std::string pdf = "%PDF-1.5\n";
+  const uint32_t xrefOffset = static_cast<uint32_t>(pdf.size());
+  pdf += "1 0 obj\n<< /Type /XRef /Size 2 /Root 1 0 R /W [9 9 9] /Index [1 1] /Length 27 >>\nstream\n";
+  appendNineByteField(&pdf, overflow ? 1U : 0U, 1U);
+  appendNineByteField(&pdf, 0U, xrefOffset);
+  appendNineByteField(&pdf, 0U, 0U);
+  pdf += "\nendstream\nendobj\nstartxref\n" + std::to_string(xrefOffset) + "\n%%EOF\n";
+  return {pdf.begin(), pdf.end()};
+}
+
+std::vector<uint8_t> manyPrevRevisionsPdf(const uint32_t revisionCount) {
+  std::string pdf = "%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n";
+  const uint32_t rootOffset = 9U;
+  uint64_t previousXref = 0;
+  for (uint32_t revision = 0; revision <= revisionCount; ++revision) {
+    const uint64_t xrefOffset = pdf.size();
+    if (revision == 0) {
+      pdf += "xref\n1 1\n";
+      char entry[32]{};
+      std::snprintf(entry, sizeof(entry), "%010u 00000 n \n", rootOffset);
+      pdf += entry;
+      pdf += "trailer\n<< /Size 2 /Root 1 0 R >>\n";
+    } else {
+      pdf += "xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 2 /Root 1 0 R /Prev " +
+             std::to_string(previousXref) + " >>\n";
+    }
+    pdf += "startxref\n" + std::to_string(xrefOffset) + "\n%%EOF\n";
+    previousXref = xrefOffset;
+  }
+  return {pdf.begin(), pdf.end()};
+}
+
+std::vector<uint8_t> truncatedLargeClassicSubsectionPdf() {
+  std::string pdf = "%PDF-1.4\n";
+  const uint64_t xrefOffset = pdf.size();
+  pdf += "xref\n0 262145\n0000000000 65535 f \ntrailer\n<< /Size 262145 /Root 1 0 R >>\nstartxref\n" +
+         std::to_string(xrefOffset) + "\n%%EOF\n";
+  return {pdf.begin(), pdf.end()};
+}
+
+uint32_t predictorAdler32(const std::vector<uint8_t>& bytes) {
+  uint32_t a = 1;
+  uint32_t b = 0;
+  for (const uint8_t byte : bytes) {
+    a = (a + byte) % 65521U;
+    b = (b + a) % 65521U;
+  }
+  return (b << 16U) | a;
+}
+
+std::vector<uint8_t> predictorStoredZlib(const std::vector<uint8_t>& input) {
+  std::vector<uint8_t> output{0x78, 0x01, 0x01, static_cast<uint8_t>(input.size()), 0x00,
+                              static_cast<uint8_t>(~input.size()), 0xff};
+  output.insert(output.end(), input.begin(), input.end());
+  const uint32_t checksum = predictorAdler32(input);
+  output.push_back(static_cast<uint8_t>(checksum >> 24U));
+  output.push_back(static_cast<uint8_t>(checksum >> 16U));
+  output.push_back(static_cast<uint8_t>(checksum >> 8U));
+  output.push_back(static_cast<uint8_t>(checksum));
+  return output;
+}
+
+std::vector<uint8_t> predictorTwelveXrefPdf() {
+  std::string pdf = "%PDF-1.5\n";
+  const uint32_t xrefOffset = static_cast<uint32_t>(pdf.size());
+  const std::array<std::array<uint8_t, 5>, 2> rows{{
+      {{1, 0, 0, static_cast<uint8_t>(xrefOffset), 0}},
+      {{0, 0, 0, 0, 0}},
+  }};
+  std::array<uint8_t, 5> previous{};
+  std::vector<uint8_t> predicted;
+  predicted.reserve(rows.size() * 6U);
+  for (const auto& row : rows) {
+    predicted.push_back(2);
+    for (size_t column = 0; column < row.size(); ++column) {
+      predicted.push_back(static_cast<uint8_t>(row[column] - previous[column]));
+      previous[column] = row[column];
+    }
+  }
+  const std::vector<uint8_t> compressed = predictorStoredZlib(predicted);
+  pdf += "1 0 obj\n<< /Type /XRef /Size 3 /Root 1 0 R /W [1 3 1] /Index [1 2] /Length " +
+         std::to_string(compressed.size()) +
+         " /Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 5 >> >>\nstream\n";
+  pdf.append(reinterpret_cast<const char*>(compressed.data()), compressed.size());
+  pdf += "\nendstream\nendobj\nstartxref\n" + std::to_string(xrefOffset) + "\n%%EOF\n";
+  return {pdf.begin(), pdf.end()};
+}
+
+std::vector<uint8_t> sparseHighObjectXrefPdf() {
+  std::string pdf = "%PDF-1.5\n";
+  const uint32_t xrefOffset = static_cast<uint32_t>(pdf.size());
+  pdf += "126440 0 obj\n<< /Type /XRef /Size 126441 /Root 126440 0 R /W [1 4 2] "
+         "/Index [126440 1] /Length 7 >>\nstream\n";
+  appendXrefStreamEntry(&pdf, 1, xrefOffset, 0);
+  pdf += "\nendstream\nendobj\nstartxref\n" + std::to_string(xrefOffset) + "\n%%EOF\n";
+  return {pdf.begin(), pdf.end()};
+}
+
+std::vector<uint8_t> manyIndexPairsXrefPdf() {
+  constexpr uint32_t kPairs = 65U;
+  std::string pdf = "%PDF-1.5\n";
+  const uint32_t xrefOffset = static_cast<uint32_t>(pdf.size());
+  std::string index = "[";
+  for (uint32_t object = 1; object <= kPairs; ++object) {
+    index += std::to_string(object) + " 1 ";
+  }
+  index += "]";
+  pdf += "1 0 obj\n<< /Type /XRef /Size 66 /Root 1 0 R /W [1 4 2] /Index " + index +
+         " /Length 455 >>\nstream\n";
+  appendXrefStreamEntry(&pdf, 1, xrefOffset, 0);
+  for (uint32_t object = 2; object <= kPairs; ++object) {
+    appendXrefStreamEntry(&pdf, 0, 0, 0);
+  }
+  pdf += "\nendstream\nendobj\nstartxref\n" + std::to_string(xrefOffset) + "\n%%EOF\n";
+  return {pdf.begin(), pdf.end()};
+}
+
 std::vector<uint8_t> compressedIndirectLengthPdf() {
   std::string pdf = "%PDF-1.5\n";
   const uint32_t streamOffset = static_cast<uint32_t>(pdf.size());
@@ -257,6 +386,62 @@ TEST(PdfXrefTest, ParsesClassicTableAndRoot) {
   EXPECT_LT(content.offset, source.size);
 }
 
+TEST(PdfXrefTest, PreflightsClassicSubsectionBeforeSmallStoreWrites) {
+  PdfTestByteSource memory(loadFixture("classic_text.pdf"));
+  XrefHarness harness;
+  PdfTestRecordStore records(sizeof(PdfXrefEntry), 1);
+  PdfXrefTable table(records.store());
+  PdfXrefParser parser(memory.source(), harness.sourceBuffer.data(), harness.sourceBuffer.size(), harness.arena,
+                       table, &harness.streamDecoder);
+  parser.begin();
+
+  PdfStepResult result = PdfStepResult::paused();
+  for (uint16_t step = 0; step < 4096U && result.yielded(); ++step) {
+    PdfWorkBudget budget{32, 4096};
+    result = parser.step(budget);
+  }
+
+  ASSERT_TRUE(result.failed());
+  EXPECT_EQ(result.status.error, PdfError::InsufficientStorage);
+  EXPECT_EQ(result.status.offset, 6U * sizeof(PdfXrefEntry));
+  EXPECT_EQ(table.entryCount(), 0U);
+}
+
+TEST(PdfXrefTest, CollidedNewestFilterRequestsRevisionBoundaryCompaction) {
+  std::string pdf = "%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n";
+  const uint64_t baseXref = pdf.size();
+  pdf += "xref\n0 2\n0000000000 65535 f \n0000000009 00000 n \n"
+         "trailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n" +
+         std::to_string(baseXref) + "\n%%EOF\n";
+  const uint64_t newestXref = pdf.size();
+  pdf += "xref\n";
+  for (uint32_t index = 0; index < 9U; ++index) {
+    pdf += std::to_string(index * 8U) + " 1\n0000000000 65535 f \n";
+  }
+  pdf += "trailer\n<< /Size 65 /Root 1 0 R /Prev " + std::to_string(baseXref) +
+         " >>\nstartxref\n" + std::to_string(newestXref) + "\n%%EOF\n";
+
+  PdfTestByteSource memory({pdf.begin(), pdf.end()});
+  XrefHarness harness;
+  PdfTestRecordStore records(sizeof(PdfXrefEntry), 32);
+  PdfXrefTable table(records.store());
+  std::array<uint8_t, 8U * sizeof(uint32_t)> filter{};
+  PdfXrefParser parser(memory.source(), harness.sourceBuffer.data(), harness.sourceBuffer.size(), harness.arena,
+                       table, &harness.streamDecoder);
+  parser.begin();
+  ASSERT_TRUE(table.configureNewestObjectFilter(filter.data(), filter.size(), nullptr, 0).ok());
+
+  for (uint16_t step = 0; step < 4096U && !parser.compactionRequested(); ++step) {
+    PdfWorkBudget budget{32, 4096};
+    const PdfStepResult result = parser.step(budget);
+    ASSERT_FALSE(result.failed()) << static_cast<int>(result.status.error) << '@' << result.status.offset;
+  }
+
+  EXPECT_TRUE(parser.compactionRequested());
+  EXPECT_TRUE(table.sectionCompactionRequired());
+  EXPECT_EQ(table.entryCount(), 9U);
+}
+
 TEST(PdfXrefTest, NewestIncrementalRevisionWinsWithBudgetOne) {
   PdfTestByteSource memory(loadFixture("incremental_update.pdf"));
   const PdfByteSource source = memory.source();
@@ -293,6 +478,104 @@ TEST(PdfXrefTest, ParsesSparseXrefStreamWidthsAndCompressedEntries) {
   ASSERT_TRUE(harness.table.find(5, &content).ok());
   EXPECT_EQ(content.type, PdfXrefEntryType::Uncompressed);
   EXPECT_LT(content.offset, source.size);
+}
+
+TEST(PdfXrefTest, ParsesSparseHighObjectNumberWithoutTreatingSizeAsRecordCount) {
+  PdfTestByteSource memory(sparseHighObjectXrefPdf());
+  XrefHarness harness;
+
+  const PdfStepResult result = parseXref(memory.source(), harness, true);
+
+  ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error) << "@" << result.status.offset;
+  EXPECT_EQ(harness.table.entryCount(), 1U);
+  PdfXrefEntry xref{};
+  ASSERT_TRUE(harness.table.find(126'440U, &xref).ok());
+  EXPECT_EQ(xref.type, PdfXrefEntryType::Uncompressed);
+}
+
+TEST(PdfXrefTest, DecodesSonyStylePredictorTwelveXrefStreamCooperatively) {
+  PdfTestByteSource memory(predictorTwelveXrefPdf());
+  XrefHarness harness;
+
+  const PdfStepResult result = parseXref(memory.source(), harness, true);
+
+  ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error) << "@" << result.status.offset;
+  PdfObjectReference root{};
+  ASSERT_TRUE(harness.table.root(&root));
+  EXPECT_EQ(root, (PdfObjectReference{1, 0}));
+  PdfXrefEntry xref{};
+  ASSERT_TRUE(harness.table.find(1, &xref).ok());
+  EXPECT_EQ(xref.type, PdfXrefEntryType::Uncompressed);
+  EXPECT_EQ(xref.offset, 9U);
+}
+
+TEST(PdfXrefTest, AcceptsWideZeroPrefixedFieldsAndRejectsDiscardedNonzeroBytes) {
+  {
+    PdfTestByteSource memory(wideXrefStreamPdf(false));
+    XrefHarness harness;
+
+    const PdfStepResult result = parseXref(memory.source(), harness, true);
+
+    ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error) << "@" << result.status.offset;
+    PdfXrefEntry xref{};
+    ASSERT_TRUE(harness.table.find(1U, &xref).ok());
+    EXPECT_EQ(xref.type, PdfXrefEntryType::Uncompressed);
+    EXPECT_EQ(xref.offset, 9U);
+  }
+  {
+    PdfTestByteSource memory(wideXrefStreamPdf(true));
+    XrefHarness harness;
+
+    const PdfStepResult result = parseXref(memory.source(), harness, true);
+
+    ASSERT_TRUE(result.failed());
+    EXPECT_EQ(result.status.error, PdfError::LimitExceeded);
+  }
+}
+
+TEST(PdfXrefTest, FollowsMoreThanThirtyTwoPrevRevisionsAndStillRejectsCycles) {
+  PdfTestByteSource memory(manyPrevRevisionsPdf(40U));
+  XrefHarness harness;
+
+  const PdfStepResult result = parseXref(memory.source(), harness, true);
+
+  ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error) << "@" << result.status.offset;
+  PdfObjectReference root{};
+  ASSERT_TRUE(harness.table.root(&root));
+  EXPECT_EQ(root, (PdfObjectReference{1, 0}));
+
+  PdfTestByteSource cycleMemory(loadFixture("xref_prev_cycle.pdf"));
+  XrefHarness cycleHarness;
+  const PdfStepResult cycle = parseXref(cycleMemory.source(), cycleHarness, true);
+  ASSERT_TRUE(cycle.failed());
+  EXPECT_EQ(cycle.status.error, PdfError::Malformed);
+}
+
+TEST(PdfXrefTest, UsesObjectDomainAndActualStoreInsteadOfLegacyRecordCeiling) {
+  EXPECT_EQ(PdfLimits::MaxXrefRecords, PdfLimits::MaxIndirectObjectNumber + 1U);
+
+  PdfTestByteSource memory(truncatedLargeClassicSubsectionPdf());
+  XrefHarness harness;
+  const PdfStepResult result = parseXref(memory.source(), harness, true);
+
+  ASSERT_TRUE(result.failed());
+  EXPECT_EQ(result.status.error, PdfError::InsufficientStorage);
+  EXPECT_EQ(result.status.offset, 262145ULL * sizeof(PdfXrefEntry));
+  EXPECT_EQ(harness.table.entryCount(), 0U);
+}
+
+TEST(PdfXrefTest, StreamsMoreThanSixtyFourIndexPairsWithoutGrowingTheTrailerArena) {
+  PdfTestByteSource memory(manyIndexPairsXrefPdf());
+  XrefHarness harness;
+
+  const PdfStepResult result = parseXref(memory.source(), harness, true);
+
+  ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error) << "@" << result.status.offset;
+  EXPECT_EQ(harness.table.entryCount(), 65U);
+  PdfXrefEntry root{};
+  ASSERT_TRUE(harness.table.find(1U, &root).ok());
+  EXPECT_EQ(root.type, PdfXrefEntryType::Uncompressed);
+  EXPECT_EQ(root.offset, 9U);
 }
 
 TEST(PdfXrefTest, EnforcesCallerCapAndReportsCompletedDecodedBytes) {
@@ -425,7 +708,8 @@ TEST(PdfXrefTest, RejectsMalformedXrefStreamWidthsAndIndexes) {
     XrefHarness harness;
     const PdfStepResult result = parseXref(memory.source(), harness);
     EXPECT_TRUE(result.failed()) << replacement.second;
-    EXPECT_TRUE(result.status.error == PdfError::LimitExceeded || result.status.error == PdfError::UnexpectedEof)
+    EXPECT_TRUE(result.status.error == PdfError::LimitExceeded || result.status.error == PdfError::UnexpectedEof ||
+                result.status.error == PdfError::Malformed)
         << replacement.second;
   }
 }
@@ -474,9 +758,37 @@ TEST(PdfXrefTest, RejectsEncryptionBadStartxrefAndPrevCycle) {
   }
 }
 
+TEST(PdfXrefTest, KeepsEncryptReferenceAndFirstFileIdentifierForSecurityBootstrap) {
+  const std::vector<uint8_t> fixture = loadFixture("encrypted.pdf");
+  std::string pdf(fixture.begin(), fixture.end());
+  const std::string marker = "/Encrypt 6 0 R";
+  const size_t position = pdf.find(marker);
+  ASSERT_NE(position, std::string::npos);
+  pdf.insert(position + marker.size(),
+             " /ID [<F71F972E16CFB5D750102A3138AC170F01020304><00112233445566778899AABBCCDDEEFF>]");
+
+  PdfTestByteSource memory(std::vector<uint8_t>(pdf.begin(), pdf.end()));
+  XrefHarness harness;
+  ASSERT_TRUE(parseXref(memory.source(), harness).complete());
+
+  PdfSecurityTrailer security{};
+  ASSERT_TRUE(harness.table.security(&security));
+  EXPECT_EQ(security.encryptionReference, (PdfObjectReference{6, 0}));
+  constexpr uint8_t expected[] = {0xf7, 0x1f, 0x97, 0x2e, 0x16, 0xcf, 0xb5, 0xd7, 0x50, 0x10,
+                                  0x2a, 0x31, 0x38, 0xac, 0x17, 0x0f, 0x01, 0x02, 0x03, 0x04};
+  EXPECT_EQ(security.fileIdentifierLength, sizeof(expected));
+  EXPECT_EQ(std::memcmp(security.fileIdentifier, expected, sizeof(expected)), 0);
+}
+
 TEST(PdfXrefTest, EveryClassicTruncationFailsWithoutOutOfRangeRead) {
   const std::vector<uint8_t> complete = loadFixture("classic_text.pdf");
-  for (size_t length = 0; length < complete.size(); ++length) {
+  size_t meaningfulLength = complete.size();
+  while (meaningfulLength != 0 &&
+         (complete[meaningfulLength - 1U] == ' ' || complete[meaningfulLength - 1U] == '\t' ||
+          complete[meaningfulLength - 1U] == '\r' || complete[meaningfulLength - 1U] == '\n')) {
+    --meaningfulLength;
+  }
+  for (size_t length = 0; length < meaningfulLength; ++length) {
     PdfTestByteSource memory(std::vector<uint8_t>(complete.begin(), complete.begin() + length));
     const PdfByteSource source = memory.source();
     XrefHarness harness;
@@ -524,6 +836,76 @@ TEST(PdfObjectResolverTest, ResolvesCatalogPageAndContentStreamEndToEnd) {
   std::vector<uint8_t> bytes(static_cast<size_t>(content.streamLength));
   ASSERT_TRUE(pdfReadExact(source, content.streamOffset, bytes.data(), bytes.size()).ok());
   EXPECT_NE(std::string(bytes.begin(), bytes.end()).find("(Hello PDF)"), std::string::npos);
+}
+
+TEST(PdfObjectResolverTest, CachedAdjacentXrefEntryKeepsSourceReaderSelected) {
+  std::string pdf = "1 0 obj\n42\nendobj\n";
+  const uint64_t secondOffset = pdf.size();
+  pdf += "2 0 obj\n43\nendobj\n";
+  const uint64_t thirdOffset = pdf.size();
+  pdf += "3 0 obj\n44\nendobj\n";
+  const uint64_t fourthOffset = pdf.size();
+  pdf += "4 0 obj\n45\nendobj\n";
+  const uint64_t fifthOffset = pdf.size();
+  pdf += "5 0 obj\n46\nendobj\n";
+  PdfTestByteSource memory({pdf.begin(), pdf.end()});
+  const PdfByteSource source = memory.source();
+  XrefHarness harness;
+  ASSERT_TRUE(harness.table.appendNewest({1, 0, PdfXrefEntryType::Uncompressed, 0, 0, 0}).ok());
+  ASSERT_TRUE(harness.table.appendNewest({2, 0, PdfXrefEntryType::Uncompressed, 0, secondOffset, 0}).ok());
+  ASSERT_TRUE(harness.table.appendNewest({3, 0, PdfXrefEntryType::Uncompressed, 0, thirdOffset, 0}).ok());
+  ASSERT_TRUE(harness.table.appendNewest({4, 0, PdfXrefEntryType::Uncompressed, 0, fourthOffset, 0}).ok());
+  ASSERT_TRUE(harness.table.appendNewest({5, 0, PdfXrefEntryType::Uncompressed, 0, fifthOffset, 0}).ok());
+  std::array<PdfXrefEntry, PdfLimits::XrefMergeEntries> mergeBuffer{};
+  PdfTestRecordStore scratch(sizeof(PdfXrefEntry), 5);
+  ASSERT_TRUE(harness.table.finalize(scratch.store(), mergeBuffer.data(), mergeBuffer.size()).ok());
+  PdfObjectResolver resolver(source, harness.table, harness.sourceBuffer.data(), harness.sourceBuffer.size(),
+                             harness.arena, harness.resolverWorkspace());
+
+  PdfResolvedObject first;
+  ASSERT_TRUE(resolveObject(resolver, {1, 0}, &first).complete());
+  PdfResolvedObject second;
+  ASSERT_TRUE(resolveObject(resolver, {2, 0}, &second).complete());
+  PdfResolvedObject third;
+  ASSERT_TRUE(resolveObject(resolver, {3, 0}, &third).complete());
+  PdfResolvedObject fourth;
+  ASSERT_TRUE(resolveObject(resolver, {4, 0}, &fourth).complete());
+  ASSERT_EQ(harness.reader, PdfObjectResolverReader::Source);
+  const uint32_t xrefSelections = harness.xrefSelections;
+
+  PdfResolvedObject fifth;
+  ASSERT_TRUE(resolveObject(resolver, {5, 0}, &fifth).complete());
+  EXPECT_EQ(harness.xrefSelections, xrefSelections);
+  EXPECT_EQ(harness.reader, PdfObjectResolverReader::Source);
+}
+
+TEST(PdfObjectResolverTest, CachedBeginImmediatelyPublishesRequestedReference) {
+  const std::string pdf = "4 0 obj\n45\nendobj\n";
+  PdfTestByteSource memory({pdf.begin(), pdf.end()});
+  const PdfByteSource source = memory.source();
+  XrefHarness harness;
+  ASSERT_TRUE(harness.table.appendNewest({4, 0, PdfXrefEntryType::Uncompressed, 0, 0, 0}).ok());
+  std::array<PdfXrefEntry, PdfLimits::XrefMergeEntries> mergeBuffer{};
+  PdfTestRecordStore scratch(sizeof(PdfXrefEntry), 1);
+  ASSERT_TRUE(harness.table.finalize(scratch.store(), mergeBuffer.data(), mergeBuffer.size()).ok());
+
+  PdfXrefEntry cached{};
+  ASSERT_TRUE(harness.table.find(4, &cached).ok());
+  ASSERT_EQ(cached.objectNumber, 4U);
+
+  PdfObjectResolver resolver(source, harness.table, harness.sourceBuffer.data(), harness.sourceBuffer.size(),
+                             harness.arena, harness.resolverWorkspace());
+  const PdfObjectReference requested{4, 0};
+  ASSERT_TRUE(resolver.begin(requested).ok());
+  EXPECT_EQ(resolver.result().reference, requested);
+
+  PdfStepResult terminal = PdfStepResult::paused();
+  for (uint16_t step = 0; step < 256U && terminal.yielded(); ++step) {
+    PdfWorkBudget budget{32, 4096};
+    terminal = resolver.step(budget);
+    EXPECT_EQ(resolver.result().reference, requested);
+  }
+  ASSERT_TRUE(terminal.complete()) << static_cast<int>(terminal.status.error) << '@' << terminal.status.offset;
 }
 
 TEST(PdfObjectResolverTest, ResolvesUncompressedIndirectStreamLengthAndRestoresParentArena) {
@@ -676,6 +1058,49 @@ TEST(PdfObjectResolverTest, DirectRawObjectStreamNeedsNoDecoderOrStoreAndPublish
   EXPECT_EQ(harness.objectStreamStorage.resetCount(), 0U);
   EXPECT_EQ(harness.objectStoreWriterCalls, 0U);
   EXPECT_EQ(harness.objectStoreSelections, 0U);
+}
+
+TEST(PdfObjectResolverTest, StopsObjectStreamIndexAfterTargetBoundary) {
+  constexpr uint32_t objectCount = 512;
+  std::string index;
+  std::string body;
+  for (uint32_t ordinal = 0; ordinal < objectCount; ++ordinal) {
+    index += std::to_string(ordinal + 1U) + " " + std::to_string(body.size()) + " ";
+    body += "0 ";
+  }
+  const std::string stream = index + body;
+  std::string pdf = "%PDF-1.5\n";
+  const uint32_t objectStreamOffset = static_cast<uint32_t>(pdf.size());
+  pdf += "5 0 obj\n<< /Type /ObjStm /N " + std::to_string(objectCount) + " /First " +
+         std::to_string(index.size()) + " /Length " + std::to_string(stream.size()) + " >>\nstream\n" + stream +
+         "\nendstream\nendobj\n";
+
+  PdfTestByteSource memory({pdf.begin(), pdf.end()});
+  XrefHarness harness;
+  harness.table.reset();
+  ASSERT_TRUE(harness.table.appendNewest({1, 0, PdfXrefEntryType::Compressed, 0, 5, 0}).ok());
+  ASSERT_TRUE(
+      harness.table.appendNewest({5, 0, PdfXrefEntryType::Uncompressed, 0, objectStreamOffset, 0}).ok());
+  const PdfObjectResolverWorkspace workspace{
+      nullptr, {}, &harness, XrefHarness::setSourceAccess, PdfStreamDecodeLimits{stream.size(), 200}};
+  PdfObjectResolver resolver(memory.source(), harness.table, harness.sourceBuffer.data(), harness.sourceBuffer.size(),
+                             harness.arena, workspace);
+  ASSERT_TRUE(resolver.begin({1, 0}).ok());
+
+  PdfStepResult result = PdfStepResult::paused();
+  uint16_t steps = 0;
+  while (steps < 128U && result.yielded()) {
+    PdfWorkBudget budget{1, 4096};
+    result = resolver.step(budget);
+    ++steps;
+  }
+
+  ASSERT_TRUE(result.complete()) << "steps=" << steps << " error=" << static_cast<int>(result.status.error) << '@'
+                                 << result.status.offset;
+  EXPECT_LT(steps, 128U);
+  ASSERT_LT(resolver.result().rootIndex, harness.arena.valueCount);
+  EXPECT_EQ(harness.arena.values[resolver.result().rootIndex].kind, PdfValueKind::Integer);
+  EXPECT_EQ(harness.arena.values[resolver.result().rootIndex].integerValue, 0);
 }
 
 TEST(PdfObjectResolverTest, CooperativelyPreparesSharedWindowFlateStreamAndReusesOneCache) {

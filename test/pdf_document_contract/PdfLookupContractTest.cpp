@@ -414,7 +414,7 @@ TEST(PdfXrefAppendBudgetContract, SparseStreamCancellationResetsAndReplaysFromTh
 
 TEST(PdfXrefNewestObjectFilterContract, SegmentedBoundariesResetAndDetachStayWithinCallerOwnedSpans) {
   constexpr size_t kPrimaryBytes = 12'288U;
-  constexpr size_t kTailBytes = 213U;
+  constexpr size_t kTailBytes = 2'048U;
   std::array<uint8_t, kPrimaryBytes> primary{};
   std::array<uint8_t, kTailBytes + 1U> tail{};
   primary.fill(0xa5U);
@@ -428,21 +428,21 @@ TEST(PdfXrefNewestObjectFilterContract, SegmentedBoundariesResetAndDetachStayWit
   EXPECT_EQ(tail.back(), 0xa5U);
 
   const PdfXrefEntry objectZero{0, 65'535U, PdfXrefEntryType::Free, 0, 0, 0};
-  const PdfXrefEntry objectMaximum{100'000U, 0, PdfXrefEntryType::Uncompressed, 0, 77, 0};
+  const PdfXrefEntry objectMaximum{8'388'607U, 0, PdfXrefEntryType::Uncompressed, 0, 77, 0};
   ASSERT_TRUE(table.appendNewest(objectZero).ok());
   ASSERT_TRUE(table.appendNewest(objectMaximum).ok());
   ASSERT_TRUE(table.appendNewest({0, 0, PdfXrefEntryType::Free, 0, 1, 0}).ok());
-  ASSERT_TRUE(table.appendNewest({100'000U, 0, PdfXrefEntryType::Uncompressed, 0, 88, 0}).ok());
+  ASSERT_TRUE(table.appendNewest({8'388'607U, 0, PdfXrefEntryType::Uncompressed, 0, 88, 0}).ok());
   EXPECT_EQ(table.entryCount(), 2U);
   PdfXrefEntry found{};
-  ASSERT_TRUE(table.find(100'000U, &found).ok());
+  ASSERT_TRUE(table.find(8'388'607U, &found).ok());
   EXPECT_EQ(found.offset, 77U);
 
   table.reset();
   EXPECT_TRUE(std::all_of(primary.begin(), primary.end(), [](const uint8_t value) { return value == 0; }));
   EXPECT_TRUE(std::all_of(tail.begin(), tail.begin() + kTailBytes, [](const uint8_t value) { return value == 0; }));
   EXPECT_EQ(tail.back(), 0xa5U);
-  EXPECT_EQ(table.appendNewest({100'001U, 0, PdfXrefEntryType::Free, 0, 0, 0}).error,
+  EXPECT_EQ(table.appendNewest({8'388'608U, 0, PdfXrefEntryType::Free, 0, 0, 0}).error,
             PdfError::InvalidArgument);
   ASSERT_TRUE(table.appendNewest(objectZero).ok());
   ASSERT_TRUE(table.appendNewest(objectMaximum).ok());
@@ -456,15 +456,28 @@ TEST(PdfXrefNewestObjectFilterContract, SegmentedBoundariesResetAndDetachStayWit
   EXPECT_TRUE(std::all_of(tail.begin(), tail.end(), [](const uint8_t value) { return value == 0x3cU; }));
 }
 
-TEST(PdfXrefNewestObjectFilterContract, RejectsAggregateSpanSmallerThanExactObjectDomain) {
+TEST(PdfXrefNewestObjectFilterContract, RejectsMisalignedCallerOwnedSpan) {
   std::array<uint8_t, 12'288U> primary{};
-  std::array<uint8_t, 212U> shortTail{};
+  std::array<uint8_t, 211U> shortTail{};
   PdfTestRecordStore records(sizeof(PdfXrefEntry), 1);
   PdfXrefTable table(records.store());
 
   EXPECT_EQ(table.configureNewestObjectFilter(primary.data(), primary.size(), shortTail.data(), shortTail.size()).error,
             PdfError::InvalidArgument);
   EXPECT_EQ(table.entryCount(), 0U);
+}
+
+TEST(PdfXrefNewestObjectFilterContract, TracksSparseHighObjectNumbersWithoutDomainSizedStorage) {
+  std::array<uint8_t, 64U> primary{};
+  std::array<uint8_t, 32U> tail{};
+  PdfTestRecordStore records(sizeof(PdfXrefEntry), 4);
+  PdfXrefTable table(records.store());
+
+  ASSERT_TRUE(table.configureNewestObjectFilter(primary.data(), primary.size(), tail.data(), tail.size()).ok());
+  ASSERT_TRUE(table.appendNewest({126'440U, 0, PdfXrefEntryType::Uncompressed, 0, 116U, 0}).ok());
+  ASSERT_TRUE(table.appendNewest({126'440U, 0, PdfXrefEntryType::Uncompressed, 0, 999U, 0}).ok());
+  ASSERT_TRUE(table.appendNewest({8'388'607U, 0, PdfXrefEntryType::Uncompressed, 0, 77U, 0}).ok());
+  EXPECT_EQ(table.entryCount(), 2U);
 }
 
 TEST(PdfXrefAdoptContract, FindsExternallySortedFirstMiddleAndLastWithoutScanningOnAdopt) {
@@ -531,6 +544,123 @@ TEST(PdfXrefAdoptContract, MaximumLogicalCapacityLookupUsesAtMostEighteenExactRe
   EXPECT_EQ(entry.objectNumber, 100000U);
   EXPECT_LE(records.reads, 18U);
   EXPECT_LE(records.bytes, 18U * sizeof(PdfXrefEntry));
+}
+
+TEST(PdfXrefAdoptContract, AdjacentLookupsReuseFixedSixteenEntryWindowWithoutStoreReads) {
+  CountingXrefStore records(64);
+  for (uint32_t ordinal = 0; ordinal < records.entries.size(); ++ordinal) {
+    records.entries[ordinal] = {ordinal, 0, PdfXrefEntryType::Uncompressed, 0, ordinal + 1U, 0};
+  }
+  PdfXrefTable table(records.fixed());
+  ASSERT_TRUE(table.adoptSortedRecords(static_cast<uint32_t>(records.entries.size())).ok());
+
+  PdfXrefEntry entry{};
+  ASSERT_TRUE(table.find(14U, &entry).ok());
+  ASSERT_TRUE(table.find(15U, &entry).ok());
+  ASSERT_TRUE(table.find(16U, &entry).ok());
+  ASSERT_TRUE(table.find(17U, &entry).ok());
+  const uint32_t readsAfterFill = records.reads;
+  for (uint32_t objectNumber = 18U; objectNumber < 33U; ++objectNumber) {
+    ASSERT_TRUE(table.find(objectNumber, &entry).ok());
+    EXPECT_EQ(entry.objectNumber, objectNumber);
+  }
+  EXPECT_EQ(records.reads, readsAfterFill);
+}
+
+TEST(PdfXrefAdoptContract, SparseLookupsDoNotTriggerSpeculativeWindowReads) {
+  CountingXrefStore records(64);
+  for (uint32_t ordinal = 0; ordinal < records.entries.size(); ++ordinal) {
+    records.entries[ordinal] = {ordinal, 0, PdfXrefEntryType::Uncompressed, 0, ordinal + 1U, 0};
+  }
+  PdfXrefTable table(records.fixed());
+  ASSERT_TRUE(table.adoptSortedRecords(static_cast<uint32_t>(records.entries.size())).ok());
+
+  PdfXrefEntry entry{};
+  ASSERT_TRUE(table.find(1U, &entry).ok());
+  const uint32_t readsBeforeSparseLookup = records.reads;
+  ASSERT_TRUE(table.find(40U, &entry).ok());
+  EXPECT_EQ(entry.objectNumber, 40U);
+  EXPECT_LE(records.reads - readsBeforeSparseLookup, 8U);
+}
+
+TEST(PdfXrefAdoptContract, VictimCachePreservesReusedEntryAcrossWindowReplacement) {
+  CountingXrefStore records(64);
+  for (uint32_t ordinal = 0; ordinal < records.entries.size(); ++ordinal) {
+    records.entries[ordinal] = {ordinal, 0, PdfXrefEntryType::Uncompressed, 0, ordinal + 1U, 0};
+  }
+  PdfXrefTable table(records.fixed());
+  ASSERT_TRUE(table.adoptSortedRecords(static_cast<uint32_t>(records.entries.size())).ok());
+
+  PdfXrefEntry entry{};
+  for (const uint32_t objectNumber : {1U, 2U, 3U, 4U, 10U, 20U}) {
+    ASSERT_TRUE(table.find(objectNumber, &entry).ok());
+  }
+  const uint32_t readsBeforeVictimHit = records.reads;
+  ASSERT_TRUE(table.find(10U, &entry).ok());
+  EXPECT_EQ(entry.objectNumber, 10U);
+  EXPECT_EQ(records.reads, readsBeforeVictimHit);
+}
+
+TEST(PdfXrefLookupBudgetContract, SampledIndexBuildsCooperativelyAndNarrowsLaterSparseLookups) {
+  CountingXrefStore records(4096);
+  for (uint32_t ordinal = 0; ordinal < records.entries.size(); ++ordinal) {
+    records.entries[ordinal] = {ordinal, 0, PdfXrefEntryType::Uncompressed, 0, ordinal + 1U, 0};
+  }
+  PdfXrefTable table(records.fixed());
+  ASSERT_TRUE(table.adoptSortedRecords(static_cast<uint32_t>(records.entries.size())).ok());
+  PdfXrefEntry entry{};
+  for (const uint32_t objectNumber : {1U, 1000U, 2000U, 3000U}) {
+    ASSERT_TRUE(table.find(objectNumber, &entry).ok());
+  }
+
+  PdfXrefLookupState state{};
+  ASSERT_TRUE(table.beginFind(4000U, &state).ok());
+  PdfStepResult result = PdfStepResult::paused();
+  uint32_t steps = 0;
+  while (result.yielded() && steps++ < 96U) {
+    const uint32_t readsBefore = records.reads;
+    PdfWorkBudget budget{1, sizeof(PdfXrefEntry)};
+    result = table.stepFind(state, &entry, budget);
+    EXPECT_LE(records.reads - readsBefore, 1U);
+  }
+  ASSERT_TRUE(result.complete());
+  EXPECT_EQ(entry.objectNumber, 4000U);
+
+  const uint32_t readsBeforeSampledLookup = records.reads;
+  ASSERT_TRUE(table.find(3500U, &entry).ok());
+  EXPECT_EQ(entry.objectNumber, 3500U);
+  EXPECT_LE(records.reads - readsBeforeSampledLookup, 8U);
+}
+
+TEST(PdfXrefLookupBudgetContract, LocalReadAheadCompletesAcrossOneRecordSlices) {
+  CountingXrefStore records(64);
+  for (uint32_t ordinal = 0; ordinal < records.entries.size(); ++ordinal) {
+    records.entries[ordinal] = {ordinal, 0, PdfXrefEntryType::Uncompressed, 0, ordinal + 1U, 0};
+  }
+  PdfXrefTable table(records.fixed());
+  ASSERT_TRUE(table.adoptSortedRecords(static_cast<uint32_t>(records.entries.size())).ok());
+  PdfXrefEntry entry{};
+  ASSERT_TRUE(table.find(14U, &entry).ok());
+  ASSERT_TRUE(table.find(15U, &entry).ok());
+  ASSERT_TRUE(table.find(16U, &entry).ok());
+
+  PdfXrefLookupState state{};
+  ASSERT_TRUE(table.beginFind(17U, &state).ok());
+  PdfStepResult result = PdfStepResult::paused();
+  uint32_t steps = 0;
+  while (result.yielded() && steps++ < 32U) {
+    const uint32_t readsBefore = records.reads;
+    PdfWorkBudget budget{1, sizeof(PdfXrefEntry)};
+    result = table.stepFind(state, &entry, budget);
+    EXPECT_LE(records.reads - readsBefore, 1U);
+  }
+  ASSERT_TRUE(result.complete());
+  EXPECT_EQ(entry.objectNumber, 17U);
+
+  const uint32_t readsAfterFill = records.reads;
+  ASSERT_TRUE(table.find(32U, &entry).ok());
+  EXPECT_EQ(entry.objectNumber, 32U);
+  EXPECT_EQ(records.reads, readsAfterFill);
 }
 
 TEST(PdfXrefLookupBudgetContract, MaximumLookupYieldsAfterOneExactRecordWithoutExceedingBudget) {
@@ -949,6 +1079,14 @@ TEST(PdfResolverSourceAccessContract, UncompressedLookupClosesXrefReaderThenReop
   ASSERT_TRUE(runResolver(resolver).complete());
   EXPECT_EQ(harness.transitions, (std::vector<bool>{false, true}));
   EXPECT_TRUE(harness.sourceOpen);
+
+  harness.transitions.clear();
+  ASSERT_TRUE(ResolverHarness::setTraversalAccess(&harness, false).ok());
+  resolver.invalidateSourceAccess();
+  ASSERT_TRUE(resolver.begin({1, 0}).ok());
+  ASSERT_TRUE(runResolver(resolver).complete());
+  EXPECT_EQ(harness.transitions, (std::vector<bool>{true}));
+  EXPECT_TRUE(harness.sourceOpen);
 }
 
 TEST(PdfResolverSourceAccessContract, CompressedUncachedKeepsSourceClosedAcrossBothXrefLookups) {
@@ -972,7 +1110,7 @@ TEST(PdfResolverSourceAccessContract, CompressedUncachedKeepsSourceClosedAcrossB
   EXPECT_TRUE(harness.sourceOpen);
 }
 
-TEST(PdfResolverSourceAccessContract, CachedCompressedLookupReselectsXrefThenDirectObjectStreamSource) {
+TEST(PdfResolverSourceAccessContract, CachedCompressedLookupBypassesXrefAndReassertsDirectObjectStreamSource) {
   const std::string objectStream =
       "10 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length 6 >>\nstream\n2 0 42\nendstream\nendobj\n";
   PdfTestByteSource bytes({objectStream.begin(), objectStream.end()});
@@ -997,7 +1135,7 @@ TEST(PdfResolverSourceAccessContract, CachedCompressedLookupReselectsXrefThenDir
   EXPECT_TRUE(harness.transitions.empty());
   EXPECT_TRUE(harness.sourceOpen);
   EXPECT_TRUE(runResolver(resolver).complete());
-  EXPECT_EQ(harness.transitions, (std::vector<bool>{false, true}));
+  EXPECT_EQ(harness.transitions, (std::vector<bool>{true}));
 }
 
 TEST(PdfResolverSourceAccessContract, PageTreeReassertsXrefAfterTraversalEvictsDirectObjectStreamReader) {

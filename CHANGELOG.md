@@ -1,3 +1,23 @@
+## [v1.5.0.3] - 2026-08-08
+
+### Added
+
+- Passwordless PDFs using Standard V4/R4 RC4-128 encryption can now be prepared directly on the reader.
+
+### Changed
+
+- PDF preparation uses fewer SD-card open, close, and sync operations and batches repeated xref, font, content, and navigation work, substantially reducing first-open time on complex books.
+- Cross-reference revisions, `/Index` ranges, page content streams, and excess annotations now use storage-backed processing instead of small document-wide count limits.
+- Excess outline entries, section boundaries, fonts, glyphs, Forms, and optional artwork are omitted or merged locally instead of closing an otherwise readable book.
+
+### Fixed
+
+- Large PDFs no longer stall for long periods near 45, 55, or 90 percent while repeatedly reopening the same SD-card records.
+- Interrupted PDF preparation now resumes reliably from discovery, page, section, and image boundaries without retaining an encryption key on the SD card.
+- PDFs with more than 100,000 object numbers, long revision chains, PNG-predicted xref streams, large resource dictionaries, or more than 16 page content streams can now be prepared within the device's fixed memory workspace.
+- Unsupported optional color spaces, raster data, deep Forms, extra XObjects, and malformed decorative resources no longer take down the whole document.
+- Simple-font fallback now preserves ASCII and Windows-1252 text when a dense page exceeds the resident glyph table.
+
 ## [v1.5.0.2] - 2026-08-07
 
 ### Fixed

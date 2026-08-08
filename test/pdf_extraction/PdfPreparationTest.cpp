@@ -163,18 +163,27 @@ std::vector<uint8_t> loadFixture(const char* name) {
   return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
 }
 
-std::vector<uint8_t> makeTwoPageTextPdf() {
-  const std::string firstStream = "BT /F1 12 Tf 72 720 Td (First durable page) Tj ET";
+std::vector<uint8_t> makeTwoPageTextPdf(const bool unreadableFirst = false, const bool includeThird = false) {
+  const std::string firstStream =
+      unreadableFirst ? "q Q" : "BT /F1 12 Tf 72 720 Td (First durable page) Tj ET";
   const std::string secondStream = "BT /F1 12 Tf 72 720 Td (Second resumed page) Tj ET";
-  const std::vector<std::string> objects = {
+  const std::string thirdStream = "BT /F1 12 Tf 72 720 Td (Third durable page) Tj ET";
+  std::vector<std::string> objects = {
       "<< /Type /Catalog /Pages 2 0 R >>",
-      "<< /Type /Pages /Count 2 /Kids [3 0 R 5 0 R] >>",
+      includeThird ? "<< /Type /Pages /Count 3 /Kids [3 0 R 5 0 R 8 0 R] >>"
+                   : "<< /Type /Pages /Count 2 /Kids [3 0 R 5 0 R] >>",
       "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 7 0 R >> >> /Contents 4 0 R >>",
       "<< /Length " + std::to_string(firstStream.size()) + " >>\nstream\n" + firstStream + "\nendstream",
       "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 7 0 R >> >> /Contents 6 0 R >>",
       "<< /Length " + std::to_string(secondStream.size()) + " >>\nstream\n" + secondStream + "\nendstream",
       "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
   };
+  if (includeThird) {
+    objects.push_back(
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 7 0 R >> >> /Contents 9 0 R >>");
+    objects.push_back("<< /Length " + std::to_string(thirdStream.size()) + " >>\nstream\n" + thirdStream +
+                      "\nendstream");
+  }
   std::string pdf = "%PDF-1.4\n";
   std::vector<size_t> offsets;
   offsets.reserve(objects.size());
@@ -183,7 +192,7 @@ std::vector<uint8_t> makeTwoPageTextPdf() {
     pdf += std::to_string(index + 1U) + " 0 obj\n" + objects[index] + "\nendobj\n";
   }
   const size_t xrefOffset = pdf.size();
-  pdf += "xref\n0 8\n0000000000 65535 f \n";
+  pdf += "xref\n0 " + std::to_string(objects.size() + 1U) + "\n0000000000 65535 f \n";
   char entry[32]{};
   for (const size_t offset : offsets) {
     const int length = std::snprintf(entry, sizeof(entry), "%010zu 00000 n \n", offset);
@@ -192,16 +201,25 @@ std::vector<uint8_t> makeTwoPageTextPdf() {
     }
     pdf.append(entry, static_cast<size_t>(length));
   }
-  pdf += "trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n" + std::to_string(xrefOffset) + "\n%%EOF\n";
+  pdf += "trailer\n<< /Size " + std::to_string(objects.size() + 1U) +
+         " /Root 1 0 R >>\nstartxref\n" + std::to_string(xrefOffset) + "\n%%EOF\n";
   return {pdf.begin(), pdf.end()};
 }
 
-std::vector<uint8_t> makeOnePageTextPdf(const std::string& contentStream) {
+std::vector<uint8_t> makeOnePageTextPdf(const std::string& contentStream, const uint16_t propertyCount = 0) {
+  std::string resources = "<< /Font << /F1 5 0 R >>";
+  if (propertyCount != 0) {
+    resources += " /Properties <<";
+    for (uint16_t index = 0; index < propertyCount; ++index) {
+      resources += " /MC" + std::to_string(index) + " 5 0 R";
+    }
+    resources += " >>";
+  }
+  resources += " >>";
   const std::vector<std::string> objects = {
       "<< /Type /Catalog /Pages 2 0 R >>",
       "<< /Type /Pages /Count 1 /Kids [3 0 R] >>",
-      "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> "
-      "/Contents 4 0 R >>",
+      "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources " + resources + " /Contents 4 0 R >>",
       "<< /Length " + std::to_string(contentStream.size()) + " >>\nstream\n" + contentStream + "\nendstream",
       "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
   };
@@ -224,6 +242,104 @@ std::vector<uint8_t> makeOnePageTextPdf(const std::string& contentStream) {
   }
   pdf += "trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n" + std::to_string(xrefOffset) + "\n%%EOF\n";
   return {pdf.begin(), pdf.end()};
+}
+
+std::vector<uint8_t> makeCollidedIncrementalXrefPdf() {
+  const std::string content = "BT /F1 12 Tf 72 720 Td (Collision proof) Tj ET";
+  const std::vector<uint8_t> base = makeOnePageTextPdf(content);
+  std::string pdf(base.begin(), base.end());
+  const size_t marker = pdf.rfind("startxref\n");
+  if (marker == std::string::npos) {
+    return {};
+  }
+  const size_t offsetStart = marker + std::strlen("startxref\n");
+  const size_t offsetEnd = pdf.find('\n', offsetStart);
+  if (offsetEnd == std::string::npos) {
+    return {};
+  }
+  uint64_t previousXref = std::stoull(pdf.substr(offsetStart, offsetEnd - offsetStart));
+  constexpr uint32_t filterSlots =
+      (PdfLimits::PageRunBytes + PdfLimits::OperandOrderHistogramBytes) / sizeof(uint32_t);
+  constexpr uint32_t firstCollisionObject = 100;
+  for (uint8_t revision = 0; revision < 3U; ++revision) {
+    const uint64_t newestXref = pdf.size();
+    pdf += "xref\n";
+    for (uint32_t index = 0; index < 9U; ++index) {
+      pdf += std::to_string(firstCollisionObject + index * filterSlots) + " 1\n0000000000 65535 f \n";
+    }
+    const uint32_t size = firstCollisionObject + 8U * filterSlots + 1U;
+    pdf += "trailer\n<< /Size " + std::to_string(size) + " /Root 1 0 R /Prev " +
+           std::to_string(previousXref) + " >>\nstartxref\n" + std::to_string(newestXref) + "\n%%EOF\n";
+    previousXref = newestXref;
+  }
+  return {pdf.begin(), pdf.end()};
+}
+
+std::vector<uint8_t> assembleClassicPdf(const std::vector<std::string>& objects) {
+  std::string pdf = "%PDF-1.4\n";
+  std::vector<size_t> offsets;
+  offsets.reserve(objects.size());
+  for (size_t index = 0; index < objects.size(); ++index) {
+    offsets.push_back(pdf.size());
+    pdf += std::to_string(index + 1U) + " 0 obj\n" + objects[index] + "\nendobj\n";
+  }
+  const size_t xrefOffset = pdf.size();
+  pdf += "xref\n0 " + std::to_string(objects.size() + 1U) + "\n0000000000 65535 f \n";
+  char entry[32]{};
+  for (const size_t offset : offsets) {
+    const int length = std::snprintf(entry, sizeof(entry), "%010zu 00000 n \n", offset);
+    if (length <= 0 || static_cast<size_t>(length) >= sizeof(entry)) {
+      return {};
+    }
+    pdf.append(entry, static_cast<size_t>(length));
+  }
+  pdf += "trailer\n<< /Size " + std::to_string(objects.size() + 1U) + " /Root 1 0 R >>\nstartxref\n" +
+         std::to_string(xrefOffset) + "\n%%EOF\n";
+  return {pdf.begin(), pdf.end()};
+}
+
+std::vector<uint8_t> makeManyContentStreamsPdf(const uint8_t streamCount) {
+  if (streamCount == 0) {
+    return {};
+  }
+  const uint32_t fontObject = 4U + streamCount;
+  std::string contents = "[";
+  for (uint8_t index = 0; index < streamCount; ++index) {
+    contents += std::to_string(4U + index) + " 0 R ";
+  }
+  contents += "]";
+  std::vector<std::string> objects = {
+      "<< /Type /Catalog /Pages 2 0 R >>",
+      "<< /Type /Pages /Count 1 /Kids [3 0 R] >>",
+      "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 " +
+          std::to_string(fontObject) + " 0 R >> >> /Contents " + contents + " >>",
+  };
+  for (uint8_t index = 0; index < streamCount; ++index) {
+    const std::string text = "Overflow" + (index < 10 ? std::string("0") : std::string()) +
+                             std::to_string(index);
+    const std::string stream = "BT /F1 12 Tf 72 " + std::to_string(720 - index * 18) + " Td (" + text + ") Tj ET";
+    objects.push_back("<< /Length " + std::to_string(stream.size()) + " >>\nstream\n" + stream +
+                      "\nendstream");
+  }
+  objects.push_back("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+  return assembleClassicPdf(objects);
+}
+
+std::vector<uint8_t> makeIndirectSeparationImagePdf() {
+  const std::string content =
+      "q 10 0 0 10 72 700 cm /Im1 Do Q BT /F1 12 Tf 72 650 Td (Readable page text) Tj ET";
+  return assembleClassicPdf({
+      "<< /Type /Catalog /Pages 2 0 R >>",
+      "<< /Type /Pages /Count 1 /Kids [3 0 R] >>",
+      "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> "
+      "/XObject << /Im1 6 0 R >> >> /Contents 4 0 R >>",
+      "<< /Length " + std::to_string(content.size()) + " >>\nstream\n" + content + "\nendstream",
+      "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+      "<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace 7 0 R /BitsPerComponent 8 "
+      "/Length 1 >>\nstream\nx\nendstream",
+      "[/Separation /Spot /DeviceCMYK 8 0 R]",
+      "<< /FunctionType 2 /Domain [0 1] /C0 [0 0 0 0] /C1 [0 0 0 1] /N 1 >>",
+  });
 }
 
 void writeLittleEndian32(std::vector<uint8_t>* const bytes, const size_t offset, const uint32_t value) {
@@ -272,15 +388,16 @@ void resealTrailingCrc(std::vector<uint8_t>* const bytes) {
 }
 
 void setDiscoveryPageRotationAndReseal(std::vector<uint8_t>* const bytes, const uint16_t rotation) {
-  constexpr size_t discoveryHeaderBytes = 192;
   constexpr size_t discoveryXrefRecordBytes = 24;
-  constexpr size_t discoveryPageRecordBytes = 244;
+  constexpr size_t discoveryPageRecordBytes = 256;
   constexpr size_t discoveryTrailerBytes = 72;
   constexpr size_t discoveryPageRotationOffset = 234;
-  constexpr size_t discoveryPageCrcOffset = 240;
+  constexpr size_t discoveryPageCrcOffset = 252;
   ASSERT_NE(bytes, nullptr);
-  ASSERT_GE(bytes->size(), discoveryHeaderBytes + discoveryPageRecordBytes + discoveryTrailerBytes);
+  ASSERT_GE(bytes->size(), 8U);
   ASSERT_EQ(std::memcmp(bytes->data(), "PDRH", 4), 0);
+  const size_t discoveryHeaderBytes = readLittleEndian16(*bytes, 6);
+  ASSERT_GE(bytes->size(), discoveryHeaderBytes + discoveryPageRecordBytes + discoveryTrailerBytes);
   const uint32_t xrefCount = readLittleEndian32(*bytes, 52);
   const uint16_t pageCount = readLittleEndian16(*bytes, 56);
   ASSERT_GT(xrefCount, 0U);
@@ -445,6 +562,164 @@ TEST(PdfPreparation, ConvertsMinimalFixtureIntoCommittedDeviceStyleXhtml) {
   EXPECT_EQ(selection.manifest.requiredFileCount, 5U);
   EXPECT_TRUE(harness.storage.exists(generationRoot + "/cover.bmp"));
   EXPECT_TRUE(harness.storage.exists(generationRoot + "/thumb.bmp"));
+}
+
+TEST(PdfPreparation, CompactsCollidedIncrementalXrefBeforeFollowingPrev) {
+  constexpr char sourcePath[] = "/books/collided-incremental-xref.pdf";
+  PreparationHarness harness;
+  harness.storage.setMaximumReadHandles(1);
+  const std::vector<uint8_t> fixture = makeCollidedIncrementalXrefPdf();
+  ASSERT_FALSE(fixture.empty());
+  harness.storage.addFile(sourcePath, fixture, 1234, true);
+
+  PdfPreparation preparation;
+  ASSERT_TRUE(preparation.begin(harness.config(sourcePath)).ok());
+  const PdfStepResult result = runToTerminal(preparation, harness);
+
+  ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error) << '@' << result.status.offset
+                                 << " phase=" << static_cast<int>(preparation.phase());
+  EXPECT_EQ(preparation.totalWords(), 2U);
+  EXPECT_GT(preparation.workCounters().xrefSpoolRecordsRead, 0U);
+  EXPECT_GT(preparation.workCounters().xrefSpoolRecordsWritten, 0U);
+  EXPECT_EQ(harness.storage.openHandleCount(), 0U);
+}
+
+TEST(PdfPreparation, ReflowsMoreThanSixteenPageContentStreamsInSourceOrder) {
+  constexpr char sourcePath[] = "/books/content-overflow.pdf";
+  PreparationHarness harness;
+  harness.storage.setMaximumReadHandles(1);
+  const std::vector<uint8_t> fixture = makeManyContentStreamsPdf(20);
+  ASSERT_FALSE(fixture.empty());
+  harness.storage.addFile(sourcePath, fixture, 1234, true);
+
+  PdfPreparation preparation;
+  ASSERT_TRUE(preparation.begin(harness.config(sourcePath)).ok());
+  const PdfStepResult result = runToTerminal(preparation, harness);
+
+  ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error) << "@" << result.status.offset
+                                 << " phase=" << static_cast<int>(preparation.phase());
+  EXPECT_EQ(preparation.totalWords(), 20U);
+  const std::string sectionPath = std::string(preparation.cacheRoot()) + "/gen_" +
+                                  std::to_string(preparation.generation()) + "/sections/000000.xhtml";
+  ASSERT_TRUE(harness.storage.exists(sectionPath));
+  const auto& sectionBytes = harness.storage.bytes(sectionPath);
+  const std::string section(sectionBytes.begin(), sectionBytes.end());
+  const size_t first = section.find("Overflow00");
+  const size_t last = section.find("Overflow19");
+  ASSERT_NE(first, std::string::npos);
+  ASSERT_NE(last, std::string::npos);
+  EXPECT_LT(first, last);
+  EXPECT_EQ(harness.storage.openHandleCount(), 0U);
+}
+
+TEST(PdfPreparation, RestoresContentOverflowRecordsFromDiscoveryCheckpoint) {
+  constexpr char sourcePath[] = "/books/content-overflow-resume.pdf";
+  PreparationHarness harness;
+  harness.storage.setMaximumReadHandles(1);
+  const std::vector<uint8_t> fixture = makeManyContentStreamsPdf(20);
+  ASSERT_FALSE(fixture.empty());
+  harness.storage.addFile(sourcePath, fixture, 1234, true);
+
+  PdfPreparation interrupted;
+  ASSERT_TRUE(interrupted.begin(harness.config(sourcePath)).ok());
+  for (uint32_t slice = 0;
+       slice < 20000 && interrupted.durableResumePhase() != PdfBuildResumePhase::AfterDiscovery;
+       ++slice) {
+    const PdfStepResult step = interrupted.step();
+    ++harness.nowMs;
+    ASSERT_TRUE(step.yielded()) << static_cast<int>(step.status.error) << "@" << step.status.offset;
+  }
+  ASSERT_EQ(interrupted.durableResumePhase(), PdfBuildResumePhase::AfterDiscovery);
+  const uint32_t generation = interrupted.generation();
+  const PdfStepResult cancelled = cancelToTerminal(interrupted, harness);
+  ASSERT_TRUE(cancelled.failed());
+  ASSERT_EQ(cancelled.status.error, PdfError::Cancelled);
+  ASSERT_EQ(harness.storage.openHandleCount(), 0U);
+
+  PdfPreparation resumed;
+  ASSERT_TRUE(resumed.begin(harness.config(sourcePath)).ok());
+  const PdfStepResult result = runToTerminal(resumed, harness);
+
+  ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error) << "@" << result.status.offset
+                                 << " phase=" << static_cast<int>(resumed.phase());
+  EXPECT_TRUE(resumed.resumedFromCheckpoint());
+  EXPECT_EQ(resumed.resumedPhase(), PdfBuildResumePhase::AfterDiscovery);
+  EXPECT_EQ(resumed.generation(), generation);
+  EXPECT_EQ(resumed.totalWords(), 20U);
+  const std::string sectionPath = std::string(resumed.cacheRoot()) + "/gen_" +
+                                  std::to_string(resumed.generation()) + "/sections/000000.xhtml";
+  ASSERT_TRUE(harness.storage.exists(sectionPath));
+  const auto& sectionBytes = harness.storage.bytes(sectionPath);
+  const std::string section(sectionBytes.begin(), sectionBytes.end());
+  EXPECT_NE(section.find("Overflow00"), std::string::npos);
+  EXPECT_NE(section.find("Overflow19"), std::string::npos);
+  EXPECT_EQ(harness.storage.openHandleCount(), 0U);
+}
+
+TEST(PdfPreparation, OmitsIndirectSeparationImageWithoutDroppingPageText) {
+  constexpr char sourcePath[] = "/books/indirect-separation.pdf";
+  PreparationHarness harness;
+  harness.storage.setMaximumReadHandles(1);
+  const std::vector<uint8_t> fixture = makeIndirectSeparationImagePdf();
+  ASSERT_FALSE(fixture.empty());
+  harness.storage.addFile(sourcePath, fixture, 1234, true);
+
+  PdfPreparation preparation;
+  ASSERT_TRUE(preparation.begin(harness.config(sourcePath)).ok());
+  const PdfStepResult result = runToTerminal(preparation, harness);
+
+  ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error) << "@" << result.status.offset
+                                 << " phase=" << static_cast<int>(preparation.phase());
+  EXPECT_EQ(preparation.totalWords(), 3U);
+  const std::string sectionPath = std::string(preparation.cacheRoot()) + "/gen_" +
+                                  std::to_string(preparation.generation()) + "/sections/000000.xhtml";
+  ASSERT_TRUE(harness.storage.exists(sectionPath));
+  const auto& sectionBytes = harness.storage.bytes(sectionPath);
+  const std::string section(sectionBytes.begin(), sectionBytes.end());
+  EXPECT_NE(section.find("Readable page text"), std::string::npos);
+  EXPECT_EQ(harness.storage.openHandleCount(), 0U);
+}
+
+TEST(PdfPreparation, OmitsInlineRasterWithoutDroppingPageText) {
+  constexpr char sourcePath[] = "/books/inline-raster.pdf";
+  std::string content = "q 1 0 0 1 0 0 cm BI /W 1 /H 1 /CS /G /BPC 8 ID ";
+  content.push_back(static_cast<char>(0x80));
+  content += " EI Q BT /F1 12 Tf 72 720 Td (Inline image survives) Tj ET";
+  PreparationHarness harness;
+  harness.storage.setMaximumReadHandles(1);
+  harness.storage.addFile(sourcePath, makeOnePageTextPdf(content), 1234, true);
+
+  PdfPreparation preparation;
+  ASSERT_TRUE(preparation.begin(harness.config(sourcePath)).ok());
+  const PdfStepResult result = runToTerminal(preparation, harness);
+
+  ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error) << "@" << result.status.offset
+                                 << " phase=" << static_cast<int>(preparation.phase());
+  EXPECT_EQ(preparation.totalWords(), 3U);
+  const std::string sectionPath = std::string(preparation.cacheRoot()) + "/gen_" +
+                                  std::to_string(preparation.generation()) + "/sections/000000.xhtml";
+  ASSERT_TRUE(harness.storage.exists(sectionPath));
+  const auto& sectionBytes = harness.storage.bytes(sectionPath);
+  const std::string section(sectionBytes.begin(), sectionBytes.end());
+  EXPECT_NE(section.find("Inline image survives"), std::string::npos);
+  EXPECT_EQ(section.find("<img"), std::string::npos);
+  EXPECT_EQ(harness.storage.openHandleCount(), 0U);
+}
+
+TEST(PdfPreparation, PreparesSonySizedInlineResourceDictionaryInsideTheExistingFixedArena) {
+  constexpr char sourcePath[] = "/books/large-inline-resources.pdf";
+  const std::string content = "BT /F1 12 Tf 72 720 Td (Large resources) Tj ET";
+  PreparationHarness harness;
+  harness.storage.addFile(sourcePath, makeOnePageTextPdf(content, 358), 1234, true);
+
+  PdfPreparation preparation;
+  ASSERT_TRUE(preparation.begin(harness.config(sourcePath)).ok());
+  const PdfStepResult result = runToTerminal(preparation, harness);
+
+  ASSERT_TRUE(result.complete()) << static_cast<unsigned>(result.status.error) << '@' << result.status.offset;
+  EXPECT_EQ(preparation.workCounters().pagesWalked, 1U);
+  EXPECT_EQ(preparation.totalWords(), 2U);
+  EXPECT_EQ(preparation.resourcePeakBytes(), 63488U);
 }
 
 TEST(PdfPreparation, ManifestVerifierReopenStaysBoundedUnderSingleReaderContract) {
@@ -944,8 +1219,8 @@ TEST(PdfPreparation, ReportsCheckpointWriteFailureInsteadOfUserCancellation) {
 }
 
 TEST(PdfPreparation, ResumeOutputWriteFailureClosesHandleRemovesPartialFileAndPreservesCheckpoint) {
-  for (const PdfTestFaultPoint faultPoint : {PdfTestFaultPoint::Write, PdfTestFaultPoint::Flush,
-                                             PdfTestFaultPoint::Sync, PdfTestFaultPoint::Close}) {
+  for (const PdfTestFaultPoint faultPoint :
+       {PdfTestFaultPoint::Write, PdfTestFaultPoint::Sync, PdfTestFaultPoint::Close}) {
     for (const char* const failedLeaf : {"metadata.bin", "outline.bin"}) {
       SCOPED_TRACE(static_cast<int>(faultPoint));
       SCOPED_TRACE(failedLeaf);
@@ -1056,12 +1331,14 @@ TEST(PdfPreparation, RecreatedInstanceResumesTheSameGenerationAfterOneVerifiedPa
   const uint32_t generation = interrupted.generation();
   const std::string generationRoot = std::string(interrupted.cacheRoot()) + "/gen_" + std::to_string(generation);
   const std::string journalPath = generationRoot + "/resume.journal";
+  // One durable slot publish seals discovery; the second seals the verified
+  // page. No extra checkpoint sync may occur inside either failure window.
   EXPECT_EQ(std::count_if(harness.storage.syncObservations().begin(), harness.storage.syncObservations().end(),
                           [&](const std::string& path) {
                             return path == std::string(interrupted.cacheRoot()) + "/build.a" ||
                                    path == std::string(interrupted.cacheRoot()) + "/build.b";
                           }),
-            1);
+            2);
   const std::string firstPath = generationRoot + "/sections/000000.xhtml";
   ASSERT_TRUE(harness.storage.exists(firstPath));
   const std::vector<uint8_t> firstBytes = harness.storage.bytes(firstPath);
@@ -1232,6 +1509,38 @@ TEST(PdfPreparation, RecreatedInstanceResumesTheSameGenerationAfterOneVerifiedPa
               0);
     EXPECT_EQ(rejected.storage.openHandleCount(), 0U);
   }
+}
+
+TEST(PdfPreparation, ResumesAfterAnUnreadablePageWithoutInventingJournalRecords) {
+  constexpr char sourcePath[] = "/books/skipped-page-resume.pdf";
+  const std::vector<uint8_t> fixture = makeTwoPageTextPdf(true, true);
+  ASSERT_FALSE(fixture.empty());
+
+  PreparationHarness harness;
+  harness.storage.setMaximumReadHandles(1);
+  harness.storage.addFile(sourcePath, fixture, 1234, true);
+  uint32_t generation = 0;
+  {
+    PdfPreparation interrupted;
+    ASSERT_TRUE(interrupted.begin(harness.config(sourcePath)).ok());
+    for (uint32_t slice = 0; slice < 20000 && interrupted.durableResumePage() != 3U; ++slice) {
+      const PdfStepResult step = interrupted.step();
+      ++harness.nowMs;
+      ASSERT_TRUE(step.yielded()) << static_cast<int>(step.status.error) << "@" << step.status.offset;
+    }
+    ASSERT_EQ(interrupted.durableResumePhase(), PdfBuildResumePhase::AfterPage);
+    ASSERT_EQ(interrupted.durableResumePage(), 3U);
+    generation = interrupted.generation();
+  }
+
+  PdfPreparation resumed;
+  ASSERT_TRUE(resumed.begin(harness.config(sourcePath)).ok());
+  const PdfStepResult result = runToTerminal(resumed, harness);
+  ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error) << "@" << result.status.offset;
+  EXPECT_TRUE(resumed.resumedFromCheckpoint());
+  EXPECT_EQ(resumed.resumedPhase(), PdfBuildResumePhase::AfterPage);
+  EXPECT_EQ(resumed.generation(), generation);
+  EXPECT_EQ(resumed.totalWords(), 6U);
 }
 
 TEST(PdfPreparationPaintGate, RequiresBothProgressAndElapsedTimeAndCapsIntermediatePaints) {

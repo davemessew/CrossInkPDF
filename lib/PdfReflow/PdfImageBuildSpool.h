@@ -9,12 +9,14 @@
 #include "PdfStreamDecoder.h"
 #include "PdfWorkBudget.h"
 
-inline constexpr uint16_t PDF_IMAGE_BUILD_SPOOL_VERSION = 3;
+inline constexpr uint16_t PDF_IMAGE_BUILD_SPOOL_VERSION = 4;
 inline constexpr uint8_t PDF_IMAGE_BUILD_SPOOL_MAX_RECORDS = 64;
 inline constexpr uint16_t PDF_IMAGE_BUILD_PALETTE_BYTES = 768;
-inline constexpr size_t PDF_IMAGE_BUILD_RECORD_BYTES = 864;
+inline constexpr size_t PDF_IMAGE_BUILD_RECORD_BYTES = 880;
 
 struct PdfDeferredImageRecord {
+  PdfObjectReference reference{};
+  PdfObjectReference auxiliaryReference{};
   uint64_t streamOffset = 0;
   uint64_t streamLength = 0;
   uint64_t contentHash = 0;

@@ -21,6 +21,13 @@ struct PdfPageTreeRecord {
   bool hasCropBox = false;
 };
 
+struct PdfPageContentOverflowRecord {
+  uint32_t pageIndex = 0;
+  uint16_t ordinal = 0;
+  uint16_t reserved = 0;
+  PdfObjectReference reference{};
+};
+
 struct PdfPageInfo {
   PdfObjectReference pageReference{};
   PdfObjectReference resourceOwner{};
@@ -30,10 +37,12 @@ struct PdfPageInfo {
   int32_t viewXMin = 0;
   int32_t viewYMin = 0;
   uint32_t pageIndex = 0;
+  uint32_t contentOverflowStart = 0;
   uint16_t pageWidth = 0;
   uint16_t pageHeight = 0;
   uint16_t rotation = 0;
   uint16_t overflowAnnotationCount = 0;
+  uint16_t overflowContentCount = 0;
   uint8_t contentCount = 0;
   uint8_t annotationCount = 0;
   bool hasResources = false;
@@ -42,7 +51,9 @@ struct PdfPageInfo {
 
 static_assert(sizeof(PdfPageTreeRecord) <= 72,
               "page-tree inheritance state must stay in fixed record storage");
-static_assert(sizeof(PdfPageInfo) <= 304,
+static_assert(sizeof(PdfPageContentOverflowRecord) == 16,
+              "content-overflow records must remain fixed-size");
+static_assert(sizeof(PdfPageInfo) <= 312,
               "captured page metadata must stay bounded");
 
 class PdfPageTreeWalker {
@@ -53,7 +64,8 @@ class PdfPageTreeWalker {
   PdfPageTreeWalker(PdfObjectResolver& resolver, PdfObjectArena& arena, PdfFixedRecordStore traversalStore,
                     PageFn pageFn, void* pageContext, TraversalAccessFn traversalAccess, void* traversalContext,
                     PdfPageInfo* pageWorkspace, PdfFixedRecordStore annotationOverflowStore = {},
-                    uint32_t maxPages = PdfLimits::MaxPages);
+                    uint32_t maxPages = PdfLimits::MaxPages,
+                    PdfFixedRecordStore contentOverflowStore = {});
 
   PdfStatus begin(PdfObjectReference rootPages);
   PdfStepResult step(PdfWorkBudget& budget);
@@ -63,11 +75,10 @@ class PdfPageTreeWalker {
   enum class Phase : uint8_t {
     Idle,
     Initialize,
-    NeedNode,
     Resolving,
     OpenTraversal,
     Processing,
-    CloseTraversal,
+    SelectNextNode,
     Done,
     Failed,
   };
@@ -78,6 +89,8 @@ class PdfPageTreeWalker {
     LoadChild,
     CheckAncestor,
     WriteChild,
+    LoadContent,
+    BeginAnnotations,
     LoadAnnotation,
     EmitPage,
     Complete,
@@ -92,6 +105,7 @@ class PdfPageTreeWalker {
   PdfObjectArena& arena_;
   PdfFixedRecordStore traversalStore_{};
   PdfFixedRecordStore annotationOverflowStore_{};
+  PdfFixedRecordStore contentOverflowStore_{};
   PageFn pageFn_ = nullptr;
   void* pageContext_ = nullptr;
   TraversalAccessFn traversalAccess_ = nullptr;
@@ -106,9 +120,12 @@ class PdfPageTreeWalker {
   uint32_t processingStackTop_ = UINT32_MAX;
   uint32_t ancestorOrdinal_ = UINT32_MAX;
   uint32_t overflowAnnotationRecordCount_ = 0;
+  uint32_t overflowContentRecordCount_ = 0;
   uint16_t kidsValueIndex_ = PDF_INVALID_INDEX;
+  uint16_t contentsValueIndex_ = PDF_INVALID_INDEX;
   uint16_t annotationsValueIndex_ = PDF_INVALID_INDEX;
   uint16_t kidsRemaining_ = 0;
+  uint16_t contentOrdinal_ = 0;
   uint16_t annotationOrdinal_ = 0;
   uint16_t ancestorVisited_ = 0;
   bool hasDeclaredRootCount_ = false;

@@ -1,6 +1,7 @@
 #include "PdfStreamDecoder.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 
@@ -13,6 +14,21 @@ constexpr size_t MIN_DECODER_BUFFER_BYTES = 128;
 constexpr size_t MIN_INFLATE_INPUT_BYTES = 64;
 constexpr size_t INFLATE_INPUT_DIVISOR = 2;
 constexpr size_t INFLATE_OUTPUT_SAFETY_BYTES = 64;
+
+bool isPngBitsPerComponent(const uint8_t bits) {
+  return bits == 1U || bits == 2U || bits == 4U || bits == 8U || bits == 16U;
+}
+
+uint8_t paethPredictor(const uint8_t left, const uint8_t up, const uint8_t upperLeft) {
+  const int32_t estimate = static_cast<int32_t>(left) + static_cast<int32_t>(up) - upperLeft;
+  const uint32_t leftDistance = static_cast<uint32_t>(std::abs(estimate - left));
+  const uint32_t upDistance = static_cast<uint32_t>(std::abs(estimate - up));
+  const uint32_t upperLeftDistance = static_cast<uint32_t>(std::abs(estimate - upperLeft));
+  if (leftDistance <= upDistance && leftDistance <= upperLeftDistance) {
+    return left;
+  }
+  return upDistance <= upperLeftDistance ? up : upperLeft;
+}
 
 bool isWhitespace(const uint8_t byte) {
   return byte == 0 || byte == '\t' || byte == '\n' || byte == '\f' || byte == '\r' || byte == ' ';
@@ -59,7 +75,8 @@ bool dictionaryKeyEquals(const PdfObjectArena& arena, const PdfDictionaryEntry& 
 }
 
 PdfStatus validateDefaultDecodeParameters(const PdfObjectArena& arena, const uint16_t dictionaryIndex,
-                                          const PdfStreamFilter filter) {
+                                          const PdfStreamFilter filter,
+                                          PdfStreamDecodeParameters* const decodeParameters) {
   if (dictionaryIndex >= arena.valueCount || arena.values[dictionaryIndex].kind != PdfValueKind::Dictionary) {
     return PdfStatus::failure(PdfError::Malformed, dictionaryIndex);
   }
@@ -70,6 +87,7 @@ PdfStatus validateDefaultDecodeParameters(const PdfObjectArena& arena, const uin
   if (filter != PdfStreamFilter::Flate) {
     return PdfStatus::failure(PdfError::UnsupportedFilter, dictionaryIndex);
   }
+  PdfStreamDecodeParameters parameters{};
   uint16_t entryIndex = dictionary.firstLink;
   uint8_t seenKeys = 0;
   for (uint16_t ordinal = 0; ordinal < dictionary.count; ++ordinal) {
@@ -102,16 +120,43 @@ PdfStatus validateDefaultDecodeParameters(const PdfObjectArena& arena, const uin
     if (parameter.kind != PdfValueKind::Integer || parameter.integerValue <= 0) {
       return PdfStatus::failure(PdfError::Malformed, entry.valueIndex);
     }
-    if (keyMask == (1U << 0) && parameter.integerValue != 1) {
-      return PdfStatus::failure(PdfError::UnsupportedFilter, static_cast<uint64_t>(parameter.integerValue));
+    if (keyMask == (1U << 0)) {
+      if (parameter.integerValue > UINT8_MAX) {
+        return PdfStatus::failure(PdfError::UnsupportedFilter, static_cast<uint64_t>(parameter.integerValue));
+      }
+      parameters.predictor = static_cast<uint8_t>(parameter.integerValue);
+    } else if (keyMask == (1U << 1)) {
+      if (parameter.integerValue > UINT8_MAX) {
+        return PdfStatus::failure(PdfError::UnsupportedFilter, static_cast<uint64_t>(parameter.integerValue));
+      }
+      parameters.colors = static_cast<uint8_t>(parameter.integerValue);
+    } else if (keyMask == (1U << 2)) {
+      if (parameter.integerValue > UINT8_MAX) {
+        return PdfStatus::failure(PdfError::UnsupportedFilter, static_cast<uint64_t>(parameter.integerValue));
+      }
+      parameters.bitsPerComponent = static_cast<uint8_t>(parameter.integerValue);
+    } else {
+      if (parameter.integerValue > UINT32_MAX) {
+        return PdfStatus::failure(PdfError::UnsupportedFilter, static_cast<uint64_t>(parameter.integerValue));
+      }
+      parameters.columns = static_cast<uint32_t>(parameter.integerValue);
     }
     entryIndex = entry.next;
   }
+  if (parameters.predictor == 1U) {
+    return PdfStatus::success();
+  }
+  if (parameters.predictor < 10U || parameters.predictor > 15U ||
+      !isPngBitsPerComponent(parameters.bitsPerComponent) || decodeParameters == nullptr) {
+    return PdfStatus::failure(PdfError::UnsupportedFilter, parameters.predictor);
+  }
+  *decodeParameters = parameters;
   return PdfStatus::success();
 }
 
 PdfStatus validateDecodeParameters(const PdfObjectArena& arena, const uint16_t dictionaryIndex,
-                                   const PdfStreamFilter* filters, const uint8_t filterCount) {
+                                   const PdfStreamFilter* filters, const uint8_t filterCount,
+                                   PdfStreamDecodeParameters* const decodeParameters) {
   uint16_t parametersIndex = PDF_INVALID_INDEX;
   if (!pdfDictionaryFind(arena, dictionaryIndex, "DecodeParms", &parametersIndex)) {
     return PdfStatus::success();
@@ -127,7 +172,7 @@ PdfStatus validateDecodeParameters(const PdfObjectArena& arena, const uint16_t d
     return PdfStatus::failure(PdfError::Malformed, parametersIndex);
   }
   if (parameters.kind == PdfValueKind::Dictionary) {
-    return filterCount == 1 ? validateDefaultDecodeParameters(arena, parametersIndex, filters[0])
+    return filterCount == 1 ? validateDefaultDecodeParameters(arena, parametersIndex, filters[0], decodeParameters)
                             : PdfStatus::failure(PdfError::Malformed, parametersIndex);
   }
   if (parameters.kind != PdfValueKind::Array || parameters.count != filterCount) {
@@ -141,7 +186,7 @@ PdfStatus validateDecodeParameters(const PdfObjectArena& arena, const uint16_t d
     if (arena.values[itemIndex].kind == PdfValueKind::Null) {
       continue;
     }
-    const PdfStatus status = validateDefaultDecodeParameters(arena, itemIndex, filters[ordinal]);
+    const PdfStatus status = validateDefaultDecodeParameters(arena, itemIndex, filters[ordinal], decodeParameters);
     if (!status.ok()) {
       return status;
     }
@@ -156,7 +201,8 @@ PdfStreamDecoder::PdfStreamDecoder(const PdfStreamDecoderWorkspace workspace) : 
 }
 
 PdfStatus PdfStreamDecoder::begin(const PdfByteSource& source, const PdfByteSink& sink, const PdfStreamFilter* filters,
-                                  const uint8_t filterCount, const PdfStreamDecodeLimits limits, const bool required) {
+                                  const uint8_t filterCount, const PdfStreamDecodeLimits limits, const bool required,
+                                  const PdfStreamDecodeParameters* const decodeParameters) {
   source_ = {};
   sink_ = {};
   limits_ = limits;
@@ -171,6 +217,10 @@ PdfStatus PdfStreamDecoder::begin(const PdfByteSource& source, const PdfByteSink
   outputBytes_ = 0;
   filterCount_ = 0;
   preFlateStages_ = 0;
+  predictorRowBytes_ = 0;
+  predictorRowPosition_ = 0;
+  predictorBytesPerPixel_ = 0;
+  predictor_ = 1;
   zlibHeaderLength_ = 0;
   hasFlate_ = false;
   inflateInputAtEnd_ = false;
@@ -216,6 +266,39 @@ PdfStatus PdfStreamDecoder::begin(const PdfByteSource& source, const PdfByteSink
     filters_[index] = filter;
   }
 
+  if (decodeParameters != nullptr && decodeParameters->predictor != 1U) {
+    if (decodeParameters->predictor < 10U || decodeParameters->predictor > 15U ||
+        decodeParameters->columns == 0U || decodeParameters->colors == 0U ||
+        !isPngBitsPerComponent(decodeParameters->bitsPerComponent) || !hasFlate_) {
+      phase_ = Phase::Failed;
+      return PdfStatus::failure(PdfError::UnsupportedFilter, decodeParameters->predictor);
+    }
+    uint64_t rowBits = 0;
+    uint64_t pixelBits = 0;
+    if (!pdfCheckedMultiply(decodeParameters->columns, decodeParameters->colors, &rowBits) ||
+        !pdfCheckedMultiply(rowBits, decodeParameters->bitsPerComponent, &rowBits) ||
+        !pdfCheckedMultiply(decodeParameters->colors, decodeParameters->bitsPerComponent, &pixelBits)) {
+      phase_ = Phase::Failed;
+      return PdfStatus::failure(PdfError::LimitExceeded, decodeParameters->columns);
+    }
+    const uint64_t rowBytes = (rowBits + 7U) / 8U;
+    const uint64_t bytesPerPixel = std::max<uint64_t>(1U, (pixelBits + 7U) / 8U);
+    uint64_t predictorWorkspaceBytes = 0;
+    // The previous row must remain resident while Flate owns the dictionary and
+    // output buffer. Wider rows fail this document only; spilling would require
+    // a second SD-reader phase and make every decoded row substantially slower.
+    if (!pdfCheckedAdd(rowBytes, bytesPerPixel, &predictorWorkspaceBytes) || bytesPerPixel > UINT16_MAX ||
+        predictorWorkspaceBytes >= workspace_.sourceBufferSize) {
+      phase_ = Phase::Failed;
+      return PdfStatus::failure(PdfError::InsufficientMemory, rowBytes);
+    }
+    predictorRowBytes_ = static_cast<size_t>(rowBytes);
+    predictorBytesPerPixel_ = static_cast<uint16_t>(bytesPerPixel);
+    predictor_ = decodeParameters->predictor;
+    std::memset(workspace_.sourceBuffer + workspace_.sourceBufferSize - predictorWorkspaceBytes, 0,
+                static_cast<size_t>(predictorWorkspaceBytes));
+  }
+
   source_ = source;
   sink_ = sink;
   filterCount_ = filterCount;
@@ -231,7 +314,6 @@ PdfStatus PdfStreamDecoder::begin(const PdfByteSource& source, const PdfByteSink
       phase_ = Phase::Failed;
       return PdfStatus::failure(PdfError::InvalidArgument);
     }
-    finalOutputOffset_ = inflateInputCapacity_;
     finalOutputCapacity_ = workspace_.outputBufferSize - inflateInputCapacity_;
     finalOutputCapacity_ = std::min(finalOutputCapacity_, inflateInputCapacity_ - INFLATE_OUTPUT_SAFETY_BYTES);
     if (!inflateContext_.reader.initWithExternalDictionary(workspace_.inflateDictionary,
@@ -246,7 +328,6 @@ PdfStatus PdfStreamDecoder::begin(const PdfByteSource& source, const PdfByteSink
     inflateContext_.reader.deinit();
     inflateInitialized_ = false;
     inflateInputCapacity_ = 0;
-    finalOutputOffset_ = 0;
     finalOutputCapacity_ = workspace_.outputBufferSize;
     phase_ = Phase::Decode;
   }
@@ -386,7 +467,7 @@ PdfStepResult PdfStreamDecoder::step(PdfWorkBudget& budget) {
     inflate->source = workspace_.outputBuffer;
     inflate->source_limit = workspace_.outputBuffer + inflateInputLength_;
     inflate->eof = false;
-    uint8_t* destination = workspace_.outputBuffer + finalOutputOffset_;
+    uint8_t* destination = workspace_.outputBuffer + inflateInputCapacity_;
     inflate->dest = destination;
     inflate->dest_limit = destination + finalOutputCapacity_;
     callbackStatus_ = PdfStatus::success();
@@ -419,18 +500,32 @@ PdfStepResult PdfStreamDecoder::step(PdfWorkBudget& budget) {
       return fail(
           PdfStatus::failure(inflateInputAtEnd_ ? PdfError::UnexpectedEof : PdfError::ExpansionLimit, inputBytes_));
     }
-    const PdfStatus growth = validateGrowth(produced);
+    size_t decodedProduced = 0;
+    const PdfStatus predictorStatus = applyPredictor(destination, produced, &decodedProduced);
+    if (!predictorStatus.ok()) {
+      activeBudget_ = nullptr;
+      return fail(predictorStatus);
+    }
+    const bool inflateFinished = inflateResult == TINF_DONE;
+    if (inflateFinished && predictorRowBytes_ != 0U && predictorRowPosition_ != 0U) {
+      activeBudget_ = nullptr;
+      return fail(PdfStatus::failure(PdfError::UnexpectedEof, outputBytes_ + decodedProduced));
+    }
+    const PdfStatus growth = validateGrowth(decodedProduced);
     if (!growth.ok()) {
       activeBudget_ = nullptr;
       return fail(growth);
     }
-    pendingOutputLength_ = produced;
+    pendingOutputLength_ = decodedProduced;
     pendingOutputWritten_ = 0;
-    finishAfterFlush_ = inflateResult == TINF_DONE;
+    finishAfterFlush_ = inflateFinished;
     if (pendingOutputLength_ == 0) {
-      phase_ = Phase::Done;
-      activeBudget_ = nullptr;
-      return PdfStepResult::completed();
+      if (finishAfterFlush_) {
+        phase_ = Phase::Done;
+        activeBudget_ = nullptr;
+        return PdfStepResult::completed();
+      }
+      continue;
     }
     phase_ = Phase::Flush;
   }
@@ -477,7 +572,9 @@ PdfStreamDecoder::PullResult PdfStreamDecoder::pullRaw(uint8_t* byte) {
   const uint64_t remaining64 = source_.size - sourceOffset_;
   const size_t remaining = remaining64 > std::numeric_limits<size_t>::max() ? std::numeric_limits<size_t>::max()
                                                                             : static_cast<size_t>(remaining64);
-  const size_t requested = activeBudget_->takeBytes(std::min(workspace_.sourceBufferSize, remaining));
+  const size_t predictorWorkspaceBytes = predictorRowBytes_ + predictorBytesPerPixel_;
+  const size_t sourceCapacity = workspace_.sourceBufferSize - predictorWorkspaceBytes;
+  const size_t requested = activeBudget_->takeBytes(std::min(sourceCapacity, remaining));
   if (requested == 0) {
     return {PullState::Yielded, PdfStatus::failure(PdfError::BudgetExhausted, sourceOffset_)};
   }
@@ -643,7 +740,7 @@ PdfStreamDecoder::PullResult PdfStreamDecoder::pullAscii85(const uint8_t stage, 
 }
 
 PdfStreamDecoder::PullResult PdfStreamDecoder::flushPending(PdfWorkBudget& budget) {
-  const uint8_t* source = workspace_.outputBuffer + (hasFlate_ ? finalOutputOffset_ : 0);
+  const uint8_t* source = workspace_.outputBuffer + (hasFlate_ ? inflateInputCapacity_ : 0);
   while (pendingOutputWritten_ < pendingOutputLength_) {
     if (budget.cancelRequested()) {
       return {PullState::Failed, PdfStatus::failure(PdfError::Cancelled, outputBytes_)};
@@ -673,6 +770,66 @@ PdfStreamDecoder::PullResult PdfStreamDecoder::flushPending(PdfWorkBudget& budge
   pendingOutputLength_ = 0;
   pendingOutputWritten_ = 0;
   return {PullState::End, PdfStatus::success()};
+}
+
+PdfStatus PdfStreamDecoder::applyPredictor(uint8_t* const bytes, const size_t inputLength,
+                                           size_t* const outputLength) {
+  if (outputLength == nullptr || (bytes == nullptr && inputLength != 0U)) {
+    return PdfStatus::failure(PdfError::InvalidArgument, outputBytes_);
+  }
+  *outputLength = inputLength;
+  if (predictorRowBytes_ == 0U) {
+    return PdfStatus::success();
+  }
+
+  uint8_t* const previousRow = workspace_.sourceBuffer + workspace_.sourceBufferSize - predictorRowBytes_;
+  uint8_t* const upperLeftRing = previousRow - predictorBytesPerPixel_;
+  size_t written = 0;
+  for (size_t read = 0; read < inputLength; ++read) {
+    const uint8_t encoded = bytes[read];
+    if (predictorRowPosition_ == 0U) {
+      if (encoded > 4U || (predictor_ != 15U && encoded != predictor_ - 10U)) {
+        return PdfStatus::failure(PdfError::Malformed, outputBytes_ + written);
+      }
+      zlibHeader_[0] = encoded;
+      predictorRowPosition_ = 1U;
+      continue;
+    }
+
+    const size_t column = predictorRowPosition_ - 1U;
+    const size_t pixelColumn = column % predictorBytesPerPixel_;
+    const uint8_t up = previousRow[column];
+    const uint8_t left = column < predictorBytesPerPixel_ ? 0U : previousRow[column - predictorBytesPerPixel_];
+    const uint8_t upperLeft = column < predictorBytesPerPixel_ ? 0U : upperLeftRing[pixelColumn];
+    upperLeftRing[pixelColumn] = up;
+    uint8_t prediction = 0;
+    switch (zlibHeader_[0]) {
+      case 0:
+        break;
+      case 1:
+        prediction = left;
+        break;
+      case 2:
+        prediction = up;
+        break;
+      case 3:
+        prediction = static_cast<uint8_t>((static_cast<uint16_t>(left) + up) / 2U);
+        break;
+      case 4:
+        prediction = paethPredictor(left, up, upperLeft);
+        break;
+      default:
+        return PdfStatus::failure(PdfError::Malformed, outputBytes_ + written);
+    }
+    const uint8_t decoded = static_cast<uint8_t>(encoded + prediction);
+    previousRow[column] = decoded;
+    bytes[written++] = decoded;
+    predictorRowPosition_ = predictorRowPosition_ == predictorRowBytes_
+                                ? 0U
+                                : static_cast<uint16_t>(predictorRowPosition_ + 1U);
+  }
+  *outputLength = written;
+  return PdfStatus::success();
 }
 
 PdfStatus PdfStreamDecoder::validateGrowth(const uint64_t additionalBytes) const {
@@ -709,12 +866,16 @@ int PdfStreamDecoder::refillInflateInput(uzlib_uncomp*) {
 }
 
 PdfStatus pdfStreamFiltersFromDictionary(const PdfObjectArena& arena, const uint16_t dictionaryIndex,
-                                         PdfStreamFilter* filters, const uint8_t filterCapacity, uint8_t* filterCount) {
+                                         PdfStreamFilter* filters, const uint8_t filterCapacity, uint8_t* filterCount,
+                                         PdfStreamDecodeParameters* const decodeParameters) {
   if (filters == nullptr || filterCount == nullptr || dictionaryIndex >= arena.valueCount ||
       arena.values[dictionaryIndex].kind != PdfValueKind::Dictionary) {
     return PdfStatus::failure(PdfError::InvalidArgument, dictionaryIndex);
   }
   *filterCount = 0;
+  if (decodeParameters != nullptr) {
+    *decodeParameters = {};
+  }
   const PdfValue& dictionary = arena.values[dictionaryIndex];
   uint16_t entryIndex = dictionary.firstLink;
   uint8_t filterKeys = 0;
@@ -736,7 +897,7 @@ PdfStatus pdfStreamFiltersFromDictionary(const PdfObjectArena& arena, const uint
   }
   uint16_t valueIndex = PDF_INVALID_INDEX;
   if (!pdfDictionaryFind(arena, dictionaryIndex, "Filter", &valueIndex)) {
-    return validateDecodeParameters(arena, dictionaryIndex, filters, 0);
+    return validateDecodeParameters(arena, dictionaryIndex, filters, 0, decodeParameters);
   }
   if (valueIndex >= arena.valueCount) {
     return PdfStatus::failure(PdfError::Malformed, dictionaryIndex);
@@ -763,5 +924,5 @@ PdfStatus pdfStreamFiltersFromDictionary(const PdfObjectArena& arena, const uint
     }
     *filterCount = static_cast<uint8_t>(value.count);
   }
-  return validateDecodeParameters(arena, dictionaryIndex, filters, *filterCount);
+  return validateDecodeParameters(arena, dictionaryIndex, filters, *filterCount, decodeParameters);
 }

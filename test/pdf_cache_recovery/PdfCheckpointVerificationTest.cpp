@@ -138,4 +138,19 @@ INSTANTIATE_TEST_SUITE_P(
     Codec3Fields, CheckpointPostWriteVerificationTest, ::testing::ValuesIn(kCheckpointFieldMutations),
     [](const ::testing::TestParamInfo<CheckpointFieldMutation>& info) { return info.param.name; });
 
+TEST(PdfCheckpointDurability, UsesOneStatusBearingSyncWithoutRedundantFlushBeforeReadback) {
+  PdfTestCacheIo storage;
+  PdfCacheStore store;
+  ASSERT_TRUE(store.initialize(storage.io(), kRoot));
+
+  ASSERT_TRUE(store.commitCheckpoint(checkpoint()));
+
+  EXPECT_EQ(storage.flushCalls(), 0u);
+  EXPECT_EQ(storage.syncCalls(), 1u);
+  EXPECT_EQ(storage.closeCalls(), 2u);
+  ASSERT_EQ(storage.syncObservations().size(), 1u);
+  EXPECT_EQ(storage.syncObservations().front(), kCheckpointPath);
+  EXPECT_EQ(storage.openHandleCount(), 0u);
+}
+
 }  // namespace

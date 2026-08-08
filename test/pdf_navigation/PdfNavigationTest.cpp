@@ -316,6 +316,89 @@ struct NavigationParserHarness {
   }
 };
 
+struct ParsedNavigationObject {
+  std::vector<uint8_t> encoded;
+  PdfTestByteSource bytes;
+  PdfByteSource source;
+  std::array<uint8_t, 256> sourceBuffer{};
+  std::array<PdfValue, 96> values{};
+  std::array<PdfDictionaryEntry, 48> dictionaries{};
+  std::array<PdfArrayItem, 96> arrays{};
+  std::array<uint8_t, 1024> text{};
+  PdfObjectArena arena{
+      values.data(),       static_cast<uint16_t>(values.size()),
+      dictionaries.data(), static_cast<uint16_t>(dictionaries.size()),
+      arrays.data(),       static_cast<uint16_t>(arrays.size()),
+      text.data(),         static_cast<uint16_t>(text.size()),
+  };
+  PdfLexer lexer;
+  PdfObjectParser parser;
+  PdfStepResult result{};
+  uint16_t rootIndex = PDF_INVALID_INDEX;
+
+  explicit ParsedNavigationObject(const std::string& object)
+      : encoded(object.begin(), object.end()),
+        bytes(encoded),
+        source(bytes.source()),
+        lexer(source, sourceBuffer.data(), sourceBuffer.size()),
+        parser(lexer, arena) {
+    parser.begin();
+    do {
+      PdfWorkBudget budget{8, 256};
+      result = parser.step(budget);
+    } while (result.yielded());
+    rootIndex = parser.rootIndex();
+  }
+};
+
+struct WideKeyTreeSource {
+  uint16_t visited = 0;
+  bool cycle = false;
+
+  static PdfStatus inspect(void* context, const PdfObjectReference reference, uint16_t* kidCount) {
+    if (context == nullptr || kidCount == nullptr) {
+      return PdfStatus::failure(PdfError::InvalidArgument);
+    }
+    auto& self = *static_cast<WideKeyTreeSource*>(context);
+    ++self.visited;
+    if (reference.objectNumber == 1U) {
+      *kidCount = self.cycle ? 1U : 20U;
+      return PdfStatus::success();
+    }
+    if (self.cycle && reference.objectNumber == 2U) {
+      *kidCount = 1U;
+      return PdfStatus::success();
+    }
+    if (!self.cycle && reference.objectNumber >= 2U && reference.objectNumber <= 21U) {
+      *kidCount = 0;
+      return PdfStatus::success();
+    }
+    return PdfStatus::failure(PdfError::Malformed, reference.objectNumber);
+  }
+
+  static PdfStatus readKid(void* context, const PdfObjectReference parent, const uint16_t ordinal,
+                           PdfObjectReference* child) {
+    if (context == nullptr || child == nullptr) {
+      return PdfStatus::failure(PdfError::InvalidArgument);
+    }
+    const auto& self = *static_cast<WideKeyTreeSource*>(context);
+    if (self.cycle) {
+      if (ordinal != 0 || (parent.objectNumber != 1U && parent.objectNumber != 2U)) {
+        return PdfStatus::failure(PdfError::Malformed, ordinal);
+      }
+      *child = {parent.objectNumber == 1U ? 2U : 1U, 0};
+      return PdfStatus::success();
+    }
+    if (parent.objectNumber != 1U || ordinal >= 20U) {
+      return PdfStatus::failure(PdfError::Malformed, ordinal);
+    }
+    *child = {static_cast<uint32_t>(ordinal + 2U), 0};
+    return PdfStatus::success();
+  }
+
+  PdfKeyTreeSource source() { return {this, inspect, readKid}; }
+};
+
 }  // namespace
 
 TEST(PdfMetadataStore, AppliesDeterministicSourcePrecedenceAndUtf8Bounds) {
@@ -398,7 +481,7 @@ TEST(PdfMetadataStore, RoundTripsBoundedSectionsAndRejectsCorruption) {
   EXPECT_EQ(pdfDecodeMetadata(corruptSource.source(), &decoded, ignored.visitor()).error, PdfError::Malformed);
 }
 
-TEST(PdfOutline, PreservesHierarchyAndDestinationsWithHardCycleAndDepthLimits) {
+TEST(PdfOutline, PreservesHierarchyAndFlattensDepthWithoutDroppingEntries) {
   std::array<PdfOutlineEntry, 8> entries{};
   PdfOutlineBuilder builder({entries.data(), static_cast<uint16_t>(entries.size())});
   ASSERT_TRUE(builder.begin().ok());
@@ -423,8 +506,104 @@ TEST(PdfOutline, PreservesHierarchyAndDestinationsWithHardCycleAndDepthLimits) {
   for (uint8_t level = 0; level < PdfOutlineLimits::MaxDepth; ++level) {
     ASSERT_TRUE(deep.append(candidate(100 + level, level == 0 ? -1 : level - 1, "nested", 0, level)).ok());
   }
-  EXPECT_EQ(deep.append(candidate(999, PdfOutlineLimits::MaxDepth - 1, "too deep", 0, 99)).error,
-            PdfError::LimitExceeded);
+  ASSERT_TRUE(deep.append(candidate(999, PdfOutlineLimits::MaxDepth - 1, "too deep", 0, 99)).ok());
+  ASSERT_EQ(deep.count(), PdfOutlineLimits::MaxDepth + 1U);
+  EXPECT_EQ(deepEntries[PdfOutlineLimits::MaxDepth].level, PdfOutlineLimits::MaxDepth);
+  EXPECT_EQ(deepEntries[PdfOutlineLimits::MaxDepth].parentIndex, PdfOutlineLimits::MaxDepth - 2);
+  EXPECT_EQ(deepEntries[PdfOutlineLimits::MaxDepth].sectionIndex, 0U);
+  EXPECT_EQ(deepEntries[PdfOutlineLimits::MaxDepth].anchorOrdinal, 99U);
+  EXPECT_STREQ(deepEntries[PdfOutlineLimits::MaxDepth].title, "too deep");
+}
+
+TEST(PdfOutline, TruncatesDisplayTitlesOnUtf8BoundariesButRejectsOverlongDestinationNamesLocally) {
+  std::string longTitle(PdfOutlineLimits::TitleBytes - 2U, 'a');
+  longTitle += "\xE2\x82\xAC";
+  std::array<PdfOutlineEntry, 1> entries{};
+  PdfOutlineBuilder builder({entries.data(), static_cast<uint16_t>(entries.size())});
+  ASSERT_TRUE(builder.begin().ok());
+  PdfOutlineCandidate item = candidate(1, -1, "unused", 0, 0);
+  item.title = reinterpret_cast<const uint8_t*>(longTitle.data());
+  item.titleLength = longTitle.size();
+  ASSERT_TRUE(builder.append(item).ok());
+  EXPECT_EQ(entries[0].titleLength, PdfOutlineLimits::TitleBytes - 2U);
+  EXPECT_EQ(entries[0].title[entries[0].titleLength], '\0');
+
+  std::array<PdfNamedDestinationRecord, 2> records{};
+  PdfNamedDestinationMap destinations({records.data(), static_cast<uint16_t>(records.size())});
+  ASSERT_TRUE(destinations.begin().ok());
+  const std::string longName(PdfOutlineLimits::DestinationNameBytes + 8U, 'n');
+  const PdfRawDestination destination{PdfRawDestinationKind::Explicit, {7, 0}, {}, 0};
+  EXPECT_EQ(destinations.add(reinterpret_cast<const uint8_t*>(longName.data()), longName.size(), destination).error,
+            PdfError::Unsupported);
+  EXPECT_EQ(destinations.count(), 0U);
+}
+
+TEST(PdfOutline, WalksMoreThanSixteenKeyTreeNodesThroughFixedRecordCallbacksAndRejectsCycles) {
+  std::string object = "<< /Kids [";
+  for (uint32_t number = 2; number <= 21; ++number) {
+    object += std::to_string(number) + " 0 R ";
+  }
+  object += "] >>";
+  ParsedNavigationObject parsed(object);
+  ASSERT_TRUE(parsed.result.complete()) << static_cast<int>(parsed.result.status.error);
+  PdfKeyTreeNode node{};
+  ASSERT_TRUE(pdfReadKeyTreeNode(parsed.arena, parsed.rootIndex, &node).ok());
+  EXPECT_EQ(node.kidCount, 20U);
+  PdfObjectReference last{};
+  ASSERT_TRUE(pdfReadKeyTreeKid(parsed.arena, node, 19, &last).ok());
+  EXPECT_EQ(last.objectNumber, 21U);
+  std::array<PdfNamedDestinationRecord, 2> destinationRecords{};
+  PdfNamedDestinationMap destinations(
+      {destinationRecords.data(), static_cast<uint16_t>(destinationRecords.size())});
+  ASSERT_TRUE(destinations.begin().ok());
+  EXPECT_EQ(pdfReadNamedDestinations(parsed.arena, parsed.rootIndex, &destinations).error, PdfError::Unsupported);
+  std::array<PdfPageLabelRange, 2> labelRanges{};
+  PdfPageLabelMap labels({labelRanges.data(), static_cast<uint8_t>(labelRanges.size())});
+  ASSERT_TRUE(labels.begin().ok());
+  EXPECT_EQ(pdfReadPageLabels(parsed.arena, parsed.rootIndex, &labels).error, PdfError::Unsupported);
+
+  PdfTestRecordStore frames(sizeof(PdfKeyTreeFrame), 1);
+  WideKeyTreeSource wide;
+  PdfKeyTreeWalkRuntime runtime{};
+  ASSERT_TRUE(pdfBeginKeyTreeWalk({1, 0}, frames.store(), &runtime).ok());
+  PdfStepResult walk;
+  do {
+    PdfWorkBudget budget{1, sizeof(PdfKeyTreeFrame)};
+    walk = pdfStepKeyTreeWalk(wide.source(), frames.store(), &runtime, budget);
+  } while (walk.yielded());
+  ASSERT_TRUE(walk.complete()) << static_cast<int>(walk.status.error);
+  EXPECT_EQ(wide.visited, 21U);
+
+  PdfTestRecordStore cycleFrames(sizeof(PdfKeyTreeFrame), 2);
+  WideKeyTreeSource cycle;
+  cycle.cycle = true;
+  runtime = {};
+  ASSERT_TRUE(pdfBeginKeyTreeWalk({1, 0}, cycleFrames.store(), &runtime).ok());
+  do {
+    PdfWorkBudget budget{1, sizeof(PdfKeyTreeFrame)};
+    walk = pdfStepKeyTreeWalk(cycle.source(), cycleFrames.store(), &runtime, budget);
+  } while (walk.yielded());
+  ASSERT_TRUE(walk.failed());
+  EXPECT_EQ(walk.status.error, PdfError::Malformed);
+}
+
+TEST(PdfOutline, SkipsMalformedOptionalDestinationItemsAndContinuesTheNameTree) {
+  ParsedNavigationObject parsed("<< /Names [(bad) 7 (good) [3 0 R /Fit]] >>");
+  ASSERT_TRUE(parsed.result.complete()) << static_cast<int>(parsed.result.status.error);
+  std::array<PdfNamedDestinationRecord, 2> records{};
+  PdfNamedDestinationMap destinations({records.data(), static_cast<uint16_t>(records.size())});
+  ASSERT_TRUE(destinations.begin().ok());
+  ASSERT_TRUE(pdfReadNamedDestinations(parsed.arena, parsed.rootIndex, &destinations).ok());
+  ASSERT_EQ(destinations.count(), 1U);
+  PdfRawDestination good{};
+  ASSERT_TRUE(destinations.resolve(reinterpret_cast<const uint8_t*>("good"), 4, &good).ok());
+  EXPECT_EQ(good.pageReference.objectNumber, 3U);
+
+  ParsedNavigationObject malformedLink("<< /Subtype /Link /Dest [3 0 R /Fit] /Rect [0 0 (bad) 1] >>");
+  ASSERT_TRUE(malformedLink.result.complete()) << static_cast<int>(malformedLink.result.status.error);
+  PdfRawLinkAnnotation annotation{};
+  EXPECT_EQ(pdfReadLinkAnnotation(malformedLink.arena, malformedLink.rootIndex, &annotation).error,
+            PdfError::Unsupported);
 }
 
 TEST(PdfOutline, FallsBackToHeadingsThenToOneDocumentRoot) {

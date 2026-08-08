@@ -78,6 +78,25 @@ bool pdfDictionaryFind(const PdfObjectArena& arena, uint16_t dictionaryIndex, co
 bool pdfArrayAt(const PdfObjectArena& arena, uint16_t arrayIndex, uint16_t ordinal, uint16_t* valueIndex);
 bool pdfTextEquals(const PdfObjectArena& arena, const PdfValue& value, const char* expected);
 
+enum class PdfNamedIntegerArrayEvent : uint8_t {
+  Begin,
+  Value,
+  End,
+};
+
+using PdfNamedIntegerArrayCallback =
+    PdfStatus (*)(void* context, PdfNamedIntegerArrayEvent event, int64_t value, uint64_t sourceOffset);
+
+struct PdfNamedIntegerArraySink {
+  const char* key = nullptr;
+  uint16_t keyLength = 0;
+  uint8_t dictionaryDepth = 0;
+  void* context = nullptr;
+  PdfNamedIntegerArrayCallback callback = nullptr;
+
+  bool valid() const { return key != nullptr && keyLength != 0 && dictionaryDepth != 0 && callback != nullptr; }
+};
+
 class PdfObjectParser {
  public:
   PdfObjectParser(PdfLexer& lexer, PdfObjectArena& arena);
@@ -89,6 +108,10 @@ class PdfObjectParser {
     stringTokenBuffer_ = buffer;
     stringTokenCapacity_ = capacity;
   }
+  void setSkipUnusedPageResources(bool enabled) { skipUnusedPageResources_ = enabled; }
+  // The sink is caller-owned and must outlive parsing. A pointer keeps the
+  // generic parser small for users that do not stream named arrays.
+  void setNamedIntegerArraySink(const PdfNamedIntegerArraySink* sink) { namedIntegerArraySink_ = sink; }
 
  private:
   struct Frame {
@@ -106,8 +129,11 @@ class PdfObjectParser {
   PdfStatus emitReference(int64_t objectNumber, int64_t generation);
   PdfStatus emitTokenValue(const PdfToken& token);
   PdfStatus openContainer(bool dictionary);
+  PdfStatus openNamedIntegerArray();
+  PdfStatus handleNamedIntegerArrayToken(const PdfToken& token);
   PdfStatus closeContainer(bool dictionary);
   PdfStatus handleToken(const PdfToken& token);
+  bool shouldStreamNamedIntegerArray() const;
 
   PdfLexer& lexer_;
   PdfObjectArena& arena_;
@@ -119,8 +145,11 @@ class PdfObjectParser {
   uint8_t pendingIntegerStage_ = 0;
   bool complete_ = false;
   bool failed_ = false;
-  bool skipPieceInfoValue_ = false;
+  bool skipDictionaryValue_ = false;
+  bool skipUnusedPageResources_ = false;
+  bool namedIntegerArrayActive_ = false;
   uint8_t skipDepth_ = 0;
+  const PdfNamedIntegerArraySink* namedIntegerArraySink_ = nullptr;
   uint8_t* stringTokenBuffer_ = nullptr;
   size_t stringTokenCapacity_ = 0;
 };

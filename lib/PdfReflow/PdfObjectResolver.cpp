@@ -5,6 +5,7 @@
 #include <limits>
 
 #include "PdfCheckedMath.h"
+#include "PdfSecurity.h"
 #include "PdfStreamBoundary.h"
 
 namespace {
@@ -127,7 +128,13 @@ PdfStatus PdfObjectResolver::begin(const PdfObjectReference reference) {
   publishObjectStream_ = false;
   streamFilterCount_ = 0;
   const PdfStatus status = xref_.beginFind(reference.objectNumber, &xrefLookup_);
-  phase_ = status ? Phase::SelectXref : Phase::Failed;
+  if (status && xrefLookup_.phase == PdfXrefLookupPhase::Done) {
+    // A caller may have closed the previously selected reader between
+    // objects. Reassert the actual source/store before using a cached xref.
+    invalidateSourceAccess();
+  }
+  phase_ = status ? (xrefLookup_.phase == PdfXrefLookupPhase::Done ? Phase::LookupReference : Phase::SelectXref)
+                  : Phase::Failed;
   return status;
 }
 
@@ -188,8 +195,8 @@ PdfStepResult PdfObjectResolver::step(PdfWorkBudget& budget) {
         return PdfStepResult::paused();
       }
 
-      if (lookupTargetReference().generation != 0 || xrefLookup_.entry.offset > PdfLimits::MaxIndirectObjects ||
-          xrefLookup_.entry.objectStreamIndex >= PdfLimits::MaxIndirectObjects) {
+      if (lookupTargetReference().generation != 0 ||
+          xrefLookup_.entry.offset > PdfLimits::MaxIndirectObjectNumber) {
         return fail(PdfStatus::failure(PdfError::Malformed, lookupTargetReference().objectNumber));
       }
       objectStreamNumber_ = static_cast<uint32_t>(xrefLookup_.entry.offset);
@@ -212,6 +219,16 @@ PdfStepResult PdfObjectResolver::step(PdfWorkBudget& budget) {
       const PdfStatus status = xref_.beginFind(objectStreamNumber_, &xrefLookup_);
       if (!status) {
         return fail(status);
+      }
+      phase_ = xrefLookup_.phase == PdfXrefLookupPhase::Done ? Phase::LookupObjectStream
+                                                             : Phase::SelectObjectStreamXref;
+      return PdfStepResult::paused();
+    }
+
+    if (phase_ == Phase::SelectObjectStreamXref) {
+      const PdfStepResult access = stepSourceAccess(PdfObjectResolverReader::Xref, budget);
+      if (!access.complete()) {
+        return access.failed() ? fail(access.status) : access;
       }
       phase_ = Phase::LookupObjectStream;
       return PdfStepResult::paused();
@@ -320,6 +337,12 @@ PdfStepResult PdfObjectResolver::step(PdfWorkBudget& budget) {
           phase_ = Phase::Failed;
         }
         return parseResult;
+      }
+      if (!embedded && workspace_.security != nullptr) {
+        const PdfStatus securityStatus = workspace_.security->decryptStrings(arena_, activeReference_);
+        if (!securityStatus) {
+          return fail(securityStatus);
+        }
       }
       result_.rootIndex = parser_.rootIndex();
       if (embedded) {
@@ -505,7 +528,7 @@ PdfStepResult PdfObjectResolver::step(PdfWorkBudget& budget) {
         break;
 
       case Phase::ObjectStreamIndexNumber:
-        if (!parseUnsigned(token, &value) || value > PdfLimits::MaxIndirectObjects) {
+        if (!parseUnsigned(token, &value) || value > PdfLimits::MaxIndirectObjectNumber) {
           return fail(PdfStatus::failure(PdfError::Malformed, lexer_.tokenOffset()));
         }
         objectStreamIndexObjectNumber_ = static_cast<uint32_t>(value);
@@ -530,6 +553,20 @@ PdfStepResult PdfObjectResolver::step(PdfWorkBudget& budget) {
         }
         objectStreamPreviousOffset_ = value;
         ++objectStreamIndexOrdinal_;
+        const bool targetBoundaryKnown =
+            objectStreamTargetFound_ &&
+            (objectStreamTargetIndex_ + 1U >= objectStreamObjectCount_ ||
+             objectStreamIndexOrdinal_ > objectStreamTargetIndex_ + 1U);
+        if (targetBoundaryKnown) {
+          if (objectStreamTargetIndex_ + 1U >= objectStreamObjectCount_) {
+            objectStreamTargetEnd_ = bodyLength;
+          }
+          const PdfStatus status = beginEmbeddedObject();
+          if (!status.ok()) {
+            return fail(status);
+          }
+          break;
+        }
         if (objectStreamIndexOrdinal_ == objectStreamObjectCount_) {
           if (!objectStreamTargetFound_) {
             return fail(PdfStatus::failure(PdfError::Malformed, lookupTargetReference().objectNumber));
@@ -577,7 +614,12 @@ PdfStatus PdfObjectResolver::beginIndirectLength(const PdfObjectReference refere
   objectStreamTargetFound_ = false;
   streamFilterCount_ = 0;
   const PdfStatus status = xref_.beginFind(reference.objectNumber, &xrefLookup_);
-  phase_ = status.ok() ? Phase::SelectXref : Phase::Failed;
+  if (status && xrefLookup_.phase == PdfXrefLookupPhase::Done) {
+    invalidateSourceAccess();
+  }
+  phase_ = status.ok()
+               ? (xrefLookup_.phase == PdfXrefLookupPhase::Done ? Phase::LookupReference : Phase::SelectXref)
+               : Phase::Failed;
   return status;
 }
 
@@ -601,7 +643,12 @@ PdfStatus PdfObjectResolver::finishIndirectLength() {
   objectStreamTargetFound_ = false;
   streamFilterCount_ = 0;
   const PdfStatus status = xref_.beginFind(result_.reference.objectNumber, &xrefLookup_);
-  phase_ = status.ok() ? Phase::SelectXref : Phase::Failed;
+  if (status && xrefLookup_.phase == PdfXrefLookupPhase::Done) {
+    invalidateSourceAccess();
+  }
+  phase_ = status.ok()
+               ? (xrefLookup_.phase == PdfXrefLookupPhase::Done ? Phase::LookupReference : Phase::SelectXref)
+               : Phase::Failed;
   return status;
 }
 
@@ -616,8 +663,8 @@ PdfStatus PdfObjectResolver::configureObjectStream(const uint64_t streamOffset) 
   }
   uint64_t count = 0;
   uint64_t first = 0;
-  if (!dictionaryUnsigned(arena_, result_.rootIndex, "N", &count) || count == 0 ||
-      count > PdfLimits::MaxIndirectObjects || !dictionaryUnsigned(arena_, result_.rootIndex, "First", &first)) {
+  if (!dictionaryUnsigned(arena_, result_.rootIndex, "N", &count) || count == 0 || count > UINT32_MAX ||
+      !dictionaryUnsigned(arena_, result_.rootIndex, "First", &first)) {
     return PdfStatus::failure(PdfError::LimitExceeded, objectStreamNumber_);
   }
   if (objectStreamTargetIndex_ >= count) {
@@ -643,7 +690,9 @@ PdfStatus PdfObjectResolver::configureObjectStream(const uint64_t streamOffset) 
   if (!status.ok()) {
     return status;
   }
-  objectStreamUsesStore_ = streamFilterCount_ != 0;
+  // An encrypted raw ObjStm still has to pass through the decoded store so
+  // its members are decrypted exactly once with the container object's key.
+  objectStreamUsesStore_ = streamFilterCount_ != 0 || workspace_.security != nullptr;
   publishObjectStream_ = true;
   objectStreamDecodedSize_ = 0;
   result_.streamOffset = 0;
@@ -668,7 +717,15 @@ PdfStatus PdfObjectResolver::configureObjectStream(const uint64_t streamOffset) 
 }
 
 PdfStatus PdfObjectResolver::beginObjectStreamDecode() {
-  const PdfByteSource streamSource = pdfByteRangeSource(objectStreamSourceRange_);
+  PdfByteSource streamSource = pdfByteRangeSource(objectStreamSourceRange_);
+  if (workspace_.security != nullptr) {
+    PdfByteSource decrypted{};
+    const PdfStatus securityStatus = workspace_.security->openStream(streamSource, activeReference_, &decrypted);
+    if (!securityStatus) {
+      return securityStatus;
+    }
+    streamSource = decrypted;
+  }
   const PdfByteSink streamSink = pdfByteStoreSink(workspace_.objectStreamStore);
   PdfStreamDecodeLimits limits = workspace_.decodeLimits;
   limits.maxExpandedBytes = std::min(limits.maxExpandedBytes, workspace_.objectStreamStore.capacity);

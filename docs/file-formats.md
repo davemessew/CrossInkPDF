@@ -289,7 +289,7 @@ For `AfterPage`, the three-byte resume-data count is the committed prefix of
 records the encoded resume-ledger length. It is zero for checkpoints without
 one of those durable data sets.
 
-### `resume.sections`: PRES version 1
+### `resume.sections`: PRES version 2
 
 An in-progress generation stores a fixed 256-byte section/image resume control
 at `gen_<generation>/resume.sections`. It is accepted only when its sequence,
@@ -297,14 +297,14 @@ generation, resume phase, section count, completed source-page count, and
 retained-image count match the selected PRCP checkpoint.
 
 - `[0-3]` magic `PRES`
-- `[4-5]` version (`1`)
+- `[4-5]` version (`2`)
 - `[6-7]` record size (`256`)
 - `[8-11]` matching checkpoint sequence
 - `[12-15]` generation
 - `[16]` resume phase (`2=AfterEmitSections`, `4=AfterImage`,
   `5=AfterImageRepair`)
 - `[17]` flags (`bit0=cover selected`, `bit1=cover record available`,
-  `bit2=source cover is JPEG`)
+  `bit2=source cover is JPEG`, `bit3=encrypted source`)
 - `[18]` deferred-image count (maximum `64`)
 - `[19]` retained required-image-file count
 - `[20-21]` emitted section count
@@ -330,16 +330,18 @@ falls back safely.
 
 The single page-resume journal starts with one discovery snapshot:
 
-- `PDRH` version 1, 192 bytes
+- `PDRH` version 5, 336 bytes
 - sorted 24-byte xref records, each with its own CRC-32
-- 244-byte explicit page records, each with its own CRC-32
-- `PDRT` version 1, 72 bytes
+- 256-byte explicit page records, each with its own CRC-32
+- 12-byte annotation-overflow records and 20-byte content-overflow records,
+  each with its own CRC-32
+- `PDRT` version 5, 72 bytes
 
-Each explicit page record is bound to the PDRH/PDRT version-1 envelope and has
+Each explicit page record is bound to the PDRH/PDRT version-5 envelope and has
 this fixed PDRP layout:
 
 - `[0-3]` magic `PDRP`
-- `[4-5]` record size (`244`)
+- `[4-5]` record size (`256`)
 - `[6-7]` zero-based page ordinal
 - `[8-13]` page object reference
 - `[14-19]` resource-owner object reference
@@ -356,19 +358,25 @@ this fixed PDRP layout:
 - `[237]` annotation count
 - `[238]` resource flags (`bit0=resources present`,
   `bit1=resource dictionary is indirect`)
-- `[239]` annotation-overflow marker (`0` means the fixed record is complete;
-  `1` makes discovery resume restart because excess references are session-only)
-- `[240-243]` record CRC-32 over bytes `[0-239]`
+- `[239-240]` annotation-overflow record count
+- `[241-242]` content-overflow record count
+- `[243]` reserved zero
+- `[244-247]` first content-overflow record ordinal
+- `[248-251]` reserved zero
+- `[252-255]` record CRC-32 over bytes `[0-251]`
 
 Every object reference occupies six bytes: a little-endian `uint32_t` object
 number followed by a little-endian `uint16_t` generation.
 
 The discovery snapshot length is exactly
-`192 + xrefCount * 24 + pageCount * 244 + 72`. The header binds the source
+`336 + xrefCount * 24 + pageCount * 256 + annotationOverflowCount * 12 +
+contentOverflowCount * 20 + 72`. The header binds the source
 identity, generation, xref and page counts, record sizes, catalog references,
-and language. The trailer repeats the source size, head and tail fingerprints,
+language, overflow counts, and passwordless-encryption metadata needed to
+rederive the key after resume. The derived key itself is never stored. The
+trailer repeats the source size, head and tail fingerprints,
 modification-time-known flag, generation, counts, and record sizes. It also
-stores an aggregate CRC-32 and FNV-1a ledger over all xref and explicit-page
+stores an aggregate CRC-32 and FNV-1a ledger over all xref, page, and overflow
 records. Xrefs must decode in strictly increasing object-number order.
 
 After the discovery trailer, committed prepared pages append `PRJR` version 2, 512 bytes each.
@@ -610,9 +618,9 @@ The following files are implementation workspaces, not durable cache APIs.
 They are never required-file records in a completed PRMF manifest and are
 removed during preparation cleanup:
 
-- `build.images`: `PIBS`/`PIBE` version 3, with at most 64 fixed 864-byte
+- `build.images`: `PIBS`/`PIBE` version 4, with at most 64 fixed 880-byte
   deferred-image records.
-- `build.image-files` and `build.image-files.resume`: `PIFS`/`PIFE` version 3,
+- `build.image-files` and `build.image-files.resume`: `PIFS`/`PIFE` version 4,
   with at most 64 fixed 116-byte required-file records. The `.resume` ledger is
   the separately published required-file snapshot used at image resume
   boundaries.
@@ -627,15 +635,16 @@ removed during preparation cleanup:
 The PIBS and PIFS files share this 16-byte header envelope:
 
 - `[0-3]` start magic (`PIBS` or `PIFS`)
-- `[4-5]` version (`3`)
+- `[4-5]` version (`4`)
 - `[6]` maximum record count (`64`)
 - `[7]` reserved zero
-- `[8-9]` record size (`864` for PIBS, `116` for PIFS)
+- `[8-9]` record size (`880` for PIBS, `116` for PIFS)
 - `[10-11]` reserved zero
 - `[12-15]` header CRC-32 over bytes `[0-11]`
 
-Each 864-byte deferred-image record stores its own CRC-32 in `[860-863]`,
-covering bytes `[0-859]`. Each 116-byte required-file record stores its own
+Each 880-byte deferred-image record stores its source and auxiliary object
+references in `[860-871]`, keeps `[872-875]` reserved, and stores its CRC-32 in
+`[876-879]`, covering bytes `[0-875]`. Each 116-byte required-file record stores its own
 CRC-32 in `[112-115]`, covering bytes `[0-111]`. The running aggregate CRC is
 calculated over every complete encoded record, including those record-local
 CRCs.
@@ -643,7 +652,7 @@ CRCs.
 Their common 24-byte footer layout is:
 
 - `[0-3]` end magic (`PIBE` or `PIFE`)
-- `[4-5]` version (`3`)
+- `[4-5]` version (`4`)
 - `[6]` encoded record count
 - `[7]` reserved zero
 - `[8-15]` first-record offset (`16`)

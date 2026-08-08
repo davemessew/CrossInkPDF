@@ -195,8 +195,8 @@ TEST(PdfCacheFaultInjection, ValidationAndOpenWriterStateFailBeforeCommitMarkerW
 }
 
 TEST(PdfCacheFaultInjection, TrackedWriterFailsClosedAtEveryDurabilityBoundary) {
-  for (const PdfTestFaultPoint point : {PdfTestFaultPoint::Open, PdfTestFaultPoint::Write, PdfTestFaultPoint::Flush,
-                                        PdfTestFaultPoint::Sync, PdfTestFaultPoint::Close}) {
+  for (const PdfTestFaultPoint point : {PdfTestFaultPoint::Open, PdfTestFaultPoint::Write, PdfTestFaultPoint::Sync,
+                                        PdfTestFaultPoint::Close}) {
     PdfTestCacheIo storage;
     storage.addDirectory(kRoot);
     PdfCacheTrackedWriter writer{};
@@ -229,6 +229,27 @@ TEST(PdfCacheFaultInjection, TrackedWriterFailsClosedAtEveryDurabilityBoundary) 
   const std::array<uint8_t, 4> bytes{{1, 2, 3, 4}};
   EXPECT_FALSE(pdfWriteTrackedCacheFile(&shortWriter, bytes.data(), bytes.size()).ok());
   pdfAbortTrackedCacheFile(&shortWriter);
+}
+
+TEST(PdfCacheFaultInjection, TrackedWriterUsesOneStatusBearingSyncWithoutRedundantFlush) {
+  PdfTestCacheIo storage;
+  storage.addDirectory(kRoot);
+  const std::string path = std::string(kRoot) + "/metadata.bin";
+  PdfCacheTrackedWriter writer{};
+  ASSERT_TRUE(pdfOpenTrackedCacheWriter(storage.io(), path.c_str(), "metadata.bin", PdfCacheFileKind::Required, 16,
+                                        &writer));
+  const std::array<uint8_t, 4> bytes{{1, 2, 3, 4}};
+  ASSERT_TRUE(pdfWriteTrackedCacheFile(&writer, bytes.data(), bytes.size()));
+
+  PdfRequiredFileRecord output{};
+  ASSERT_TRUE(pdfCloseTrackedCacheFile(&writer, &output));
+
+  EXPECT_EQ(storage.flushCalls(), 0u);
+  EXPECT_EQ(storage.syncCalls(), 1u);
+  EXPECT_EQ(storage.closeCalls(), 1u);
+  ASSERT_EQ(storage.syncObservations().size(), 1u);
+  EXPECT_EQ(storage.syncObservations().front(), path);
+  EXPECT_EQ(storage.openHandleCount(), 0u);
 }
 
 TEST(PdfCacheFaultInjection, CleanupFailureLeavesCommittedSelectionRecoverable) {

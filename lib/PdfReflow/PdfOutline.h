@@ -108,6 +108,62 @@ struct PdfRawDestination {
   uint8_t nameLength = 0;
 };
 
+struct PdfKeyTreeNode {
+  uint16_t kidsArrayIndex = PDF_INVALID_INDEX;
+  uint16_t kidCount = 0;
+};
+
+struct PdfKeyTreeSource {
+  using InspectFn = PdfStatus (*)(void* context, PdfObjectReference reference, uint16_t* kidCount);
+  using ReadKidFn = PdfStatus (*)(void* context, PdfObjectReference parent, uint16_t ordinal,
+                                  PdfObjectReference* child);
+
+  void* context = nullptr;
+  InspectFn inspect = nullptr;
+  ReadKidFn readKid = nullptr;
+
+  constexpr bool valid() const { return inspect != nullptr && readKid != nullptr; }
+};
+
+struct PdfKeyTreeFrame {
+  PdfObjectReference reference{};
+  uint16_t nextKid = 0;
+  uint16_t kidCount = 0;
+};
+
+static_assert(sizeof(PdfKeyTreeFrame) <= 16, "key-tree traversal frames must remain compact");
+
+enum class PdfKeyTreeWalkStage : uint8_t {
+  Idle,
+  Root,
+  Descend,
+  PersistParent,
+  CheckCycle,
+  InspectChild,
+  Complete,
+  Failed,
+};
+
+struct PdfKeyTreeWalkRuntime {
+  PdfStatus failure{};
+  PdfObjectReference root{};
+  PdfObjectReference pendingChild{};
+  PdfKeyTreeFrame activeFrame{};
+  uint32_t depth = 0;
+  uint32_t ancestorIndex = 0;
+  PdfKeyTreeWalkStage stage = PdfKeyTreeWalkStage::Idle;
+};
+
+static_assert(sizeof(PdfKeyTreeWalkRuntime) <= 64, "key-tree traversal state must remain compact");
+
+PdfStatus pdfReadKeyTreeNode(const PdfObjectArena& arena, uint16_t rootIndex, PdfKeyTreeNode* node);
+PdfStatus pdfReadKeyTreeKid(const PdfObjectArena& arena, const PdfKeyTreeNode& node, uint16_t ordinal,
+                            PdfObjectReference* child);
+PdfStatus pdfBeginKeyTreeWalk(PdfObjectReference root, const PdfFixedRecordStore& frames,
+                              PdfKeyTreeWalkRuntime* runtime);
+PdfStepResult pdfStepKeyTreeWalk(const PdfKeyTreeSource& source, const PdfFixedRecordStore& frames,
+                                 PdfKeyTreeWalkRuntime* runtime, PdfWorkBudget& budget);
+
 struct PdfCatalogNavigation {
   PdfObjectReference pages{};
   PdfObjectReference outlines{};
@@ -141,7 +197,7 @@ struct PdfNamedDestinationRecord {
 
 struct PdfNamedDestinationWorkspace {
   PdfNamedDestinationRecord* records = nullptr;
-  uint8_t capacity = 0;
+  uint16_t capacity = 0;
 };
 
 class PdfNamedDestinationMap {
@@ -151,11 +207,11 @@ class PdfNamedDestinationMap {
   PdfStatus begin();
   PdfStatus add(const uint8_t* name, size_t nameLength, const PdfRawDestination& destination);
   PdfStatus resolve(const uint8_t* name, size_t nameLength, PdfRawDestination* destination) const;
-  uint8_t count() const { return count_; }
+  uint16_t count() const { return count_; }
 
  private:
   PdfNamedDestinationWorkspace workspace_{};
-  uint8_t count_ = 0;
+  uint16_t count_ = 0;
   bool initialized_ = false;
 };
 

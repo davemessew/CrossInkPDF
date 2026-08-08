@@ -13,13 +13,13 @@ There is no desktop conversion step and nothing special to do before upload. Cop
 >
 > **Standard text — 10, 12, 14, and 16 pt**
 >
-> **[Download `firmware-tiny-pdf-reflow-v1.5.0.2.bin`](https://github.com/davemessew/CrossInkPDF/releases/download/pdf-reflow-v1.5.0.2/firmware-tiny-pdf-reflow-v1.5.0.2.bin)**
+> **[Download `firmware-tiny-pdf-reflow-v1.5.0.3.bin`](https://github.com/davemessew/CrossInkPDF/releases/download/pdf-reflow-v1.5.0.3/firmware-tiny-pdf-reflow-v1.5.0.3.bin)**
 >
 > **Large text — 16, 18, and 20 pt**
 >
-> **[Download `firmware-xlarge-pdf-reflow-v1.5.0.2.bin`](https://github.com/davemessew/CrossInkPDF/releases/download/pdf-reflow-v1.5.0.2/firmware-xlarge-pdf-reflow-v1.5.0.2.bin)**
+> **[Download `firmware-xlarge-pdf-reflow-v1.5.0.3.bin`](https://github.com/davemessew/CrossInkPDF/releases/download/pdf-reflow-v1.5.0.3/firmware-xlarge-pdf-reflow-v1.5.0.3.bin)**
 >
-> [Release page](https://github.com/davemessew/CrossInkPDF/releases/tag/pdf-reflow-v1.5.0.2) · [Installation guide](./docs/installation.md)
+> [Release page](https://github.com/davemessew/CrossInkPDF/releases/tag/pdf-reflow-v1.5.0.3) · [Installation guide](./docs/installation.md)
 >
 > Both downloads contain the full CrossInk firmware, PDF support, emoji, and symbol support. They are not PDF-only images.
 
@@ -72,11 +72,12 @@ PDF Reflow is intended for:
 - Born-digital PDFs with selectable text
 - Scanned PDFs that already contain a usable OCR text layer
 - Documents with ordinary text columns, headings, tables, links, and supported images
+- Passwordless RC4-encrypted PDFs that use the PDF Standard security handler
 
 It is not intended for:
 
 - Image-only scans without OCR text
-- Password-protected or encrypted PDFs
+- PDFs that require a password, AES encryption, or another unsupported security handler
 - Comics, magazines, forms, or documents where the exact printed page is the content
 - PDFs that depend on unsupported encodings, filters, or interactive features
 
@@ -137,7 +138,7 @@ See [Font Build Variants](./docs/font-build-variants.md) for more detail.
 
 The easiest route is the web installer:
 
-1. Download the [`tiny` firmware](https://github.com/davemessew/CrossInkPDF/releases/download/pdf-reflow-v1.5.0.2/firmware-tiny-pdf-reflow-v1.5.0.2.bin) for standard text or the [`xlarge` firmware](https://github.com/davemessew/CrossInkPDF/releases/download/pdf-reflow-v1.5.0.2/firmware-xlarge-pdf-reflow-v1.5.0.2.bin) for large text.
+1. Download the [`tiny` firmware](https://github.com/davemessew/CrossInkPDF/releases/download/pdf-reflow-v1.5.0.3/firmware-tiny-pdf-reflow-v1.5.0.3.bin) for standard text or the [`xlarge` firmware](https://github.com/davemessew/CrossInkPDF/releases/download/pdf-reflow-v1.5.0.3/firmware-xlarge-pdf-reflow-v1.5.0.3.bin) for large text.
 2. Open the CrossInk web installer.
 3. Select **Custom .bin**.
 4. Choose the downloaded file and flash it.

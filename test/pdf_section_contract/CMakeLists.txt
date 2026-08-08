@@ -26,6 +26,7 @@ add_executable(PdfSectionContractTest
   ${REPO_ROOT}/lib/PdfReflow/PdfHiddenText.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfLexer.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfObjectParser.cpp
+  ${REPO_ROOT}/lib/PdfReflow/PdfSecurity.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfObjectResolver.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfPageModel.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfPreparedContent.cpp

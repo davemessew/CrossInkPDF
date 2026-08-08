@@ -761,7 +761,7 @@ TEST(PdfContentInterpreterTest, AppliesFormBboxClipAndPageTransformToTextAndImag
   EXPECT_LT(caption.yMin, image.yMax);
 }
 
-TEST(PdfContentInterpreterTest, ActualTextOverridesUnmappedCidButMeaningfulCidFailsClearly) {
+TEST(PdfContentInterpreterTest, ReplacesUnmappedCidAndHonorsActualText) {
   std::array<PdfFontWidthRecord, 2> widths{};
   PdfFontMap cidFont({widths.data(), static_cast<uint16_t>(widths.size())});
   ASSERT_TRUE(cidFont.begin(2, true, nullptr, nullptr, 1000).ok());
@@ -774,8 +774,8 @@ TEST(PdfContentInterpreterTest, ActualTextOverridesUnmappedCidButMeaningfulCidFa
   ASSERT_TRUE(
       unsupportedHarness.interpreter.begin(&unsupportedSource, 1, resources.descriptor, unsupportedHarness.model).ok());
   const PdfStepResult unsupportedResult = runInterpreter(unsupportedHarness.interpreter);
-  ASSERT_TRUE(unsupportedResult.failed());
-  EXPECT_EQ(unsupportedResult.status.error, PdfError::UnsupportedEncoding);
+  ASSERT_TRUE(unsupportedResult.complete()) << static_cast<int>(unsupportedResult.status.error);
+  EXPECT_EQ(transcript(unsupportedHarness.model), "\xEF\xBF\xBD");
 
   PdfTestByteSource accessible(
       bytes("BT /F1 12 Tf 72 700 Td /Span << /ActualText (Readable) >> BDC "
@@ -789,7 +789,7 @@ TEST(PdfContentInterpreterTest, ActualTextOverridesUnmappedCidButMeaningfulCidFa
   EXPECT_EQ(transcript(accessibleHarness.model), "Readable");
 }
 
-TEST(PdfContentInterpreterTest, RejectsGraphicsOverflowAndFormCyclesAtBoundedDepth) {
+TEST(PdfContentInterpreterTest, RejectsGraphicsOverflowButOmitsRecursiveForms) {
   DefaultFont defaultFont;
   TestResourceTable resources;
   resources.font = &defaultFont.font;
@@ -803,7 +803,7 @@ TEST(PdfContentInterpreterTest, RejectsGraphicsOverflowAndFormCyclesAtBoundedDep
   ASSERT_TRUE(graphicsResult.failed());
   EXPECT_EQ(graphicsResult.status.error, PdfError::LimitExceeded);
 
-  PdfTestByteSource page(bytes("/Loop Do"));
+  PdfTestByteSource page(bytes("/Loop Do BT /F1 12 Tf (after) Tj ET"));
   PdfTestByteSource loop(bytes("/Loop Do"));
   resources.loop.kind = PdfContentXObjectKind::Form;
   resources.loop.reference = {99, 0};
@@ -815,8 +815,40 @@ TEST(PdfContentInterpreterTest, RejectsGraphicsOverflowAndFormCyclesAtBoundedDep
   InterpreterHarness cycleHarness;
   ASSERT_TRUE(cycleHarness.interpreter.begin(&pageSource, 1, resources.descriptor, cycleHarness.model).ok());
   const PdfStepResult cycleResult = runInterpreter(cycleHarness.interpreter);
-  ASSERT_TRUE(cycleResult.failed());
-  EXPECT_EQ(cycleResult.status.error, PdfError::Malformed);
+  ASSERT_TRUE(cycleResult.complete()) << static_cast<int>(cycleResult.status.error);
+  EXPECT_EQ(transcript(cycleHarness.model), "after");
+  EXPECT_NE(static_cast<uint16_t>(cycleHarness.model.warnings()) &
+                static_cast<uint16_t>(PdfPageWarning::VectorArtOmitted),
+            0U);
+}
+
+TEST(PdfContentInterpreterTest, OperatorBudgetEndsOnlyTheCurrentPage) {
+  DefaultFont defaultFont;
+  TestResourceTable resources;
+  resources.font = &defaultFont.font;
+  PdfTestByteSource exhaustedPage(bytes("BT /F1 12 Tf (omitted) Tj ET"));
+  const PdfByteSource exhaustedSource = exhaustedPage.source();
+  InterpreterHarness exhaustedHarness;
+  exhaustedHarness.documentOperatorCount = PdfLimits::MaxOperatorsPerDocument;
+  ASSERT_TRUE(
+      exhaustedHarness.interpreter.begin(&exhaustedSource, 1, resources.descriptor, exhaustedHarness.model).ok());
+
+  const PdfStepResult exhaustedResult = runInterpreter(exhaustedHarness.interpreter);
+
+  ASSERT_TRUE(exhaustedResult.complete()) << static_cast<int>(exhaustedResult.status.error);
+  EXPECT_EQ(transcript(exhaustedHarness.model), "");
+  EXPECT_EQ(exhaustedHarness.documentOperatorCount, 0U);
+  EXPECT_NE(static_cast<uint16_t>(exhaustedHarness.model.warnings()) &
+                static_cast<uint16_t>(PdfPageWarning::VectorArtOmitted),
+            0U);
+
+  PdfTestByteSource nextPage(bytes("BT /F1 12 Tf (after budget) Tj ET"));
+  const PdfByteSource nextSource = nextPage.source();
+  InterpreterHarness nextHarness;
+  ASSERT_TRUE(nextHarness.interpreter.begin(&nextSource, 1, resources.descriptor, nextHarness.model).ok());
+  const PdfStepResult nextResult = runInterpreter(nextHarness.interpreter);
+  ASSERT_TRUE(nextResult.complete()) << static_cast<int>(nextResult.status.error);
+  EXPECT_EQ(transcript(nextHarness.model), "after budget");
 }
 
 TEST(PdfContentInterpreterTest, PdfFontSizesSixAndSeventyTwoProduceIdenticalSemanticText) {

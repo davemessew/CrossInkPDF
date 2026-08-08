@@ -24,6 +24,13 @@ struct PdfStreamDecodeLimits {
   uint16_t maxExpansionRatio = PdfLimits::MaxExpansionRatio;
 };
 
+struct PdfStreamDecodeParameters {
+  uint16_t columns = 1;
+  uint8_t predictor = 1;
+  uint8_t colors = 1;
+  uint8_t bitsPerComponent = 8;
+};
+
 struct PdfStreamDecoderWorkspace {
   uint8_t* sourceBuffer = nullptr;
   size_t sourceBufferSize = 0;
@@ -38,7 +45,8 @@ class PdfStreamDecoder {
   explicit PdfStreamDecoder(PdfStreamDecoderWorkspace workspace);
 
   PdfStatus begin(const PdfByteSource& source, const PdfByteSink& sink, const PdfStreamFilter* filters,
-                  uint8_t filterCount, PdfStreamDecodeLimits limits = {}, bool required = true);
+                  uint8_t filterCount, PdfStreamDecodeLimits limits = {}, bool required = true,
+                  const PdfStreamDecodeParameters* decodeParameters = nullptr);
   PdfStepResult step(PdfWorkBudget& budget);
 
   uint64_t inputBytes() const { return inputBytes_; }
@@ -101,6 +109,7 @@ class PdfStreamDecoder {
   PullResult pullAsciiHex(uint8_t stage, uint8_t* byte);
   PullResult pullAscii85(uint8_t stage, uint8_t* byte);
   PullResult flushPending(PdfWorkBudget& budget);
+  PdfStatus applyPredictor(uint8_t* bytes, size_t inputLength, size_t* outputLength);
   PdfStatus validateGrowth(uint64_t additionalBytes) const;
   PdfStepResult fail(PdfStatus status);
 
@@ -120,13 +129,16 @@ class PdfStreamDecoder {
   size_t pendingOutputWritten_ = 0;
   size_t inflateInputLength_ = 0;
   size_t inflateInputCapacity_ = 0;
-  size_t finalOutputOffset_ = 0;
+  size_t predictorRowBytes_ = 0;
   size_t finalOutputCapacity_ = 0;
   uint64_t sourceOffset_ = 0;
   uint64_t inputBytes_ = 0;
   uint64_t outputBytes_ = 0;
   uint8_t filterCount_ = 0;
   uint8_t preFlateStages_ = 0;
+  uint16_t predictorRowPosition_ = 0;
+  uint16_t predictorBytesPerPixel_ = 0;
+  uint8_t predictor_ = 1;
   uint8_t zlibHeader_[2]{};
   uint8_t zlibHeaderLength_ = 0;
   bool hasFlate_ = false;
@@ -137,4 +149,5 @@ class PdfStreamDecoder {
 };
 
 PdfStatus pdfStreamFiltersFromDictionary(const PdfObjectArena& arena, uint16_t dictionaryIndex,
-                                         PdfStreamFilter* filters, uint8_t filterCapacity, uint8_t* filterCount);
+                                         PdfStreamFilter* filters, uint8_t filterCapacity, uint8_t* filterCount,
+                                         PdfStreamDecodeParameters* decodeParameters = nullptr);

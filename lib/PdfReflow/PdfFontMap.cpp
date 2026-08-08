@@ -403,7 +403,26 @@ PdfStatus PdfFontMap::decodeNext(const uint8_t* const source, const size_t sourc
     return PdfStatus::failure(PdfError::InvalidArgument);
   }
   if (materialized()) {
-    return findMaterializedGlyph(source, sourceLength, glyph);
+    const PdfStatus status = findMaterializedGlyph(source, sourceLength, glyph);
+    if (status.ok() || cid_ || status.error != PdfError::UnsupportedEncoding) {
+      return status;
+    }
+    uint32_t scalar = 0;
+    if (!pdfConservativeLatinFallback(source[0], &scalar) && !pdfWinAnsiFallback(source[0], &scalar)) {
+      return status;
+    }
+    *glyph = {};
+    glyph->sourceCode = source[0];
+    glyph->sourceLength = 1;
+    size_t encodedLength = 0;
+    const PdfStatus encodeStatus =
+        pdfAppendUtf8Scalar(scalar, glyph->unicode.bytes, sizeof(glyph->unicode.bytes), &encodedLength);
+    if (!encodeStatus) {
+      return encodeStatus;
+    }
+    glyph->unicode.length = static_cast<uint8_t>(encodedLength);
+    glyph->width = 500;
+    return PdfStatus::success();
   }
   *glyph = {};
   if (toUnicode_ != nullptr) {
@@ -431,7 +450,7 @@ PdfStatus PdfFontMap::decodeNext(const uint8_t* const source, const size_t sourc
       return status;
     }
     uint32_t scalar = 0;
-    if (!pdfConservativeLatinFallback(source[0], &scalar)) {
+    if (!pdfConservativeLatinFallback(source[0], &scalar) && !pdfWinAnsiFallback(source[0], &scalar)) {
       return status;
     }
     size_t length = 0;

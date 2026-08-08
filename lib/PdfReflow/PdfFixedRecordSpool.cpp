@@ -104,6 +104,25 @@ PdfStatus PdfFixedRecordSpool::appendRecords(const void* const records, const ui
   return PdfStatus::success();
 }
 
+PdfStatus PdfFixedRecordSpool::readRecords(const uint32_t ordinal, void* const records, const uint32_t count) {
+  if (io_ == nullptr || !handle_.valid() || mode_ == PdfCacheOpenMode::WriteTruncate || records == nullptr ||
+      count == 0 || ordinal > recordCount_ || count > recordCount_ - ordinal ||
+      recordSize_ > std::numeric_limits<size_t>::max() / count) {
+    return PdfStatus::failure(PdfError::InvalidOffset, ordinal);
+  }
+  const size_t bytes = static_cast<size_t>(count) * recordSize_;
+  const uint64_t offset = static_cast<uint64_t>(ordinal) * recordSize_;
+  size_t bytesRead = 0;
+  const PdfStatus status =
+      io_->read(io_->context, handle_, offset, static_cast<uint8_t*>(records), bytes, &bytesRead);
+  if (!status) {
+    return status;
+  }
+  readOperations_ += count;
+  return bytesRead == bytes ? PdfStatus::success()
+                            : PdfStatus::failure(PdfError::UnexpectedEof, offset + bytesRead);
+}
+
 PdfStatus PdfFixedRecordSpool::rewriteExisting(const uint32_t ordinal, const void* const record,
                                                 const size_t recordSize) {
   if (io_ == nullptr || !handle_.valid() || mode_ != PdfCacheOpenMode::ReadWrite || record == nullptr ||

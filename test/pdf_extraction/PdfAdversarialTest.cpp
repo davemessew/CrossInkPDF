@@ -263,6 +263,7 @@ PdfStepResult runInterpreter(PdfContentInterpreter& interpreter) {
 struct OperatorObservation {
   PdfStepResult result = PdfStepResult::failure(PdfStatus::failure(PdfError::BudgetExhausted));
   uint32_t documentOperatorCount = 0;
+  PdfPageWarning warnings = PdfPageWarning::None;
 };
 
 OperatorObservation interpretOneDocumentOperator(const uint32_t initialDocumentOperatorCount) {
@@ -275,6 +276,7 @@ OperatorObservation interpretOneDocumentOperator(const uint32_t initialDocumentO
   const PdfStatus status = harness.interpreter.begin(&source, 1, resources, harness.model);
   observation.result = status.ok() ? runInterpreter(harness.interpreter) : PdfStepResult::failure(status);
   observation.documentOperatorCount = harness.documentOperatorCount;
+  observation.warnings = harness.model.warnings();
   return observation;
 }
 
@@ -328,6 +330,7 @@ struct FormChain {
 struct FormObservation {
   PdfStepResult result = PdfStepResult::failure(PdfStatus::failure(PdfError::BudgetExhausted));
   uint8_t maximumDepth = 0;
+  PdfPageWarning warnings = PdfPageWarning::None;
 };
 
 FormObservation interpretFormChain(const uint8_t formCount) {
@@ -339,6 +342,7 @@ FormObservation interpretFormChain(const uint8_t formCount) {
   const PdfStatus status = harness.interpreter.begin(&source, 1, forms.resources[0], harness.model);
   observation.result = status.ok() ? runInterpreter(harness.interpreter) : PdfStepResult::failure(status);
   observation.maximumDepth = harness.interpreter.maximumFormDepth();
+  observation.warnings = harness.model.warnings();
   return observation;
 }
 
@@ -526,26 +530,26 @@ TEST(PdfAdversarialTest, ObjectContainerDepthAcceptsNAndRejectsNPlusOne) {
   EXPECT_EQ(over.status.error, PdfError::LimitExceeded);
 }
 
-TEST(PdfAdversarialTest, DocumentOperatorLimitAcceptsNAndRejectsNAtNMinusOneCapacity) {
+TEST(PdfAdversarialTest, DocumentOperatorLimitEndsOnlyTheCurrentPage) {
   const OperatorObservation exact = interpretOneDocumentOperator(PdfLimits::MaxOperatorsPerDocument - 1U);
   ASSERT_TRUE(exact.result.complete()) << static_cast<int>(exact.result.status.error);
   EXPECT_EQ(exact.documentOperatorCount, PdfLimits::MaxOperatorsPerDocument);
 
   const OperatorObservation shortByOne = interpretOneDocumentOperator(PdfLimits::MaxOperatorsPerDocument);
-  ASSERT_TRUE(shortByOne.result.failed());
-  EXPECT_EQ(shortByOne.result.status.error, PdfError::LimitExceeded);
-  EXPECT_EQ(shortByOne.documentOperatorCount, PdfLimits::MaxOperatorsPerDocument);
+  ASSERT_TRUE(shortByOne.result.complete()) << static_cast<int>(shortByOne.result.status.error);
+  EXPECT_EQ(shortByOne.documentOperatorCount, 0U);
+  EXPECT_NE(static_cast<uint16_t>(shortByOne.warnings) & static_cast<uint16_t>(PdfPageWarning::VectorArtOmitted), 0U);
 }
 
-TEST(PdfAdversarialTest, FormDepthAcceptsProductionMaximumAndRejectsOneMore) {
+TEST(PdfAdversarialTest, FormDepthAcceptsProductionMaximumAndOmitsOneMore) {
   const FormObservation exact = interpretFormChain(PdfLimits::MaxFormDepth);
   ASSERT_TRUE(exact.result.complete()) << static_cast<int>(exact.result.status.error);
   EXPECT_EQ(exact.maximumDepth, PdfLimits::MaxFormDepth);
 
   const FormObservation over = interpretFormChain(PdfLimits::MaxFormDepth + 1U);
-  ASSERT_TRUE(over.result.failed());
-  EXPECT_EQ(over.result.status.error, PdfError::LimitExceeded);
+  ASSERT_TRUE(over.result.complete()) << static_cast<int>(over.result.status.error);
   EXPECT_EQ(over.maximumDepth, PdfLimits::MaxFormDepth);
+  EXPECT_NE(static_cast<uint16_t>(over.warnings) & static_cast<uint16_t>(PdfPageWarning::VectorArtOmitted), 0U);
 }
 
 TEST(PdfAdversarialTest, ExpandedByteLimitAcceptsNAndRejectsNAtNMinusOneCapacity) {

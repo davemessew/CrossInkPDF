@@ -179,6 +179,7 @@ add_executable(PdfImagePreparationTest
   ${REPO_ROOT}/lib/PdfReflow/PdfLexer.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfMetadataStore.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfObjectParser.cpp
+  ${REPO_ROOT}/lib/PdfReflow/PdfSecurity.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfObjectResolver.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfOutline.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfPageModel.cpp

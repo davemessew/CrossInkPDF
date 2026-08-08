@@ -121,7 +121,21 @@ TEST(PdfLexerTest, ReportsExactEofAndTokenLimitFailures) {
     EXPECT_EQ(result.status.offset, input.size());
   }
   {
-    const std::string input = "/" + std::string(113, 'A');
+    const std::string input = "/" + std::string(127, 'A');
+    PdfTestByteSource memory(std::vector<uint8_t>(input.begin(), input.end()));
+    auto source = memory.source();
+    std::array<uint8_t, 4096> sourceBuffer{};
+    PdfLexer lexer(source, sourceBuffer.data(), sourceBuffer.size());
+    PdfToken token;
+    PdfWorkBudget budget{32, 4096};
+    const PdfStepResult result = lexer.next(token, budget);
+    ASSERT_TRUE(result.complete());
+    EXPECT_EQ(token.kind, PdfTokenKind::Name);
+    EXPECT_EQ(token.length, 127U);
+    EXPECT_EQ(std::string(token.bytes, token.length), std::string(127, 'A'));
+  }
+  {
+    const std::string input = "/" + std::string(128, 'A');
     PdfTestByteSource memory(std::vector<uint8_t>(input.begin(), input.end()));
     auto source = memory.source();
     std::array<uint8_t, 4096> sourceBuffer{};
@@ -132,6 +146,45 @@ TEST(PdfLexerTest, ReportsExactEofAndTokenLimitFailures) {
     EXPECT_TRUE(result.failed());
     EXPECT_EQ(result.status.error, PdfError::LimitExceeded);
   }
+}
+
+TEST(PdfObjectParserTest, RejectsRelevantTruncatedStringsButSkipsTruncatedPieceInfo) {
+  const auto parse = [](const std::string& input, PdfObjectArena& arena, uint16_t* rootIndex) {
+    PdfTestByteSource memory(std::vector<uint8_t>(input.begin(), input.end()));
+    const PdfByteSource source = memory.source();
+    std::array<uint8_t, 64> sourceBuffer{};
+    std::array<uint8_t, 8> stringBuffer{};
+    PdfLexer lexer(source, sourceBuffer.data(), sourceBuffer.size());
+    PdfObjectParser parser(lexer, arena);
+    parser.setStringTokenBuffer(stringBuffer.data(), stringBuffer.size());
+    parser.begin();
+    PdfStepResult result;
+    do {
+      PdfWorkBudget budget{8, 64};
+      result = parser.step(budget);
+    } while (result.yielded());
+    *rootIndex = parser.rootIndex();
+    return result;
+  };
+
+  ArenaStorage relevantStorage;
+  PdfObjectArena relevantArena = relevantStorage.arena();
+  uint16_t relevantRoot = PDF_INVALID_INDEX;
+  const PdfStepResult relevant =
+      parse("<< /Title (This string does not fit) >>", relevantArena, &relevantRoot);
+  ASSERT_TRUE(relevant.failed());
+  EXPECT_EQ(relevant.status.error, PdfError::LimitExceeded);
+
+  ArenaStorage ignoredStorage;
+  PdfObjectArena ignoredArena = ignoredStorage.arena();
+  uint16_t ignoredRoot = PDF_INVALID_INDEX;
+  const PdfStepResult ignored =
+      parse("<< /PieceInfo << /Private (This string does not fit) >> /Type /Page >>", ignoredArena, &ignoredRoot);
+  ASSERT_TRUE(ignored.complete()) << static_cast<int>(ignored.status.error);
+  ASSERT_NE(ignoredRoot, PDF_INVALID_INDEX);
+  uint16_t typeIndex = PDF_INVALID_INDEX;
+  ASSERT_TRUE(pdfDictionaryFind(ignoredArena, ignoredRoot, "Type", &typeIndex));
+  EXPECT_TRUE(pdfTextEquals(ignoredArena, ignoredArena.values[typeIndex], "Page"));
 }
 
 TEST(PdfObjectParserTest, ParsesReferencesNestedContainersAndDecodedKeys) {

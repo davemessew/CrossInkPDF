@@ -3,6 +3,7 @@ add_executable(PdfNavigationTest
   ${REPO_ROOT}/lib/PdfReflow/PdfIo.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfLexer.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfObjectParser.cpp
+  ${REPO_ROOT}/lib/PdfReflow/PdfSecurity.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfObjectResolver.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfStreamDecoder.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfXref.cpp
@@ -12,6 +13,7 @@ add_executable(PdfNavigationTest
   ${REPO_ROOT}/lib/PdfReflow/PdfCacheStore.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfLayoutWordIndex.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfMetadataStore.cpp
+  ${REPO_ROOT}/lib/PdfReflow/PdfEncoding.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfOutline.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfProgressStore.cpp
   ${REPO_ROOT}/lib/PdfReflow/PdfSavedItemWordMap.cpp

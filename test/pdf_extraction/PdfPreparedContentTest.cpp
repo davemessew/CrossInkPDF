@@ -137,6 +137,26 @@ struct GeneratedByteSource {
   }
 };
 
+struct SingleByteSource {
+  uint8_t value = 0;
+
+  PdfByteSource source() { return {this, 1, readAt}; }
+
+  static PdfStatus readAt(void* const context, const uint64_t offset, uint8_t* const destination,
+                          const size_t requested, size_t* const bytesRead) {
+    if (context == nullptr || destination == nullptr || bytesRead == nullptr || offset > 1) {
+      return PdfStatus::failure(PdfError::InvalidArgument, offset);
+    }
+    if (offset == 1 || requested == 0) {
+      *bytesRead = 0;
+      return PdfStatus::success();
+    }
+    destination[0] = static_cast<const SingleByteSource*>(context)->value;
+    *bytesRead = 1;
+    return PdfStatus::success();
+  }
+};
+
 struct CountingByteStore {
   uint64_t capacity = 0;
   uint64_t length = 0;
@@ -326,6 +346,44 @@ TEST(PdfPreparedContentStreams, DecodesRawAndFlateStreamsIntoStableDeclaredRange
   EXPECT_EQ(decodedStore.resetCount(), 1U);
 }
 
+TEST(PdfPreparedContentStreams, CoalescesBookkeepingButDecodesAtMostOneStreamPerStep) {
+  constexpr size_t streamBytes = 64;
+  PdfTestByteSource firstInput(std::vector<uint8_t>(streamBytes, static_cast<uint8_t>('A')));
+  PdfTestByteSource secondInput(std::vector<uint8_t>(streamBytes, static_cast<uint8_t>('B')));
+  std::array<PdfEncodedContentStream, 2> streams{};
+  streams[0].source = firstInput.source();
+  streams[1].source = secondInput.source();
+
+  std::array<uint8_t, PdfLimits::SourceBufferBytes> sourceBuffer{};
+  std::array<uint8_t, PdfLimits::DecoderOutputBytes> outputBuffer{};
+  std::array<uint8_t, PdfLimits::UzlibDictionaryBytes> dictionary{};
+  PdfTestByteStore decodedStore(2U * streamBytes);
+  PdfPreparedContentStreams prepared(
+      {sourceBuffer.data(), sourceBuffer.size(), outputBuffer.data(), outputBuffer.size(), dictionary.data(),
+       dictionary.size()});
+  ASSERT_TRUE(prepared.begin(streams.data(), streams.size(), decodedStore.store()).ok());
+
+  PdfWorkBudget firstBudget{256, 3U * 1024U};
+  const PdfStepResult first = prepared.step(firstBudget);
+
+  ASSERT_TRUE(first.yielded());
+  ASSERT_EQ(decodedStore.bytes().size(), streamBytes);
+  EXPECT_LE(decodedStore.bytes().size(), PdfLimits::SourceBufferBytes);
+  EXPECT_TRUE(std::all_of(decodedStore.bytes().begin(), decodedStore.bytes().end(),
+                          [](const uint8_t byte) { return byte == static_cast<uint8_t>('A'); }));
+
+  const size_t bytesBeforeSecondStep = decodedStore.bytes().size();
+  PdfWorkBudget secondBudget{256, 3U * 1024U};
+  const PdfStepResult second = prepared.step(secondBudget);
+
+  ASSERT_TRUE(second.complete()) << static_cast<int>(second.status.error) << '@' << second.status.offset;
+  ASSERT_EQ(decodedStore.bytes().size(), 2U * streamBytes);
+  EXPECT_LE(decodedStore.bytes().size() - bytesBeforeSecondStep, PdfLimits::SourceBufferBytes);
+  EXPECT_TRUE(std::all_of(decodedStore.bytes().begin() + static_cast<std::ptrdiff_t>(streamBytes),
+                          decodedStore.bytes().end(),
+                          [](const uint8_t byte) { return byte == static_cast<uint8_t>('B'); }));
+}
+
 TEST(PdfPreparedContentStreams, AppendsWithoutResetAndReturnsOnlyTheNewRange) {
   PdfTestByteSource source(std::vector<uint8_t>{'n', 'e', 'w'});
   const PdfEncodedContentStream stream{source.source(), {}, 0};
@@ -345,6 +403,53 @@ TEST(PdfPreparedContentStreams, AppendsWithoutResetAndReturnsOnlyTheNewRange) {
   EXPECT_EQ(prepared.decodedBytes(), 8U);
   EXPECT_EQ(prepared.sources()[0].size, 3U);
   EXPECT_EQ(store.length, 8U);
+}
+
+TEST(PdfPreparedContentStreams, AppendsMoreThanSixteenStreamsAsOneSeparatedSequence) {
+  constexpr uint8_t totalStreams = PdfPreparedContentStreams::MaxSources + 4U;
+  std::array<SingleByteSource, totalStreams> inputs{};
+  std::array<PdfEncodedContentStream, PdfPreparedContentStreams::MaxSources> batch{};
+  for (uint8_t index = 0; index < totalStreams; ++index) {
+    inputs[index].value = static_cast<uint8_t>('A' + index);
+  }
+
+  std::array<uint8_t, PdfLimits::SourceBufferBytes> sourceBuffer{};
+  std::array<uint8_t, PdfLimits::DecoderOutputBytes> outputBuffer{};
+  std::array<uint8_t, PdfLimits::UzlibDictionaryBytes> dictionary{};
+  PdfTestByteStore decodedStore(totalStreams * 2U);
+  PdfPreparedContentStreams prepared(
+      {sourceBuffer.data(), sourceBuffer.size(), outputBuffer.data(), outputBuffer.size(), dictionary.data(),
+       dictionary.size()});
+
+  for (uint8_t index = 0; index < PdfPreparedContentStreams::MaxSources; ++index) {
+    batch[index].source = inputs[index].source();
+  }
+  ASSERT_TRUE(prepared.beginSequence(batch.data(), PdfPreparedContentStreams::MaxSources,
+                                     decodedStore.store()).ok());
+  ASSERT_TRUE(runPreparedWithLargeBudget(prepared).complete());
+  const uint64_t firstBatchBytes = prepared.decodedBytes();
+  EXPECT_EQ(firstBatchBytes, PdfPreparedContentStreams::MaxSources * 2U - 1U);
+
+  constexpr uint8_t overflowStreams = totalStreams - PdfPreparedContentStreams::MaxSources;
+  for (uint8_t index = 0; index < overflowStreams; ++index) {
+    batch[index] = {};
+    batch[index].source = inputs[PdfPreparedContentStreams::MaxSources + index].source();
+  }
+  ASSERT_TRUE(prepared.beginSequenceAppend(batch.data(), overflowStreams, decodedStore.store(),
+                                           firstBatchBytes).ok());
+  const PdfStepResult result = runPreparedWithLargeBudget(prepared);
+
+  ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error) << '@' << result.status.offset;
+  ASSERT_TRUE(prepared.sequenceSource().valid());
+  ASSERT_EQ(prepared.sequenceSource().size, totalStreams * 2U - 1U);
+  std::array<uint8_t, totalStreams * 2U - 1U> decoded{};
+  ASSERT_TRUE(pdfReadExact(prepared.sequenceSource(), 0, decoded.data(), decoded.size()).ok());
+  for (uint8_t index = 0; index < totalStreams; ++index) {
+    EXPECT_EQ(decoded[index * 2U], static_cast<uint8_t>('A' + index));
+    if (index + 1U < totalStreams) {
+      EXPECT_EQ(decoded[index * 2U + 1U], static_cast<uint8_t>('\n'));
+    }
+  }
 }
 
 TEST(PdfPreparedContentStreams, ClearsPartialSpoolBeforeReportingRequiredStreamFailure) {
@@ -446,9 +551,9 @@ TEST(PdfPreparedContentStreams, DecoderOriginatedCancellationUsesTheSameBoundedC
       {sourceBuffer.data(), sourceBuffer.size(), outputBuffer.data(), outputBuffer.size(), dictionary.data(),
        dictionary.size()});
   ASSERT_TRUE(prepared.begin(&stream, 1, decodedStore.store()).ok());
-  PdfWorkBudget setupBudget{1, 17};
+  PdfWorkBudget setupBudget{1, 0};
   ASSERT_TRUE(prepared.step(setupBudget).yielded());
-  setupBudget = {1, 17};
+  setupBudget = {1, 0};
   ASSERT_TRUE(prepared.step(setupBudget).yielded());
 
   CancelAfterChecks cancellation{0, 3};

@@ -369,6 +369,10 @@ bool pdfConservativeLatinFallback(const uint8_t code, uint32_t* const scalar) {
   return true;
 }
 
+bool pdfWinAnsiFallback(const uint8_t code, uint32_t* const scalar) {
+  return baseEncodingScalar(PdfBaseEncoding::WinAnsi, code, scalar);
+}
+
 PdfStatus pdfDecodePdfTextString(const uint8_t* const source, const size_t sourceLength, const PdfByteSink& sink) {
   if (source == nullptr || !sink.valid()) {
     return PdfStatus::failure(PdfError::InvalidArgument);

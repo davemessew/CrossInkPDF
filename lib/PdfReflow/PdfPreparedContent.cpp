@@ -9,18 +9,33 @@ PdfPreparedContentStreams::PdfPreparedContentStreams(const PdfStreamDecoderWorks
 
 PdfStatus PdfPreparedContentStreams::begin(const PdfEncodedContentStream* const streams, const uint8_t count,
                                            const PdfByteStore decodedStore, const PdfStreamDecodeLimits limits) {
-  return beginInternal(streams, count, decodedStore, 0, true, limits);
+  return beginInternal(streams, count, decodedStore, 0, true, false, false, limits);
 }
 
 PdfStatus PdfPreparedContentStreams::beginAppend(const PdfEncodedContentStream* const streams, const uint8_t count,
                                                  const PdfByteStore decodedStore, const uint64_t existingBytes,
                                                  const PdfStreamDecodeLimits limits) {
-  return beginInternal(streams, count, decodedStore, existingBytes, false, limits);
+  return beginInternal(streams, count, decodedStore, existingBytes, false, false, false, limits);
+}
+
+PdfStatus PdfPreparedContentStreams::beginSequence(const PdfEncodedContentStream* const streams,
+                                                   const uint8_t count, const PdfByteStore decodedStore,
+                                                   const PdfStreamDecodeLimits limits) {
+  return beginInternal(streams, count, decodedStore, 0, true, true, false, limits);
+}
+
+PdfStatus PdfPreparedContentStreams::beginSequenceAppend(const PdfEncodedContentStream* const streams,
+                                                         const uint8_t count,
+                                                         const PdfByteStore decodedStore,
+                                                         const uint64_t existingBytes,
+                                                         const PdfStreamDecodeLimits limits) {
+  return beginInternal(streams, count, decodedStore, existingBytes, false, true, true, limits);
 }
 
 PdfStatus PdfPreparedContentStreams::beginInternal(const PdfEncodedContentStream* const streams,
                                                    const uint8_t count, const PdfByteStore decodedStore,
                                                    const uint64_t existingBytes, const bool resetStore,
+                                                   const bool sequenceMode, const bool prefixSeparator,
                                                    const PdfStreamDecodeLimits limits) {
   streams_ = nullptr;
   streamCount_ = 0;
@@ -31,6 +46,11 @@ PdfStatus PdfPreparedContentStreams::beginInternal(const PdfEncodedContentStream
   streamIndex_ = 0;
   finalizeIndex_ = 0;
   storeReady_ = false;
+  sequenceMode_ = false;
+  prefixSeparator_ = false;
+  separatorWrittenForCurrent_ = false;
+  sequenceRange_ = {};
+  sequenceSource_ = {};
   phase_ = Phase::Idle;
   for (uint8_t index = 0; index < MaxSources; ++index) {
     ranges_[index] = {};
@@ -40,7 +60,8 @@ PdfStatus PdfPreparedContentStreams::beginInternal(const PdfEncodedContentStream
   }
 
   if (streams == nullptr || count == 0 || !decodedStore.valid() || decodedStore.capacity == 0 ||
-      existingBytes > decodedStore.capacity || limits.maxExpandedBytes == 0 || limits.maxExpansionRatio == 0) {
+      existingBytes > decodedStore.capacity || (prefixSeparator && existingBytes == 0) ||
+      limits.maxExpandedBytes == 0 || limits.maxExpansionRatio == 0) {
     return PdfStatus::failure(PdfError::InvalidArgument);
   }
   if (count > MaxSources) {
@@ -63,6 +84,9 @@ PdfStatus PdfPreparedContentStreams::beginInternal(const PdfEncodedContentStream
       limits_.maxExpandedBytes, PdfLimits::MaxExpandedRequiredStreamBytes);
   limits_.maxExpansionRatio = std::min<uint16_t>(
       limits_.maxExpansionRatio, PdfLimits::MaxExpansionRatio);
+  sequenceMode_ = sequenceMode;
+  prefixSeparator_ = prefixSeparator;
+  storeReady_ = !resetStore;
   phase_ = resetStore ? Phase::ResetStore : Phase::BeginStream;
   return PdfStatus::success();
 }
@@ -102,107 +126,167 @@ PdfStepResult PdfPreparedContentStreams::step(PdfWorkBudget& budget) {
     return PdfStepResult::paused();
   }
 
-  if (phase_ == Phase::ResetStore) {
-    if (!budget.consumeOperation()) {
-      return PdfStepResult::paused();
+  bool decoderStepped = false;
+  while (true) {
+    if (phase_ == Phase::ResetStore) {
+      if (!budget.consumeOperation()) {
+        return PdfStepResult::paused();
+      }
+      const PdfStatus status = decodedStore_.reset(decodedStore_.context);
+      if (!status) {
+        failure_ = status;
+        phase_ = Phase::Failed;
+        return PdfStepResult::failure(status);
+      }
+      storeReady_ = true;
+      phase_ = Phase::BeginStream;
+      continue;
     }
-    const PdfStatus status = decodedStore_.reset(decodedStore_.context);
-    if (!status) {
-      failure_ = status;
-      phase_ = Phase::Failed;
-      return PdfStepResult::failure(status);
-    }
-    storeReady_ = true;
-    phase_ = Phase::BeginStream;
-    return PdfStepResult::paused();
-  }
 
-  if (phase_ == Phase::BeginStream) {
-    if (streamIndex_ >= streamCount_) {
-      finalizeIndex_ = 0;
-      phase_ = Phase::FinalizeSources;
-      return PdfStepResult::paused();
+    if (phase_ == Phase::BeginStream) {
+      if (streamIndex_ >= streamCount_) {
+        finalizeIndex_ = 0;
+        phase_ = Phase::FinalizeSources;
+        continue;
+      }
+      if (!budget.consumeOperation()) {
+        return PdfStepResult::paused();
+      }
+      const uint64_t storedBytes = decodedStore_.size(decodedStore_.context);
+      if (storedBytes != decodedBytes_ || storedBytes > decodedStore_.capacity) {
+        return fail(PdfStatus::failure(PdfError::IoFailure, storedBytes));
+      }
+      if (decodedBytes_ >= limits_.maxExpandedBytes) {
+        return fail(PdfStatus::failure(PdfError::ExpansionLimit, decodedBytes_));
+      }
+      if (decodedBytes_ >= decodedStore_.capacity) {
+        return fail(PdfStatus::failure(PdfError::InsufficientStorage, decodedBytes_));
+      }
+      if (sequenceMode_ && !separatorWrittenForCurrent_ &&
+          (prefixSeparator_ || streamIndex_ != 0)) {
+        phase_ = Phase::WriteSeparator;
+        continue;
+      }
+      offsets_[streamIndex_] = decodedBytes_;
+      PdfStreamDecodeLimits streamLimits = limits_;
+      streamLimits.maxExpandedBytes =
+          std::min(limits_.maxExpandedBytes - decodedBytes_, decodedStore_.capacity - decodedBytes_);
+      PdfByteSource encoded = streams_[streamIndex_].source;
+      PdfStatus status = PdfStatus::success();
+      if (streams_[streamIndex_].security != nullptr) {
+        status = streams_[streamIndex_].security->openStream(
+            encoded, streams_[streamIndex_].reference, &encoded);
+      }
+      if (status) {
+        status = decoder_.begin(encoded, pdfByteStoreSink(decodedStore_), streams_[streamIndex_].filters,
+                                streams_[streamIndex_].filterCount, streamLimits, true);
+      }
+      if (!status) {
+        return fail(status);
+      }
+      phase_ = Phase::DecodeStream;
+      continue;
     }
-    if (!budget.consumeOperation()) {
-      return PdfStepResult::paused();
-    }
-    const uint64_t storedBytes = decodedStore_.size(decodedStore_.context);
-    if (storedBytes != decodedBytes_ || storedBytes > decodedStore_.capacity) {
-      return fail(PdfStatus::failure(PdfError::IoFailure, storedBytes));
-    }
-    if (decodedBytes_ >= limits_.maxExpandedBytes) {
-      return fail(PdfStatus::failure(PdfError::ExpansionLimit, decodedBytes_));
-    }
-    if (decodedBytes_ >= decodedStore_.capacity) {
-      return fail(PdfStatus::failure(PdfError::InsufficientStorage, decodedBytes_));
-    }
-    offsets_[streamIndex_] = decodedBytes_;
-    PdfStreamDecodeLimits streamLimits = limits_;
-    streamLimits.maxExpandedBytes =
-        std::min(limits_.maxExpandedBytes - decodedBytes_, decodedStore_.capacity - decodedBytes_);
-    const PdfStatus status = decoder_.begin(streams_[streamIndex_].source, pdfByteStoreSink(decodedStore_),
-                                            streams_[streamIndex_].filters, streams_[streamIndex_].filterCount,
-                                            streamLimits, true);
-    if (!status) {
-      return fail(status);
-    }
-    phase_ = Phase::DecodeStream;
-    return PdfStepResult::paused();
-  }
 
-  if (phase_ == Phase::DecodeStream) {
-    const PdfStepResult result = decoder_.step(budget);
-    if (result.failed()) {
-      return fail(result.status);
+    if (phase_ == Phase::WriteSeparator) {
+      if (budget.bytesRemaining == 0 || !budget.consumeOperation()) {
+        return PdfStepResult::paused();
+      }
+      const uint64_t storedBytes = decodedStore_.size(decodedStore_.context);
+      if (storedBytes != decodedBytes_ || decodedBytes_ >= decodedStore_.capacity) {
+        return fail(PdfStatus::failure(PdfError::InsufficientStorage, decodedBytes_));
+      }
+      if (decodedBytes_ >= limits_.maxExpandedBytes) {
+        return fail(PdfStatus::failure(PdfError::ExpansionLimit, decodedBytes_));
+      }
+      static constexpr uint8_t kContentStreamSeparator = '\n';
+      const PdfStatus status = pdfWriteExact(pdfByteStoreSink(decodedStore_), &kContentStreamSeparator, 1);
+      if (!status) {
+        return fail(status);
+      }
+      (void)budget.takeBytes(1);
+      ++decodedBytes_;
+      prefixSeparator_ = false;
+      separatorWrittenForCurrent_ = true;
+      phase_ = Phase::BeginStream;
+      continue;
     }
-    if (result.complete()) {
+
+    if (phase_ == Phase::DecodeStream) {
+      if (decoderStepped) {
+        return PdfStepResult::paused();
+      }
+      decoderStepped = true;
+      const PdfStepResult result = decoder_.step(budget);
+      if (result.failed()) {
+        return fail(result.status);
+      }
+      if (!result.complete()) {
+        return PdfStepResult::paused();
+      }
       phase_ = Phase::FinishStream;
+      continue;
     }
-    return PdfStepResult::paused();
-  }
 
-  if (phase_ == Phase::FinishStream) {
-    if (!budget.consumeOperation()) {
-      return PdfStepResult::paused();
+    if (phase_ == Phase::FinishStream) {
+      if (!budget.consumeOperation()) {
+        return PdfStepResult::paused();
+      }
+      uint64_t expectedEnd = 0;
+      if (!pdfCheckedAdd(offsets_[streamIndex_], decoder_.outputBytes(), &expectedEnd)) {
+        return fail(PdfStatus::failure(PdfError::LimitExceeded, offsets_[streamIndex_]));
+      }
+      const uint64_t storedBytes = decodedStore_.size(decodedStore_.context);
+      if (storedBytes != expectedEnd || storedBytes > decodedStore_.capacity) {
+        return fail(PdfStatus::failure(PdfError::IoFailure, storedBytes));
+      }
+      lengths_[streamIndex_] = decoder_.outputBytes();
+      decodedBytes_ = storedBytes;
+      ++streamIndex_;
+      separatorWrittenForCurrent_ = false;
+      phase_ = Phase::BeginStream;
+      continue;
     }
-    uint64_t expectedEnd = 0;
-    if (!pdfCheckedAdd(offsets_[streamIndex_], decoder_.outputBytes(), &expectedEnd)) {
-      return fail(PdfStatus::failure(PdfError::LimitExceeded, offsets_[streamIndex_]));
-    }
-    const uint64_t storedBytes = decodedStore_.size(decodedStore_.context);
-    if (storedBytes != expectedEnd || storedBytes > decodedStore_.capacity) {
-      return fail(PdfStatus::failure(PdfError::IoFailure, storedBytes));
-    }
-    lengths_[streamIndex_] = decoder_.outputBytes();
-    decodedBytes_ = storedBytes;
-    ++streamIndex_;
-    phase_ = Phase::BeginStream;
-    return PdfStepResult::paused();
-  }
 
-  if (phase_ == Phase::FinalizeSources) {
-    if (finalizeIndex_ >= streamCount_) {
-      phase_ = Phase::Done;
-      return PdfStepResult::completed();
+    if (phase_ == Phase::FinalizeSources) {
+      if (finalizeIndex_ >= streamCount_) {
+        if (sequenceMode_ && !sequenceSource_.valid()) {
+          if (!budget.consumeOperation()) {
+            return PdfStepResult::paused();
+          }
+          const PdfByteSource decodedSource = pdfByteStoreSource(decodedStore_);
+          if (!decodedSource.valid() || decodedSource.size != decodedBytes_) {
+            return fail(PdfStatus::failure(PdfError::IoFailure, decodedSource.size));
+          }
+          const PdfStatus status =
+              pdfInitializeByteRange(decodedSource, 0, decodedBytes_, &sequenceRange_);
+          if (!status) {
+            return fail(status);
+          }
+          sequenceSource_ = pdfByteRangeSource(sequenceRange_);
+        }
+        phase_ = Phase::Done;
+        return PdfStepResult::completed();
+      }
+      if (!budget.consumeOperation()) {
+        return PdfStepResult::paused();
+      }
+      const PdfByteSource decodedSource = pdfByteStoreSource(decodedStore_);
+      if (!decodedSource.valid() || decodedSource.size != decodedBytes_) {
+        return fail(PdfStatus::failure(PdfError::IoFailure, decodedSource.size));
+      }
+      const PdfStatus status = pdfInitializeByteRange(decodedSource, offsets_[finalizeIndex_],
+                                                      lengths_[finalizeIndex_], &ranges_[finalizeIndex_]);
+      if (!status) {
+        return fail(status);
+      }
+      sources_[finalizeIndex_] = pdfByteRangeSource(ranges_[finalizeIndex_]);
+      ++finalizeIndex_;
+      continue;
     }
-    if (!budget.consumeOperation()) {
-      return PdfStepResult::paused();
-    }
-    const PdfByteSource decodedSource = pdfByteStoreSource(decodedStore_);
-    if (!decodedSource.valid() || decodedSource.size != decodedBytes_) {
-      return fail(PdfStatus::failure(PdfError::IoFailure, decodedSource.size));
-    }
-    const PdfStatus status = pdfInitializeByteRange(decodedSource, offsets_[finalizeIndex_], lengths_[finalizeIndex_],
-                                                    &ranges_[finalizeIndex_]);
-    if (!status) {
-      return fail(status);
-    }
-    sources_[finalizeIndex_] = pdfByteRangeSource(ranges_[finalizeIndex_]);
-    ++finalizeIndex_;
-    return PdfStepResult::paused();
-  }
 
-  return fail(PdfStatus::failure(PdfError::InvalidArgument));
+    return fail(PdfStatus::failure(PdfError::InvalidArgument));
+  }
 }
 
 PdfStepResult PdfPreparedContentStreams::fail(const PdfStatus status) {
@@ -345,7 +429,11 @@ PdfStatus PdfPreparedContentResources::resolveXObject(void* const context, const
   if (resources.parent_ != nullptr && resources.parent_->resolveXObject != nullptr) {
     return resources.parent_->resolveXObject(resources.parent_->context, name, length, object);
   }
-  return PdfStatus::failure(PdfError::Unsupported);
+  // XObjects are optional page content. Represent an unresolved or deliberately
+  // unretained resource as an empty image so the interpreter warns and keeps
+  // the surrounding text instead of rejecting the whole document.
+  *object = {};
+  return PdfStatus::success();
 }
 
 PdfStatus PdfPreparedContentResources::forwardInlineImageToken(void* const context, const PdfToken& token) {

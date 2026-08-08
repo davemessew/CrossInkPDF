@@ -194,7 +194,8 @@ PdfStatus PdfCMap::handleToken(const PdfToken& token) {
     return PdfStatus::success();
   }
   if (pendingCount_ > PdfLimits::MaxCMapRanges) {
-    return PdfStatus::failure(PdfError::LimitExceeded, pendingCount_);
+    section_ = Section::Done;
+    return PdfStatus::success();
   }
   sectionRemaining_ = pendingCount_;
   hasPendingCount_ = false;
@@ -231,11 +232,12 @@ PdfStatus PdfCMap::handleCodeSpace(const PdfToken& token) {
     field_ = 1;
     return PdfStatus::success();
   }
-  if (token.length != pendingRecord_.sourceLength || code < pendingRecord_.sourceFirst ||
-      codeSpaceCount_ >= static_cast<uint8_t>(sizeof(codeSpaces_) / sizeof(codeSpaces_[0]))) {
-    return PdfStatus::failure(PdfError::LimitExceeded, codeSpaceCount_);
+  if (token.length != pendingRecord_.sourceLength || code < pendingRecord_.sourceFirst) {
+    return PdfStatus::failure(PdfError::Malformed, lexer_.tokenOffset());
   }
-  codeSpaces_[codeSpaceCount_++] = {pendingRecord_.sourceFirst, code, pendingRecord_.sourceLength};
+  if (codeSpaceCount_ < static_cast<uint8_t>(sizeof(codeSpaces_) / sizeof(codeSpaces_[0]))) {
+    codeSpaces_[codeSpaceCount_++] = {pendingRecord_.sourceFirst, code, pendingRecord_.sourceLength};
+  }
   --sectionRemaining_;
   field_ = 0;
   return PdfStatus::success();
@@ -340,7 +342,7 @@ PdfStatus PdfCMap::handleBfRangeArray(const PdfToken& token) {
 
 PdfStatus PdfCMap::addRecord(const PdfCMapRecord& record) {
   if (mappingCount_ >= PdfLimits::MaxCMapRanges) {
-    return PdfStatus::failure(PdfError::LimitExceeded, mappingCount_);
+    return PdfStatus::success();
   }
   const uint64_t key = static_cast<uint64_t>(record.sourceLength) << 32 | record.sourceFirst;
   const bool ordered = !hasPreviousRecord_ ||
@@ -349,7 +351,7 @@ PdfStatus PdfCMap::addRecord(const PdfCMapRecord& record) {
                          record.sourceFirst > previousRecordLast_));
   if (!observingRecords() && (!ordered || !recordsSorted_) && mappingCount_ >= workspace_.recordCapacity) {
     // An unsorted SD-backed map would require a linear record scan for every glyph.
-    return PdfStatus::failure(PdfError::LimitExceeded, mappingCount_);
+    return PdfStatus::success();
   }
   if (!ordered) {
     recordsSorted_ = false;
@@ -357,22 +359,22 @@ PdfStatus PdfCMap::addRecord(const PdfCMapRecord& record) {
   if (!codeSpaceOnly()) {
     if (observingRecords()) {
       if (mappingCount_ >= workspace_.spill.capacity) {
-        return PdfStatus::failure(PdfError::LimitExceeded, mappingCount_);
+        return PdfStatus::success();
       }
       const PdfStatus status =
           workspace_.spill.write(workspace_.spill.context, mappingCount_, &record, sizeof(record));
       if (!status.ok()) {
-        return status;
+        return status.error == PdfError::LimitExceeded ? PdfStatus::success() : status;
       }
     } else if (mappingCount_ < workspace_.recordCapacity) {
       workspace_.records[mappingCount_] = record;
     } else {
       if (!workspace_.spill.valid() || spillCount_ >= workspace_.spill.capacity) {
-        return PdfStatus::failure(PdfError::LimitExceeded, mappingCount_);
+        return PdfStatus::success();
       }
       const PdfStatus status = pdfWriteRecord(workspace_.spill, spillCount_, &record);
       if (!status.ok()) {
-        return status;
+        return status.error == PdfError::LimitExceeded ? PdfStatus::success() : status;
       }
       ++spillCount_;
     }
@@ -415,8 +417,8 @@ PdfStatus PdfCMap::addSequential(const uint32_t first, const uint32_t last, cons
   const uint32_t lastScalar = count - 1 > std::numeric_limits<uint32_t>::max() - scalar
                                   ? std::numeric_limits<uint32_t>::max()
                                   : scalar + static_cast<uint32_t>(count - 1);
-  if (!decodeStatus.ok() || count > PdfLimits::MaxCMapRanges ||
-      scalar > std::numeric_limits<uint32_t>::max() - (count - 1) || !pdfIsUnicodeScalar(lastScalar) ||
+  if (!decodeStatus.ok() || scalar > std::numeric_limits<uint32_t>::max() - (count - 1) ||
+      !pdfIsUnicodeScalar(lastScalar) ||
       (scalar < 0xD800 && lastScalar >= 0xD800)) {
     return PdfStatus::failure(PdfError::Malformed, first);
   }

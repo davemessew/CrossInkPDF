@@ -91,6 +91,7 @@ struct DecodeResult {
   std::vector<uint8_t> bytes;
   uint64_t inputBytes = 0;
   uint64_t consumedInputBytes = 0;
+  uint64_t outputBytes = 0;
   bool omitted = false;
   bool externalDictionary = false;
 };
@@ -98,7 +99,7 @@ struct DecodeResult {
 DecodeResult decode(const std::vector<uint8_t>& encoded, const std::vector<PdfStreamFilter>& filters,
                     const size_t maximumRead = static_cast<size_t>(-1),
                     const size_t maximumWrite = static_cast<size_t>(-1), const PdfStreamDecodeLimits limits = {},
-                    const bool required = true) {
+                    const bool required = true, const PdfStreamDecodeParameters* const parameters = nullptr) {
   PdfTestByteSource input(encoded);
   input.setMaximumRead(maximumRead);
   PdfTestByteSink output;
@@ -110,7 +111,7 @@ DecodeResult decode(const std::vector<uint8_t>& encoded, const std::vector<PdfSt
                             dictionary.get(), PdfLimits::UzlibDictionaryBytes});
   DecodeResult decoded;
   const PdfStatus beginStatus = decoder.begin(input.source(), output.sink(), filters.data(),
-                                              static_cast<uint8_t>(filters.size()), limits, required);
+                                              static_cast<uint8_t>(filters.size()), limits, required, parameters);
   if (!beginStatus.ok()) {
     decoded.result = PdfStepResult::failure(beginStatus);
   } else {
@@ -125,6 +126,7 @@ DecodeResult decode(const std::vector<uint8_t>& encoded, const std::vector<PdfSt
   decoded.bytes = output.bytes();
   decoded.inputBytes = decoder.inputBytes();
   decoded.consumedInputBytes = decoder.consumedInputBytes();
+  decoded.outputBytes = decoder.outputBytes();
   decoded.omitted = decoder.omitted();
   decoded.externalDictionary = decoder.usesExternalDictionary();
   return decoded;
@@ -138,7 +140,7 @@ struct FilterDictionaryHarness {
         parser(lexer, arena) {}
 
   PdfStatus filters(std::array<PdfStreamFilter, PdfLimits::MaxFiltersPerStream>* const output,
-                    uint8_t* const count) {
+                    uint8_t* const count, PdfStreamDecodeParameters* const decodeParameters = nullptr) {
     parser.begin();
     for (uint16_t step = 0; step < 256U; ++step) {
       PdfWorkBudget budget{32, 4096};
@@ -150,7 +152,7 @@ struct FilterDictionaryHarness {
         return result.status;
       }
       return pdfStreamFiltersFromDictionary(arena, parser.rootIndex(), output->data(),
-                                            static_cast<uint8_t>(output->size()), count);
+                                            static_cast<uint8_t>(output->size()), count, decodeParameters);
     }
     return PdfStatus::failure(PdfError::BudgetExhausted);
   }
@@ -172,11 +174,12 @@ struct FilterDictionaryHarness {
   PdfObjectParser parser;
 };
 
-PdfStatus parseStreamFilters(const std::string& dictionary, uint8_t* const count = nullptr) {
+PdfStatus parseStreamFilters(const std::string& dictionary, uint8_t* const count = nullptr,
+                             PdfStreamDecodeParameters* const decodeParameters = nullptr) {
   FilterDictionaryHarness harness(dictionary);
   std::array<PdfStreamFilter, PdfLimits::MaxFiltersPerStream> filters{};
   uint8_t localCount = 0;
-  const PdfStatus status = harness.filters(&filters, &localCount);
+  const PdfStatus status = harness.filters(&filters, &localCount, decodeParameters);
   if (count != nullptr) {
     *count = localCount;
   }
@@ -209,8 +212,6 @@ TEST(PdfStreamDecoderTest, AcceptsAbsentNullAndBehaviorEquivalentDecodeParameter
 }
 
 TEST(PdfStreamDecoderTest, RejectsTransformingMalformedAndMisalignedDecodeParameters) {
-  EXPECT_EQ(parseStreamFilters("<< /Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 7 >> >>").error,
-            PdfError::UnsupportedFilter);
   EXPECT_EQ(parseStreamFilters("<< /Filter /FlateDecode /DecodeParms << /EarlyChange 1 >> >>").error,
             PdfError::UnsupportedFilter);
   EXPECT_EQ(parseStreamFilters("<< /Filter /ASCII85Decode /DecodeParms << /Predictor 1 >> >>").error,
@@ -228,6 +229,128 @@ TEST(PdfStreamDecoderTest, RejectsTransformingMalformedAndMisalignedDecodeParame
                 "<< /Filter /FlateDecode /DecodeParms null /DecodeParms << /Predictor 1 >> >>")
                 .error,
             PdfError::Malformed);
+}
+
+TEST(PdfStreamDecoderTest, AcceptsAllPngPredictorsAndActualRowParameters) {
+  for (uint8_t predictor = 10; predictor <= 15; ++predictor) {
+    PdfStreamDecodeParameters parameters{};
+    const std::string dictionary =
+        "<< /Filter /FlateDecode /DecodeParms << /Predictor " + std::to_string(predictor) +
+        " /Columns 17 /Colors 3 /BitsPerComponent 8 >> >>";
+    ASSERT_TRUE(parseStreamFilters(dictionary, nullptr, &parameters).ok()) << dictionary;
+    EXPECT_EQ(parameters.predictor, predictor);
+    EXPECT_EQ(parameters.columns, 17U);
+    EXPECT_EQ(parameters.colors, 3U);
+    EXPECT_EQ(parameters.bitsPerComponent, 8U);
+  }
+
+  PdfStreamDecodeParameters wide{};
+  ASSERT_TRUE(parseStreamFilters(
+                  "<< /Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 65536 >> >>", nullptr, &wide)
+                  .ok());
+  EXPECT_EQ(wide.columns, 65536U);
+}
+
+TEST(PdfStreamDecoderTest, DecodesSonyXrefPngUpRowsAcrossSingleByteSplits) {
+  const std::vector<uint8_t> predicted{
+      2, 1, 0, 0, 9, 0,
+      2, 255, 0, 0, 247, 255,
+  };
+  const std::vector<uint8_t> expected{
+      1, 0, 0, 9, 0,
+      0, 0, 0, 0, 255,
+  };
+  PdfStreamDecodeParameters parameters{};
+  parameters.predictor = 12;
+  parameters.columns = 5;
+
+  const DecodeResult result =
+      decode(storedZlib(predicted), {PdfStreamFilter::Flate}, 1, 1, {}, true, &parameters);
+
+  ASSERT_TRUE(result.result.complete())
+      << static_cast<int>(result.result.status.error) << "@" << result.result.status.offset;
+  EXPECT_EQ(result.bytes, expected);
+  EXPECT_EQ(result.outputBytes, expected.size());
+}
+
+TEST(PdfStreamDecoderTest, DecodesPngNoneSubUpAverageAndPaethAcrossSingleByteSplits) {
+  const std::vector<uint8_t> predicted{
+      0, 10, 20, 30, 40,
+      1, 15, 10, 10, 10,
+      2, 5, 5, 5, 5,
+      3, 20, 20, 25, 30,
+      4, 5, 5, 5, 5,
+  };
+  const std::vector<uint8_t> expected{
+      10, 20, 30, 40,
+      15, 25, 35, 45,
+      20, 30, 40, 50,
+      30, 50, 70, 90,
+      35, 55, 75, 95,
+  };
+  PdfStreamDecodeParameters parameters{};
+  parameters.predictor = 15;
+  parameters.columns = 4;
+
+  const DecodeResult result =
+      decode(storedZlib(predicted), {PdfStreamFilter::Flate}, 1, 1, {}, true, &parameters);
+
+  ASSERT_TRUE(result.result.complete())
+      << static_cast<int>(result.result.status.error) << "@" << result.result.status.offset;
+  EXPECT_EQ(result.bytes, expected);
+  EXPECT_EQ(result.outputBytes, expected.size());
+}
+
+TEST(PdfStreamDecoderTest, UsesPngBytesPerPixelForMultiComponentSubRows) {
+  PdfStreamDecodeParameters parameters{};
+  parameters.predictor = 11;
+  parameters.columns = 2;
+  parameters.colors = 3;
+  parameters.bitsPerComponent = 8;
+
+  const DecodeResult result =
+      decode(storedZlib({1, 10, 20, 30, 5, 5, 5}), {PdfStreamFilter::Flate}, 1, 1, {}, true, &parameters);
+
+  ASSERT_TRUE(result.result.complete())
+      << static_cast<int>(result.result.status.error) << "@" << result.result.status.offset;
+  EXPECT_EQ(result.bytes, (std::vector<uint8_t>{10, 20, 30, 15, 25, 35}));
+}
+
+TEST(PdfStreamDecoderTest, RejectsMalformedFixedFilterOverflowAndTruncatedRows) {
+  PdfStreamDecodeParameters parameters{};
+  parameters.predictor = 12;
+  parameters.columns = 5;
+
+  EXPECT_EQ(parseStreamFilters(
+                "<< /Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 5 >> >>")
+                .error,
+            PdfError::UnsupportedFilter);
+  for (const char* dictionary : {
+           "<< /Filter /FlateDecode /DecodeParms << /Predictor 9 /Columns 5 >> >>",
+           "<< /Filter /FlateDecode /DecodeParms << /Predictor 16 /Columns 5 >> >>",
+           "<< /Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 5 /BitsPerComponent 3 >> >>",
+       }) {
+    PdfStreamDecodeParameters parsed{};
+    EXPECT_EQ(parseStreamFilters(dictionary, nullptr, &parsed).error, PdfError::UnsupportedFilter) << dictionary;
+  }
+
+  const DecodeResult wrongFixedFilter =
+      decode(storedZlib({0, 1, 0, 0, 9, 0}), {PdfStreamFilter::Flate}, 1, 1, {}, true, &parameters);
+  ASSERT_TRUE(wrongFixedFilter.result.failed());
+  EXPECT_EQ(wrongFixedFilter.result.status.error, PdfError::Malformed);
+
+  const DecodeResult incompleteRow =
+      decode(storedZlib({2, 1, 0, 0, 9}), {PdfStreamFilter::Flate}, 1, 1, {}, true, &parameters);
+  ASSERT_TRUE(incompleteRow.result.failed());
+  EXPECT_EQ(incompleteRow.result.status.error, PdfError::UnexpectedEof);
+
+  PdfStreamDecodeParameters tooWide{};
+  tooWide.predictor = 15;
+  tooWide.columns = PdfLimits::SourceBufferBytes;
+  const DecodeResult overflow =
+      decode(storedZlib({0}), {PdfStreamFilter::Flate}, 1, 1, {}, true, &tooWide);
+  ASSERT_TRUE(overflow.result.failed());
+  EXPECT_EQ(overflow.result.status.error, PdfError::InsufficientMemory);
 }
 
 TEST(PdfStreamDecoderTest, DecodesRawAsciiHexAscii85FlateAndChains) {

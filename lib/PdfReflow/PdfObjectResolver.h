@@ -6,6 +6,8 @@
 #include "PdfStreamBoundary.h"
 #include "PdfXref.h"
 
+class PdfSecurity;
+
 enum class PdfObjectResolverReader : uint8_t {
   Source,
   Xref,
@@ -21,6 +23,7 @@ struct PdfObjectResolverWorkspace {
   void* sourceAccessContext = nullptr;
   SourceAccessFn setSourceAccess = nullptr;
   PdfStreamDecodeLimits decodeLimits{};
+  PdfSecurity* security = nullptr;
 };
 
 struct PdfResolvedObject {
@@ -38,6 +41,7 @@ class PdfObjectResolver {
 
   PdfStatus begin(PdfObjectReference reference);
   void setStringTokenBuffer(uint8_t* buffer, size_t capacity) { parser_.setStringTokenBuffer(buffer, capacity); }
+  void setSkipUnusedPageResources(bool enabled) { parser_.setSkipUnusedPageResources(enabled); }
   PdfStepResult step(PdfWorkBudget& budget);
   const PdfResolvedObject& result() const { return result_; }
   uint64_t currentStreamBytes() const;
@@ -52,6 +56,7 @@ class PdfObjectResolver {
     Idle,
     SelectXref,
     LookupReference,
+    SelectObjectStreamXref,
     LookupObjectStream,
     SelectUncompressedSource,
     SelectObjectStreamSource,

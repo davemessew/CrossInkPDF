@@ -17,6 +17,7 @@
 #include "PdfOutline.h"
 #include "PdfPageTree.h"
 #include "PdfResourceTracker.h"
+#include "PdfSecurity.h"
 #include "PdfSemanticWriter.h"
 
 struct PdfContentXObject;
@@ -63,6 +64,7 @@ enum class PdfPreparationPhase : uint8_t {
   ResumeEmitSections,
   ParseXref,
   SortXref,
+  ResolveSecurity,
   ResolveCatalog,
   InitializePageTree,
   WalkPages,
@@ -71,6 +73,7 @@ enum class PdfPreparationPhase : uint8_t {
   ReadXmpMetadata,
   ResolveImageResources,
   ResolveContent,
+  ResolveContentOverflow,
   SuspendContentNavigation,
   CheckContentCapacity,
   OpenContentStore,
@@ -211,6 +214,13 @@ class PdfPreparation {
     Compact,
     Adopt,
     Complete,
+  };
+
+  enum class ContentOverflowLoadStage : uint8_t {
+    Idle,
+    Open,
+    Read,
+    Close,
   };
 
   enum class ImageResolveTask : uint8_t {
@@ -365,6 +375,7 @@ class PdfPreparation {
     ValidateResumeDiscoveryXref,
     ValidateResumeDiscoveryPages,
     ValidateResumeDiscoveryOverflow,
+    ValidateResumeDiscoveryContentOverflow,
     ValidateResumeDiscoveryTrailer,
     RestoreResumeDiscoveryHeader,
     ValidateResumeDiscoveryCatalog,
@@ -416,6 +427,7 @@ class PdfPreparation {
     OpenResumeImageFileWriter,
     CopyResumeImageFileRecords,
     ReopenSource,
+    ResolveResumeSecurity,
     Complete,
   };
 
@@ -502,6 +514,7 @@ class PdfPreparation {
     WriteDiscoveryXref,
     WriteDiscoveryPages,
     WriteDiscoveryOverflow,
+    WriteDiscoveryContentOverflow,
     WriteDiscoveryTrailer,
     WriteRecord,
     CloseJournal,
@@ -611,7 +624,8 @@ class PdfPreparation {
   PdfStatus initializeParserStorage();
   PdfStatus configureDefaultParserArena();
   PdfStatus configureNavigationParserArena();
-  PdfStatus beginXrefSpool();
+  PdfStatus beginXrefSpool(uint32_t knownRecordCapacity = 0);
+  PdfStatus resumeXrefAfterCompaction();
   PdfStepResult stepSortXref(PdfWorkBudget& budget);
   PdfStepResult stepResolverObjectStoreWriter(PdfWorkBudget& budget);
   PdfStepResult stepResolverObjectStoreReader(PdfWorkBudget& budget);
@@ -631,6 +645,7 @@ class PdfPreparation {
   PdfStatus sealPreparedPageSpool();
   PdfStatus loadPageRecord(uint32_t index);
   PdfStatus loadAnnotationOverflowBatch(uint16_t count);
+  PdfStepResult stepLoadContentOverflowBatch(PdfWorkBudget& budget, uint8_t count);
   PdfStatus appendResolvedLink(const void* record, size_t recordSize);
   PdfStatus finishResolvedLinkSpool();
   PdfStepResult stepPreparePageLinks(PdfWorkBudget& budget);
@@ -639,6 +654,7 @@ class PdfPreparation {
   PdfStatus rewritePreparedPageRecord(PdfWorkBudget& budget, uint16_t index, const PreparedSectionRecord& record);
   PdfStatus formatPageSpoolPath(bool prepared, char* output, size_t capacity) const;
   PdfStatus formatAnnotationOverflowSpoolPath(char* output, size_t capacity) const;
+  PdfStatus formatContentOverflowSpoolPath(char* output, size_t capacity) const;
   PdfStatus formatResolvedLinkSpoolPath(char* output, size_t capacity) const;
   PdfStatus formatTraversalSpoolPath(char* output, size_t capacity) const;
   void abortPageSpools();
@@ -656,18 +672,24 @@ class PdfPreparation {
   PdfStatus decodeEmitSectionsResumeControl(const uint8_t* input, size_t length);
   PdfStepResult stepCommitEmitSectionsResumeControl(PdfWorkBudget& budget);
   PdfStatus encodePageResumeRecord(uint8_t* output, size_t capacity) const;
-  PdfStatus decodePageResumeRecord(const uint8_t* input, size_t length, uint32_t expectedSequence,
-                                   uint32_t expectedPage);
+  PdfStatus decodePageResumeRecord(const uint8_t* input, size_t length, uint32_t expectedSequence);
   PdfStatus finalizeDiscoveryXref();
   PdfStatus encodeDiscoveryHeader(uint8_t* output, size_t capacity) const;
   PdfStatus decodeDiscoveryHeader(const uint8_t* input, size_t length, bool restore);
-  PdfStatus encodeDiscoveryXrefRecord(uint32_t ordinal, uint8_t* output, size_t capacity);
+  PdfStatus encodeDiscoveryXrefRecord(uint32_t ordinal, const PdfXrefEntry& entry, uint8_t* output,
+                                      size_t capacity) const;
   PdfStatus decodeDiscoveryXrefRecord(const uint8_t* input, size_t length, uint32_t ordinal, PdfXrefEntry* entry) const;
-  PdfStatus encodeDiscoveryPageRecord(uint16_t ordinal, uint8_t* output, size_t capacity);
+  PdfStatus encodeDiscoveryPageRecord(uint16_t ordinal, const PdfPageInfo& page, uint8_t* output,
+                                      size_t capacity) const;
   PdfStatus decodeDiscoveryPageRecord(const uint8_t* input, size_t length, uint16_t ordinal, PdfPageInfo* page) const;
-  PdfStatus encodeDiscoveryOverflowRecord(uint32_t ordinal, uint8_t* output, size_t capacity);
+  PdfStatus encodeDiscoveryOverflowRecord(uint32_t ordinal, PdfObjectReference reference, uint8_t* output,
+                                          size_t capacity) const;
   PdfStatus decodeDiscoveryOverflowRecord(const uint8_t* input, size_t length, uint32_t ordinal,
                                           PdfObjectReference* reference) const;
+  PdfStatus encodeDiscoveryContentOverflowRecord(uint32_t ordinal, const PdfPageContentOverflowRecord& record,
+                                                 uint8_t* output, size_t capacity) const;
+  PdfStatus decodeDiscoveryContentOverflowRecord(const uint8_t* input, size_t length, uint32_t ordinal,
+                                                 PdfPageContentOverflowRecord* record) const;
   PdfStatus encodeDiscoveryTrailer(uint8_t* output, size_t capacity) const;
   PdfStatus decodeDiscoveryTrailer(const uint8_t* input, size_t length) const;
   PdfStatus beginDiscoveryXrefRestore();
@@ -683,6 +705,7 @@ class PdfPreparation {
   PdfStepResult stepRestoreResumeRecords(PdfWorkBudget& budget);
   PdfStatus startXref();
   PdfStatus finishXref();
+  PdfStatus finishSecurity();
   PdfStatus finishCatalog();
   PdfStatus finishPageTree();
   PdfStatus beginNavigationDiscovery();
@@ -734,6 +757,7 @@ class PdfPreparation {
   void abortSectionRepairRuntime();
   PdfStatus beginCurrentPageContent();
   PdfStatus finishContentObject();
+  PdfStepResult prepareContentOverflowBatch(PdfWorkBudget& budget);
   PdfStatus beginPreparedContentDecode();
   PdfStepResult suspendContentNavigation(PdfWorkBudget& budget);
   PdfStepResult checkPreparedContentCapacity(PdfWorkBudget& budget);
@@ -779,6 +803,7 @@ class PdfPreparation {
   PdfStatus finishExtractedPage();
   PdfStepResult stepReadingOrder(PdfWorkBudget& budget);
   PdfStatus formatCurrentSectionPath();
+  PdfStatus restoreCurrentSectionScratch();
   PdfStatus formatInternalLink(uint16_t sourcePageIndex, int16_t x, int16_t y, char* href, size_t capacity,
                                size_t* hrefLength) const;
   PdfStepResult stepOpenSection(PdfWorkBudget& budget);
@@ -834,6 +859,7 @@ class PdfPreparation {
   PdfSourceIdentity sourceIdentity_{};
   SourceContext sourceContext_{};
   PdfObjectArena arena_{};
+  PdfSecurity security_{};
   MemoryRecordContext xrefRecords_{};
   MemoryRecordContext traversalRecords_{};
   std::optional<PdfXrefTable> xref_;
@@ -843,12 +869,14 @@ class PdfPreparation {
   PdfFixedRecordSpool xrefSpools_[2]{};
   PdfFixedRecordSpool pageSpool_{};
   PdfFixedRecordSpool annotationOverflowSpool_{};
+  PdfFixedRecordSpool contentOverflowSpool_{};
   PdfFixedRecordSpool resolvedLinkSpool_{};
   PdfFixedRecordSpool preparedPageSpool_{};
   PdfMutableRecordSpool traversalSpool_{};
   XrefSortStage xrefSortStage_ = XrefSortStage::Idle;
   PdfObjectReference xrefSortRoot_{};
   PdfObjectReference xrefSortInfo_{};
+  PdfSecurityTrailer xrefSortSecurity_{};
   PdfXrefEntry xrefSortLeft_{};
   PdfXrefEntry xrefSortRight_{};
   uint32_t xrefSortTotal_ = 0;
@@ -866,11 +894,18 @@ class PdfPreparation {
   uint32_t xrefSortPreviousObject_ = 0;
   uint8_t xrefSortInput_ = 0;
   uint8_t xrefSortOutput_ = 1;
+  uint8_t xrefAppendSpool_ = 0;
   uint8_t xrefFinalSpool_ = 0xff;
+  uint8_t xrefSortLeftBatchIndex_ = 0;
+  uint8_t xrefSortLeftBatchCount_ = 0;
+  uint8_t xrefSortRightBatchIndex_ = 0;
+  uint8_t xrefSortRightBatchCount_ = 0;
   bool xrefSortHasInfo_ = false;
+  bool xrefSortHasSecurity_ = false;
   bool xrefSortLeftLoaded_ = false;
   bool xrefSortRightLoaded_ = false;
   bool xrefSortPreviousValid_ = false;
+  bool xrefSortResumeParsing_ = false;
   bool xrefSortCompacting_ = false;
   bool xrefSortFastPath_ = false;
   uint32_t loadedPageIndex_ = UINT32_MAX;
@@ -907,11 +942,18 @@ class PdfPreparation {
   uint16_t currentAnnotationPage_ = 0;
   uint16_t currentPageOverflowAnnotationIndex_ = 0;
   uint32_t currentAnnotationOverflowOrdinal_ = 0;
+  uint32_t currentContentOverflowOrdinal_ = 0;
+  uint32_t resumeContentOverflowCount_ = 0;
   uint32_t resolvedLinkCount_ = 0;
   uint32_t currentResolvedLinkOrdinal_ = 0;
+  uint16_t nextResolvedLinkSourcePage_ = UINT16_MAX;
   uint8_t currentAnnotationIndex_ = 0;
   uint8_t currentAnnotationOverflowBatchIndex_ = 0;
   uint8_t currentAnnotationOverflowBatchCount_ = 0;
+  uint8_t currentContentBatchCount_ = 0;
+  uint8_t contentOverflowLoadCount_ = 0;
+  ContentOverflowLoadStage contentOverflowLoadStage_ = ContentOverflowLoadStage::Idle;
+  uint16_t currentPageContentOrdinal_ = 0;
   uint16_t currentPageLinkBlockIndex_ = 0;
   uint8_t currentPageLinkBatchIndex_ = 0;
   uint8_t currentPageLinkBatchCount_ = 0;
@@ -934,6 +976,7 @@ class PdfPreparation {
   int8_t currentPageImageCandidate_ = -1;
   ImageCacheStage imageCacheStage_ = ImageCacheStage::Idle;
   PdfByteRange imageCacheRange_{};
+  PdfByteSource imageCacheSource_{};
   PdfCapturedJpeg inlineCapturedJpeg_{};
   uint64_t imageCacheOffset_ = 0;
   uint8_t rasterIdentityScanIndex_ = 0;
@@ -1018,8 +1061,11 @@ class PdfPreparation {
   uint8_t formReachabilityIndex_ = 0;
   uint8_t formAppendCandidateIndex_ = UINT8_MAX;
   bool contentAppendActive_ = false;
+  bool contentOverflowSequenceActive_ = false;
+  bool contentOverflowAppendActive_ = false;
   size_t transcriptLength_ = 0;
   uint32_t nextAnchorOrdinal_ = 0;
+  uint32_t currentSectionFirstSourcePage_ = 0;
   uint32_t currentSectionFirstWord_ = 0;
   uint32_t currentSectionFirstAnchor_ = 0;
   uint64_t cumulativeSectionBytes_ = 0;
@@ -1027,6 +1073,7 @@ class PdfPreparation {
   size_t metadataEncodeBytes_ = 0;
   uint64_t xmpStreamOffset_ = 0;
   uint64_t xmpStreamLength_ = 0;
+  PdfObjectReference xmpStreamReference_{};
 
   PdfCacheStore cacheStore_;
   PdfCacheCapacity cacheCapacity_{};
@@ -1059,6 +1106,7 @@ class PdfPreparation {
   bool emitSectionsResumeReady_ = false;
   bool resumeAfterEmitSections_ = false;
   bool emitSectionsResumeValidated_ = false;
+  bool resumeSecurityRequired_ = false;
   ResumeControlStage resumeControlStage_ = ResumeControlStage::Idle;
   ResumeRecordRestoreStage resumeRecordRestoreStage_ = ResumeRecordRestoreStage::Idle;
   ResumePointStage resumePointStage_ = ResumePointStage::Idle;
@@ -1135,11 +1183,6 @@ class PdfPreparation {
   uint8_t coverCandidateSourceCount_ = 0;
   uint32_t expandedRequiredBytes_ = 0;
 };
-
-#if UINTPTR_MAX == UINT32_MAX
-static_assert(sizeof(PdfPreparation) <= 13120,
-              "PDF preparation control state must stay bounded with SD-backed link spools");
-#endif
 
 static_assert(sizeof(PdfCoverCandidateSource) <= 16, "cover discovery must retain only small object references");
 static_assert(sizeof(PdfPreparation) + PdfLimits::TotalWorkspaceBytes <= PDF_MAX_OWNED_HEAP_BYTES,

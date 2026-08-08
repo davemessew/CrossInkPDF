@@ -454,7 +454,7 @@ TEST(PdfPreparationContentStreams, AccountsAndRetiresObjectStreamStoreBeforeCont
   EXPECT_EQ(std::count(harness.storage.removeObservations().begin(), harness.storage.removeObservations().end(),
                        storePath),
             1);
-  EXPECT_EQ(PdfPreparationTestAccess::expandedRequiredBytes(preparation), 56U + 201U + 61U);
+  EXPECT_EQ(PdfPreparationTestAccess::expandedRequiredBytes(preparation), 56U + 61U);
   EXPECT_FALSE(harness.storage.exists(storePath));
   EXPECT_EQ(harness.storage.openHandleCount(), 0U);
 }
@@ -480,7 +480,7 @@ TEST(PdfPreparationContentStreams, RedecodesRetiredObjectStreamOnceWhenALaterPag
                        storePath),
             2);
   EXPECT_EQ(PdfPreparationTestAccess::expandedRequiredBytes(preparation),
-            fixture.xrefDecodedBytes + 2U * fixture.objectStreamDecodedBytes + fixture.contentBytes);
+            fixture.xrefDecodedBytes + fixture.contentBytes);
   EXPECT_FALSE(harness.storage.exists(storePath));
   EXPECT_EQ(harness.storage.openHandleCount(), 0U);
 }

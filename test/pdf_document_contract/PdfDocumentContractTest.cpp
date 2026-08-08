@@ -75,6 +75,114 @@ std::string fontObject() {
   return "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>";
 }
 
+std::string zlibStored(const std::string& input) {
+  if (input.size() > UINT16_MAX) {
+    return {};
+  }
+  const uint16_t length = static_cast<uint16_t>(input.size());
+  const uint16_t complement = static_cast<uint16_t>(~length);
+  std::string encoded;
+  encoded.reserve(input.size() + 11U);
+  encoded.push_back(static_cast<char>(0x78));
+  encoded.push_back(static_cast<char>(0x01));
+  encoded.push_back(static_cast<char>(0x01));
+  encoded.push_back(static_cast<char>(length));
+  encoded.push_back(static_cast<char>(length >> 8U));
+  encoded.push_back(static_cast<char>(complement));
+  encoded.push_back(static_cast<char>(complement >> 8U));
+  encoded.append(input);
+  uint32_t first = 1;
+  uint32_t second = 0;
+  for (const unsigned char byte : input) {
+    first = (first + byte) % 65521U;
+    second = (second + first) % 65521U;
+  }
+  const uint32_t checksum = second << 16U | first;
+  encoded.push_back(static_cast<char>(checksum >> 24U));
+  encoded.push_back(static_cast<char>(checksum >> 16U));
+  encoded.push_back(static_cast<char>(checksum >> 8U));
+  encoded.push_back(static_cast<char>(checksum));
+  return encoded;
+}
+
+std::string streamObjectWithDictionary(const std::string& stream, const std::string& dictionary) {
+  return "<< /Length " + std::to_string(stream.size()) + " " + dictionary + ">>\nstream\n" + stream +
+         "\nendstream";
+}
+
+void appendXrefEntry(std::string* const output, const uint8_t type, const uint32_t field2,
+                     const uint16_t field3) {
+  ASSERT_NE(output, nullptr);
+  output->push_back(static_cast<char>(type));
+  output->push_back(static_cast<char>(field2 >> 24U));
+  output->push_back(static_cast<char>(field2 >> 16U));
+  output->push_back(static_cast<char>(field2 >> 8U));
+  output->push_back(static_cast<char>(field2));
+  output->push_back(static_cast<char>(field3 >> 8U));
+  output->push_back(static_cast<char>(field3));
+}
+
+std::vector<uint8_t> makeObjectStreamAnnotationHandoffPdf(const uint8_t annotationCount = 1U) {
+  if (annotationCount == 0) {
+    return {};
+  }
+  const uint32_t objectStreamNumber = 8U + annotationCount;
+  const uint32_t xrefNumber = objectStreamNumber + 1U;
+  std::string pdf = "%PDF-1.7\n";
+  std::vector<uint32_t> offsets(xrefNumber + 1U);
+  const auto appendObject = [&pdf, &offsets](const uint32_t number, const std::string& body) {
+    offsets[number] = static_cast<uint32_t>(pdf.size());
+    pdf += std::to_string(number) + " 0 obj\n" + body + "\nendobj\n";
+  };
+
+  appendObject(1, "<< /Type /Catalog /Pages 2 0 R >>");
+  appendObject(2, "<< /Type /Pages /Count 2 /Kids [3 0 R 5 0 R] >>");
+  std::string annotations;
+  for (uint8_t index = 0; index < annotationCount; ++index) {
+    annotations += std::to_string(8U + index) + " 0 R ";
+  }
+  appendObject(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+                  "/Resources << /Font << /F1 7 0 R >> >> /Annots [" +
+                      annotations + "] /Contents 4 0 R >>");
+  appendObject(4, streamObject("BT /F1 12 Tf 72 720 Td (First page) Tj ET"));
+  appendObject(5, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+                  "/Resources << /Font << /F1 7 0 R >> >> /Contents 6 0 R >>");
+  appendObject(6, streamObject("BT /F1 12 Tf 72 720 Td (Second page) Tj ET"));
+  appendObject(7, fontObject());
+
+  std::string objectStreamIndex;
+  std::string objectStreamBodies;
+  for (uint8_t index = 0; index < annotationCount; ++index) {
+    const uint32_t annotationNumber = 8U + index;
+    objectStreamIndex += std::to_string(annotationNumber) + " " + std::to_string(objectStreamBodies.size()) + " ";
+    objectStreamBodies += "<< /Type /Annot /Subtype /Link /Rect [72 700 180 720] "
+                          "/A << /S /GoTo /D (missing-destination-" +
+                          std::to_string(index) + ") >> >> ";
+  }
+  const std::string decodedObjectStream = objectStreamIndex + objectStreamBodies;
+  appendObject(objectStreamNumber,
+               streamObjectWithDictionary(zlibStored(decodedObjectStream),
+                                          "/Type /ObjStm /N " + std::to_string(annotationCount) + " /First " +
+                                              std::to_string(objectStreamIndex.size()) + " /Filter /FlateDecode "));
+
+  const uint32_t xrefOffset = static_cast<uint32_t>(pdf.size());
+  std::string xref;
+  appendXrefEntry(&xref, 0, 0, UINT16_MAX);
+  for (uint32_t object = 1; object <= 7; ++object) {
+    appendXrefEntry(&xref, 1, offsets[object], 0);
+  }
+  for (uint8_t index = 0; index < annotationCount; ++index) {
+    appendXrefEntry(&xref, 2, objectStreamNumber, index);
+  }
+  appendXrefEntry(&xref, 1, offsets[objectStreamNumber], 0);
+  appendXrefEntry(&xref, 1, xrefOffset, 0);
+  appendObject(xrefNumber,
+               streamObjectWithDictionary(xref, "/Type /XRef /Size " + std::to_string(xrefNumber + 1U) +
+                                                     " /Root 1 0 R /W [1 4 2] "));
+  pdf += "startxref\n" + std::to_string(xrefOffset) + "\n%%EOF\n";
+  return {pdf.begin(), pdf.end()};
+}
+
 std::vector<uint8_t> makePageCountPdf(const uint16_t pageCount, const uint32_t minimumXrefEntries = 0) {
   ClassicPdf pdf;
   const uint32_t font = 3U + static_cast<uint32_t>(pageCount) * 2U;
@@ -265,6 +373,34 @@ TEST(PdfDocumentScaleContract, SixtyFivePageFlatTreeCommitsInKidsOrder) {
   ASSERT_NE(first, std::string::npos);
   ASSERT_NE(last, std::string::npos);
   EXPECT_LT(first, last);
+}
+
+TEST(PdfDocumentSingleReaderContract, ObjectStreamAnnotationReleasesReaderBeforeNextPageSpoolRead) {
+  PreparationHarness harness;
+  harness.storage.addFile("/books/object-stream-annotation.pdf", makeObjectStreamAnnotationHandoffPdf());
+  PdfPreparation preparation;
+  ASSERT_TRUE(preparation.begin(harness.config("/books/object-stream-annotation.pdf")).ok());
+
+  const PdfStepResult result = runToTerminal(preparation, harness);
+
+  ASSERT_TRUE(preparationCompleted(result, preparation));
+  expectCommittedProduct(harness, preparation);
+  EXPECT_EQ(preparation.workCounters().pagesWalked, 2U);
+}
+
+TEST(PdfDocumentSingleReaderContract, ObjectStreamAnnotationReleasesReaderBeforeOverflowSpoolRead) {
+  PreparationHarness harness;
+  harness.storage.addFile(
+      "/books/object-stream-annotation-overflow.pdf",
+      makeObjectStreamAnnotationHandoffPdf(static_cast<uint8_t>(PdfLimits::MaxLinkAnnotationsPerPage + 1U)));
+  PdfPreparation preparation;
+  ASSERT_TRUE(preparation.begin(harness.config("/books/object-stream-annotation-overflow.pdf")).ok());
+
+  const PdfStepResult result = runToTerminal(preparation, harness);
+
+  ASSERT_TRUE(preparationCompleted(result, preparation));
+  expectCommittedProduct(harness, preparation);
+  EXPECT_EQ(preparation.workCounters().pagesWalked, 2U);
 }
 
 TEST(PdfDocumentSliceBudgetContract, SixtyFivePageRunBoundsEveryDiscoveryStepAndAvoidsRedundantTempSyncs) {
@@ -531,7 +667,7 @@ TEST(PdfDocumentResumeScaleContract, JournalAboveLegacySlotLimitRestoresInBatche
 TEST(PdfDocumentResumeScaleContract, SameBatchDuplicateWithRecomputedIntegrityIsRejected) {
   constexpr uint32_t kXrefEntries = 257U;
   constexpr uint16_t kPageCount = 2U;
-  constexpr size_t kHeaderBytes = 192U;
+  constexpr size_t kHeaderBytes = 224U;
   constexpr size_t kXrefRecordBytes = 24U;
   constexpr size_t kPageRecordBytes = 244U;
   constexpr size_t kTrailerBytes = 72U;

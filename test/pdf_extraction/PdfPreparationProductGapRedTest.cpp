@@ -143,6 +143,39 @@ std::vector<uint8_t> actualTextAndToUnicodePdf() {
   });
 }
 
+std::vector<uint8_t> wideCodeSpaceSimpleFontPdf() {
+  static constexpr std::string_view cmap =
+      "/CIDInit /ProcSet findresource begin\n"
+      "12 dict begin\n"
+      "begincmap\n"
+      "1 begincodespacerange\n"
+      "<0000> <FFFF>\n"
+      "endcodespacerange\n"
+      "7 beginbfchar\n"
+      "<43> <0043>\n"
+      "<61> <0061>\n"
+      "<65> <0065>\n"
+      "<6F> <006F>\n"
+      "<70> <0070>\n"
+      "<72> <0072>\n"
+      "<74> <0074>\n"
+      "endbfchar\n"
+      "endcmap\n"
+      "end\n"
+      "end";
+  static constexpr std::string_view content =
+      "BT /F1 12 Tf 1 0 0 1 72 720 Tm (Corporate) Tj ET";
+  return classicPdf({
+      "<< /Type /Catalog /Pages 2 0 R >>",
+      "<< /Type /Pages /Count 1 /Kids [3 0 R] >>",
+      "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+      "/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+      streamObject(content),
+      "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /ToUnicode 6 0 R >>",
+      streamObject(cmap),
+  });
+}
+
 std::vector<uint8_t> defaultType1EncodingPdf() {
   static constexpr std::string_view content =
       "/Artifact << /Payload <4E6F74207061696E746564> >> DP "
@@ -747,7 +780,7 @@ std::vector<uint8_t> nestedFormDepthPdf(const size_t depth) {
                "/Resources << /Font << /F1 " +
                std::to_string(fontObject) +
                " 0 R >> /XObject << /First 5 0 R >> >> /Contents 4 0 R >>";
-  objects[3] = streamObject("/First Do");
+  objects[3] = streamObject("BT /F1 12 Tf 1 0 0 1 72 740 Tm (RootText) Tj ET /First Do");
   for (size_t index = 0; index < depth; ++index) {
     std::string body;
     std::string resources = "/Resources << /Font << /F1 " + std::to_string(fontObject) + " 0 R >>";
@@ -934,6 +967,10 @@ struct CancelOnSequentialCMapReadHarness {
 };
 
 struct ProductReadTrace {
+  uint32_t parseFontSteps = 0;
+  uint32_t decodeFontFlushCalls = 0;
+  uint32_t decodeFontSyncCalls = 0;
+  uint32_t decodeFontStoreCloseCalls = 0;
   uint32_t fontStoreReadCalls = 0;
   uint32_t finalInterpretationFontStoreReadCalls = 0;
   uint32_t parseFontStoreReadCalls = 0;
@@ -959,10 +996,28 @@ PdfStepResult runToTerminal(PdfPreparation& preparation, PreparationHarness& har
   size_t nextReadObservation = harness.storage.readObservations().size();
   for (uint32_t step = 0; step < 50000; ++step) {
     const PdfPreparationPhase entryPhase = preparation.phase();
+    if (readTrace != nullptr && entryPhase == PdfPreparationPhase::ParseFonts) {
+      ++readTrace->parseFontSteps;
+    }
     const uint32_t writeCallsBefore = harness.storage.writeCalls();
     const uint64_t writeBytesBefore = harness.storage.bytesWrittenTotal();
+    const uint32_t flushCallsBefore = harness.storage.flushCalls();
+    const uint32_t syncCallsBefore = harness.storage.syncCalls();
+    const size_t eventsBefore = harness.storage.events().size();
     const PdfStepResult result = preparation.step();
     ++harness.nowMs;
+    if (readTrace != nullptr && entryPhase == PdfPreparationPhase::DecodeFonts) {
+      readTrace->decodeFontFlushCalls += harness.storage.flushCalls() - flushCallsBefore;
+      readTrace->decodeFontSyncCalls += harness.storage.syncCalls() - syncCallsBefore;
+      const std::vector<std::string>& events = harness.storage.events();
+      for (size_t event = eventsBefore; event < events.size(); ++event) {
+        static constexpr std::string_view prefix = "close:";
+        if (events[event].compare(0, prefix.size(), prefix) == 0 &&
+            isFontStorePath(events[event].substr(prefix.size()))) {
+          ++readTrace->decodeFontStoreCloseCalls;
+        }
+      }
+    }
     const std::vector<PdfTestReadObservation>& reads = harness.storage.readObservations();
     uint32_t parseFontReadsThisStep = 0;
     uint64_t parseFontBytesThisStep = 0;
@@ -1021,6 +1076,10 @@ struct ProductObservation {
   PdfStepResult terminal = PdfStepResult::failure(PdfStatus::failure(PdfError::InvalidArgument));
   PdfPreparationPhase terminalEntryPhase = PdfPreparationPhase::Idle;
   uint32_t words = 0;
+  uint32_t parseFontSteps = 0;
+  uint32_t decodeFontFlushCalls = 0;
+  uint32_t decodeFontSyncCalls = 0;
+  uint32_t decodeFontStoreCloseCalls = 0;
   uint32_t fontStoreOpenCalls = 0;
   uint32_t fontStoreReadCalls = 0;
   uint32_t finalInterpretationFontStoreReadCalls = 0;
@@ -1053,6 +1112,10 @@ ProductObservation prepareProduct(const char* const sourcePath, const std::vecto
   observation.terminal =
       runToTerminal(preparation, harness, &observation.terminalEntryPhase, &readTrace);
   observation.words = preparation.totalWords();
+  observation.parseFontSteps = readTrace.parseFontSteps;
+  observation.decodeFontFlushCalls = readTrace.decodeFontFlushCalls;
+  observation.decodeFontSyncCalls = readTrace.decodeFontSyncCalls;
+  observation.decodeFontStoreCloseCalls = readTrace.decodeFontStoreCloseCalls;
   observation.section = preparedSection(preparation, harness);
   const std::string fontStorePath = std::string(preparation.cacheRoot()) + "/gen_" +
                                     std::to_string(preparation.generation()) + "/build.font";
@@ -1184,11 +1247,26 @@ TEST(PdfPreparationProductGapRed, DecodesFlateToUnicodeAndUtf16ActualTextIntoCom
   ASSERT_NE(actualTextOffset, std::string::npos) << observation.section;
   EXPECT_LT(mappedOffset, actualTextOffset) << observation.section;
   EXPECT_EQ(countOccurrences(observation.section, "Replacement"), 1U) << observation.section;
-  EXPECT_GT(observation.fontStoreOpenCalls, 0U);
+  EXPECT_EQ(observation.fontStoreOpenCalls, 2U);
+  EXPECT_EQ(observation.decodeFontFlushCalls, 0U);
+  EXPECT_EQ(observation.decodeFontSyncCalls, 1U);
+  EXPECT_EQ(observation.decodeFontStoreCloseCalls, 1U);
   EXPECT_GT(observation.fontStoreReadCalls, 0U);
   EXPECT_GT(observation.fontStoreReadBytes, 0U);
   EXPECT_EQ(observation.finalInterpretationFontStoreReadCalls, 0U);
   EXPECT_EQ(observation.finalInterpretationFontStoreReadBytes, 0U);
+}
+
+TEST(PdfPreparationProductGapRed, TreatsSimpleFontStringsAsOneByteCodesDespiteWideToUnicodeCodeSpace) {
+  const std::vector<uint8_t> pdf = wideCodeSpaceSimpleFontPdf();
+  ASSERT_FALSE(pdf.empty());
+
+  const ProductObservation observation = prepareProduct("/books/product-gap-wide-simple-codespace.pdf", pdf);
+
+  ASSERT_TRUE(completedWithSection(observation));
+  EXPECT_EQ(observation.words, 1U);
+  EXPECT_NE(observation.section.find(">Corporate</p>"), std::string::npos) << observation.section;
+  EXPECT_EQ(observation.section.find("\xEF\xBF\xBD"), std::string::npos) << observation.section;
 }
 
 TEST(PdfPreparationProductGapRed, MaterializesObservedOneAndTwoByteToUnicodeCodesIntoCommittedXhtml) {
@@ -1206,8 +1284,83 @@ TEST(PdfPreparationProductGapRed, MaterializesObservedOneAndTwoByteToUnicodeCode
   EXPECT_EQ(observation.words, 2U);
   EXPECT_NE(observation.section.find(">Simple</p>"), std::string::npos) << observation.section;
   EXPECT_NE(observation.section.find(">CID\xCE\xA9\xCF\x80</p>"), std::string::npos) << observation.section;
+  EXPECT_EQ(observation.fontStoreOpenCalls, 2U)
+      << "all decoded fonts on one page must share the writer opened by SpoolFontNavigation";
+  EXPECT_EQ(observation.decodeFontFlushCalls, 0U);
+  EXPECT_EQ(observation.decodeFontSyncCalls, 1U);
+  EXPECT_EQ(observation.decodeFontStoreCloseCalls, 1U);
   EXPECT_EQ(observation.finalInterpretationFontStoreReadCalls, 0U);
   EXPECT_EQ(observation.finalInterpretationFontStoreReadBytes, 0U);
+}
+
+TEST(PdfPreparationProductGapRed, CancellingDecodeFontsClosesAndRemovesTheCarriedFontWriter) {
+  constexpr char sourcePath[] = "/books/product-gap-font-cancel.pdf";
+  PreparationHarness harness;
+  harness.storage.setMaximumReadHandles(1);
+  harness.storage.addFile(sourcePath, actualTextAndToUnicodePdf(), 1234, true);
+  PdfPreparation preparation;
+  ASSERT_TRUE(preparation.begin(harness.config(sourcePath)).ok());
+
+  std::string fontStorePath;
+  for (uint32_t step = 0; step < 50000 && fontStorePath.empty(); ++step) {
+    const PdfStepResult result = preparation.step();
+    ++harness.nowMs;
+    ASSERT_TRUE(result.yielded()) << static_cast<int>(result.status.error) << "@" << result.status.offset;
+    if (preparation.phase() != PdfPreparationPhase::DecodeFonts) {
+      continue;
+    }
+    for (const std::string& path : harness.storage.openHandlePaths()) {
+      if (isFontStorePath(path)) {
+        fontStorePath = path;
+        break;
+      }
+    }
+  }
+  ASSERT_FALSE(fontStorePath.empty());
+
+  preparation.requestCancel();
+  const PdfStepResult cancelled = runToTerminal(preparation, harness);
+
+  ASSERT_TRUE(cancelled.failed());
+  EXPECT_EQ(cancelled.status.error, PdfError::Cancelled);
+  EXPECT_EQ(preparation.phase(), PdfPreparationPhase::Cancelled);
+  EXPECT_EQ(harness.storage.openHandleCount(), 0U);
+  EXPECT_FALSE(harness.storage.exists(fontStorePath));
+}
+
+TEST(PdfPreparationProductGapRed, DecodeFontWriterSyncFailureClosesAndRemovesTheTemporaryStore) {
+  constexpr char sourcePath[] = "/books/product-gap-font-sync-failure.pdf";
+  PreparationHarness harness;
+  harness.storage.setMaximumReadHandles(1);
+  harness.storage.addFile(sourcePath, actualTextAndToUnicodePdf(), 1234, true);
+  PdfPreparation preparation;
+  ASSERT_TRUE(preparation.begin(harness.config(sourcePath)).ok());
+
+  std::string fontStorePath;
+  for (uint32_t step = 0; step < 50000 && fontStorePath.empty(); ++step) {
+    const PdfStepResult result = preparation.step();
+    ++harness.nowMs;
+    ASSERT_TRUE(result.yielded()) << static_cast<int>(result.status.error) << "@" << result.status.offset;
+    if (preparation.phase() != PdfPreparationPhase::DecodeFonts) {
+      continue;
+    }
+    for (const std::string& path : harness.storage.openHandlePaths()) {
+      if (isFontStorePath(path)) {
+        fontStorePath = path;
+        break;
+      }
+    }
+  }
+  ASSERT_FALSE(fontStorePath.empty());
+
+  harness.storage.fail(PdfTestFaultPoint::Sync);
+  const PdfStepResult failed = runToTerminal(preparation, harness);
+
+  ASSERT_TRUE(failed.failed());
+  EXPECT_EQ(failed.status.error, PdfError::IoFailure);
+  EXPECT_EQ(preparation.phase(), PdfPreparationPhase::Failed);
+  EXPECT_EQ(harness.storage.openHandleCount(), 0U);
+  EXPECT_FALSE(harness.storage.exists(fontStorePath));
 }
 
 TEST(PdfPreparationProductGapRed, DenseRepeatedCidTextDoesNotOverflowObservedGlyphTracking) {
@@ -1255,19 +1408,21 @@ TEST(PdfPreparationProductGapRed, AcceptsExactlyTwoHundredFiftySixUniquePaintedC
   const ProductObservation observation = prepareProduct("/books/product-gap-256-cid-codes.pdf", pdf);
 
   ASSERT_TRUE(completedWithSection(observation));
+  EXPECT_LE(observation.parseFontSteps, 64U)
+      << "materializing successive observed glyphs must consume the existing work slice";
   EXPECT_EQ(observation.finalInterpretationFontStoreReadCalls, 0U);
 }
 
-TEST(PdfPreparationProductGapRed, RejectsTheTwoHundredFiftySeventhUniquePaintedCidCode) {
+TEST(PdfPreparationProductGapRed, OmitsOnlyTheTwoHundredFiftySeventhUniquePaintedCidCode) {
   const std::vector<uint8_t> pdf = cidUniqueGlyphPdf(257U);
   ASSERT_FALSE(pdf.empty());
 
   const ProductObservation observation = prepareProduct("/books/product-gap-257-cid-codes.pdf", pdf);
 
-  ASSERT_TRUE(observation.beginStatus.ok());
-  ASSERT_TRUE(observation.terminal.failed());
-  EXPECT_EQ(observation.terminal.status.error, PdfError::LimitExceeded);
-  EXPECT_EQ(observation.terminalEntryPhase, PdfPreparationPhase::ParseFonts);
+  ASSERT_TRUE(completedWithSection(observation));
+  EXPECT_NE(observation.section.find("\xC4\x80"), std::string::npos);
+  EXPECT_EQ(observation.section.find("\xC8\x80"), std::string::npos);
+  EXPECT_EQ(observation.finalInterpretationFontStoreReadCalls, 0U);
 }
 
 TEST(PdfPreparationProductGapRed, ReplaysOneSpilledJournalOnceAcrossSixteenPaintedFonts) {
@@ -1278,6 +1433,8 @@ TEST(PdfPreparationProductGapRed, ReplaysOneSpilledJournalOnceAcrossSixteenPaint
   const ProductObservation observation = prepareProduct("/books/product-gap-sixteen-fonts.pdf", pdf);
 
   ASSERT_TRUE(completedWithSection(observation));
+  EXPECT_LE(observation.parseFontSteps, 128U)
+      << "the observed-string journal must consume the existing work slice instead of yielding per glyph";
   EXPECT_EQ(observation.parseFontStoreReadBytes, kSixteenFontJournalBytes)
       << "the raw observed-string journal must be read globally once, not once per font";
   EXPECT_EQ(observation.finalInterpretationFontStoreReadCalls, 0U);
@@ -1600,7 +1757,7 @@ TEST(PdfPreparationProductGapRed, RejectsAProductFormCycleByObjectIdentity) {
   EXPECT_EQ(observation.terminal.status.error, PdfError::Malformed);
 }
 
-TEST(PdfPreparationProductGapRed, AcceptsExactFormDepthAndRejectsOneMore) {
+TEST(PdfPreparationProductGapRed, AcceptsExactFormDepthAndOmitsOnlyTheDeeperBranch) {
   const ProductObservation exact = prepareProduct(
       "/books/product-gap-form-depth-exact.pdf", nestedFormDepthPdf(PdfLimits::MaxFormDepth));
   ASSERT_TRUE(completedWithSection(exact));
@@ -1608,12 +1765,12 @@ TEST(PdfPreparationProductGapRed, AcceptsExactFormDepthAndRejectsOneMore) {
 
   const ProductObservation over = prepareProduct(
       "/books/product-gap-form-depth-over.pdf", nestedFormDepthPdf(PdfLimits::MaxFormDepth + 1U));
-  ASSERT_TRUE(over.beginStatus.ok());
-  ASSERT_TRUE(over.terminal.failed());
-  EXPECT_EQ(over.terminal.status.error, PdfError::LimitExceeded);
+  ASSERT_TRUE(completedWithSection(over));
+  EXPECT_EQ(countOccurrences(over.section, "RootText"), 1U) << over.section;
+  EXPECT_EQ(countOccurrences(over.section, "DepthTarget"), 0U) << over.section;
 }
 
-TEST(PdfPreparationProductGapRed, AcceptsExactPerScopeFormResourceCapAndRejectsOneMore) {
+TEST(PdfPreparationProductGapRed, AcceptsExactPerScopeFormResourceCapAndOmitsOnlyTheExcessForm) {
   const ProductObservation exact =
       prepareProduct("/books/product-gap-form-cap-exact.pdf",
                      formResourceCapPdf(PdfPreparedContentResources::MaxXObjects));
@@ -1625,9 +1782,11 @@ TEST(PdfPreparationProductGapRed, AcceptsExactPerScopeFormResourceCapAndRejectsO
   const ProductObservation over =
       prepareProduct("/books/product-gap-form-cap-over.pdf",
                      formResourceCapPdf(PdfPreparedContentResources::MaxXObjects + 1U));
-  ASSERT_TRUE(over.beginStatus.ok());
-  ASSERT_TRUE(over.terminal.failed());
-  EXPECT_EQ(over.terminal.status.error, PdfError::LimitExceeded);
+  ASSERT_TRUE(completedWithSection(over));
+  EXPECT_EQ(over.words, PdfPreparedContentResources::MaxXObjects);
+  EXPECT_EQ(countOccurrences(over.section, "Cap00"), 1U) << over.section;
+  EXPECT_EQ(countOccurrences(over.section, "Cap15"), 1U) << over.section;
+  EXPECT_EQ(countOccurrences(over.section, "Cap16"), 0U) << over.section;
 }
 
 TEST(PdfPreparationProductGapRed, DecodesOneFormBodyOnceWhenItIsInvokedTwice) {

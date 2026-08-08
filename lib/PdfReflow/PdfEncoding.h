@@ -55,4 +55,5 @@ class PdfSimpleEncoding {
 
 bool pdfGlyphNameToUnicode(const uint8_t* name, size_t length, uint32_t* scalar);
 bool pdfConservativeLatinFallback(uint8_t code, uint32_t* scalar);
+bool pdfWinAnsiFallback(uint8_t code, uint32_t* scalar);
 PdfStatus pdfDecodePdfTextString(const uint8_t* source, size_t sourceLength, const PdfByteSink& sink);

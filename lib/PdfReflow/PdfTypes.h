@@ -129,7 +129,7 @@ struct PdfToken {
   uint32_t length = 0;
   PdfTokenKind kind = PdfTokenKind::End;
   uint8_t reserved[3]{};
-  char bytes[112]{};
+  char bytes[127]{};
 };
 
 struct PdfTextRun {
@@ -148,5 +148,5 @@ struct PdfTextRun {
   uint16_t flags = 0;
 };
 
-static_assert(sizeof(PdfToken) <= 128, "PDF tokens must fit the bounded token workspace");
+static_assert(sizeof(PdfToken) <= 136, "PDF tokens must fit the bounded token workspace");
 static_assert(sizeof(PdfTextRun) <= 48, "PDF text runs must fit the bounded page workspace");

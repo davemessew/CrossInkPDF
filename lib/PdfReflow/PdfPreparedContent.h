@@ -5,10 +5,13 @@
 
 #include "PdfContentInterpreter.h"
 #include "PdfIo.h"
+#include "PdfSecurity.h"
 #include "PdfStreamDecoder.h"
 
 struct PdfEncodedContentStream {
   PdfByteSource source{};
+  PdfObjectReference reference{};
+  PdfSecurity* security = nullptr;
   PdfStreamFilter filters[PdfLimits::MaxFiltersPerStream]{};
   uint8_t filterCount = 0;
 };
@@ -23,17 +26,26 @@ class PdfPreparedContentStreams {
                   PdfStreamDecodeLimits limits = {});
   PdfStatus beginAppend(const PdfEncodedContentStream* streams, uint8_t count, PdfByteStore decodedStore,
                         uint64_t existingBytes, PdfStreamDecodeLimits limits = {});
+  PdfStatus beginSequence(const PdfEncodedContentStream* streams, uint8_t count, PdfByteStore decodedStore,
+                          PdfStreamDecodeLimits limits = {});
+  PdfStatus beginSequenceAppend(const PdfEncodedContentStream* streams, uint8_t count,
+                                PdfByteStore decodedStore, uint64_t existingBytes,
+                                PdfStreamDecodeLimits limits = {});
   PdfStepResult step(PdfWorkBudget& budget);
 
   const PdfByteSource* sources() const { return sources_; }
   uint8_t count() const { return phase_ == Phase::Done ? streamCount_ : 0; }
   uint64_t decodedBytes() const { return decodedBytes_; }
+  PdfByteSource sequenceSource() const {
+    return phase_ == Phase::Done && sequenceMode_ ? sequenceSource_ : PdfByteSource{};
+  }
 
  private:
   enum class Phase : uint8_t {
     Idle,
     ResetStore,
     BeginStream,
+    WriteSeparator,
     DecodeStream,
     FinishStream,
     FinalizeSources,
@@ -44,7 +56,8 @@ class PdfPreparedContentStreams {
 
   PdfStepResult fail(PdfStatus status);
   PdfStatus beginInternal(const PdfEncodedContentStream* streams, uint8_t count, PdfByteStore decodedStore,
-                          uint64_t existingBytes, bool resetStore, PdfStreamDecodeLimits limits);
+                          uint64_t existingBytes, bool resetStore, bool sequenceMode,
+                          bool prefixSeparator, PdfStreamDecodeLimits limits);
 
   PdfStreamDecoder decoder_;
   const PdfEncodedContentStream* streams_ = nullptr;
@@ -54,6 +67,8 @@ class PdfPreparedContentStreams {
   PdfByteSource sources_[MaxSources]{};
   uint64_t offsets_[MaxSources]{};
   uint64_t lengths_[MaxSources]{};
+  PdfByteRange sequenceRange_{};
+  PdfByteSource sequenceSource_{};
   PdfStatus failure_{};
   uint64_t decodedBytes_ = 0;
   uint8_t streamCount_ = 0;
@@ -61,10 +76,13 @@ class PdfPreparedContentStreams {
   uint8_t finalizeIndex_ = 0;
   Phase phase_ = Phase::Idle;
   bool storeReady_ = false;
+  bool sequenceMode_ = false;
+  bool prefixSeparator_ = false;
+  bool separatorWrittenForCurrent_ = false;
 };
 
-static_assert(sizeof(PdfPreparedContentStreams) <= PdfLimits::SourceBufferBytes,
-              "prepared content stream state must fit a 4 KiB phase overlay");
+static_assert(sizeof(PdfPreparedContentStreams) <= PdfLimits::PageRunBytes,
+              "prepared content stream state must fit the fixed page-run phase overlay");
 
 struct PdfPreparedFontResource {
   uint8_t name[32]{};

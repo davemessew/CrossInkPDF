@@ -26,7 +26,8 @@ Supported PDFs may include:
 - readable text with usable Unicode, standard-font, or common Latin mappings;
 - multi-column pages and simple table-like regions, which are placed into a stable reading order;
 - document outlines, internal destinations, contents and index text, and publisher page labels;
-- meaningful JPEG images and supported Flate-compressed raster images.
+- meaningful JPEG images and supported Flate-compressed raster images;
+- Standard-handler V4/R4 RC4-128 encryption when the document opens with an empty user password.
 
 PDF is a flexible container, so a `.pdf` extension alone does not guarantee
 that a document can be reflowed. CrossInk accepts the capabilities it can
@@ -82,7 +83,7 @@ from the printed page while remaining readable on the small e-ink display.
 CrossInk does not support:
 
 - image-only scans without an OCR text layer;
-- encrypted or password-protected PDFs, including files with an empty password;
+- PDFs that require a password, use AES, or use another unsupported security handler;
 - fixed-page display, zoom, crop, or pan;
 - on-device OCR;
 - PDF forms, JavaScript, signatures, attachments, audio, or video;
@@ -99,7 +100,7 @@ CrossInk shows a specific message when it can identify the problem:
 | Message | What to do |
 | --- | --- |
 | **No readable text was found in this PDF** | Add an OCR text layer on a computer, then copy the new file to the reader. |
-| **Password-protected PDFs are not supported** | Use an unencrypted copy that you are allowed to read. |
+| **Password-protected PDFs are not supported** | Use a passwordless RC4 copy or an unencrypted copy that you are allowed to read. |
 | **This PDF uses unsupported compression** | Create a compatible copy with standard PDF compression. |
 | **This PDF uses unsupported text encoding** | Create a new PDF with embedded, Unicode-mappable text. |
 | **This PDF is damaged or cannot be read safely** | Replace the file with a known-good copy. |

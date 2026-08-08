@@ -5,6 +5,7 @@
 
 #include "PdfIo.h"
 #include "PdfObjectParser.h"
+#include "PdfSecurity.h"
 #include "PdfStreamBoundary.h"
 #include "PdfStreamDecoder.h"
 
@@ -23,11 +24,15 @@ struct PdfXrefEntry {
   uint32_t objectStreamIndex = 0;
 };
 
+static_assert(sizeof(PdfXrefEntry) == 24, "xref read-ahead storage assumes 24-byte records");
+
 enum class PdfXrefLookupPhase : uint8_t {
   Idle,
   Linear,
+  BuildSampleIndex,
   Binary,
   Verify,
+  ReadAhead,
   Done,
   Failed,
 };
@@ -41,6 +46,7 @@ struct PdfXrefLookupState {
   uint32_t first = 0;
   uint32_t last = 0;
   uint32_t cursor = 0;
+  uint32_t readAheadToken = 0;
   PdfXrefLookupPhase phase = PdfXrefLookupPhase::Idle;
 };
 
@@ -49,14 +55,19 @@ class PdfXrefTable {
   explicit PdfXrefTable(const PdfFixedRecordStore& records) : records_(records) {}
 
   // Optional newest-first duplicate filter. The caller owns these phase-local
-  // bitset spans; together they need one bit for every legal object number,
-  // including zero. The second span may be null when the first is large enough.
+  // spans, which hold a bounded exact set independent of the object-number
+  // domain. An unrepresentable collision requests exact external compaction
+  // at the next revision boundary.
   PdfStatus configureNewestObjectFilter(uint8_t* first, size_t firstBytes, uint8_t* second, size_t secondBytes);
   // Stops using the caller-owned spans without clearing them. Call this before
   // either span is repurposed by a later processing phase.
   void detachNewestObjectFilter();
   void reset();
+  PdfStatus preflightAppend(uint32_t count) const;
   PdfStatus appendNewest(const PdfXrefEntry& entry);
+  bool sectionCompactionRequired() const { return sectionCompactionRequired_; }
+  PdfStatus adoptCompactedRecords(const PdfFixedRecordStore& records, uint32_t count,
+                                  uint32_t lastObjectNumber);
   // Adopts caller-provided records that are already sorted by object number.
   // The store is not scanned; callers retain responsibility for ordering and
   // duplicate removal.
@@ -81,14 +92,32 @@ class PdfXrefTable {
     hasInfo_ = true;
   }
   bool info(PdfObjectReference* info) const;
+  PdfStatus setSecurity(const PdfSecurityTrailer& security);
+  bool security(PdfSecurityTrailer* security) const;
 
  private:
+  static constexpr uint8_t kLookupWindowEntries = 16;
+  // Sparse resource lookups often form accidental pairs. Require a sustained
+  // forward run before paying for a full window; any cache hit restores trust.
+  static constexpr uint8_t kLocalityStreakRequired = 3;
+  static constexpr uint8_t kSampleIndexEntries = 56;
+  static constexpr uint8_t kSampleIndexLookupThreshold = 4;
+  static constexpr uint16_t kSampleIndexMinimumRecords = 128;
+  static constexpr uint8_t kVictimEntries = 24;
+
+  void initializeSampleIndex();
+  void configureBinaryLookup(PdfXrefLookupState* state) const;
+  void rememberVictim(const PdfXrefEntry& entry, uint32_t ordinal) const;
+  bool newestObjectAlreadySeen(uint32_t objectNumber);
+
   PdfFixedRecordStore records_{};
   uint32_t entryCount_ = 0;
   PdfObjectReference root_{};
   PdfObjectReference info_{};
+  PdfSecurityTrailer security_{};
   bool hasRoot_ = false;
   bool hasInfo_ = false;
+  bool hasSecurity_ = false;
   bool finalized_ = false;
   bool appendOrderStrict_ = true;
   uint32_t lastAppendedObject_ = 0;
@@ -96,7 +125,29 @@ class PdfXrefTable {
   uint8_t* seenObjectsSecond_ = nullptr;
   size_t seenObjectsFirstBytes_ = 0;
   size_t seenObjectsSecondBytes_ = 0;
+  mutable PdfXrefEntry lookupWindow_[kLookupWindowEntries]{};
+  mutable PdfXrefEntry victimEntries_[kVictimEntries]{};
+  mutable uint32_t sampleObjectNumbers_[kSampleIndexEntries]{};
+  mutable uint32_t victimOrdinals_[kVictimEntries]{};
+  mutable uint32_t lookupWindowFirstOrdinal_ = 0;
+  mutable uint32_t lastLookupOrdinal_ = 0;
+  mutable uint32_t lookupWindowToken_ = 0;
+  mutable uint32_t sampleStride_ = 0;
+  mutable uint8_t lookupWindowCount_ = 0;
+  mutable uint8_t localityStreak_ = 0;
+  mutable uint8_t sampleCount_ = 0;
+  mutable uint8_t sampleBuildCount_ = 0;
+  mutable uint8_t lookupMissCount_ = 0;
+  mutable uint8_t victimCount_ = 0;
+  mutable bool hasLastLookupOrdinal_ = false;
+  mutable bool sampleIndexReady_ = false;
+  mutable bool sampleIndexDisabled_ = false;
+  bool sectionCompactionRequired_ = false;
 };
+
+static_assert(sizeof(PdfXrefEntry) * 16U == 384U, "xref read-ahead window must stay at 384 bytes");
+static_assert(sizeof(uint32_t) * 56U + sizeof(PdfXrefEntry) * 24U + sizeof(uint32_t) * 24U == 896U,
+              "sampled and victim xref indexes must stay within 896 bytes");
 
 class PdfXrefParser {
  public:
@@ -108,6 +159,8 @@ class PdfXrefParser {
   PdfStepResult step(PdfWorkBudget& budget);
   uint64_t currentDecodedBytes() const;
   uint64_t decodedBytes() const { return decodedBytes_; }
+  bool compactionRequested() const { return phase_ == Phase::AwaitCompaction; }
+  PdfStatus resumeAfterCompaction();
 
  private:
   enum class Phase : uint8_t {
@@ -127,18 +180,22 @@ class PdfXrefParser {
     EntryGeneration,
     EntryState,
     ParseTrailer,
+    AwaitCompaction,
     Done,
     Failed,
   };
 
   PdfStatus enterSection(uint64_t offset);
+  PdfStatus finishSection();
   PdfStatus consumeTrailer();
   PdfStatus consumeCommonDictionary(uint16_t rootIndex);
   PdfStatus configureXrefStream(uint16_t rootIndex);
   PdfStatus beginXrefStreamDecode();
   PdfStatus finishXrefStream();
-  PdfStatus advanceXrefRange();
+  PdfStepResult stepAdvanceXrefRange(PdfWorkBudget& budget);
   PdfStatus consumeXrefByte(uint8_t byte);
+  static PdfStatus consumeNamedIndex(void* context, PdfNamedIntegerArrayEvent event, int64_t value,
+                                     uint64_t sourceOffset);
   static PdfStatus writeDecodedXref(void* context, const uint8_t* source, size_t requested, size_t* bytesWritten);
 
   PdfByteSource source_{};
@@ -147,6 +204,7 @@ class PdfXrefParser {
   PdfLexer lexer_;
   PdfObjectArena& trailerArena_;
   PdfObjectParser trailerParser_;
+  PdfNamedIntegerArraySink xrefIndexSink_{};
   PdfXrefTable& table_;
   PdfStreamDecoder* streamDecoder_ = nullptr;
   PdfStreamDecodeLimits decodeLimits_{};
@@ -154,8 +212,9 @@ class PdfXrefParser {
   PdfReadExactState tailRead_{};
   PdfReadExactState eolRead_{};
   Phase phase_ = Phase::FindStartXref;
-  uint64_t visitedOffsets_[32]{};
-  uint8_t visitedCount_ = 0;
+  uint64_t prevCycleAnchor_ = 0;
+  uint32_t prevCyclePower_ = 0;
+  uint32_t prevCycleLength_ = 0;
   uint32_t subsectionStart_ = 0;
   uint32_t subsectionCount_ = 0;
   uint32_t subsectionIndex_ = 0;
@@ -166,23 +225,38 @@ class PdfXrefParser {
   uint64_t eolOffset_ = 0;
   uint64_t pendingPrev_ = 0;
   uint64_t decodedBytes_ = 0;
+  uint64_t xrefIndexStartOffset_ = 0;
+  uint64_t xrefIndexEndOffset_ = 0;
+  uint64_t xrefIndexReadOffset_ = 0;
+  uint64_t xrefIndexNumber_ = 0;
   uint64_t xrefFieldValues_[3]{};
   uint32_t xrefExpectedEntries_ = 0;
   uint32_t xrefDecodedEntries_ = 0;
   uint32_t xrefCurrentObject_ = 0;
   uint32_t xrefRangeRemaining_ = 0;
-  uint16_t xrefIndexValue_ = PDF_INVALID_INDEX;
-  uint16_t xrefIndexLink_ = PDF_INVALID_INDEX;
+  uint32_t xrefIndexObservedFirst_ = 0;
+  uint32_t xrefIndexPairsRemaining_ = 0;
   uint16_t entryGeneration_ = 0;
   uint8_t eolByte_ = 0;
-  uint8_t xrefWidths_[3]{};
+  uint64_t xrefWidths_[3]{};
+  uint8_t xrefIndexBuffer_[32]{};
   PdfStreamFilter streamFilters_[PdfLimits::MaxFiltersPerStream]{};
+  PdfStreamDecodeParameters streamDecodeParameters_{};
   uint8_t xrefFieldIndex_ = 0;
-  uint8_t xrefFieldByteIndex_ = 0;
-  uint8_t xrefIndexPairsRemaining_ = 0;
+  uint64_t xrefFieldByteIndex_ = 0;
+  uint8_t xrefIndexBufferPosition_ = 0;
+  uint8_t xrefIndexBufferLength_ = 0;
   uint8_t streamFilterCount_ = 0;
   bool hasPendingPrev_ = false;
+  bool hasPrevCycleAnchor_ = false;
   bool hasPendingEntry_ = false;
   bool pendingEntryFromStream_ = false;
   bool xrefUsesDefaultIndex_ = false;
+  bool xrefIndexSeen_ = false;
+  bool xrefIndexHaveObservedFirst_ = false;
+  bool xrefIndexNeedRange_ = false;
+  bool xrefIndexScanHaveFirst_ = false;
+  bool xrefIndexNumberStarted_ = false;
+  bool xrefIndexNumberHasDigits_ = false;
+  bool xrefIndexInComment_ = false;
 };

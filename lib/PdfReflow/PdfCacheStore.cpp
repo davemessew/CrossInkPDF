@@ -370,10 +370,9 @@ PdfStatus pdfCloseTrackedCacheFile(PdfCacheTrackedWriter* const writer, PdfRequi
   if (writer == nullptr || record == nullptr || !writer->open || writer->failed) {
     return PdfStatus::failure(PdfError::InvalidArgument);
   }
-  PdfStatus status = writer->io.flush(writer->io.context, writer->handle);
-  if (status) {
-    status = writer->io.sync(writer->io.context, writer->handle);
-  }
+  // sync is the status-bearing durability gate. The HAL flush callback calls
+  // the same underlying file sync and would repeat the SD transaction here.
+  PdfStatus status = writer->io.sync(writer->io.context, writer->handle);
   const PdfStatus closeStatus = writer->io.close(writer->io.context, &writer->handle);
   writer->open = false;
   if (status && !closeStatus) {
@@ -626,9 +625,8 @@ PdfStatus PdfCacheStore::commitCheckpoint(const PdfBuildCheckpoint& checkpoint) 
   CacheHandleSink sink{&io_, handle};
   status = pdfEncodeBuildCheckpoint(checkpoint, sink.sink());
   if (status) {
-    status = io_.flush(io_.context, handle);
-  }
-  if (status) {
+    // Keep the observable sync before close/readback without first repeating
+    // that same underlying file sync through the HAL flush callback.
     status = io_.sync(io_.context, handle);
   }
   status = closeHandle(io_, &handle, status);
