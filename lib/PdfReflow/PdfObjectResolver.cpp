@@ -206,6 +206,23 @@ PdfStepResult PdfObjectResolver::step(PdfWorkBudget& budget) {
       }
 
       if (!resolvingIndirectLength() && !hasResolvedIndirectLength() &&
+          workspace_.lookupCachedObjectStream != nullptr) {
+        uint32_t cachedCount = 0;
+        uint64_t cachedFirst = 0;
+        uint64_t cachedSize = 0;
+        if (workspace_.lookupCachedObjectStream(workspace_.sourceAccessContext, objectStreamNumber_,
+                                                &cachedCount, &cachedFirst, &cachedSize)) {
+          objectStreamObjectCount_ = cachedCount;
+          objectStreamFirst_ = cachedFirst;
+          objectStreamDecodedSize_ = cachedSize;
+          objectStreamUsesStore_ = true;
+          publishObjectStream_ = false;
+          phase_ = Phase::SelectObjectStore;
+          return PdfStepResult::paused();
+        }
+      }
+
+      if (!resolvingIndirectLength() && !hasResolvedIndirectLength() &&
           cachedObjectStreamNumber_ == objectStreamNumber_ && cachedObjectStreamSize_ != 0) {
         objectStreamObjectCount_ = cachedObjectStreamCount_;
         objectStreamFirst_ = cachedObjectStreamFirst_;
@@ -680,11 +697,6 @@ PdfStatus PdfObjectResolver::configureObjectStream(const uint64_t streamOffset) 
   if (workspace_.decodeLimits.maxExpandedBytes == 0 || workspace_.decodeLimits.maxExpansionRatio == 0) {
     return PdfStatus::failure(PdfError::ExpansionLimit, objectStreamNumber_);
   }
-  if (!resolvingIndirectLength() && !hasResolvedIndirectLength() && cachedObjectStreamNumber_ != 0 &&
-      cachedObjectStreamNumber_ != objectStreamNumber_) {
-    clearObjectStreamCache();
-  }
-
   const PdfStatus status =
       pdfInitializeByteRange(source_, streamOffset, result_.streamLength, &objectStreamSourceRange_);
   if (!status.ok()) {
@@ -711,6 +723,27 @@ PdfStatus PdfObjectResolver::configureObjectStream(const uint64_t streamOffset) 
   if (!workspace_.objectStreamStore.valid() || workspace_.objectStreamStore.capacity == 0 ||
       streamDecoder_ == nullptr) {
     return PdfStatus::failure(PdfError::Unsupported, objectStreamNumber_);
+  }
+  if (workspace_.prepareCachedObjectStream != nullptr) {
+    uint64_t requiredBytes = result_.streamLength;
+    if (streamFilterCount_ != 0) {
+      if (requiredBytes > workspace_.decodeLimits.maxExpandedBytes /
+                              workspace_.decodeLimits.maxExpansionRatio) {
+        requiredBytes = workspace_.decodeLimits.maxExpandedBytes;
+      } else {
+        requiredBytes *= workspace_.decodeLimits.maxExpansionRatio;
+      }
+    }
+    requiredBytes = std::min(requiredBytes, workspace_.decodeLimits.maxExpandedBytes);
+    bool cacheCleared = false;
+    const PdfStatus prepareStatus = workspace_.prepareCachedObjectStream(
+        workspace_.sourceAccessContext, requiredBytes, &cacheCleared);
+    if (!prepareStatus) {
+      return prepareStatus;
+    }
+    if (cacheCleared) {
+      clearObjectStreamCache();
+    }
   }
   phase_ = Phase::SelectObjectStoreWriter;
   return PdfStatus::success();
@@ -754,14 +787,19 @@ PdfStatus PdfObjectResolver::activateObjectStream() {
         completedStreamBytes_ > std::numeric_limits<uint64_t>::max() - objectStreamDecodedSize_) {
       return PdfStatus::failure(PdfError::ExpansionLimit, objectStreamDecodedSize_);
     }
-    workspace_.decodeLimits.maxExpandedBytes -= objectStreamDecodedSize_;
     completedStreamBytes_ += objectStreamDecodedSize_;
     if (!resolvingIndirectLength() && !hasResolvedIndirectLength()) {
-      cachedObjectStreamNumber_ = objectStreamNumber_;
-      cachedObjectStreamCount_ = objectStreamObjectCount_;
-      cachedObjectStreamFirst_ = objectStreamFirst_;
-      cachedObjectStreamSize_ = objectStreamDecodedSize_;
-      cachedObjectStreamUsesStore_ = objectStreamUsesStore_;
+      if (objectStreamUsesStore_ && workspace_.publishCachedObjectStream != nullptr) {
+        workspace_.publishCachedObjectStream(workspace_.sourceAccessContext, objectStreamNumber_,
+                                             objectStreamObjectCount_, objectStreamFirst_,
+                                             objectStreamDecodedSize_);
+      } else {
+        cachedObjectStreamNumber_ = objectStreamNumber_;
+        cachedObjectStreamCount_ = objectStreamObjectCount_;
+        cachedObjectStreamFirst_ = objectStreamFirst_;
+        cachedObjectStreamSize_ = objectStreamDecodedSize_;
+        cachedObjectStreamUsesStore_ = objectStreamUsesStore_;
+      }
     }
     publishObjectStream_ = false;
   }

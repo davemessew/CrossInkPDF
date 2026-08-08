@@ -1,3 +1,15 @@
+## [v1.5.0.4] - 2026-08-09
+
+### Changed
+
+- PDF preparation reuses recently decoded object streams and sorts larger xref batches in the existing fixed workspace, substantially reducing repeated SD-card traffic on complex files.
+- Cancellation cleanup is split into bounded steps so large temporary PDF caches can close safely without a long CPU or storage burst.
+
+### Fixed
+
+- Linked PDF text now contributes correctly to word-count progress instead of merging adjacent linked words.
+- Cancelling and resuming PDF preparation preserves the last durable checkpoint while removing temporary page spools one at a time.
+
 ## [v1.5.0.3] - 2026-08-08
 
 ### Added

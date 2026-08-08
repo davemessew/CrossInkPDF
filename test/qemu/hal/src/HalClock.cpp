@@ -28,8 +28,11 @@ bool HalClock::getDate(uint16_t& year, uint8_t& month, uint8_t& day, uint8_t& ho
   return false;
 }
 
-bool HalClock::formatDate(char* buf, size_t bufSize, uint8_t utcOffsetQuarterHoursBiased) const {
+bool HalClock::formatDate(char* buf, size_t bufSize, uint8_t utcOffsetQuarterHoursBiased, DateFormat dateFormat,
+                          char numericSeparator) const {
   (void)utcOffsetQuarterHoursBiased;
+  (void)dateFormat;
+  (void)numericSeparator;
   if (buf != nullptr && bufSize > 0) {
     buf[0] = '\0';
   }

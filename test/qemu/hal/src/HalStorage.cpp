@@ -138,6 +138,16 @@ bool HalStorage::begin() {
 
 bool HalStorage::ready() const { return initialized; }
 
+uint64_t HalStorage::totalBytes() { return capacityInfo().total.value; }
+
+uint64_t HalStorage::usedBytes() {
+  const HalStorageCapacityInfo capacity = capacityInfo();
+  if (!capacity.total.known || !capacity.free.known || capacity.free.value > capacity.total.value) {
+    return 0;
+  }
+  return capacity.total.value - capacity.free.value;
+}
+
 std::vector<String> HalStorage::listFiles(const char* path, int maxFiles) {
   std::vector<String> paths;
   const int limit = std::clamp(maxFiles, 0, MAX_LISTED_FILES);

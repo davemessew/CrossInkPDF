@@ -87,8 +87,9 @@ PDF_SLOW_ATOMIC_SUMMARY_MARKER = re.compile(
     r"max_total_us=(\d+) max_callback_us=(\d+)$"
 )
 MAX_QEMU_SLOW_ATOMIC_WRITE_US = 30000
-MAX_QEMU_SLOW_ATOMIC_OPEN_WRITE_US = 36000
+MAX_QEMU_SLOW_ATOMIC_OPEN_WRITE_US = 60000
 MAX_QEMU_SLOW_ATOMIC_RENAME_US = 24000
+MAX_QEMU_SLOW_ATOMIC_REMOVE_US = 30000
 MAX_QEMU_SLOW_ATOMIC_OPEN_READ_US = 16000
 MAX_QEMU_SLOW_ATOMIC_STORAGE_SESSION_US = 60000
 MAX_QEMU_SLOW_ATOMIC_NONIO_US = 500
@@ -368,6 +369,11 @@ class OutputGuard:
                 and request == 0
                 and callback_us <= MAX_QEMU_SLOW_ATOMIC_RENAME_US
             ) or (
+                kind == "remove"
+                and mode == "none"
+                and request == 0
+                and callback_us <= MAX_QEMU_SLOW_ATOMIC_REMOVE_US
+            ) or (
                 kind == "open"
                 and mode == "read"
                 and request == 0
@@ -418,6 +424,7 @@ class OutputGuard:
             self.slow_atomic_slices.append(slice_index)
             self.slow_atomic_writes += int(
                 kind == "write"
+                or kind == "remove"
                 or (kind == "open" and mode != "read")
                 or (kind == "multiple" and mode != "read")
             )

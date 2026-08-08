@@ -459,7 +459,7 @@ TEST(PdfPreparationContentStreams, AccountsAndRetiresObjectStreamStoreBeforeCont
   EXPECT_EQ(harness.storage.openHandleCount(), 0U);
 }
 
-TEST(PdfPreparationContentStreams, RedecodesRetiredObjectStreamOnceWhenALaterPageNeedsIt) {
+TEST(PdfPreparationContentStreams, ReusesCachedObjectStreamWhenALaterPageNeedsIt) {
   const TwoPageObjectStreamFixture fixture = twoPageObjectStreamPdf();
   ASSERT_FALSE(fixture.pdf.empty());
 
@@ -475,10 +475,10 @@ TEST(PdfPreparationContentStreams, RedecodesRetiredObjectStreamOnceWhenALaterPag
   ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error) << "@" << result.status.offset;
   const std::string storePath = objectStorePath(preparation);
   const std::vector<PdfCacheOpenMode> modes = openModesForPath(harness.storage, storePath);
-  EXPECT_EQ(std::count(modes.begin(), modes.end(), PdfCacheOpenMode::WriteTruncate), 2);
+  EXPECT_EQ(std::count(modes.begin(), modes.end(), PdfCacheOpenMode::WriteTruncate), 1);
   EXPECT_EQ(std::count(harness.storage.removeObservations().begin(), harness.storage.removeObservations().end(),
                        storePath),
-            2);
+             1);
   EXPECT_EQ(PdfPreparationTestAccess::expandedRequiredBytes(preparation),
             fixture.xrefDecodedBytes + fixture.contentBytes);
   EXPECT_FALSE(harness.storage.exists(storePath));

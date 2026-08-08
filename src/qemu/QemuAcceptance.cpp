@@ -84,8 +84,12 @@ constexpr uint32_t kMaximumCancellationSliceMicroseconds = 8000;
 constexpr uint32_t kMaximumCancellationSliceOperations = 32;
 constexpr size_t kMaximumIoRequestBytes = 4U * 1024U;
 constexpr uint32_t kQemuSlowAtomicWriteMicroseconds = 30000;
-constexpr uint32_t kQemuSlowAtomicOpenWriteMicroseconds = 36000;
+// LittleFS may spend one flash erase cycle creating a directory entry in QEMU.
+// Keep the non-I/O slice ceiling at 8 ms, but allow that indivisible storage
+// operation up to the same bounded limit as other multi-call storage sessions.
+constexpr uint32_t kQemuSlowAtomicOpenWriteMicroseconds = 60000;
 constexpr uint32_t kQemuSlowAtomicRenameMicroseconds = 24000;
+constexpr uint32_t kQemuSlowAtomicRemoveMicroseconds = 30000;
 constexpr uint32_t kQemuSlowAtomicOpenReadMicroseconds = 16000;
 constexpr uint32_t kQemuSlowAtomicStorageSessionMicroseconds = 60000;
 constexpr uint32_t kQemuSlowAtomicNonIoMicroseconds = 500;
@@ -740,6 +744,10 @@ bool qemuSlowAtomicAllowed(const TracedPdfCacheIo::SliceTrace& trace, const uint
     return singleCall && trace.openMode == TracedPdfCacheIo::OpenMode::None && trace.requestBytes == 0 &&
            trace.callbackElapsedUs <= kQemuSlowAtomicRenameMicroseconds;
   }
+  if (trace.operation == TracedPdfCacheIo::Operation::Remove) {
+    return singleCall && !trace.recursive && trace.openMode == TracedPdfCacheIo::OpenMode::None &&
+           trace.requestBytes == 0 && trace.callbackElapsedUs <= kQemuSlowAtomicRemoveMicroseconds;
+  }
   if (trace.operation == TracedPdfCacheIo::Operation::Open) {
     const bool readOpen = trace.openMode == TracedPdfCacheIo::OpenMode::Read &&
                           trace.callbackElapsedUs <= kQemuSlowAtomicOpenReadMicroseconds;
@@ -761,6 +769,7 @@ bool recordQemuSlowAtomic(QemuSlowAtomicTotals& totals, const uint16_t slice, co
                           const TracedPdfCacheIo::SliceTrace& trace, const uint32_t nonIoUs) {
   ++totals.total;
   if (trace.operation == TracedPdfCacheIo::Operation::Write ||
+      trace.operation == TracedPdfCacheIo::Operation::Remove ||
       (trace.operation == TracedPdfCacheIo::Operation::Open &&
        trace.openMode != TracedPdfCacheIo::OpenMode::Read) ||
       (trace.operation == TracedPdfCacheIo::Operation::Multiple &&
@@ -1277,12 +1286,13 @@ bool loadOrCreateSection(const std::shared_ptr<ReflowDocument>& document, GfxRen
     return false;
   }
   const int fontId = SETTINGS.getReaderFontId();
-  const bool loaded = (*output)->loadSectionFile(
-      fontId, SETTINGS.getReaderLineCompression(), SETTINGS.extraParagraphSpacing, SETTINGS.forceParagraphIndents,
-      SETTINGS.paragraphAlignment, layout.width, layout.height, SETTINGS.hyphenationEnabled,
-      document->getFormat() == ReflowDocumentFormat::Epub && SETTINGS.embeddedStyle, SETTINGS.imageRendering,
-      SETTINGS.bionicReadingEnabled, SETTINGS.guideReadingEnabled,
-      document->getFormat() == ReflowDocumentFormat::Epub ? EpubRenderMode::CrossInkDefault : EpubRenderMode::Light);
+  const EpubRenderMode renderMode = document->getFormat() == ReflowDocumentFormat::Epub
+                                        ? EpubRenderMode::CrossInkDefault
+                                        : EpubRenderMode::Light;
+  ReaderRenderSpec spec = SETTINGS.readerRenderSpec(layout.width, layout.height, renderMode);
+  spec.fontId = fontId;
+  spec.embeddedStyle = document->getFormat() == ReflowDocumentFormat::Epub && SETTINGS.embeddedStyle;
+  const bool loaded = (*output)->loadSectionFile(spec);
   if (loaded) {
     return (*output)->pageCount > 0;
   }
@@ -1291,12 +1301,7 @@ bool loadOrCreateSection(const std::shared_ptr<ReflowDocument>& document, GfxRen
   }
   bool imagesSuppressed = false;
   bool lowMemory = false;
-  const bool created = (*output)->createSectionFile(
-      fontId, SETTINGS.getReaderLineCompression(), SETTINGS.extraParagraphSpacing, SETTINGS.forceParagraphIndents,
-      SETTINGS.paragraphAlignment, layout.width, layout.height, SETTINGS.hyphenationEnabled,
-      document->getFormat() == ReflowDocumentFormat::Epub && SETTINGS.embeddedStyle, SETTINGS.imageRendering,
-      SETTINGS.bionicReadingEnabled, SETTINGS.guideReadingEnabled, nullptr, &imagesSuppressed, &lowMemory,
-      document->getFormat() == ReflowDocumentFormat::Epub ? EpubRenderMode::CrossInkDefault : EpubRenderMode::Light);
+  const bool created = (*output)->createSectionFile(spec, nullptr, &imagesSuppressed, &lowMemory);
   return created && !lowMemory && (*output)->pageCount > 0;
 }
 
@@ -3220,11 +3225,11 @@ bool checkPdfProductTracer(GfxRenderer& renderer) {
     bool imagesSuppressed = false;
     bool lowMemory = false;
     const int fontId = SETTINGS.getReaderFontId();
-    const bool built = section.createSectionFile(
-        fontId, SETTINGS.getReaderLineCompression(), SETTINGS.extraParagraphSpacing, SETTINGS.forceParagraphIndents,
-        SETTINGS.paragraphAlignment, static_cast<uint16_t>(availableWidth), static_cast<uint16_t>(availableHeight),
-        SETTINGS.hyphenationEnabled, false, SETTINGS.imageRendering, SETTINGS.bionicReadingEnabled,
-        SETTINGS.guideReadingEnabled, nullptr, &imagesSuppressed, &lowMemory, EpubRenderMode::Light);
+    ReaderRenderSpec spec = SETTINGS.readerRenderSpec(static_cast<uint16_t>(availableWidth),
+                                                      static_cast<uint16_t>(availableHeight), EpubRenderMode::Light);
+    spec.fontId = fontId;
+    spec.embeddedStyle = false;
+    const bool built = section.createSectionFile(spec, nullptr, &imagesSuppressed, &lowMemory);
     const std::string text = built ? section.getTextFromSectionFile() : std::string{};
     section.currentPage = 0;
     auto page = built ? section.loadPageFromSectionFile() : nullptr;

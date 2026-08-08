@@ -1450,7 +1450,11 @@ bool ParsedText::extractLine(Arena& scratchArena, const size_t breakIndex, const
     }
     lineGuideDotBefore.push_back(i > 0 && wordGuideDotBefore[sourceIndex]);
     if constexpr (SemanticWordTracking) {
-      uint8_t wordFlags = wordBackgroundBlack[sourceIndex];
+      // PDF semantic flags share the upper flag bits with EPUB link IDs.
+      // Semantic layout uses PDF anchors/navigation instead of Page footnote
+      // IDs, so strip the EPUB-only bits before recording join/split state.
+      uint8_t wordFlags =
+          static_cast<uint8_t>(wordBackgroundBlack[sourceIndex] & ~TextBlock::WORD_FLAG_LINK_ID_MASK);
       if (continuesVec[sourceIndex]) {
         wordFlags |= TextBlock::WORD_FLAG_SEMANTIC_ATTACHES;
       }

@@ -34,10 +34,13 @@ unsigned long HalGPIO::getPowerButtonHeldTime() const { return 0; }
 
 void HalGPIO::startDeepSleep() {}
 
-void HalGPIO::verifyPowerButtonWakeup(uint16_t requiredDurationMs, bool shortPressAllowed) {
+bool HalGPIO::verifyPowerButtonWakeup(uint16_t requiredDurationMs, bool shortPressAllowed) {
   (void)requiredDurationMs;
   (void)shortPressAllowed;
+  return true;
 }
+
+void HalGPIO::setSharedConfirmPowerShortPressEmitsPower(bool enabled) { (void)enabled; }
 
 bool HalGPIO::isUsbConnected() const { return false; }
 

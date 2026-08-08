@@ -67,6 +67,14 @@ void HalDisplay::displayBuffer(RefreshMode mode, bool turnOffScreen) {
   (void)turnOffScreen;
 }
 
+void HalDisplay::displayBufferAsync(RefreshMode mode) { displayBuffer(mode); }
+
+void HalDisplay::waitRefreshComplete() {}
+
+bool HalDisplay::supportsAsyncRefresh() const { return false; }
+
+bool HalDisplay::supportsAsyncGrayscaleBase() const { return false; }
+
 void HalDisplay::refreshDisplay(RefreshMode mode, bool turnOffScreen) {
   displayBuffer(mode, turnOffScreen);
 }
@@ -74,6 +82,15 @@ void HalDisplay::refreshDisplay(RefreshMode mode, bool turnOffScreen) {
 void HalDisplay::deepSleep() {}
 
 uint8_t* HalDisplay::getFrameBuffer() const { return framebuffer; }
+
+uint8_t* HalDisplay::lendFrameBufferStorage(uint32_t* size) {
+  if (size != nullptr) {
+    *size = 0;
+  }
+  return nullptr;
+}
+
+void HalDisplay::returnFrameBufferStorage() {}
 
 void HalDisplay::preconditionGrayscale() {}
 

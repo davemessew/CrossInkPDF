@@ -16,6 +16,8 @@ class HalGPIO {
   HalGPIO() = default;
   inline bool deviceIsX3() const { return _deviceType == DeviceType::X3; }
   inline bool deviceIsX4() const { return _deviceType == DeviceType::X4; }
+  inline bool hasTouch() const { return false; }
+  inline bool hasEdgeSideButtons() const { return false; }
   void begin();
   void update();
   bool isPressed(uint8_t buttonIndex) const;
@@ -26,7 +28,8 @@ class HalGPIO {
   unsigned long getHeldTime() const;
   unsigned long getPowerButtonHeldTime() const;
   void startDeepSleep();
-  void verifyPowerButtonWakeup(uint16_t requiredDurationMs, bool shortPressAllowed);
+  bool verifyPowerButtonWakeup(uint16_t requiredDurationMs, bool shortPressAllowed);
+  void setSharedConfirmPowerShortPressEmitsPower(bool enabled);
   bool isUsbConnected() const;
   bool wasUsbStateChanged() const;
 

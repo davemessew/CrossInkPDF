@@ -22,9 +22,15 @@ class HalDisplay {
   void drawImageTransparent(const uint8_t* imageData, uint16_t x, uint16_t y, uint16_t w, uint16_t h,
                             bool fromProgmem = false) const;
   void displayBuffer(RefreshMode mode = RefreshMode::FAST_REFRESH, bool turnOffScreen = false);
+  void displayBufferAsync(RefreshMode mode = RefreshMode::FAST_REFRESH);
+  void waitRefreshComplete();
+  bool supportsAsyncRefresh() const;
+  bool supportsAsyncGrayscaleBase() const;
   void refreshDisplay(RefreshMode mode = RefreshMode::FAST_REFRESH, bool turnOffScreen = false);
   void deepSleep();
   uint8_t* getFrameBuffer() const;
+  uint8_t* lendFrameBufferStorage(uint32_t* size);
+  void returnFrameBufferStorage();
   void preconditionGrayscale();
   void preconditionGrayscale(uint16_t x, uint16_t y, uint16_t w, uint16_t h);
   void displayGrayscaleBase(RefreshMode fallback = HALF_REFRESH, bool turnOffScreen = false);

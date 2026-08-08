@@ -17,6 +17,12 @@ enum class PdfObjectResolverReader : uint8_t {
 
 struct PdfObjectResolverWorkspace {
   using SourceAccessFn = PdfStepResult (*)(void* context, PdfObjectResolverReader reader, PdfWorkBudget& budget);
+  using CachedObjectStreamLookupFn = bool (*)(void* context, uint32_t objectStreamNumber,
+                                               uint32_t* objectCount, uint64_t* first, uint64_t* size);
+  using CachedObjectStreamPrepareFn = PdfStatus (*)(void* context, uint64_t requiredBytes,
+                                                     bool* cacheCleared);
+  using CachedObjectStreamPublishFn = void (*)(void* context, uint32_t objectStreamNumber,
+                                                uint32_t objectCount, uint64_t first, uint64_t size);
 
   PdfStreamDecoder* streamDecoder = nullptr;
   PdfByteStore objectStreamStore{};
@@ -24,6 +30,9 @@ struct PdfObjectResolverWorkspace {
   SourceAccessFn setSourceAccess = nullptr;
   PdfStreamDecodeLimits decodeLimits{};
   PdfSecurity* security = nullptr;
+  CachedObjectStreamLookupFn lookupCachedObjectStream = nullptr;
+  CachedObjectStreamPrepareFn prepareCachedObjectStream = nullptr;
+  CachedObjectStreamPublishFn publishCachedObjectStream = nullptr;
 };
 
 struct PdfResolvedObject {

@@ -183,6 +183,19 @@ class PdfPreparation {
     uint32_t lastSourcePageExclusive = 0;
   };
 
+  struct FontResolutionCacheEntry {
+    PdfObjectReference fontReference{};
+    uint64_t streamOffset = 0;
+    PdfObjectReference streamReference{};
+    uint32_t streamLength = 0;
+    PdfStreamFilter filters[PdfLimits::MaxFiltersPerStream]{};
+    uint8_t filterCount = 0;
+    bool cid = false;
+    bool fallback = false;
+  };
+
+  static constexpr uint8_t FontResolutionCacheCapacity = 8;
+
   enum class NavigationTask : uint8_t {
     None,
     Info,
@@ -306,7 +319,6 @@ class PdfPreparation {
 
   enum class NavigationSpoolStage : uint8_t {
     None,
-    ObjectStore,
     ContentStore,
     Writing,
     Flush,
@@ -314,6 +326,13 @@ class PdfPreparation {
     Close,
     ReadyToRead,
     Reading,
+  };
+
+  enum class ResolverObjectStoreMode : uint8_t {
+    None,
+    Closed,
+    Writer,
+    Reader,
   };
 
   enum class TypographyAssetStage : uint8_t {
@@ -474,6 +493,7 @@ class PdfPreparation {
     AbortSectionState,
     AbortImageState,
     AbortSpools,
+    AbortPageSpools,
     CloseAuxiliaryHandles,
     PrepareGeneration,
     CommitCheckpoint,
@@ -573,6 +593,9 @@ class PdfPreparation {
   static PdfStatus setPageTraversalAccess(void* context, bool traversalRequired);
   static PdfStatus readMemoryRecord(void* context, uint32_t ordinal, void* record, size_t recordSize);
   static PdfStatus writeMemoryRecord(void* context, uint32_t ordinal, const void* record, size_t recordSize);
+  static PdfStatus readContentOverflowRecord(void* context, uint32_t ordinal, void* record, size_t recordSize);
+  static PdfStatus writeContentOverflowRecord(void* context, uint32_t ordinal, const void* record,
+                                              size_t recordSize);
   static PdfStatus capturePage(void* context, const PdfPageInfo& page);
   static PdfStatus writeSection(void* context, const uint8_t* source, size_t requested, size_t* bytesWritten);
   static PdfStatus writeMetadata(void* context, const uint8_t* source, size_t requested, size_t* bytesWritten);
@@ -591,7 +614,18 @@ class PdfPreparation {
   static PdfStatus readPreparedContentStore(void* context, uint64_t offset, uint8_t* destination,
                                             size_t requested, size_t* bytesRead);
   static PdfStatus writePreparedContentStore(void* context, const uint8_t* source, size_t requested,
-                                             size_t* bytesWritten);
+                                              size_t* bytesWritten);
+  static PdfStatus resetResolverObjectStoreWindow(void* context);
+  static uint64_t resolverObjectStoreWindowSize(void* context);
+  static PdfStatus readResolverObjectStore(void* context, uint64_t offset, uint8_t* destination,
+                                           size_t requested, size_t* bytesRead);
+  static PdfStatus writeResolverObjectStore(void* context, const uint8_t* source, size_t requested,
+                                            size_t* bytesWritten);
+  static bool lookupCachedObjectStream(void* context, uint32_t objectStreamNumber,
+                                       uint32_t* objectCount, uint64_t* first, uint64_t* size);
+  static PdfStatus prepareCachedObjectStream(void* context, uint64_t requiredBytes, bool* cacheCleared);
+  static void publishCachedObjectStream(void* context, uint32_t objectStreamNumber,
+                                        uint32_t objectCount, uint64_t first, uint64_t size);
   static PdfStatus readPreparedFontStore(void* context, uint64_t offset, uint8_t* destination,
                                          size_t requested, size_t* bytesRead);
   static PdfStatus writePreparedFontStore(void* context, const uint8_t* source, size_t requested,
@@ -632,12 +666,14 @@ class PdfPreparation {
   PdfStatus resetResolverWorkspace();
   PdfStatus accountResolverStreamBytes();
   uint64_t resolverObjectStoreCapacity() const;
+  PdfStatus formatResolverObjectStorePath(char* output, size_t capacity) const;
   void abortResolverObjectStore();
   PdfStatus switchResolverSourceAccess(PdfObjectResolverReader reader);
   PdfStatus switchPageTraversalAccess(bool traversalRequired);
   PdfStatus formatXrefSpoolPath(uint8_t index, char* output, size_t capacity) const;
   void abortXrefSpools();
   PdfStatus beginPageSpools();
+  PdfStatus openContentOverflowSpoolForWrite();
   PdfStatus beginPreparedPageSpool();
   PdfStatus resumePreparedPageSpool();
   PdfStatus finishPageDiscoverySpool();
@@ -735,6 +771,8 @@ class PdfPreparation {
   PdfStatus collectFontCandidates(uint16_t dictionaryIndex, uint8_t scopeIndex);
   PdfStatus beginNextImageObject();
   PdfStatus beginNextFontObject();
+  const FontResolutionCacheEntry* findFontResolution(PdfObjectReference reference);
+  void rememberFontResolution(const FontResolutionCacheEntry& entry);
   PdfStepResult cacheCurrentPageImage(PdfWorkBudget& budget);
   PdfStatus appendDeferredImageRecord(uint8_t candidateIndex, uint32_t tagOffset, uint16_t tagLength);
   PdfStatus appendImageFileRecord(const PdfRequiredFileRecord& record);
@@ -917,6 +955,7 @@ class PdfPreparation {
   uint16_t currentPageHeight_ = 0;
   bool preparedPageSpoolWriting_ = false;
   bool preparedPageSpoolUpdating_ = false;
+  bool pageSpoolsRemoved_ = true;
   NavigationWorkspace* navigation_ = nullptr;
   std::optional<PdfNamedDestinationMap> namedDestinations_;
   std::optional<PdfPageLabelMap> pageLabels_;
@@ -963,6 +1002,18 @@ class PdfPreparation {
   uint8_t navigationStage_ = 0;
   NavigationTask navigationTask_ = NavigationTask::None;
   ImageResolveTask imageResolveTask_ = ImageResolveTask::None;
+  struct ResolverObjectStreamCacheEntry {
+    uint32_t objectStreamNumber = 0;
+    uint32_t objectCount = 0;
+    uint32_t first = 0;
+    uint32_t size = 0;
+    uint32_t offset = 0;
+  };
+  static constexpr uint8_t ResolverObjectStreamCacheCapacity = 8;
+  ResolverObjectStreamCacheEntry resolverObjectStreamCache_[ResolverObjectStreamCacheCapacity]{};
+  uint8_t resolverObjectStreamCacheCount_ = 0;
+  FontResolutionCacheEntry fontResolutionCache_[FontResolutionCacheCapacity]{};
+  uint8_t fontResolutionCacheCount_ = 0;
   uint8_t imageCandidateCount_ = 0;
   uint8_t xObjectCandidateCount_ = 0;
   uint8_t formScopeCount_ = 0;
@@ -1024,7 +1075,12 @@ class PdfPreparation {
   char imageBuildSpoolPath_[PDF_CACHE_PATH_CAPACITY]{};
   char imageFileSpoolPath_[PDF_CACHE_PATH_CAPACITY]{};
   PdfCacheHandle navigationSpoolHandle_{};
+  PdfCacheHandle resolverObjectStoreHandle_{};
   uint64_t navigationSpoolOffset_ = 0;
+  uint32_t resolverObjectStoreFileSize_ = 0;
+  uint32_t resolverObjectStoreWindowOffset_ = 0;
+  uint32_t resolverObjectStoreWindowSize_ = 0;
+  uint32_t resolverObjectStoreCapacity_ = 0;
   uint32_t navigationSpoolCrc32_ = 0;
   uint32_t navigationSpoolReadCrc32_ = 0;
   uint32_t navigationSpoolBytes_ = 0;
@@ -1033,6 +1089,7 @@ class PdfPreparation {
   uint8_t maskSpoolWriteCount_ = 0;
   uint8_t maskSpoolReadCount_ = 0;
   NavigationSpoolStage navigationSpoolStage_ = NavigationSpoolStage::None;
+  ResolverObjectStoreMode resolverObjectStoreMode_ = ResolverObjectStoreMode::None;
   PdfImageBuildSpool imageBuildSpool_{};
   PdfImageFileSpool imageFileSpool_{};
   PdfDeferredImageRecord activeRasterCandidate_{};
@@ -1121,6 +1178,8 @@ class PdfPreparation {
   uint32_t resumeJournalScanSequence_ = 0;
   uint32_t durableResumePage_ = 0;
   uint32_t pendingResumePage_ = 0;
+  PdfCheckpointGate checkpointGate_{};
+  bool pageResumeCheckpointPending_ = false;
   uint16_t resumePageValidationIndex_ = 0;
   uint8_t resumeReferenceIndex_ = 0;
   bool resumeReferenceValidateObjectStream_ = false;

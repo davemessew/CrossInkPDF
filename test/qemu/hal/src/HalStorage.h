@@ -57,6 +57,8 @@ class HalStorage {
   bool openFileForWrite(const char* moduleName, const String& path, HalFile& file);
   bool removeDir(const char* path);
   HalStorageCapacityInfo capacityInfo();
+  uint64_t totalBytes();
+  uint64_t usedBytes();
 
   static HalStorage& getInstance() { return instance; }
 
