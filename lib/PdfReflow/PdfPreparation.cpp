@@ -1954,6 +1954,7 @@ PdfStatus PdfPreparation::begin(const PdfPreparationConfig& config) {
   xrefSortDestination_ = 0;
   xrefSortUniqueCount_ = 0;
   xrefSortPreviousObject_ = 0;
+  xrefSortSecondRunStart_ = 0;
   xrefSortInput_ = 0;
   xrefSortOutput_ = 1;
   xrefAppendSpool_ = 0;
@@ -1966,6 +1967,7 @@ PdfStatus PdfPreparation::begin(const PdfPreparationConfig& config) {
   xrefSortPreviousValid_ = false;
   xrefSortCompacting_ = false;
   xrefSortFastPath_ = false;
+  xrefSortTwoRunFastPath_ = false;
   loadedPageIndex_ = UINT32_MAX;
   currentPageFirstAnchor_ = UINT32_MAX;
   nextPageAnchorHint_ = UINT32_MAX;
@@ -5755,6 +5757,7 @@ PdfStepResult PdfPreparation::stepSortXref(PdfWorkBudget& budget) {
     xrefSortHasInfo_ = xref_->info(&xrefSortInfo_);
     xrefSortHasSecurity_ = xref_->security(&xrefSortSecurity_);
     xrefSortFastPath_ = xref_->recordsAlreadySortedUnique();
+    xrefSortTwoRunFastPath_ = xref_->recordsAreTwoSortedRuns(&xrefSortSecondRunStart_);
     if (xrefSortTotal_ == 0 || xrefSortTotal_ > kMaximumXrefRecords ||
         !xref_->root(&xrefSortRoot_) || xrefSortRoot_.objectNumber == 0) {
       return PdfStepResult::failure(PdfStatus::failure(PdfError::Malformed, xrefSortTotal_));
@@ -5802,6 +5805,10 @@ PdfStepResult PdfPreparation::stepSortXref(PdfWorkBudget& budget) {
       xrefFinalSpool_ = xrefAppendSpool_;
       xrefSortUniqueCount_ = xrefSortTotal_;
       xrefSortStage_ = XrefSortStage::Adopt;
+    } else if (xrefSortTwoRunFastPath_) {
+      xrefSortPairStart_ = 0;
+      xrefSortRunLength_ = xrefSortTotal_;
+      xrefSortStage_ = XrefSortStage::OpenMergeInput;
     } else {
       xrefSortStage_ = XrefSortStage::OpenInitialInput;
     }
@@ -5927,8 +5934,16 @@ PdfStepResult PdfPreparation::stepSortXref(PdfWorkBudget& budget) {
     if (xrefSortStage_ == XrefSortStage::OpenMergeInput) {
       xrefSortStage_ = XrefSortStage::OpenMergeOutput;
     } else if (xrefSortStage_ == XrefSortStage::OpenMergeOutput) {
-      xrefSortMiddle_ = std::min<uint32_t>(xrefSortPairStart_ + xrefSortRunLength_, xrefSortTotal_);
-      xrefSortEnd_ = std::min<uint32_t>(xrefSortMiddle_ + xrefSortRunLength_, xrefSortTotal_);
+      if (xrefSortTwoRunFastPath_) {
+        xrefSortMiddle_ = xrefSortSecondRunStart_;
+        xrefSortEnd_ = xrefSortTotal_;
+        xrefSortUniqueCount_ = 0;
+        xrefSortPreviousObject_ = 0;
+        xrefSortPreviousValid_ = false;
+      } else {
+        xrefSortMiddle_ = std::min<uint32_t>(xrefSortPairStart_ + xrefSortRunLength_, xrefSortTotal_);
+        xrefSortEnd_ = std::min<uint32_t>(xrefSortMiddle_ + xrefSortRunLength_, xrefSortTotal_);
+      }
       xrefSortLeftIndex_ = xrefSortPairStart_;
       xrefSortRightIndex_ = xrefSortMiddle_;
       xrefSortDestination_ = xrefSortPairStart_;
@@ -5968,6 +5983,10 @@ PdfStepResult PdfPreparation::stepSortXref(PdfWorkBudget& budget) {
         xrefSortPairStart_ = xrefSortEnd_;
         if (xrefSortPairStart_ >= xrefSortTotal_) {
           xrefSortRunLength_ = std::min<uint32_t>(xrefSortTotal_, xrefSortRunLength_ * 2U);
+          if (xrefSortTwoRunFastPath_) {
+            xrefFinalSpool_ = xrefSortOutput_;
+            xrefSortCompacting_ = true;
+          }
           xrefSortStage_ = XrefSortStage::ClosePassInput;
           return PdfStepResult::paused();
         }
@@ -6019,9 +6038,19 @@ PdfStepResult PdfPreparation::stepSortXref(PdfWorkBudget& budget) {
       const bool takeLeft = haveLeft &&
                             (!haveRight || leftBatch[xrefSortLeftBatchIndex_].objectNumber <=
                                                rightBatch[xrefSortRightBatchIndex_].objectNumber);
-      outputBatch[xrefSortBufferIndex_++] =
+      const PdfXrefEntry& entry =
           takeLeft ? leftBatch[xrefSortLeftBatchIndex_++] : rightBatch[xrefSortRightBatchIndex_++];
       ++xrefSortDestination_;
+      if (xrefSortTwoRunFastPath_ && xrefSortPreviousValid_ &&
+          entry.objectNumber == xrefSortPreviousObject_) {
+        continue;
+      }
+      outputBatch[xrefSortBufferIndex_++] = entry;
+      if (xrefSortTwoRunFastPath_) {
+        xrefSortPreviousObject_ = entry.objectNumber;
+        xrefSortPreviousValid_ = true;
+        ++xrefSortUniqueCount_;
+      }
     }
     return PdfStepResult::paused();
   }

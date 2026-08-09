@@ -936,6 +936,7 @@ class PdfPreparation {
   uint32_t xrefSortDestination_ = 0;
   uint32_t xrefSortUniqueCount_ = 0;
   uint32_t xrefSortPreviousObject_ = 0;
+  uint32_t xrefSortSecondRunStart_ = 0;
   uint8_t xrefSortInput_ = 0;
   uint8_t xrefSortOutput_ = 1;
   uint8_t xrefAppendSpool_ = 0;
@@ -952,6 +953,7 @@ class PdfPreparation {
   bool xrefSortResumeParsing_ = false;
   bool xrefSortCompacting_ = false;
   bool xrefSortFastPath_ = false;
+  bool xrefSortTwoRunFastPath_ = false;
   uint32_t loadedPageIndex_ = UINT32_MAX;
   uint32_t currentPageFirstAnchor_ = UINT32_MAX;
   uint32_t nextPageAnchorHint_ = UINT32_MAX;

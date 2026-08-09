@@ -182,6 +182,7 @@ void PdfXrefTable::reset() {
   finalized_ = false;
   appendOrderStrict_ = true;
   lastAppendedObject_ = 0;
+  secondSortedRunStart_ = 0;
   lookupWindowCount_ = 0;
   lookupWindowFirstOrdinal_ = 0;
   lastLookupOrdinal_ = 0;
@@ -193,6 +194,7 @@ void PdfXrefTable::reset() {
   lookupMissCount_ = 0;
   victimCount_ = 0;
   appendBatchCount_ = 0;
+  sortedRunCount_ = 0;
   hasLastLookupOrdinal_ = false;
   sampleIndexReady_ = false;
   sampleIndexDisabled_ = false;
@@ -316,8 +318,16 @@ PdfStatus PdfXrefTable::appendNewest(const PdfXrefEntry& entry) {
     return PdfStatus::failure(PdfError::InsufficientStorage,
                               (static_cast<uint64_t>(entryCount_) + 1U) * sizeof(PdfXrefEntry));
   }
-  if (entryCount_ != 0 && entry.objectNumber <= lastAppendedObject_) {
+  if (entryCount_ == 0) {
+    sortedRunCount_ = 1;
+  } else if (entry.objectNumber <= lastAppendedObject_) {
     appendOrderStrict_ = false;
+    if (sortedRunCount_ < UINT8_MAX) {
+      ++sortedRunCount_;
+    }
+    if (sortedRunCount_ == 2) {
+      secondSortedRunStart_ = entryCount_;
+    }
   }
   lastAppendedObject_ = entry.objectNumber;
   if (records_.writeMany == nullptr) {
@@ -358,9 +368,11 @@ PdfStatus PdfXrefTable::adoptCompactedRecords(const PdfFixedRecordStore& records
   entryCount_ = count;
   appendOrderStrict_ = true;
   lastAppendedObject_ = lastObjectNumber;
+  secondSortedRunStart_ = 0;
   lookupWindowCount_ = 0;
   victimCount_ = 0;
   appendBatchCount_ = 0;
+  sortedRunCount_ = 1;
   sampleIndexReady_ = false;
   sampleIndexDisabled_ = false;
   sectionCompactionRequired_ = false;
@@ -376,8 +388,19 @@ PdfStatus PdfXrefTable::adoptSortedRecords(const uint32_t count) {
   entryCount_ = count;
   finalized_ = true;
   appendOrderStrict_ = true;
+  secondSortedRunStart_ = 0;
+  sortedRunCount_ = 1;
   initializeSampleIndex();
   return PdfStatus::success();
+}
+
+bool PdfXrefTable::recordsAreTwoSortedRuns(uint32_t* const secondRunStart) const {
+  if (secondRunStart == nullptr || appendOrderStrict_ || sortedRunCount_ != 2 ||
+      secondSortedRunStart_ == 0 || secondSortedRunStart_ >= entryCount_) {
+    return false;
+  }
+  *secondRunStart = secondSortedRunStart_;
+  return true;
 }
 
 PdfStatus PdfXrefTable::finalize(const PdfFixedRecordStore scratch, PdfXrefEntry* mergeBuffer,

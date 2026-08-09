@@ -85,6 +85,7 @@ class PdfXrefTable {
   uint32_t entryCount() const { return entryCount_; }
   bool finalized() const { return finalized_; }
   bool recordsAlreadySortedUnique() const { return appendOrderStrict_; }
+  bool recordsAreTwoSortedRuns(uint32_t* secondRunStart) const;
   void setRoot(PdfObjectReference root) {
     root_ = root;
     hasRoot_ = true;
@@ -124,6 +125,7 @@ class PdfXrefTable {
   bool finalized_ = false;
   bool appendOrderStrict_ = true;
   uint32_t lastAppendedObject_ = 0;
+  uint32_t secondSortedRunStart_ = 0;
   uint8_t* seenObjectsFirst_ = nullptr;
   uint8_t* seenObjectsSecond_ = nullptr;
   size_t seenObjectsFirstBytes_ = 0;
@@ -143,6 +145,7 @@ class PdfXrefTable {
   mutable uint8_t lookupMissCount_ = 0;
   mutable uint8_t victimCount_ = 0;
   uint8_t appendBatchCount_ = 0;
+  uint8_t sortedRunCount_ = 0;
   mutable bool hasLastLookupOrdinal_ = false;
   mutable bool sampleIndexReady_ = false;
   mutable bool sampleIndexDisabled_ = false;

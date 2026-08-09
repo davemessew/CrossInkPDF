@@ -416,9 +416,9 @@ TEST(PdfXrefTest, CollidedNewestFilterRequestsRevisionBoundaryCompaction) {
   const uint64_t newestXref = pdf.size();
   pdf += "xref\n";
   for (uint32_t index = 0; index < 9U; ++index) {
-    pdf += std::to_string(index * 8U) + " 1\n0000000000 65535 f \n";
+    pdf += std::to_string(256U + index * 8U) + " 1\n0000000000 65535 f \n";
   }
-  pdf += "trailer\n<< /Size 65 /Root 1 0 R /Prev " + std::to_string(baseXref) +
+  pdf += "trailer\n<< /Size 321 /Root 1 0 R /Prev " + std::to_string(baseXref) +
          " >>\nstartxref\n" + std::to_string(newestXref) + "\n%%EOF\n";
 
   PdfTestByteSource memory({pdf.begin(), pdf.end()});
