@@ -118,6 +118,7 @@ class PdfContentInterpreter {
     uint8_t renderMode = 0;
     bool active = false;
     bool clipPending = false;
+    bool positionReset = false;
   };
 
   struct MarkedContentFrame {

@@ -1,3 +1,16 @@
+## [v1.5.0.6] - 2026-08-09
+
+### Changed
+
+- PDF preparation reuses an eight-page record window during link discovery, cutting repeated SD-card page-record opens without adding RAM or borrowing the display framebuffer.
+- Existing prepared PDF caches are rebuilt once so corrected text structure and character handling take effect after the update. EPUB caches are unchanged.
+
+### Fixed
+
+- Split drop caps, full-width headings, multi-column pages, and wide tables now keep a readable book order instead of inheriting the printed page layout.
+- PDF paragraph reconstruction now preserves real paragraph breaks while joining wrapped visual lines with correct spaces and punctuation.
+- Non-breaking spaces and unsupported phonetic marks no longer appear as replacement or question-mark glyphs in reflowed text.
+
 ## [v1.5.0.5] - 2026-08-09
 
 ### Changed

@@ -82,6 +82,7 @@ PdfStatus PdfFontMap::begin(const uint16_t fontId, const bool cid, PdfCMap* cons
   widthsSorted_ = true;
   hasPreviousWidth_ = false;
   hasCachedWidth_ = false;
+  hasExplicitWhitespace_ = false;
   return setSourceAccess(true);
 }
 
@@ -107,6 +108,7 @@ PdfStatus PdfFontMap::beginMaterialized(const uint16_t fontId, const bool cid) {
   widthsSorted_ = true;
   hasPreviousWidth_ = false;
   hasCachedWidth_ = false;
+  hasExplicitWhitespace_ = false;
   return PdfStatus::success();
 }
 
@@ -154,6 +156,9 @@ PdfStatus PdfFontMap::addMaterializedGlyph(const PdfDecodedGlyph& glyph) {
   }
   workspace_.materializedGlyphs[first] = glyph;
   ++widthCount_;
+  if (glyph.unicode.length == 1U && glyph.unicode.bytes[0] == ' ') {
+    hasExplicitWhitespace_ = true;
+  }
   return PdfStatus::success();
 }
 

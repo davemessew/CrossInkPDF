@@ -95,6 +95,15 @@ constexpr uint16_t kPreparationReadingOrderLimit = 256;
 constexpr uint8_t kReadingOrderHistogramBins = 64;
 constexpr int16_t kUnknownTextOrigin = INT16_MIN;
 constexpr int16_t kMappedLinkOrigin = INT16_MIN + 1;
+constexpr uint16_t kExtractedTextOffsetMask = 0x1fffU;
+constexpr uint16_t kExtractedExplicitWhitespace = 0x2000U;
+constexpr uint16_t kExtractedHeading = 0x8000U;
+constexpr uint16_t kExtractedDropCap = 0x4000U;
+constexpr uint16_t kExtractedTextLengthMask = 0x3fffU;
+constexpr uint16_t kExtractedJoinsPrevious = 0x4000U;
+constexpr uint16_t kExtractedNewBlock = 0x8000U;
+static_assert(PdfLimits::PageTextBytes <= kExtractedTextOffsetMask + 1U);
+static_assert(PdfLimits::PageTextBytes <= kExtractedTextLengthMask);
 constexpr uint32_t kWarningOptionalImageOmitted = PDF_CACHE_WARNING_OPTIONAL_CONTENT_OMITTED;
 constexpr size_t kRasterDecoderWorkspaceOffset = 4096;
 constexpr uint32_t kPreparedContentStoreClosed = 0;
@@ -402,6 +411,11 @@ enum class ReadingOrderStage : uint8_t {
   RemapImages,
   ClearVisited,
   ApplyPermutation,
+  ClearBlockHistogram,
+  MeasureLineSteps,
+  SelectLineStep,
+  FindLeftEdges,
+  MarkBlocks,
   Complete,
 };
 
@@ -1508,6 +1522,7 @@ struct PdfPreparation::ReadingOrderWorkspace {
   CompactTextPlacement sortValue;
   uint16_t scanIndex;
   uint16_t tableStart;
+  uint16_t tableEnd;
   uint16_t sortGap;
   uint16_t sortIndex;
   uint16_t sortCursor;
@@ -2006,6 +2021,7 @@ PdfStatus PdfPreparation::begin(const PdfPreparationConfig& config) {
   currentPageIndex_ = 0;
   currentContentIndex_ = 0;
   extractedBlockCount_ = 0;
+  currentPageSemanticBlockCount_ = 0;
   currentBlockIndex_ = 0;
   sectionEmitEndBlock_ = 0;
   sectionCount_ = 0;
@@ -4810,7 +4826,8 @@ PdfStatus PdfPreparation::loadPageRecord(const uint32_t index) {
   }
   const bool sequentialPageLoop = phase_ == PdfPreparationPhase::BeginPage ||
                                   (phase_ == PdfPreparationPhase::ResolveNavigation &&
-                                   navigationTask_ == NavigationTask::Complete);
+                                   (navigationTask_ == NavigationTask::Complete ||
+                                    (navigationTask_ == NavigationTask::None && navigationStage_ == 7U)));
   constexpr size_t boundaryBytes = PdfOutlineLimits::MaxEntries * sizeof(uint16_t);
   constexpr size_t windowHeaderBytes = 12U;
   constexpr uint8_t windowRecordCapacity = 8U;
@@ -10274,15 +10291,16 @@ PdfStepResult PdfPreparation::stepStartNextNavigationObject(PdfWorkBudget& budge
       case 7:
         if (currentAnnotationPage_ < pageCount_) {
           constexpr uint32_t kLoadPageRecordOperations = 5U;
+          constexpr size_t kMaximumPageWindowBytes = 8U * sizeof(PdfPageInfo);
           if (budget.cancelRequested()) {
             return PdfStepResult::failure(PdfStatus::failure(PdfError::Cancelled, currentAnnotationPage_));
           }
           if (budget.stopRequested() || budget.operationsRemaining < kLoadPageRecordOperations ||
-              budget.bytesRemaining < sizeof(PdfPageInfo)) {
+              budget.bytesRemaining < kMaximumPageWindowBytes) {
             return PdfStepResult::paused();
           }
           budget.operationsRemaining -= kLoadPageRecordOperations;
-          budget.bytesRemaining -= sizeof(PdfPageInfo);
+          budget.bytesRemaining -= kMaximumPageWindowBytes;
           const PdfStatus pageStatus = loadPageRecord(currentAnnotationPage_);
           if (!pageStatus) {
             return PdfStepResult::failure(pageStatus);
@@ -10693,6 +10711,7 @@ PdfStatus PdfPreparation::skipCurrentUnreadablePage() {
   }
   transcriptLength_ = 0;
   extractedBlockCount_ = 0;
+  currentPageSemanticBlockCount_ = 0;
   currentBlockIndex_ = 0;
   if (++currentPageIndex_ < pageCount_) {
     setPhase(PdfPreparationPhase::BeginPage, 68);
@@ -12989,6 +13008,7 @@ PdfStatus PdfPreparation::beginCurrentPageContent() {
   contentOverflowAppendActive_ = false;
   transcriptLength_ = 0;
   extractedBlockCount_ = 0;
+  currentPageSemanticBlockCount_ = 0;
   currentBlockIndex_ = 0;
   lastContentNameLength_ = 0;
   resetInlineImageDictionaryState();
@@ -15436,6 +15456,7 @@ PdfStatus PdfPreparation::beginContentInterpretation() {
   currentContentIndex_ = kContentInterpreterActive;
   transcriptLength_ = 0;
   extractedBlockCount_ = 0;
+  currentPageSemanticBlockCount_ = 0;
   setPhase(PdfPreparationPhase::InterpretContent, 72);
   return PdfStatus::success();
 }
@@ -15514,6 +15535,94 @@ PdfStatus PdfPreparation::finishContentInterpretation() {
     hasVisibleText = false;
   }
 
+  const auto usableRun = [&](const PdfTextRun& run) {
+    return (hasVisibleText ? (run.flags & PdfTextHidden) == 0 : true) && run.textLength != 0 &&
+           run.textOffset <= textLength && run.textLength <= textLength - run.textOffset;
+  };
+  const auto runHeightPoints = [](const PdfTextRun& run) {
+    const int64_t rawHeight = static_cast<int64_t>(run.yMax) - run.yMin;
+    if (rawHeight <= 0) {
+      return uint16_t{0};
+    }
+    return static_cast<uint16_t>(
+        std::min<int64_t>(kReadingOrderHistogramBins - 1U, (rawHeight + 32768) / 65536));
+  };
+  uint16_t heightHistogram[kReadingOrderHistogramBins]{};
+  for (uint16_t runIndex = 0; runIndex < runCount; ++runIndex) {
+    if (!usableRun(runs[runIndex])) {
+      continue;
+    }
+    const uint16_t height = runHeightPoints(runs[runIndex]);
+    if (height != 0) {
+      ++heightHistogram[height];
+    }
+  }
+  uint16_t bodyTextHeight = 12;
+  uint16_t bodyTextHeightCount = 0;
+  for (uint16_t height = 1; height < kReadingOrderHistogramBins; ++height) {
+    if (heightHistogram[height] > bodyTextHeightCount) {
+      bodyTextHeight = height;
+      bodyTextHeightCount = heightHistogram[height];
+    }
+  }
+
+  uint16_t dropCapRunIndex = UINT16_MAX;
+  uint16_t dropCapTargetIndex = UINT16_MAX;
+  for (uint16_t runIndex = 0; runIndex < runCount; ++runIndex) {
+    const PdfTextRun& run = runs[runIndex];
+    if (!usableRun(run) || run.textLength != 1 || runHeightPoints(run) * 2U < bodyTextHeight * 3U) {
+      continue;
+    }
+    const uint8_t value = pageText_[run.textOffset];
+    if (value < 'A' || value > 'Z') {
+      continue;
+    }
+    dropCapRunIndex = runIndex;
+    int32_t highestBaseline = INT32_MIN;
+    for (uint16_t candidateIndex = 0; candidateIndex < runCount; ++candidateIndex) {
+      const PdfTextRun& candidate = runs[candidateIndex];
+      const int64_t horizontalGap = static_cast<int64_t>(candidate.xMin) - run.xMax;
+      if (candidateIndex == runIndex || !usableRun(candidate) || runHeightPoints(candidate) > bodyTextHeight * 2U ||
+          candidate.xMin <= run.xMin || horizontalGap > static_cast<int64_t>(bodyTextHeight) * 4 * 65536 ||
+          candidate.yMax <= run.yMin || candidate.yMin >= run.yMax || candidate.baseline <= highestBaseline) {
+        continue;
+      }
+      dropCapTargetIndex = candidateIndex;
+      highestBaseline = candidate.baseline;
+    }
+    if (dropCapTargetIndex != UINT16_MAX) {
+      break;
+    }
+    dropCapRunIndex = UINT16_MAX;
+  }
+  bool dropCapTargetJoinsNext = false;
+  if (dropCapTargetIndex != UINT16_MAX) {
+    for (uint16_t candidateIndex = static_cast<uint16_t>(dropCapTargetIndex + 1U); candidateIndex < runCount;
+         ++candidateIndex) {
+      const PdfTextRun& candidate = runs[candidateIndex];
+      if (!usableRun(candidate)) {
+        continue;
+      }
+      if (std::abs(static_cast<int64_t>(candidate.baseline) - runs[dropCapTargetIndex].baseline) <= 65536) {
+        const uint8_t* const candidateText = pageText_.get() + candidate.textOffset;
+        uint16_t firstWordLength = 0;
+        while (firstWordLength < candidate.textLength) {
+          const uint8_t value = candidateText[firstWordLength];
+          if ((value < 'A' || value > 'Z') && (value < 'a' || value > 'z')) {
+            break;
+          }
+          ++firstWordLength;
+        }
+        const uint8_t first = candidateText[0];
+        dropCapTargetJoinsNext = first == '-' ||
+                                 (firstWordLength == 1U && first != 'A' && first != 'I' && first != 'a' &&
+                                  first != 'i');
+      }
+      break;
+    }
+  }
+  const bool sectionBoundaryPage = currentPageIndex_ == 0 || pendingSectionBoundary_ || isSectionBoundary(currentPageIndex_);
+
   for (uint16_t imageIndex = 0; imageIndex < model->imageCount(); ++imageIndex) {
     const PdfImagePlacement& placement = model->images()[imageIndex];
     for (uint8_t candidateIndex = currentPageImageStart_; candidateIndex < currentPageImageEnd_;
@@ -15556,10 +15665,46 @@ PdfStatus PdfPreparation::finishContentInterpretation() {
       std::memmove(pageText_.get() + compactTextLength, pageText_.get() + run.textOffset, run.textLength);
     }
     ExtractedBlockRecord& block = converted[convertedCount++];
-    block.textOffset = static_cast<uint16_t>(compactTextLength);
+    uint16_t encodedTextOffset = static_cast<uint16_t>(compactTextLength);
+    if ((run.flags & PdfTextExplicitWhitespace) != 0) {
+      encodedTextOffset |= kExtractedExplicitWhitespace;
+    }
+    const uint8_t* const runText = pageText_.get() + compactTextLength;
+    uint16_t letterCount = 0;
+    uint16_t lowercaseCount = 0;
+    for (uint32_t textIndex = 0; textIndex < run.textLength; ++textIndex) {
+      const uint8_t value = runText[textIndex];
+      if ((value >= 'A' && value <= 'Z') || (value >= 'a' && value <= 'z')) {
+        ++letterCount;
+        lowercaseCount = static_cast<uint16_t>(lowercaseCount + (value >= 'a' && value <= 'z' ? 1U : 0U));
+      }
+    }
+    const uint16_t height = runHeightPoints(run);
+    const int64_t runCenter = (static_cast<int64_t>(run.xMin) + run.xMax) / (2 * 65536);
+    const int64_t pageCenter = currentPageWidth_ / 2;
+    const int64_t centerDistance = runCenter >= pageCenter ? runCenter - pageCenter : pageCenter - runCenter;
+    const bool allCapsHeading = run.textLength <= 128U && letterCount >= 3U && lowercaseCount == 0;
+    const bool tallHeading = run.textLength <= 160U && letterCount >= 2U && height * 2U >= bodyTextHeight * 3U;
+    const bool centeredTitle = sectionBoundaryPage && run.textLength <= 48U && height >= 14U &&
+                               (bodyTextHeightCount < 3U || height > bodyTextHeight) &&
+                               centerDistance <= std::max<uint16_t>(1, currentPageWidth_ / 12U);
+    const bool dropCapOpeningLine = dropCapTargetIndex != UINT16_MAX && index != dropCapRunIndex &&
+                                    index >= dropCapTargetIndex &&
+                                    std::abs(static_cast<int64_t>(run.baseline) - runs[dropCapTargetIndex].baseline) <=
+                                        65536;
+    if (index != dropCapRunIndex && !dropCapOpeningLine && (allCapsHeading || tallHeading || centeredTitle)) {
+      encodedTextOffset |= kExtractedHeading;
+    }
+    if (index == dropCapRunIndex || (index == dropCapTargetIndex && dropCapTargetJoinsNext)) {
+      encodedTextOffset |= kExtractedDropCap;
+    }
+    block.textOffset = encodedTextOffset;
     block.textLength = static_cast<uint16_t>(run.textLength);
     const int64_t x = static_cast<int64_t>(run.baselineX) / 65536;
-    const int64_t y = static_cast<int64_t>(run.baseline) / 65536;
+    const int64_t y = static_cast<int64_t>(index == dropCapRunIndex && dropCapTargetIndex != UINT16_MAX
+                                               ? runs[dropCapTargetIndex].baseline
+                                               : run.baseline) /
+                      65536;
     if (x > INT16_MIN && x <= INT16_MAX && y > INT16_MIN && y <= INT16_MAX) {
       block.x = static_cast<int16_t>(x);
       block.y = static_cast<int16_t>(y);
@@ -15670,6 +15815,7 @@ PdfStatus PdfPreparation::finishExtractedPage() {
   auto* const order = new (operandScratch_.get()) ReadingOrderWorkspace;
   order->scanIndex = 0;
   order->tableStart = extractedBlockCount_;
+  order->tableEnd = extractedBlockCount_;
   order->sortGap = 0;
   order->sortIndex = 0;
   order->sortCursor = 0;
@@ -15722,7 +15868,13 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
   };
   const auto columnFor = [&](const CompactTextPlacement& placement) {
     const uint8_t bin = histogramBin(placement.x);
-    if (order->columnCount < 2 || bin <= order->columnSplits[0]) {
+    const bool credibleFirstGap = order->columnCount >= 2 &&
+                                  order->clusterCenters[1] >= order->clusterCenters[0] +
+                                                                       kReadingOrderHistogramBins / 6U;
+    const bool credibleSecondGap = order->columnCount < 3 ||
+                                   order->clusterCenters[2] >= order->clusterCenters[1] +
+                                                                        kReadingOrderHistogramBins / 6U;
+    if (!credibleFirstGap || !credibleSecondGap || bin <= order->columnSplits[0]) {
       return uint8_t{0};
     }
     if (order->columnCount == 2 || bin <= order->columnSplits[1]) {
@@ -15734,18 +15886,12 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
     if (order->lexicalFallback) {
       return first.sourceIndex < second.sourceIndex;
     }
-    const bool firstTable = first.sourceIndex >= order->tableStart;
-    const bool secondTable = second.sourceIndex >= order->tableStart;
+    const bool firstTable = first.sourceIndex >= order->tableStart && first.sourceIndex < order->tableEnd;
+    const bool secondTable = second.sourceIndex >= order->tableStart && second.sourceIndex < order->tableEnd;
     if (firstTable != secondTable) {
-      return !firstTable;
+      return first.sourceIndex < second.sourceIndex;
     }
     if (firstTable) {
-      if (!sameCoordinate(first.y, second.y, 2)) {
-        return first.y > second.y;
-      }
-      if (first.x != second.x) {
-        return first.x < second.x;
-      }
       return first.sourceIndex < second.sourceIndex;
     }
     if (order->columnCount >= 2) {
@@ -15789,11 +15935,20 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
                                                 : ReadingOrderStage::ClearHistogram;
           break;
         }
-        order->records[order->scanIndex] = {
-            order->scanIndex,
-            blocks[order->scanIndex].x,
-            blocks[order->scanIndex].y,
-        };
+        {
+          const uint16_t sourceIndex = order->scanIndex;
+          int16_t orderingX = blocks[sourceIndex].x;
+          if (sourceIndex != 0 && (blocks[sourceIndex].textOffset & kExtractedHeading) != 0 &&
+              (blocks[sourceIndex - 1U].textOffset & kExtractedHeading) != 0 &&
+              sameCoordinate(blocks[sourceIndex].y, blocks[sourceIndex - 1U].y, 2)) {
+            orderingX = order->records[sourceIndex - 1U].x;
+          }
+          order->records[sourceIndex] = {
+              sourceIndex,
+              orderingX,
+              blocks[sourceIndex].y,
+          };
+        }
         if (blocks[order->scanIndex].x == kUnknownTextOrigin ||
             blocks[order->scanIndex].y == kUnknownTextOrigin) {
           order->lexicalFallback = true;
@@ -15828,8 +15983,29 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
           const bool alignedColumns = first.x < second.x && third.x < fourth.x &&
                                       sameCoordinate(first.x, third.x, 4) &&
                                       sameCoordinate(second.x, fourth.x, 4);
-          if (shortCells && pairedRows && alignedColumns && ((blockCount - index) & 1U) == 0) {
+          const uint16_t semanticFlags =
+              static_cast<uint16_t>(first.textOffset | second.textOffset | third.textOffset | fourth.textOffset);
+          const int32_t minimumCellGap = std::max<int32_t>(8, pageWidth / 20U);
+          const bool wideRow = (semanticFlags & (kExtractedHeading | kExtractedDropCap)) == 0 &&
+                               sameCoordinate(first.y, second.y, 2) && sameCoordinate(first.y, third.y, 2) &&
+                               sameCoordinate(first.y, fourth.y, 2) &&
+                               static_cast<int32_t>(second.x) - first.x >= minimumCellGap &&
+                               static_cast<int32_t>(third.x) - second.x >= minimumCellGap &&
+                               static_cast<int32_t>(fourth.x) - third.x >= minimumCellGap &&
+                               static_cast<int32_t>(fourth.x) - first.x > static_cast<int32_t>(pageWidth / 3U);
+          if (wideRow || (shortCells && pairedRows && alignedColumns && ((blockCount - index) & 1U) == 0)) {
             order->tableStart = index;
+            order->tableEnd = blockCount;
+            const uint16_t tableBreakGap = std::max<uint16_t>(24U, currentPageHeight_ / 23U);
+            for (uint16_t probe = static_cast<uint16_t>(index + 4U); probe < blockCount; ++probe) {
+              const ExtractedBlockRecord& previous = blocks[probe - 1U];
+              const ExtractedBlockRecord& current = blocks[probe];
+              if (previous.y != kUnknownTextOrigin && current.y != kUnknownTextOrigin &&
+                  std::abs(static_cast<int32_t>(previous.y) - current.y) > tableBreakGap) {
+                order->tableEnd = probe;
+                break;
+              }
+            }
             order->scanIndex = 0;
             order->stage = ReadingOrderStage::BuildHistogram;
           }
@@ -15846,14 +16022,18 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
           order->stage = ReadingOrderStage::AnalyzeHistogram;
           break;
         } else {
-          const uint8_t bin = histogramBin(order->records[order->scanIndex++].x);
+          const CompactTextPlacement& placement = order->records[order->scanIndex++];
+          if ((blocks[placement.sourceIndex].textOffset & (kExtractedHeading | kExtractedDropCap)) != 0) {
+            break;
+          }
+          const uint8_t bin = histogramBin(placement.x);
           if (order->histogram[bin] != UINT8_MAX) {
             ++order->histogram[bin];
           }
         }
         break;
 
-      case ReadingOrderStage::AnalyzeHistogram:
+      case ReadingOrderStage::AnalyzeHistogram: {
         if (order->scanIndex < kReadingOrderHistogramBins) {
           const uint8_t bin = static_cast<uint8_t>(order->scanIndex++);
           if (order->histogram[bin] == 0) {
@@ -15880,7 +16060,12 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
           order->runActive = false;
           break;
         }
-        if (!order->clusterOverflow && (order->clusterCount == 2 || order->clusterCount == 3)) {
+        const uint16_t minimumColumnItems = std::max<uint16_t>(2, blockCount / 6U);
+        const bool supportedColumns = order->clusterItems[0] >= minimumColumnItems &&
+                                      order->clusterItems[1] >= minimumColumnItems &&
+                                      (order->clusterCount < 3 || order->clusterItems[2] >= minimumColumnItems);
+        if (!order->clusterOverflow && supportedColumns &&
+            (order->clusterCount == 2 || order->clusterCount == 3)) {
           order->columnCount = order->clusterCount;
           order->columnSplits[0] =
               static_cast<uint8_t>((order->clusterCenters[0] + order->clusterCenters[1]) / 2U);
@@ -15896,6 +16081,7 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
         order->sortHolding = false;
         order->stage = ReadingOrderStage::Sort;
         break;
+      }
 
       case ReadingOrderStage::Sort:
         if (order->sortGap == 0) {
@@ -15959,7 +16145,8 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
 
       case ReadingOrderStage::ApplyPermutation:
         if (order->applyIndex >= blockCount) {
-          order->stage = ReadingOrderStage::Complete;
+          order->clearIndex = 0;
+          order->stage = ReadingOrderStage::ClearBlockHistogram;
           break;
         }
         if (!order->cycleActive) {
@@ -15987,6 +16174,156 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
             order->cycleCursor = sourceIndex;
           }
         }
+        break;
+
+      case ReadingOrderStage::ClearBlockHistogram:
+        if (order->clearIndex < kReadingOrderHistogramBins) {
+          order->histogram[order->clearIndex++] = 0;
+          break;
+        }
+        order->scanIndex = 1;
+        order->stage = ReadingOrderStage::MeasureLineSteps;
+        break;
+
+      case ReadingOrderStage::MeasureLineSteps:
+        if (order->scanIndex < blockCount) {
+          const uint16_t index = order->scanIndex++;
+          const CompactTextPlacement& previous = order->records[index - 1U];
+          const CompactTextPlacement& current = order->records[index];
+          const int32_t gap = static_cast<int32_t>(previous.y) - current.y;
+          if (previous.y != kUnknownTextOrigin && current.y != kUnknownTextOrigin &&
+              columnFor(previous) == columnFor(current) && gap > 2) {
+            const uint8_t bin = static_cast<uint8_t>(std::min<int32_t>(kReadingOrderHistogramBins - 1U, gap));
+            if (order->histogram[bin] != UINT8_MAX) {
+              ++order->histogram[bin];
+            }
+          }
+          break;
+        }
+        order->scanIndex = 3;
+        order->sortGap = 0;
+        order->runItems = std::max<uint16_t>(8, currentPageHeight_ / 50U);
+        order->stage = ReadingOrderStage::SelectLineStep;
+        break;
+
+      case ReadingOrderStage::SelectLineStep:
+        if (order->scanIndex < kReadingOrderHistogramBins) {
+          const uint16_t gap = order->scanIndex++;
+          if (order->histogram[gap] >= 2U && order->histogram[gap] > order->sortGap) {
+            order->sortGap = order->histogram[gap];
+            order->runItems = gap;
+          }
+          break;
+        }
+        order->clusterItems[0] = UINT16_MAX;
+        order->clusterItems[1] = UINT16_MAX;
+        order->clusterItems[2] = UINT16_MAX;
+        order->scanIndex = 0;
+        order->stage = ReadingOrderStage::FindLeftEdges;
+        break;
+
+      case ReadingOrderStage::FindLeftEdges:
+        if (order->scanIndex < blockCount) {
+          const uint16_t index = order->scanIndex++;
+          const ExtractedBlockRecord& block = blocks[index];
+          if (block.x >= 0 && (block.textOffset & (kExtractedHeading | kExtractedDropCap)) == 0) {
+            const uint8_t column = columnFor(order->records[index]);
+            order->clusterItems[column] = std::min<uint16_t>(order->clusterItems[column],
+                                                             static_cast<uint16_t>(block.x));
+          }
+          break;
+        }
+        order->applyIndex = 0;
+        currentPageSemanticBlockCount_ = 0;
+        order->stage = ReadingOrderStage::MarkBlocks;
+        break;
+
+      case ReadingOrderStage::MarkBlocks:
+        if (order->applyIndex < blockCount) {
+          const uint16_t index = order->applyIndex++;
+          ExtractedBlockRecord& current = blocks[index];
+          current.textLength &= kExtractedTextLengthMask;
+          bool newBlock = index == 0 || order->lexicalFallback;
+          bool sameLine = false;
+          bool wideFourCellRow = false;
+          if (blockCount >= 4U) {
+            const uint16_t firstCandidate = index > 3U ? static_cast<uint16_t>(index - 3U) : 0U;
+            const uint16_t lastCandidate =
+                std::min<uint16_t>(index, static_cast<uint16_t>(blockCount - 4U));
+            for (uint16_t start = firstCandidate; start <= lastCandidate; ++start) {
+              const CompactTextPlacement& firstCell = order->records[start];
+              const CompactTextPlacement& secondCell = order->records[start + 1U];
+              const CompactTextPlacement& thirdCell = order->records[start + 2U];
+              const CompactTextPlacement& fourthCell = order->records[start + 3U];
+              const bool rowCoordinatesValid = firstCell.x >= 0 && firstCell.y >= 0 && secondCell.x >= 0 &&
+                                               secondCell.y >= 0 && thirdCell.x >= 0 && thirdCell.y >= 0 &&
+                                               fourthCell.x >= 0 && fourthCell.y >= 0;
+              const uint16_t semanticFlags = static_cast<uint16_t>(
+                  blocks[start].textOffset | blocks[start + 1U].textOffset | blocks[start + 2U].textOffset |
+                  blocks[start + 3U].textOffset);
+              if (rowCoordinatesValid && (semanticFlags & (kExtractedHeading | kExtractedDropCap)) == 0 &&
+                  sameCoordinate(firstCell.y, secondCell.y, 2) && sameCoordinate(firstCell.y, thirdCell.y, 2) &&
+                  sameCoordinate(firstCell.y, fourthCell.y, 2) &&
+                  static_cast<int32_t>(fourthCell.x) - firstCell.x > static_cast<int32_t>(pageWidth / 3U)) {
+                wideFourCellRow = true;
+                break;
+              }
+            }
+          }
+          if (!newBlock) {
+            const ExtractedBlockRecord& previous = blocks[index - 1U];
+            const bool currentHeading = (current.textOffset & kExtractedHeading) != 0;
+            const bool previousHeading = (previous.textOffset & kExtractedHeading) != 0;
+            const uint8_t currentColumn = columnFor(order->records[index]);
+            const uint8_t previousColumn = columnFor(order->records[index - 1U]);
+            const bool coordinatesValid = current.x >= 0 && current.y >= 0 && previous.x >= 0 && previous.y >= 0;
+            const uint16_t gap = coordinatesValid
+                                     ? static_cast<uint16_t>(std::min<int32_t>(UINT16_MAX,
+                                                                               std::abs(static_cast<int32_t>(previous.y) - current.y)))
+                                     : UINT16_MAX;
+            sameLine = coordinatesValid && gap <= 2U;
+            const bool tableRecord = order->records[index].sourceIndex >= order->tableStart &&
+                                     order->records[index].sourceIndex < order->tableEnd;
+            const bool previousTableRecord = order->records[index - 1U].sourceIndex >= order->tableStart &&
+                                             order->records[index - 1U].sourceIndex < order->tableEnd;
+            newBlock = !coordinatesValid || tableRecord || currentColumn != previousColumn ||
+                       currentHeading != previousHeading;
+            if (tableRecord && previousTableRecord && coordinatesValid && !currentHeading && !previousHeading) {
+              const uint16_t horizontalGap = static_cast<uint16_t>(
+                  std::abs(static_cast<int32_t>(current.x) - static_cast<int32_t>(previous.x)));
+              const uint16_t sameCellXThreshold = std::max<uint16_t>(4U, pageWidth / 100U);
+              const bool sameTableCell = horizontalGap <= sameCellXThreshold &&
+                                         gap <= static_cast<uint32_t>(order->runItems) * 2U;
+              newBlock = !sameTableCell;
+            }
+            if (!newBlock && currentHeading) {
+              newBlock = static_cast<uint32_t>(gap) * 4U > static_cast<uint32_t>(order->runItems) * 9U;
+            } else if (!newBlock && !sameLine) {
+              const uint16_t leftEdge = order->clusterItems[currentColumn];
+              const uint16_t indentThreshold = std::max<uint16_t>(6, order->runItems / 2U);
+              const uint16_t horizontalShift = static_cast<uint16_t>(
+                  std::abs(static_cast<int32_t>(current.x) - static_cast<int32_t>(previous.x)));
+              const bool previousIndented = leftEdge != UINT16_MAX && previous.x > 0 &&
+                                            static_cast<uint16_t>(previous.x) > leftEdge + indentThreshold;
+              const bool indented = leftEdge != UINT16_MAX && !previousIndented && current.x > 0 &&
+                                    static_cast<uint16_t>(current.x) > leftEdge + indentThreshold &&
+                                    horizontalShift > indentThreshold;
+              newBlock = static_cast<uint32_t>(gap) * 2U > static_cast<uint32_t>(order->runItems) * 3U || indented;
+            }
+            if (wideFourCellRow) {
+              newBlock = !sameLine;
+            }
+          }
+          if (newBlock) {
+            current.textLength |= kExtractedNewBlock;
+            ++currentPageSemanticBlockCount_;
+          } else if (sameLine && !wideFourCellRow &&
+                     (current.textOffset & kExtractedExplicitWhitespace) != 0) {
+            current.textLength |= kExtractedJoinsPrevious;
+          }
+          break;
+        }
+        order->stage = ReadingOrderStage::Complete;
         break;
 
       case ReadingOrderStage::Complete:
@@ -17813,6 +18150,9 @@ PdfStepResult PdfPreparation::emitSection(PdfWorkBudget& budget) {
   while (budget.consumeOperation()) {
 
   if (sectionEmitStage_ == SectionEmitStage::Idle) {
+    if (currentPageSemanticBlockCount_ == 0) {
+      return PdfStepResult::failure(PdfStatus::failure(PdfError::InvalidArgument, currentPageIndex_));
+    }
     char pageLabel[PdfSemanticWriterLimits::PublisherLabelBytes]{};
     size_t pageLabelLength = 0;
     PdfStatus status = pageLabels_->format(currentPageIndex_, pageLabel, sizeof(pageLabel), &pageLabelLength);
@@ -17829,7 +18169,7 @@ PdfStepResult PdfPreparation::emitSection(PdfWorkBudget& budget) {
       currentPageFirstAnchor_ = nextAnchorOrdinal_;
       if (currentPageIndex_ + 1U < pageCount_) {
         nextPageAnchorHintIndex_ = currentPageIndex_ + 1U;
-        nextPageAnchorHint_ = nextAnchorOrdinal_ + extractedBlockCount_;
+        nextPageAnchorHint_ = nextAnchorOrdinal_ + currentPageSemanticBlockCount_;
       }
       status = semanticWriter_.writePublisherPageBreak(currentPageIndex_, reinterpret_cast<const uint8_t*>(pageLabel),
                                                        pageLabelLength);
@@ -17848,12 +18188,53 @@ PdfStepResult PdfPreparation::emitSection(PdfWorkBudget& budget) {
       continue;
     }
     const ExtractedBlockRecord& record = blocks[currentBlockIndex_];
-    const uint8_t* const text = pageText_.get() + record.textOffset;
-    const bool heading = !synthesizedOutline_ && currentBlockIndex_ == 0 &&
-                         (pendingSectionBoundary_ || isSectionBoundary(currentPageIndex_));
+    const uint16_t textOffset = record.textOffset & kExtractedTextOffsetMask;
+    const uint16_t textLength = record.textLength & kExtractedTextLengthMask;
+    const uint8_t* const text = pageText_.get() + textOffset;
+    const bool heading = (record.textOffset & kExtractedHeading) != 0;
+    const bool startsBlock = (record.textLength & kExtractedNewBlock) != 0;
     PdfStatus status = PdfStatus::success();
-    status = semanticWriter_.beginBlock({heading ? PdfSemanticBlockKind::Heading : PdfSemanticBlockKind::Paragraph,
-                                         nextAnchorOrdinal_, static_cast<uint8_t>(heading ? 1 : 0)});
+    if (startsBlock) {
+      const uint8_t headingLevel = heading && nextAnchorOrdinal_ == currentSectionFirstAnchor_ ? 1U : 2U;
+      status = semanticWriter_.beginBlock({heading ? PdfSemanticBlockKind::Heading : PdfSemanticBlockKind::Paragraph,
+                                           nextAnchorOrdinal_, static_cast<uint8_t>(heading ? headingLevel : 0U)});
+    } else if (!semanticWriter_.blockOpen() || currentBlockIndex_ == 0) {
+      status = PdfStatus::failure(PdfError::InvalidArgument, currentBlockIndex_);
+    } else {
+      const ExtractedBlockRecord& previous = blocks[currentBlockIndex_ - 1U];
+      const uint16_t previousOffset = previous.textOffset & kExtractedTextOffsetMask;
+      const uint16_t previousLength = previous.textLength & kExtractedTextLengthMask;
+      const uint8_t previousEnd = previousLength == 0 ? 0 : pageText_[previousOffset + previousLength - 1U];
+      const uint8_t currentStart = textLength == 0 ? 0 : text[0];
+      const bool currentApostrophe = currentStart == '\'' ||
+                                     (textLength >= 3U && text[0] == 0xe2U && text[1] == 0x80U && text[2] == 0x99U);
+      const bool currentPunctuation = currentApostrophe || currentStart == ',' || currentStart == '.' ||
+                                      currentStart == '-' || currentStart == ';' || currentStart == ':' || currentStart == '!' ||
+                                      currentStart == '?' || currentStart == ')' || currentStart == ']' ||
+                                      currentStart == '}';
+      uint16_t currentWordLength = 0;
+      while (currentWordLength < textLength) {
+        const uint8_t value = text[currentWordLength];
+        if ((value < 'A' || value > 'Z') && (value < 'a' || value > 'z')) {
+          break;
+        }
+        ++currentWordLength;
+      }
+      const bool standaloneDropCapI = (previous.textOffset & kExtractedDropCap) != 0 && previousEnd == 'I' &&
+                                      !currentApostrophe && currentWordLength > 1U;
+      const bool dropCapJoins = (previous.textOffset & kExtractedDropCap) != 0 && !standaloneDropCapI;
+      const bool previousJoins = previousEnd == '-' || previousEnd == '/' || previousEnd == '(' ||
+                                 previousEnd == '[' || previousEnd == '{' || dropCapJoins;
+      const bool whitespacePresent = previousEnd == ' ' || previousEnd == '\t' || previousEnd == '\r' ||
+                                     previousEnd == '\n' || currentStart == ' ' || currentStart == '\t' ||
+                                     currentStart == '\r' || currentStart == '\n';
+      const bool joinsPrevious = (record.textLength & kExtractedJoinsPrevious) != 0 && !standaloneDropCapI;
+      if (!whitespacePresent && !currentPunctuation && !previousJoins &&
+          !joinsPrevious) {
+        constexpr uint8_t separator = ' ';
+        status = semanticWriter_.writeText(&separator, 1);
+      }
+    }
     char href[PdfOutlineLimits::HrefBytes]{};
     size_t hrefLength = 0;
     bool linked = false;
@@ -17863,7 +18244,7 @@ PdfStepResult PdfPreparation::emitSection(PdfWorkBudget& budget) {
       linked = status.ok();
     }
     if (status) {
-      status = semanticWriter_.writeText(text, record.textLength);
+      status = semanticWriter_.writeText(text, textLength);
     }
     if (status && linked) {
       status = semanticWriter_.endInternalLink();
@@ -17951,12 +18332,16 @@ PdfStepResult PdfPreparation::emitSection(PdfWorkBudget& budget) {
   }
 
   if (sectionEmitStage_ == SectionEmitStage::EndBlock) {
-    const PdfStatus status = semanticWriter_.endBlock();
-    if (!status) {
-      return PdfStepResult::failure(status);
-    }
-    ++nextAnchorOrdinal_;
     ++currentBlockIndex_;
+    const bool closesBlock = currentBlockIndex_ >= sectionEmitEndBlock_ ||
+                             (blocks[currentBlockIndex_].textLength & kExtractedNewBlock) != 0;
+    if (closesBlock) {
+      const PdfStatus status = semanticWriter_.endBlock();
+      if (!status) {
+        return PdfStepResult::failure(status);
+      }
+      ++nextAnchorOrdinal_;
+    }
     sectionEmitStage_ = SectionEmitStage::BeginBlock;
     continue;
   }
@@ -18638,7 +19023,9 @@ PdfStepResult PdfPreparation::stepTypographyAssets(PdfWorkBudget& budget) {
     if (budget.operationsRemaining < 2U || budget.bytesRemaining < rowBytes || budget.stopRequested()) {
       return PdfStepResult::paused();
     }
-    const size_t maximumBuffered = std::min<size_t>(PdfLimits::PageTextBytes, budget.bytesRemaining);
+    constexpr size_t kMaximumTypographyWriteBytes = 3U * 1024U;
+    const size_t maximumBuffered =
+        std::min({PdfLimits::PageTextBytes, budget.bytesRemaining, kMaximumTypographyWriteBytes});
     size_t buffered = 0;
     while (typographyRow_ < height && buffered + rowBytes <= maximumBuffered && budget.operationsRemaining > 1U &&
            !budget.stopRequested()) {

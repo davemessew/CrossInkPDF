@@ -182,3 +182,20 @@ TEST(SemanticWriterTest, CountsAWordSplitAcrossExtractionChunksExactlyOnce) {
   EXPECT_EQ(harness.writer.totalWords(), 1u);
   EXPECT_NE(harness.output().find(">inter-national</p>"), std::string::npos);
 }
+
+TEST(SemanticWriterTest, NormalizesUnsupportedPhoneticsAndNoBreakSpacesForDeviceFonts) {
+  WriterHarness harness;
+  ASSERT_TRUE(harness.begin().ok());
+  ASSERT_TRUE(harness.writer.beginBlock({PdfSemanticBlockKind::Paragraph, 0, 0}).ok());
+  static constexpr uint8_t TEXT[] = {
+      'w', 'o', 'r', 'd', 0xc2, 0xa0, 'w', 'r', 'a', 'p', ' ',
+      0xc9, 0x99, 0xcb, 0x88, 't', 0xc3, 0xa4, 'm', 'i', 'k',
+  };
+  ASSERT_TRUE(harness.writer.writeText(TEXT, sizeof(TEXT)).ok());
+  ASSERT_TRUE(harness.writer.endBlock().ok());
+  ASSERT_TRUE(harness.writer.finish().ok());
+
+  EXPECT_NE(harness.output().find(">word wrap uh-t\xC3\xA4mik</p>"), std::string::npos);
+  ASSERT_EQ(harness.blocks.records.size(), 1U);
+  EXPECT_EQ(harness.blocks.records[0].wordCount, 3U);
+}

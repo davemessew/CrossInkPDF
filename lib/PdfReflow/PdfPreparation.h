@@ -983,6 +983,7 @@ class PdfPreparation {
   uint32_t currentPageIndex_ = 0;
   uint16_t currentContentIndex_ = 0;
   uint16_t extractedBlockCount_ = 0;
+  uint16_t currentPageSemanticBlockCount_ = 0;
   uint16_t currentBlockIndex_ = 0;
   uint16_t sectionEmitEndBlock_ = 0;
   uint16_t sectionCount_ = 0;

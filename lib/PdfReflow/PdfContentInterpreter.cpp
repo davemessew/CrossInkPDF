@@ -749,6 +749,7 @@ PdfStatus PdfContentInterpreter::processTextOperator(const PdfToken& token) {
     text_.matrix = {{workspace_.operands[0].number}, {workspace_.operands[1].number}, {workspace_.operands[2].number},
                     {workspace_.operands[3].number}, {workspace_.operands[4].number}, {workspace_.operands[5].number}};
     text_.lineMatrix = text_.matrix;
+    text_.positionReset = true;
     return PdfStatus::success();
   }
   if (tokenEquals(token, "Td") || tokenEquals(token, "TD")) {
@@ -878,6 +879,7 @@ PdfStatus PdfContentInterpreter::processGraphicsOperator(const PdfToken& token) 
     const PdfMatrix lineMatrix = text_.lineMatrix;
     const bool textActive = text_.active;
     const bool clipPending = text_.clipPending;
+    const bool positionReset = text_.positionReset;
     --graphicsDepth_;
     graphics_ = graphicsStack_[graphicsDepth_];
     text_ = textStack_[graphicsDepth_];
@@ -889,6 +891,7 @@ PdfStatus PdfContentInterpreter::processGraphicsOperator(const PdfToken& token) 
     text_.lineMatrix = lineMatrix;
     text_.active = textActive;
     text_.clipPending = clipPending;
+    text_.positionReset = positionReset;
     return PdfStatus::success();
   }
   if (tokenEquals(token, "gs")) {
@@ -1350,6 +1353,12 @@ PdfStatus PdfContentInterpreter::makeRun(PdfTextRun* const run, const uint16_t f
   run->baseline = y.raw;
   run->fontId = text_.font != nullptr ? text_.font->fontId() : 0;
   run->flags = flags;
+  if (text_.positionReset) {
+    run->flags |= PdfTextPositionReset;
+  }
+  if ((flags & PdfTextActualText) != 0 || (text_.font != nullptr && text_.font->hasExplicitWhitespace())) {
+    run->flags |= PdfTextExplicitWhitespace;
+  }
   return PdfStatus::success();
 }
 
@@ -1581,13 +1590,21 @@ PdfStatus PdfContentInterpreter::showString(const uint8_t* const source, const s
     return PdfStatus::success();
   }
   if (textCapacityReached_) {
-    return advanceVisualText(source, length);
+    const PdfStatus status = advanceVisualText(source, length);
+    if (status.ok()) {
+      text_.positionReset = false;
+    }
+    return status;
   }
   if (text_.renderMode >= 4) {
     text_.clipPending = true;
   }
   if (text_.renderMode == 7 || markedContentSuppressed()) {
-    return advanceVisualText(source, length);
+    const PdfStatus status = advanceVisualText(source, length);
+    if (status.ok()) {
+      text_.positionReset = false;
+    }
+    return status;
   }
   MarkedContentFrame* actual = nullptr;
   for (uint8_t depth = markedDepth_; depth-- > 0;) {
@@ -1616,15 +1633,24 @@ PdfStatus PdfContentInterpreter::showString(const uint8_t* const source, const s
       if (pageModel_->runCount() <= actual->runIndex) {
         actual->runIndex = UINT16_MAX;
       }
+      text_.positionReset = false;
       return PdfStatus::success();
     }
     PdfStatus status = advanceVisualText(source, length);
     if (!status.ok() || actual->runIndex == UINT16_MAX) {
       return status;
     }
-    return expandRunGeometry(actual->runIndex);
+    status = expandRunGeometry(actual->runIndex);
+    if (status.ok()) {
+      text_.positionReset = false;
+    }
+    return status;
   }
-  return emitDecodedText(source, length, false);
+  const PdfStatus status = emitDecodedText(source, length, false);
+  if (status.ok()) {
+    text_.positionReset = false;
+  }
+  return status;
 }
 
 PdfStatus PdfContentInterpreter::showArray(const PdfContentOperand& array) {

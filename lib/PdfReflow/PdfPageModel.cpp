@@ -135,14 +135,38 @@ PdfStatus PdfPageModel::finishTextRun() {
         std::max(static_cast<int64_t>(previous.yMax) - previous.yMin,
                  static_cast<int64_t>(current.yMax) - current.yMin);
     const int64_t maximumMergeGap = std::max<int64_t>(65536, lineHeight * 2);
-    if (previous.fontId == current.fontId && previous.flags == current.flags &&
+    const int64_t originAdvance = static_cast<int64_t>(current.baselineX) - previous.baselineX;
+    const bool wideAbsolutePosition = (current.flags & PdfTextPositionReset) != 0 &&
+                                      originAdvance > lineHeight * 4;
+    constexpr uint16_t mergeRelevantFlags = PdfTextHidden | PdfTextActualText | PdfTextExplicitWhitespace;
+    if (previous.fontId == current.fontId &&
+        (previous.flags & mergeRelevantFlags) == (current.flags & mergeRelevantFlags) &&
+        !wideAbsolutePosition &&
         baselineDifference >= -65536 && baselineDifference <= 65536 &&
         baselineGap <= maximumMergeGap &&
         previousTextEnd == current.textOffset && current.textLength <= UINT32_MAX - previous.textLength &&
         currentEndX - previous.baselineX >= INT32_MIN && currentEndX - previous.baselineX <= INT32_MAX &&
         currentEndY - previous.baseline >= INT32_MIN && currentEndY - previous.baseline <= INT32_MAX) {
-      const int64_t wordGap = std::max<int64_t>(32768, lineHeight / 8);
-      const bool insertSpace = baselineGap > wordGap && workspace_.text[current.textOffset - 1U] != ' ' &&
+      const int64_t wordGap = std::max<int64_t>(32768, lineHeight * 3 / 8);
+      const uint8_t currentFirst = workspace_.text[current.textOffset];
+      const bool currentJoinsPunctuation = currentFirst == '-' || currentFirst == ',' || currentFirst == '.' ||
+                                           currentFirst == ';' || currentFirst == ':' || currentFirst == '!' ||
+                                           currentFirst == '?' || currentFirst == ')' || currentFirst == ']' ||
+                                           currentFirst == '}';
+      bool splitAllCapsGlyph = false;
+      if (current.textLength == 1U && currentFirst >= 'B' && currentFirst <= 'Z' && currentFirst != 'I') {
+        bool hasUppercase = false;
+        bool hasLowercase = false;
+        for (uint64_t offset = previous.textOffset; offset < previousTextEnd; ++offset) {
+          const uint8_t value = workspace_.text[offset];
+          hasUppercase = hasUppercase || (value >= 'A' && value <= 'Z');
+          hasLowercase = hasLowercase || (value >= 'a' && value <= 'z');
+        }
+        splitAllCapsGlyph = hasUppercase && !hasLowercase;
+      }
+      const bool insertSpace = (current.flags & PdfTextExplicitWhitespace) == 0 && baselineGap > wordGap &&
+                               !currentJoinsPunctuation && !splitAllCapsGlyph &&
+                               workspace_.text[current.textOffset - 1U] != ' ' &&
                                workspace_.text[current.textOffset] != ' ';
       if (insertSpace) {
         if (textLength_ >= workspace_.textCapacity || current.textLength == UINT32_MAX - previous.textLength) {

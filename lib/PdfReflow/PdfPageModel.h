@@ -38,6 +38,8 @@ enum PdfImagePlacementFlag : uint16_t {
 enum PdfTextRunFlag : uint16_t {
   PdfTextHidden = 1U << 0,
   PdfTextActualText = 1U << 1,
+  PdfTextExplicitWhitespace = 1U << 2,
+  PdfTextPositionReset = 1U << 3,
 };
 
 struct PdfPageModelWorkspace {

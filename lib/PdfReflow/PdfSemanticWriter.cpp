@@ -293,6 +293,13 @@ PdfStatus PdfSemanticWriter::writeText(const uint8_t* const text, const size_t l
   if (!blockOpen_ || (text == nullptr && length != 0)) {
     return fail(PdfStatus::failure(PdfError::InvalidArgument));
   }
+  const auto emit = [&](const uint8_t* const bytes, const size_t byteCount) {
+    PdfStatus status = wordCounter_.consume(bytes, byteCount);
+    if (status.ok()) {
+      status = appendEscaped(bytes, byteCount, false);
+    }
+    return status;
+  };
   size_t offset = 0;
   size_t spanStart = 0;
   while (offset < length) {
@@ -302,22 +309,28 @@ PdfStatus PdfSemanticWriter::writeText(const uint8_t* const text, const size_t l
     if (!status.ok()) {
       return fail(status);
     }
-    if (isXmlScalar(scalar)) {
+    const char* replacement = nullptr;
+    if (scalar == 0x00A0U) {
+      replacement = " ";
+    } else if (scalar == 0x0259U) {
+      // The built-in reading fonts do not carry IPA schwa. Keep the PDF
+      // pronunciation readable instead of rendering a replacement glyph.
+      replacement = "uh";
+    } else if (scalar == 0x02C8U) {
+      replacement = "-";
+    } else if (isXmlScalar(scalar)) {
       continue;
     }
-    status = wordCounter_.consume(text + spanStart, scalarStart - spanStart);
-    if (status.ok()) {
-      status = appendEscaped(text + spanStart, scalarStart - spanStart, false);
+    status = emit(text + spanStart, scalarStart - spanStart);
+    if (status.ok() && replacement != nullptr) {
+      status = emit(reinterpret_cast<const uint8_t*>(replacement), std::strlen(replacement));
     }
     if (!status.ok()) {
       return fail(status);
     }
     spanStart = offset;
   }
-  PdfStatus status = wordCounter_.consume(text + spanStart, length - spanStart);
-  if (status.ok()) {
-    status = appendEscaped(text + spanStart, length - spanStart, false);
-  }
+  const PdfStatus status = emit(text + spanStart, length - spanStart);
   return status.ok() ? status : fail(status);
 }
 

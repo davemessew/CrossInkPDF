@@ -53,6 +53,7 @@ class PdfFontMap {
   uint16_t widthCount() const { return widthCount_; }
   uint16_t materializedGlyphCount() const { return materialized() ? widthCount_ : 0; }
   bool materialized() const { return defaultWidth_ < 0; }
+  bool hasExplicitWhitespace() const { return hasExplicitWhitespace_; }
   bool fullyResident() const {
     return spillCount_ == 0 && (toUnicode_ == nullptr || toUnicode_->fullyResident()) &&
            (encoding_ == nullptr || encoding_->fullyResident());
@@ -77,4 +78,5 @@ class PdfFontMap {
   bool widthsSorted_ = true;
   bool hasPreviousWidth_ = false;
   bool hasCachedWidth_ = false;
+  bool hasExplicitWhitespace_ = false;
 };

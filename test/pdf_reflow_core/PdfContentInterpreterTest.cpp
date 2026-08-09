@@ -406,6 +406,52 @@ TEST(PdfContentInterpreterTest, HandlesTextStateShowingOperatorsAndContentArrays
   EXPECT_GT(harness.interpreter.operatorCount(), 10u);
 }
 
+TEST(PdfContentInterpreterTest, DoesNotInventSpacesWhenTheMaterializedFontContainsRealSpaces) {
+  std::array<PdfDecodedGlyph, 1> glyphs{};
+  PdfFontMap font({nullptr, 0, {}, nullptr, nullptr, glyphs.data(), static_cast<uint16_t>(glyphs.size())});
+  ASSERT_TRUE(font.beginMaterialized(1, false).ok());
+  PdfDecodedGlyph space{};
+  space.sourceCode = ' ';
+  space.sourceLength = 1;
+  space.unicode.bytes[0] = ' ';
+  space.unicode.length = 1;
+  space.width = 250;
+  ASSERT_TRUE(font.addMaterializedGlyph(space).ok());
+  ASSERT_TRUE(font.hasExplicitWhitespace());
+
+  TestResourceTable resources;
+  resources.font = &font;
+  PdfTestByteSource page(bytes("BT /F1 10 Tf 1 0 0 1 10 20 Tm (P) Tj 7 0 Td (enguin supports) Tj ET"));
+  const PdfByteSource source = page.source();
+  InterpreterHarness harness;
+  ASSERT_TRUE(harness.interpreter.begin(&source, 1, resources.descriptor, harness.model).ok());
+
+  const PdfStepResult result = runInterpreter(harness.interpreter);
+
+  ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error);
+  ASSERT_EQ(harness.model.runCount(), 1U);
+  EXPECT_EQ(transcript(harness.model), "Penguin supports");
+}
+
+TEST(PdfContentInterpreterTest, UsesOnlyLargePositionalGapsAsMissingWordSpaces) {
+  DefaultFont defaultFont;
+  TestResourceTable resources;
+  resources.font = &defaultFont.font;
+  PdfTestByteSource page(bytes("BT /F1 25 Tf "
+                               "1 0 0 1 10 20 Tm (A) Tj "
+                               "1 0 0 1 27 20 Tm (cknow) Tj "
+                               "1 0 0 1 110 20 Tm (Notes) Tj ET"));
+  const PdfByteSource source = page.source();
+  InterpreterHarness harness;
+  ASSERT_TRUE(harness.interpreter.begin(&source, 1, resources.descriptor, harness.model).ok());
+
+  const PdfStepResult result = runInterpreter(harness.interpreter);
+
+  ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error);
+  ASSERT_EQ(harness.model.runCount(), 1U);
+  EXPECT_EQ(transcript(harness.model), "Acknow Notes");
+}
+
 TEST(PdfContentInterpreterTest, ResolvesFormAndActualTextBeforeVisualGlyphs) {
   DefaultFont defaultFont;
   PdfTestByteSource page(

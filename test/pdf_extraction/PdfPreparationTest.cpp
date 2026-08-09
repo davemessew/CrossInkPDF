@@ -451,8 +451,8 @@ PdfStepResult runToTerminal(PdfPreparation& preparation, PreparationHarness& har
     const uint64_t readBefore = harness.storage.bytesReadTotal();
     const uint64_t writtenBefore = harness.storage.bytesWrittenTotal();
     const PdfStepResult result = preparation.step();
-    EXPECT_LE(harness.storage.bytesReadTotal() - readBefore, 4096U);
-    EXPECT_LE(harness.storage.bytesWrittenTotal() - writtenBefore, 4096U);
+    EXPECT_LE(harness.storage.bytesReadTotal() - readBefore, PdfLimits::InterpreterSourceBufferBytes);
+    EXPECT_LE(harness.storage.bytesWrittenTotal() - writtenBefore, PdfLimits::InterpreterSourceBufferBytes);
     ++harness.nowMs;
     if (!result.yielded()) {
       return result;
@@ -856,6 +856,149 @@ TEST(PdfPreparation, SourceFontSizeDoesNotChangePreparedSemanticXhtml) {
   EXPECT_EQ(xhtml.find("<h1"), std::string::npos);
 }
 
+TEST(PdfPreparation, ReflowsVisualLinesIntoHeadingsParagraphsAndDropCaps) {
+  constexpr char sourcePath[] = "/books/semantic-lines.pdf";
+  const std::string content =
+      "BT "
+      "/F1 24 Tf 1 0 0 1 72 720 Tm (THE TWO-STEP PROCESS T) Tj "
+      "1 0 0 1 382 718 Tm (O CHANGING) Tj "
+      "1 0 0 1 72 702 Tm (YOUR IDENTITY) Tj "
+      "/F1 18 Tf 1 0 0 1 72 650 Tm (Why Tiny Changes Make a Big) Tj "
+      "1 0 0 1 72 632 Tm (Difference) Tj "
+      "/F1 32 Tf 1 0 0 1 72 540 Tm (O) Tj "
+      "/F1 12 Tf 1 0 0 1 100 550 Tm (N THE FINAL day of school, everything changed.) Tj "
+      "1 0 0 1 72 534 Tm (This sentence continues on the next visual line.) Tj "
+      "1 0 0 1 90 500 Tm (Next paragraph starts here and) Tj "
+      "1 0 0 1 72 484 Tm (continues without a forced line break.) Tj "
+      "ET";
+  PreparationHarness harness;
+  harness.storage.addFile(sourcePath, makeOnePageTextPdf(content), 1234, true);
+
+  PdfPreparation preparation;
+  ASSERT_TRUE(preparation.begin(harness.config(sourcePath)).ok());
+  const PdfStepResult result = runToTerminal(preparation, harness);
+  ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error) << "@" << result.status.offset;
+
+  const std::string sectionPath = std::string(preparation.cacheRoot()) + "/gen_" +
+                                  std::to_string(preparation.generation()) + "/sections/000000.xhtml";
+  ASSERT_TRUE(harness.storage.exists(sectionPath));
+  const std::vector<uint8_t>& bytes = harness.storage.bytes(sectionPath);
+  const std::string xhtml(bytes.begin(), bytes.end());
+  EXPECT_NE(xhtml.find("<h1 id=\"b00000000\">THE TWO-STEP PROCESS TO CHANGING YOUR IDENTITY</h1>"),
+            std::string::npos)
+      << xhtml;
+  EXPECT_NE(xhtml.find("<h2 id=\"b00000001\">Why Tiny Changes Make a Big Difference</h2>"),
+            std::string::npos)
+      << xhtml;
+  EXPECT_NE(xhtml.find("<p id=\"b00000002\">ON THE FINAL day of school, everything changed. This sentence "
+                       "continues on the next visual line.</p>"),
+            std::string::npos)
+      << xhtml;
+  EXPECT_NE(xhtml.find("<p id=\"b00000003\">Next paragraph starts here and continues without a forced line "
+                       "break.</p>"),
+            std::string::npos)
+      << xhtml;
+  EXPECT_EQ(preparation.totalWords(), 41U);
+}
+
+TEST(PdfPreparation, DistinguishesStandaloneDropCapIFromIn) {
+  struct Case {
+    const char* target;
+    const char* expected;
+  };
+  constexpr Case cases[] = {
+      {"HAVE RELIED HEAVILY on others.", "I HAVE RELIED HEAVILY on others."},
+      {"N 2001, habits changed.", "IN 2001, habits changed."},
+  };
+  for (const Case& testCase : cases) {
+    constexpr char sourcePath[] = "/books/drop-cap-i.pdf";
+    const std::string content = std::string("BT ") +
+                                "/F1 32 Tf 1 0 0 1 72 540 Tm (I) Tj " +
+                                "/F1 12 Tf 1 0 0 1 100 550 Tm (" + testCase.target + ") Tj " +
+                                "1 0 0 1 72 534 Tm (This line completes the paragraph.) Tj ET";
+    PreparationHarness harness;
+    harness.storage.addFile(sourcePath, makeOnePageTextPdf(content), 1234, true);
+
+    PdfPreparation preparation;
+    ASSERT_TRUE(preparation.begin(harness.config(sourcePath)).ok());
+    const PdfStepResult result = runToTerminal(preparation, harness);
+    ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error) << "@" << result.status.offset;
+
+    const std::string sectionPath = std::string(preparation.cacheRoot()) + "/gen_" +
+                                    std::to_string(preparation.generation()) + "/sections/000000.xhtml";
+    ASSERT_TRUE(harness.storage.exists(sectionPath));
+    const std::vector<uint8_t>& bytes = harness.storage.bytes(sectionPath);
+    const std::string xhtml(bytes.begin(), bytes.end());
+    const std::string expected = std::string("<p id=\"b00000000\">") + testCase.expected +
+                                 " This line completes the paragraph.</p>";
+    EXPECT_NE(xhtml.find(expected), std::string::npos) << xhtml;
+  }
+}
+
+TEST(PdfPreparation, KeepsSplitDropCapOpeningLineInTheParagraph) {
+  constexpr char sourcePath[] = "/books/drop-cap-split-line.pdf";
+  const std::string content =
+      "BT "
+      "/F1 32 Tf 1 0 0 1 72 540 Tm (H) Tj "
+      "/F1 12 Tf 1 0 0 1 100 550 Tm (ABITS CREAT) Tj "
+      "1 0 0 1 180 550 Tm (E THE FOUNDATION FOR MASTERY.) Tj ET";
+  PreparationHarness harness;
+  harness.storage.addFile(sourcePath, makeOnePageTextPdf(content), 1234, true);
+
+  PdfPreparation preparation;
+  ASSERT_TRUE(preparation.begin(harness.config(sourcePath)).ok());
+  const PdfStepResult result = runToTerminal(preparation, harness);
+  ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error) << "@" << result.status.offset;
+
+  const std::string sectionPath = std::string(preparation.cacheRoot()) + "/gen_" +
+                                  std::to_string(preparation.generation()) + "/sections/000000.xhtml";
+  ASSERT_TRUE(harness.storage.exists(sectionPath));
+  const std::vector<uint8_t>& bytes = harness.storage.bytes(sectionPath);
+  const std::string xhtml(bytes.begin(), bytes.end());
+  EXPECT_NE(xhtml.find("<p id=\"b00000000\">HABITS CREATE THE FOUNDATION FOR MASTERY.</p>"),
+            std::string::npos)
+      << xhtml;
+  EXPECT_EQ(xhtml.find("<h1"), std::string::npos) << xhtml;
+  EXPECT_EQ(xhtml.find("<h2"), std::string::npos) << xhtml;
+}
+
+TEST(PdfPreparation, KeepsSplitFullWidthHeadingAheadOfColumnText) {
+  constexpr char sourcePath[] = "/books/split-heading-columns.pdf";
+  std::string content =
+      "BT /F1 12 Tf "
+      "1 0 0 1 72 720 Tm (ONETIME ACTIONS THA) Tj "
+      "1 0 0 1 300 720 Tm (T LOCK IN GOOD HABITS) Tj ";
+  for (uint8_t row = 0; row < 6; ++row) {
+    char line[128]{};
+    const int length = std::snprintf(line, sizeof(line),
+                                     "1 0 0 1 72 %u Tm (left item %u) Tj "
+                                     "1 0 0 1 300 %u Tm (right item %u) Tj ",
+                                     static_cast<unsigned>(680U - row * 16U), static_cast<unsigned>(row),
+                                     static_cast<unsigned>(680U - row * 16U), static_cast<unsigned>(row));
+    ASSERT_GT(length, 0);
+    ASSERT_LT(static_cast<size_t>(length), sizeof(line));
+    content.append(line, static_cast<size_t>(length));
+  }
+  content += "ET";
+  PreparationHarness harness;
+  harness.storage.addFile(sourcePath, makeOnePageTextPdf(content), 1234, true);
+
+  PdfPreparation preparation;
+  ASSERT_TRUE(preparation.begin(harness.config(sourcePath)).ok());
+  const PdfStepResult result = runToTerminal(preparation, harness);
+  ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error) << "@" << result.status.offset;
+
+  const std::string sectionPath = std::string(preparation.cacheRoot()) + "/gen_" +
+                                  std::to_string(preparation.generation()) + "/sections/000000.xhtml";
+  ASSERT_TRUE(harness.storage.exists(sectionPath));
+  const std::vector<uint8_t>& bytes = harness.storage.bytes(sectionPath);
+  const std::string xhtml(bytes.begin(), bytes.end());
+  const size_t heading = xhtml.find("<h1 id=\"b00000000\">ONETIME ACTIONS THAT LOCK IN GOOD HABITS</h1>");
+  ASSERT_NE(heading, std::string::npos) << xhtml;
+  EXPECT_LT(heading, xhtml.find("left item 0")) << xhtml;
+  EXPECT_EQ(xhtml.find("<h2"), std::string::npos) << xhtml;
+}
+
 TEST(PdfPreparation, OrdersColumnsDownBeforePreservingRowMajorTableCells) {
   constexpr char sourcePath[] = "/books/columns-table.pdf";
   PreparationHarness harness;
@@ -873,10 +1016,12 @@ TEST(PdfPreparation, OrdersColumnsDownBeforePreservingRowMajorTableCells) {
   const std::vector<uint8_t>& bytes = harness.storage.bytes(sectionPath);
   const std::string xhtml(bytes.begin(), bytes.end());
   const char* const expectedBlocks[] = {
-      "<p id=\"b00000000\">Left one.</p>",  "<p id=\"b00000001\">Left two.</p>",
-      "<p id=\"b00000002\">Right one.</p>", "<p id=\"b00000003\">Right two.</p>",
-      "<p id=\"b00000004\">Name</p>",       "<p id=\"b00000005\">Value</p>",
-      "<p id=\"b00000006\">Alpha</p>",      "<p id=\"b00000007\">10</p>",
+      "<p id=\"b00000000\">Left one. Left two.</p>",
+      "<p id=\"b00000001\">Right one. Right two.</p>",
+      "<p id=\"b00000002\">Name</p>",
+      "<p id=\"b00000003\">Value</p>",
+      "<p id=\"b00000004\">Alpha</p>",
+      "<p id=\"b00000005\">10</p>",
   };
   size_t previous = 0;
   for (const char* const expected : expectedBlocks) {
@@ -902,6 +1047,65 @@ TEST(PdfPreparation, OrdersColumnsDownBeforePreservingRowMajorTableCells) {
   EXPECT_EQ(sections[0].firstWordOrdinal, 0U);
   EXPECT_EQ(sections[0].wordCount, 12U);
   EXPECT_EQ(sections[0].firstAnchorOrdinal, 0U);
+}
+
+TEST(PdfPreparation, SeparatesWideSameLineTableCellsWhenTheFontAlsoContainsSpaces) {
+  constexpr char sourcePath[] = "/books/wide-table-cells.pdf";
+  std::string content = "BT /F1 10 Tf ";
+  for (uint8_t line = 0; line < 12; ++line) {
+    char body[96]{};
+    const int length = std::snprintf(body, sizeof(body),
+                                     "1 0 0 1 72 %u Tm (Body line %u keeps prose in one column.) Tj ",
+                                     static_cast<unsigned>(760U - line * 12U), static_cast<unsigned>(line));
+    ASSERT_GT(length, 0);
+    ASSERT_LT(static_cast<size_t>(length), sizeof(body));
+    content.append(body, static_cast<size_t>(length));
+  }
+  content +=
+      "1 0 0 1 72 580 Tm (Very easy) Tj "
+      "1 0 0 1 180 580 Tm (Easy) Tj "
+      "1 0 0 1 270 580 Tm (Moderate) Tj "
+      "1 0 0 1 380 580 Tm (Hard) Tj "
+      "1 0 0 1 470 580 Tm (Very hard) Tj "
+      "1 0 0 1 72 568 Tm (Put on shoes) Tj "
+      "1 0 0 1 180 568 Tm (Walk ten minutes) Tj "
+      "1 0 0 1 270 568 Tm (Walk ten thousand steps) Tj "
+      "1 0 0 1 380 568 Tm (Run a 5K) Tj "
+      "1 0 0 1 470 568 Tm (Run a marathon) Tj "
+      "1 0 0 1 72 548 Tm (Open your) Tj "
+      "1 0 0 1 72 536 Tm (notes) Tj "
+      "1 0 0 1 180 548 Tm (Study for ten) Tj "
+      "1 0 0 1 180 536 Tm (minutes) Tj "
+      "1 0 0 1 300 548 Tm (Earn a) Tj "
+      "1 0 0 1 300 536 Tm (degree) Tj "
+      "1 0 0 1 430 548 Tm (Write a) Tj "
+      "1 0 0 1 430 536 Tm (book) Tj "
+      "1 0 0 1 90 490 Tm (Continue with the surrounding paragraph and) Tj "
+      "1 0 0 1 72 478 Tm (join its next visual line normally.) Tj ET";
+  PreparationHarness harness;
+  harness.storage.addFile(sourcePath, makeOnePageTextPdf(content), 1234, true);
+
+  PdfPreparation preparation;
+  ASSERT_TRUE(preparation.begin(harness.config(sourcePath)).ok());
+  const PdfStepResult result = runToTerminal(preparation, harness);
+  ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error) << "@" << result.status.offset;
+
+  const std::string sectionPath = std::string(preparation.cacheRoot()) + "/gen_" +
+                                  std::to_string(preparation.generation()) + "/sections/000000.xhtml";
+  ASSERT_TRUE(harness.storage.exists(sectionPath));
+  const std::vector<uint8_t>& bytes = harness.storage.bytes(sectionPath);
+  const std::string xhtml(bytes.begin(), bytes.end());
+  EXPECT_NE(xhtml.find(">Very easy Easy Moderate Hard Very hard</p>"), std::string::npos) << xhtml;
+  EXPECT_NE(xhtml.find(">Put on shoes Walk ten minutes Walk ten thousand steps Run a 5K Run a marathon</p>"),
+            std::string::npos)
+      << xhtml;
+  EXPECT_NE(xhtml.find(">Open your notes</p>"), std::string::npos) << xhtml;
+  EXPECT_NE(xhtml.find(">Study for ten minutes</p>"), std::string::npos) << xhtml;
+  EXPECT_NE(xhtml.find(">Earn a degree</p>"), std::string::npos) << xhtml;
+  EXPECT_NE(xhtml.find(">Write a book</p>"), std::string::npos) << xhtml;
+  EXPECT_NE(xhtml.find(">Continue with the surrounding paragraph and join its next visual line normally.</p>"),
+            std::string::npos)
+      << xhtml;
 }
 
 TEST(PdfPreparation, OrdersMaximumThreeColumnPageAcrossAtLeastEightBoundedSlices) {
@@ -948,13 +1152,11 @@ TEST(PdfPreparation, OrdersMaximumThreeColumnPageAcrossAtLeastEightBoundedSlices
   const auto& sectionBytes = harness.storage.bytes(sectionPath);
   const std::string xhtml(sectionBytes.begin(), sectionBytes.end());
   size_t previous = 0;
-  uint16_t anchor = 0;
   for (uint8_t column = 0; column < 3; ++column) {
     const uint16_t rows = column == 0 ? 86U : 85U;
     for (uint16_t row = 0; row < rows; ++row) {
       char expected[64]{};
-      const int length = std::snprintf(expected, sizeof(expected), "<p id=\"b%08x\">%c%03u</p>",
-                                       static_cast<unsigned>(anchor++), static_cast<char>('A' + column),
+      const int length = std::snprintf(expected, sizeof(expected), "%c%03u", static_cast<char>('A' + column),
                                        static_cast<unsigned>(row));
       ASSERT_GT(length, 0);
       ASSERT_LT(static_cast<size_t>(length), sizeof(expected));
