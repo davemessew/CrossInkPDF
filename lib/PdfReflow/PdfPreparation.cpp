@@ -1424,6 +1424,16 @@ PdfStatus closeDurableWriter(const PdfCacheIo& io, PdfCacheHandle* const handle)
   return status ? closeStatus : status;
 }
 
+PdfStatus closeTemporaryWriter(const PdfCacheIo& io, PdfCacheHandle* const handle) {
+  if (handle == nullptr || !handle->valid()) {
+    return PdfStatus::failure(PdfError::InvalidArgument);
+  }
+  // HalFile::close delegates to SdFat close, which synchronizes the file and
+  // reports failure. A preceding explicit sync only repeats that card work for
+  // a temporary file that is immediately reopened or discarded.
+  return io.close(io.context, handle);
+}
+
 template <typename T>
 void resetInPlace(T& value) {
   value.~T();
@@ -5481,7 +5491,7 @@ PdfStepResult PdfPreparation::stepResolverObjectStoreWriter(PdfWorkBudget& budge
     if (!budget.consumeOperation()) {
       return PdfStepResult::paused();
     }
-    const PdfStatus status = closeDurableWriter(config_.io, &inlineNavigationSpoolHandle_);
+    const PdfStatus status = closeTemporaryWriter(config_.io, &inlineNavigationSpoolHandle_);
     if (!status) {
       abortInlineNavigationSpill();
       return PdfStepResult::failure(status);
@@ -5549,7 +5559,7 @@ PdfStepResult PdfPreparation::stepResolverObjectStoreReader(PdfWorkBudget& budge
     if (!budget.consumeOperation()) {
       return PdfStepResult::paused();
     }
-    const PdfStatus status = closeDurableWriter(config_.io, &resolverObjectStoreHandle_);
+    const PdfStatus status = closeTemporaryWriter(config_.io, &resolverObjectStoreHandle_);
     resolverObjectStoreMode_ = ResolverObjectStoreMode::Closed;
     return status ? PdfStepResult::paused() : PdfStepResult::failure(status);
   }
@@ -12756,7 +12766,7 @@ PdfStepResult PdfPreparation::repairFailedImageSections(PdfWorkBudget& budget) {
   }
 
   if (runtime->stage == SectionRepairStage::CloseTemporary) {
-    PdfStatus status = closeDurableWriter(config_.io, &runtime->temporaryWriter);
+    PdfStatus status = closeTemporaryWriter(config_.io, &runtime->temporaryWriter);
     const PdfStatus closeStatus =
         runtime->reader.valid() ? config_.io.close(config_.io.context, &runtime->reader) : PdfStatus::success();
     if (status && !closeStatus) {
@@ -14242,7 +14252,7 @@ PdfStepResult PdfPreparation::decodePreparedFonts(PdfWorkBudget& budget) {
     if (!budget.consumeOperation()) {
       return PdfStepResult::paused();
     }
-    const PdfStatus status = closeDurableWriter(config_.io, &inlineNavigationSpoolHandle_);
+    const PdfStatus status = closeTemporaryWriter(config_.io, &inlineNavigationSpoolHandle_);
     if (!status) {
       abortPreparedFontStore();
       return PdfStepResult::failure(status);
@@ -16481,7 +16491,7 @@ PdfStepResult PdfPreparation::finishInlineImageData(PdfWorkBudget& budget) {
           return PdfStepResult::paused();
         }
       }
-      status = closeDurableWriter(config_.io, &inlineNavigationSpoolHandle_);
+      status = closeTemporaryWriter(config_.io, &inlineNavigationSpoolHandle_);
       if (!status) {
         abortInlineNavigationSpill();
         return PdfStepResult::failure(status);
@@ -16892,7 +16902,7 @@ PdfStepResult PdfPreparation::stepObservedJournalSpill(PdfWorkBudget& budget) {
     if (!budget.consumeOperation()) {
       return PdfStepResult::paused();
     }
-    const PdfStatus status = closeDurableWriter(config_.io, &inlineNavigationSpoolHandle_);
+    const PdfStatus status = closeTemporaryWriter(config_.io, &inlineNavigationSpoolHandle_);
     if (!status) {
       return PdfStepResult::failure(status);
     }

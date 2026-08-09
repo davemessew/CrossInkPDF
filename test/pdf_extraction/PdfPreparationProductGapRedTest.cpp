@@ -1328,8 +1328,8 @@ TEST(PdfPreparationProductGapRed, CancellingDecodeFontsClosesAndRemovesTheCarrie
   EXPECT_FALSE(harness.storage.exists(fontStorePath));
 }
 
-TEST(PdfPreparationProductGapRed, DecodeFontWriterSyncFailureClosesAndRemovesTheTemporaryStore) {
-  constexpr char sourcePath[] = "/books/product-gap-font-sync-failure.pdf";
+TEST(PdfPreparationProductGapRed, DecodeFontWriterCloseFailureClosesAndRemovesTheTemporaryStore) {
+  constexpr char sourcePath[] = "/books/product-gap-font-close-failure.pdf";
   PreparationHarness harness;
   harness.storage.setMaximumReadHandles(1);
   harness.storage.addFile(sourcePath, actualTextAndToUnicodePdf(), 1234, true);
@@ -1353,7 +1353,7 @@ TEST(PdfPreparationProductGapRed, DecodeFontWriterSyncFailureClosesAndRemovesThe
   }
   ASSERT_FALSE(fontStorePath.empty());
 
-  harness.storage.fail(PdfTestFaultPoint::Sync);
+  harness.storage.fail(PdfTestFaultPoint::Close);
   const PdfStepResult failed = runToTerminal(preparation, harness);
 
   ASSERT_TRUE(failed.failed());
