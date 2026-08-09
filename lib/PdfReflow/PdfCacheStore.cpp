@@ -366,6 +366,19 @@ PdfStatus pdfWriteTrackedCacheFile(PdfCacheTrackedWriter* const writer, const ui
   return PdfStatus::success();
 }
 
+PdfStatus pdfSyncTrackedCacheFile(PdfCacheTrackedWriter* const writer, PdfRequiredFileRecord* const record) {
+  if (writer == nullptr || record == nullptr || !writer->open || writer->failed) {
+    return PdfStatus::failure(PdfError::InvalidArgument);
+  }
+  const PdfStatus status = writer->io.sync(writer->io.context, writer->handle);
+  if (!status) {
+    writer->failed = true;
+    return status;
+  }
+  *record = writer->record;
+  return PdfStatus::success();
+}
+
 PdfStatus pdfCloseTrackedCacheFile(PdfCacheTrackedWriter* const writer, PdfRequiredFileRecord* const record) {
   if (writer == nullptr || record == nullptr || !writer->open || writer->failed) {
     return PdfStatus::failure(PdfError::InvalidArgument);

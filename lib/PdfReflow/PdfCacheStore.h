@@ -84,6 +84,7 @@ PdfStatus pdfReserveCacheBytes(PdfCacheBudget* budget, uint64_t bytes, PdfCacheF
 PdfStatus pdfOpenTrackedCacheWriter(const PdfCacheIo& io, const char* fullPath, const char* relativePath,
                                     PdfCacheFileKind kind, uint64_t byteLimit, PdfCacheTrackedWriter* writer);
 PdfStatus pdfWriteTrackedCacheFile(PdfCacheTrackedWriter* writer, const uint8_t* bytes, size_t length);
+PdfStatus pdfSyncTrackedCacheFile(PdfCacheTrackedWriter* writer, PdfRequiredFileRecord* record);
 PdfStatus pdfCloseTrackedCacheFile(PdfCacheTrackedWriter* writer, PdfRequiredFileRecord* record);
 void pdfAbortTrackedCacheFile(PdfCacheTrackedWriter* writer);
 

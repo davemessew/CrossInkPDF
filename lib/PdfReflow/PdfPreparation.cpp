@@ -17081,11 +17081,24 @@ PdfStepResult PdfPreparation::stepOpenSection(PdfWorkBudget& budget) {
   if (byteLimit <= baseSize) {
     return PdfStepResult::failure(PdfStatus::failure(PdfError::InsufficientStorage));
   }
-  PdfStatus status =
-      newSection ? pdfOpenTrackedCacheWriter(config_.io, sectionPath_, sectionRelativePath_,
-                                             PdfCacheFileKind::Required, byteLimit, &outputWriter_)
-                 : resumeTrackedWriter(config_.io, sectionPath_, navigation_->preparedPageScratch.file, byteLimit,
-                                       &outputWriter_);
+  const bool retainedWriter = outputWriter_.open;
+  PdfStatus status = PdfStatus::success();
+  if (retainedWriter) {
+    const PdfRequiredFileRecord& file = navigation_->preparedPageScratch.file;
+    if (newSection || outputWriter_.failed || outputWriter_.record.size != file.size ||
+        outputWriter_.record.crc32 != file.crc32 || outputWriter_.record.pathLength != file.pathLength ||
+        std::memcmp(outputWriter_.record.path, file.path, file.pathLength) != 0 ||
+        std::strcmp(outputWriter_.fullPath, sectionPath_) != 0) {
+      status = PdfStatus::failure(PdfError::InvalidArgument, currentPageIndex_);
+    } else {
+      outputWriter_.byteLimit = byteLimit;
+    }
+  } else {
+    status = newSection ? pdfOpenTrackedCacheWriter(config_.io, sectionPath_, sectionRelativePath_,
+                                                    PdfCacheFileKind::Required, byteLimit, &outputWriter_)
+                        : resumeTrackedWriter(config_.io, sectionPath_, navigation_->preparedPageScratch.file,
+                                              byteLimit, &outputWriter_);
+  }
   if (!status) {
     sectionOpenPrepared_ = false;
     return PdfStepResult::failure(status);
@@ -17135,10 +17148,22 @@ PdfStepResult PdfPreparation::stepFinishPendingSection(PdfWorkBudget& budget) {
       const uint64_t baseSize = navigation_->preparedPageScratch.file.size;
       const uint64_t remaining = used >= cacheBudget_.limit ? 0 : cacheBudget_.limit - used;
       const uint64_t byteLimit = baseSize + remaining;
-      status = length > 0 && static_cast<size_t>(length) < sizeof(sectionPath_) && byteLimit > baseSize
-                   ? resumeTrackedWriter(config_.io, sectionPath_, navigation_->preparedPageScratch.file, byteLimit,
-                                         &outputWriter_)
-                   : PdfStatus::failure(PdfError::InsufficientStorage, sectionCount_ - 1U);
+      if (length <= 0 || static_cast<size_t>(length) >= sizeof(sectionPath_) || byteLimit <= baseSize) {
+        status = PdfStatus::failure(PdfError::InsufficientStorage, sectionCount_ - 1U);
+      } else if (outputWriter_.open) {
+        const PdfRequiredFileRecord& file = navigation_->preparedPageScratch.file;
+        if (outputWriter_.failed || outputWriter_.record.size != file.size ||
+            outputWriter_.record.crc32 != file.crc32 || outputWriter_.record.pathLength != file.pathLength ||
+            std::memcmp(outputWriter_.record.path, file.path, file.pathLength) != 0 ||
+            std::strcmp(outputWriter_.fullPath, sectionPath_) != 0) {
+          status = PdfStatus::failure(PdfError::InvalidArgument, sectionCount_ - 1U);
+        } else {
+          outputWriter_.byteLimit = byteLimit;
+        }
+      } else {
+        status = resumeTrackedWriter(config_.io, sectionPath_, navigation_->preparedPageScratch.file, byteLimit,
+                                     &outputWriter_);
+      }
     }
     if (!status) {
       return PdfStepResult::failure(status);
@@ -17556,7 +17581,30 @@ PdfStepResult PdfPreparation::stepCloseSection(PdfWorkBudget& budget) {
     sectionCloseNewSection_ = navigation_->preparedPageScratch.firstSourcePage ==
                               navigation_->preparedPageScratch.lastSourcePageExclusive;
     const uint64_t previousSize = navigation_->preparedPageScratch.file.size;
-    PdfStatus status = pdfCloseTrackedCacheFile(&outputWriter_, &sectionRecord_);
+    if (!outputWriter_.open || outputWriter_.failed || outputWriter_.record.size < previousSize) {
+      return PdfStepResult::failure(PdfStatus::failure(PdfError::InvalidArgument, currentPageIndex_));
+    }
+    const uint64_t prospectiveAdded = outputWriter_.record.size - previousSize;
+    if (currentBlockIndex_ >= extractedBlockCount_ && retainedImageFileCount_ == 0 && cumulativeImageBytes_ == 0 &&
+        imageBuildSpool_.recordCount() == 0) {
+      const uint32_t completedPages = currentPageIndex_ + 1U;
+      if (checkpointGate_.completedPages < durableResumePage_) {
+        pdfCheckpointCommitted(&checkpointGate_, durableResumePage_, checkpointSelection_.checkpoint.outputBytes,
+                               nowMs());
+      }
+      const uint64_t outputBytes = cumulativeSectionBytes_ + prospectiveAdded + cumulativeImageBytes_;
+      const bool forced = completedPages == 1U || completedPages == pageCount_;
+      pageResumeCheckpointPending_ =
+          pdfCheckpointDue(checkpointGate_, completedPages, outputBytes, nowMs(), forced);
+    }
+    const bool closeWriter = !pendingSectionFinish_;
+    PdfStatus status = closeWriter ? pdfCloseTrackedCacheFile(&outputWriter_, &sectionRecord_)
+                                   : pageResumeCheckpointPending_
+                                         ? pdfSyncTrackedCacheFile(&outputWriter_, &sectionRecord_)
+                                         : PdfStatus::success();
+    if (status && !closeWriter && !pageResumeCheckpointPending_) {
+      sectionRecord_ = outputWriter_.record;
+    }
     if (status) {
       if (sectionRecord_.size < previousSize) {
         status = PdfStatus::failure(PdfError::Malformed, sectionRecord_.size);
@@ -20497,15 +20545,6 @@ PdfStepResult PdfPreparation::step() {
       if (currentBlockIndex_ < extractedBlockCount_) {
         setPhase(PdfPreparationPhase::OpenSection, 78);
       } else if (retainedImageFileCount_ == 0 && cumulativeImageBytes_ == 0 && imageBuildSpool_.recordCount() == 0) {
-        const uint32_t completedPages = currentPageIndex_ + 1U;
-        if (checkpointGate_.completedPages < durableResumePage_) {
-          pdfCheckpointCommitted(&checkpointGate_, durableResumePage_, checkpointSelection_.checkpoint.outputBytes,
-                                 nowMs());
-        }
-        const uint64_t outputBytes = cumulativeSectionBytes_ + cumulativeImageBytes_;
-        const bool forced = completedPages == 1U || completedPages == pageCount_;
-        pageResumeCheckpointPending_ =
-            pdfCheckpointDue(checkpointGate_, completedPages, outputBytes, nowMs(), forced);
         setPhase(PdfPreparationPhase::CommitResumePoint, 90);
       } else {
         pendingSectionBoundary_ = false;
