@@ -828,6 +828,11 @@ class PdfPreparation {
   PdfStatus beginObservedJournalSpill(const PdfToken* retryToken = nullptr);
   PdfStepResult stepObservedJournalSpill(PdfWorkBudget& budget);
   uint8_t* preparedNavigationSpillBytes(size_t offset, size_t* contiguousBytes);
+  PdfStatus prepareFontNavigationSnapshot();
+  void resetFontNavigationSnapshot();
+  uint8_t* fontNavigationSnapshotStorageBytes(size_t offset, size_t* contiguousBytes);
+  uint8_t* fontNavigationSnapshotFieldBytes(NavigationWorkspace* workspace, size_t offset,
+                                            size_t* contiguousBytes);
   bool preparedContentRuntimeConstructed() const;
   void destroyPreparedContentRuntime();
   void abortPreparedContentStore();
@@ -1052,7 +1057,14 @@ class PdfPreparation {
   uint64_t inlineNavigationSpoolOffset_ = 0;
   uint32_t inlineNavigationSpoolCrc32_ = 0;
   uint32_t inlineNavigationSpoolReadCrc32_ = 0;
+  uint16_t fontNavigationSnapshotBytes_ = 0;
+  uint16_t fontNavigationPageWindowBytes_ = 0;
+  uint16_t fontNavigationLinkCount_ = 0;
   uint16_t inlineImagePredictorColumns_ = 1;
+  uint8_t fontNavigationXObjectCount_ = 0;
+  uint8_t fontNavigationPageLabelCount_ = 0;
+  uint8_t fontNavigationImageCacheEntryCount_ = 0;
+  uint8_t fontNavigationImageCandidateCount_ = 0;
   uint8_t inlineImageFilterCount_ = 0;
   uint8_t inlineImageKeyLength_ = 0;
   uint8_t inlineImageDecodeValueCount_ = 0;
@@ -1065,6 +1077,7 @@ class PdfPreparation {
   bool inlineImageCaptureStarted_ = false;
   bool inlineImageCaptureFailed_ = false;
   bool inlineImageSupported_ = true;
+  bool compactFontNavigation_ = false;
   InlineImageContainer inlineImageContainer_ = InlineImageContainer::None;
   InlineIndexedStage inlineIndexedStage_ = InlineIndexedStage::Family;
   InlineNavigationSpillStage inlineNavigationSpillStage_ = InlineNavigationSpillStage::None;
