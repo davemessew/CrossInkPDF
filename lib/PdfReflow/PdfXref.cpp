@@ -289,7 +289,7 @@ void PdfXrefTable::configureBinaryLookup(PdfXrefLookupState* const state) const 
 void PdfXrefTable::rememberVictim(const PdfXrefEntry& entry, const uint32_t ordinal) const {
   uint8_t existing = victimCount_;
   for (uint8_t index = 0; index < victimCount_; ++index) {
-    if (victimEntries_[index].objectNumber == entry.objectNumber) {
+    if (victimEntries()[index].objectNumber == entry.objectNumber) {
       existing = index;
       break;
     }
@@ -298,10 +298,10 @@ void PdfXrefTable::rememberVictim(const PdfXrefEntry& entry, const uint32_t ordi
       existing < victimCount_ ? victimCount_ : std::min<uint8_t>(kVictimEntries, victimCount_ + 1U);
   const uint8_t shiftFrom = existing < victimCount_ ? existing : static_cast<uint8_t>(destinationCount - 1U);
   for (uint8_t index = shiftFrom; index != 0; --index) {
-    victimEntries_[index] = victimEntries_[index - 1U];
+    victimEntries()[index] = victimEntries()[index - 1U];
     victimOrdinals_[index] = victimOrdinals_[index - 1U];
   }
-  victimEntries_[0] = entry;
+  victimEntries()[0] = entry;
   victimOrdinals_[0] = ordinal;
   victimCount_ = destinationCount;
 }
@@ -337,9 +337,9 @@ PdfStatus PdfXrefTable::appendNewest(const PdfXrefEntry& entry) {
     }
     return status;
   }
-  victimEntries_[appendBatchCount_++] = entry;
+  entryStorage_[appendBatchCount_++] = entry;
   ++entryCount_;
-  return appendBatchCount_ == kVictimEntries ? flushPendingWrites() : PdfStatus::success();
+  return appendBatchCount_ == kAppendBatchEntries ? flushPendingWrites() : PdfStatus::success();
 }
 
 PdfStatus PdfXrefTable::flushPendingWrites() {
@@ -351,7 +351,7 @@ PdfStatus PdfXrefTable::flushPendingWrites() {
     return PdfStatus::failure(PdfError::InvalidArgument, appendBatchCount_);
   }
   const uint32_t first = entryCount_ - appendBatchCount_;
-  const PdfStatus status = pdfWriteRecords(records_, first, victimEntries_, appendBatchCount_);
+  const PdfStatus status = pdfWriteRecords(records_, first, entryStorage_, appendBatchCount_);
   if (status) {
     appendBatchCount_ = 0;
   }
@@ -528,8 +528,8 @@ PdfStatus PdfXrefTable::beginFind(const uint32_t objectNumber, PdfXrefLookupStat
   *state = {};
   state->objectNumber = objectNumber;
   for (uint8_t index = 0; index < lookupWindowCount_; ++index) {
-    if (lookupWindow_[index].objectNumber == objectNumber) {
-      state->entry = lookupWindow_[index];
+    if (lookupWindowEntries()[index].objectNumber == objectNumber) {
+      state->entry = lookupWindowEntries()[index];
       state->phase = PdfXrefLookupPhase::Done;
       lastLookupOrdinal_ = lookupWindowFirstOrdinal_ + index;
       hasLastLookupOrdinal_ = true;
@@ -539,8 +539,8 @@ PdfStatus PdfXrefTable::beginFind(const uint32_t objectNumber, PdfXrefLookupStat
     }
   }
   for (uint8_t index = 0; index < victimCount_; ++index) {
-    if (victimEntries_[index].objectNumber == objectNumber) {
-      state->entry = victimEntries_[index];
+    if (victimEntries()[index].objectNumber == objectNumber) {
+      state->entry = victimEntries()[index];
       state->phase = PdfXrefLookupPhase::Done;
       lastLookupOrdinal_ = victimOrdinals_[index];
       hasLastLookupOrdinal_ = true;
@@ -703,7 +703,7 @@ PdfStepResult PdfXrefTable::stepFind(PdfXrefLookupState& state, PdfXrefEntry* co
       hasLastLookupOrdinal_ = true;
       lookupWindowCount_ = 0;
       lookupWindowFirstOrdinal_ = state.first;
-      lookupWindow_[0] = state.entry;
+      lookupWindowEntries()[0] = state.entry;
       ++lookupWindowToken_;
       if (lookupWindowToken_ == 0) {
         ++lookupWindowToken_;
@@ -739,7 +739,8 @@ PdfStepResult PdfXrefTable::stepFind(PdfXrefLookupState& state, PdfXrefEntry* co
       }
       --budget.operationsRemaining;
       budget.bytesRemaining -= sizeof(PdfXrefEntry);
-      if (!pdfReadRecord(records_, lookupWindowFirstOrdinal_ + state.cursor, &lookupWindow_[state.cursor]).ok()) {
+      if (!pdfReadRecord(records_, lookupWindowFirstOrdinal_ + state.cursor,
+                         &lookupWindowEntries()[state.cursor]).ok()) {
         lookupWindowCount_ = 0;
         state.phase = PdfXrefLookupPhase::Done;
         *entry = state.entry;

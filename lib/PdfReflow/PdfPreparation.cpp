@@ -44,12 +44,17 @@ constexpr uint16_t kNavigationArenaTextBytes =
 constexpr uint32_t kXrefRecordCount = 256;
 constexpr uint32_t kFinalXrefRecordCount = 512;
 constexpr uint32_t kMaximumXrefRecords = PdfLimits::MaxXrefRecords;
-constexpr uint8_t kXrefSortInputBatchRecords = 25;
-constexpr uint8_t kXrefSortOutputBatchRecords = 35;
-constexpr uint8_t kXrefSortBatchRecords =
-    2U * kXrefSortInputBatchRecords + kXrefSortOutputBatchRecords;
-static_assert(static_cast<size_t>(kXrefSortBatchRecords) * sizeof(PdfXrefEntry) <=
+constexpr uint8_t kXrefCompactInputBatchRecords = 25;
+constexpr uint8_t kXrefCompactOutputBatchRecords = 35;
+constexpr uint8_t kXrefFinalInputBatchRecords = 64;
+constexpr uint8_t kXrefFinalOutputBatchRecords = 128;
+static_assert(static_cast<size_t>(2U * kXrefCompactInputBatchRecords + kXrefCompactOutputBatchRecords) *
+                  sizeof(PdfXrefEntry) <=
               PdfLimits::OperandOrderHistogramBytes);
+static_assert(static_cast<size_t>(2U * kXrefFinalInputBatchRecords + kXrefFinalOutputBatchRecords) *
+                  sizeof(PdfXrefEntry) <=
+              PdfLimits::PageTextBytes);
+static_assert(static_cast<size_t>(kXrefFinalOutputBatchRecords) * sizeof(PdfXrefEntry) <= kSliceBytes);
 constexpr uint32_t kTraversalRecordCount = 64;
 constexpr uint32_t kMaximumAnnotationOverflowRecords =
     PdfLimits::MaxPages * (static_cast<uint32_t>(UINT16_MAX) - PdfLimits::MaxLinkAnnotationsPerPage);
@@ -5726,7 +5731,8 @@ PdfStatus PdfPreparation::switchResolverSourceAccess(const PdfObjectResolverRead
 }
 
 PdfStepResult PdfPreparation::stepSortXref(PdfWorkBudget& budget) {
-  if (!xref_.has_value() || !runRecords_ || !operandScratch_ || (!xrefSortResumeParsing_ && !dictionary_)) {
+  if (!xref_.has_value() || !runRecords_ || !operandScratch_ || !pageText_ ||
+      (!xrefSortResumeParsing_ && !dictionary_)) {
     return PdfStepResult::failure(PdfStatus::failure(PdfError::InvalidArgument));
   }
   auto consumeRecordIo = [&budget](const uint32_t count) {
@@ -5743,10 +5749,15 @@ PdfStepResult PdfPreparation::stepSortXref(PdfWorkBudget& budget) {
   auto* const initialScratch = initialBuffer + initialRecordCount;
   static_assert(2U * kXrefRecordCount * sizeof(PdfXrefEntry) <= PdfLimits::PageRunBytes);
   static_assert(2U * kFinalXrefRecordCount * sizeof(PdfXrefEntry) <= PdfLimits::UzlibDictionaryBytes);
-  auto* const mergeBuffer = reinterpret_cast<PdfXrefEntry*>(operandScratch_.get());
+  const uint8_t inputBatchRecords =
+      xrefSortResumeParsing_ ? kXrefCompactInputBatchRecords : kXrefFinalInputBatchRecords;
+  const uint8_t outputBatchRecords =
+      xrefSortResumeParsing_ ? kXrefCompactOutputBatchRecords : kXrefFinalOutputBatchRecords;
+  auto* const mergeBuffer = reinterpret_cast<PdfXrefEntry*>(
+      xrefSortResumeParsing_ ? operandScratch_.get() : pageText_.get());
   auto* const leftBatch = mergeBuffer;
-  auto* const rightBatch = leftBatch + kXrefSortInputBatchRecords;
-  auto* const outputBatch = rightBatch + kXrefSortInputBatchRecords;
+  auto* const rightBatch = leftBatch + inputBatchRecords;
+  auto* const outputBatch = rightBatch + inputBatchRecords;
 
   if (xrefSortStage_ == XrefSortStage::Idle) {
     const PdfStatus flushStatus = xref_->flushPendingWrites();
@@ -5966,7 +5977,7 @@ PdfStepResult PdfPreparation::stepSortXref(PdfWorkBudget& budget) {
 
   if (xrefSortStage_ == XrefSortStage::Merge) {
     while (!budget.stopRequested()) {
-      if (xrefSortBufferIndex_ == kXrefSortOutputBatchRecords ||
+      if (xrefSortBufferIndex_ == outputBatchRecords ||
           (xrefSortDestination_ >= xrefSortEnd_ && xrefSortBufferIndex_ != 0)) {
         if (!consumeRecordIo(xrefSortBufferIndex_)) {
           return PdfStepResult::paused();
@@ -6001,7 +6012,7 @@ PdfStepResult PdfPreparation::stepSortXref(PdfWorkBudget& budget) {
         xrefSortRightBatchCount_ = 0;
       }
       if (xrefSortLeftBatchIndex_ >= xrefSortLeftBatchCount_ && xrefSortLeftIndex_ < xrefSortMiddle_) {
-        const uint32_t count = std::min<uint32_t>(kXrefSortInputBatchRecords,
+        const uint32_t count = std::min<uint32_t>(inputBatchRecords,
                                                   xrefSortMiddle_ - xrefSortLeftIndex_);
         if (!consumeRecordIo(count)) {
           return PdfStepResult::paused();
@@ -6017,7 +6028,7 @@ PdfStepResult PdfPreparation::stepSortXref(PdfWorkBudget& budget) {
       }
       if (xrefSortRightBatchIndex_ >= xrefSortRightBatchCount_ && xrefSortRightIndex_ < xrefSortEnd_) {
         const uint32_t count =
-            std::min<uint32_t>(kXrefSortInputBatchRecords, xrefSortEnd_ - xrefSortRightIndex_);
+            std::min<uint32_t>(inputBatchRecords, xrefSortEnd_ - xrefSortRightIndex_);
         if (!consumeRecordIo(count)) {
           return PdfStepResult::paused();
         }
@@ -6057,7 +6068,7 @@ PdfStepResult PdfPreparation::stepSortXref(PdfWorkBudget& budget) {
 
   if (xrefSortStage_ == XrefSortStage::Compact) {
     while (!budget.stopRequested()) {
-      if (xrefSortBufferIndex_ == kXrefSortOutputBatchRecords ||
+      if (xrefSortBufferIndex_ == outputBatchRecords ||
           (xrefSortLeftIndex_ >= xrefSortTotal_ &&
            xrefSortLeftBatchIndex_ >= xrefSortLeftBatchCount_ && xrefSortBufferIndex_ != 0)) {
         if (!consumeRecordIo(xrefSortBufferIndex_)) {
@@ -6079,7 +6090,7 @@ PdfStepResult PdfPreparation::stepSortXref(PdfWorkBudget& budget) {
           return PdfStepResult::paused();
         }
         const uint32_t count =
-            std::min<uint32_t>(kXrefSortInputBatchRecords, xrefSortTotal_ - xrefSortLeftIndex_);
+            std::min<uint32_t>(inputBatchRecords, xrefSortTotal_ - xrefSortLeftIndex_);
         if (!consumeRecordIo(count)) {
           return PdfStepResult::paused();
         }
@@ -17398,11 +17409,11 @@ PdfStepResult PdfPreparation::stepOpenSection(PdfWorkBudget& budget) {
   }
   status = newSection
                ? semanticWriter_.begin({this, writeSection}, {this, emitBlock},
-                                       {operandScratch_.get(), PdfLimits::OperandOrderHistogramBytes}, totalWords_)
+                                       {sourceWindow_.get(), PdfLimits::SourceBufferBytes}, totalWords_)
                : semanticWriter_.resume({this, writeSection}, {this, emitBlock},
-                                        {operandScratch_.get(), PdfLimits::OperandOrderHistogramBytes}, totalWords_,
-                                        nextAnchorOrdinal_ == 0 ? 0 : nextAnchorOrdinal_ - 1U,
-                                        nextAnchorOrdinal_ != 0);
+                                        {sourceWindow_.get(), PdfLimits::SourceBufferBytes}, totalWords_,
+                                         nextAnchorOrdinal_ == 0 ? 0 : nextAnchorOrdinal_ - 1U,
+                                         nextAnchorOrdinal_ != 0);
   if (!status) {
     pdfAbortTrackedCacheFile(&outputWriter_);
   } else {
@@ -19131,7 +19142,9 @@ PdfStepResult PdfPreparation::stepCommitPageResume(PdfWorkBudget& budget) {
   }
   const bool discoveryResume = phase_ == PdfPreparationPhase::CommitDiscoveryResume;
   if (resumePointStage_ == ResumePointStage::Idle) {
-    if (resumeJournalHandle_.valid() || checkpointCommitStage_ != CheckpointCommitStage::Idle ||
+    const bool retainedPageJournal = !discoveryResume && resumeJournalHandle_.valid();
+    if ((discoveryResume && resumeJournalHandle_.valid()) ||
+        checkpointCommitStage_ != CheckpointCommitStage::Idle ||
         (!discoveryResume && currentPageIndex_ >= pageCount_) ||
         (discoveryResume && (currentPageIndex_ != 0 || sectionCount_ != 0 || resumeJournalCommittedBytes_ != 0))) {
       return PdfStepResult::failure(PdfStatus::failure(PdfError::InvalidArgument, currentPageIndex_));
@@ -19169,7 +19182,7 @@ PdfStepResult PdfPreparation::stepCommitPageResume(PdfWorkBudget& budget) {
     if (!status) {
       return PdfStepResult::failure(status);
     }
-    resumePointStage_ = ResumePointStage::OpenJournal;
+    resumePointStage_ = retainedPageJournal ? ResumePointStage::WriteRecord : ResumePointStage::OpenJournal;
     return PdfStepResult::paused();
   }
   if (resumePointStage_ == ResumePointStage::OpenJournal) {
@@ -19519,10 +19532,28 @@ PdfStepResult PdfPreparation::stepCommitPageResume(PdfWorkBudget& budget) {
     if (!status || bytesWritten != kPageResumeRecordBytes) {
       return PdfStepResult::failure(status ? PdfStatus::failure(PdfError::IoFailure, bytesWritten) : status);
     }
-    resumePointStage_ = ResumePointStage::CloseJournal;
+    resumeJournalPhysicalBytes_ += kPageResumeRecordBytes;
+    ++resumeJournalRecordSequence_;
+    resumePointStage_ = pageResumeCheckpointPending_ ? ResumePointStage::CloseJournal : ResumePointStage::Complete;
     return PdfStepResult::paused();
   }
   if (resumePointStage_ == ResumePointStage::CloseJournal) {
+    if (!discoveryResume && pageResumeCheckpointPending_) {
+      if (sourceHandle_.valid()) {
+        if (!budget.consumeOperation()) {
+          return PdfStepResult::paused();
+        }
+        const PdfStatus status = closeSource();
+        return status ? PdfStepResult::paused() : PdfStepResult::failure(status);
+      }
+      if (xrefFinalSpool_ < std::size(xrefSpools_) && !xrefSpools_[xrefFinalSpool_].isOpen()) {
+        if (!budget.consumeOperation()) {
+          return PdfStepResult::paused();
+        }
+        const PdfStatus status = switchResolverSourceAccess(PdfObjectResolverReader::Xref);
+        return status ? PdfStepResult::paused() : PdfStepResult::failure(status);
+      }
+    }
     if (!budget.consumeOperation()) {
       return PdfStepResult::paused();
     }
@@ -19535,9 +19566,6 @@ PdfStepResult PdfPreparation::stepCommitPageResume(PdfWorkBudget& budget) {
     }
     if (discoveryResume) {
       resumeJournalPhysicalBytes_ = cacheSetupFileSize_;
-    } else {
-      resumeJournalPhysicalBytes_ += kPageResumeRecordBytes;
-      ++resumeJournalRecordSequence_;
     }
     resumePointStage_ = discoveryResume || pageResumeCheckpointPending_ ? ResumePointStage::CommitCheckpoint
                                                                         : ResumePointStage::Complete;

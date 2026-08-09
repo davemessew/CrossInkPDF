@@ -1296,6 +1296,30 @@ TEST(PdfPreparation, RejectsLowHeapBeforeOpeningThePdfOrAllocatingWorkspaces) {
   EXPECT_EQ(harness.storage.openCalls(), 0U);
 }
 
+TEST(PdfPreparation, RetainsPageResumeJournalBetweenCheckpoints) {
+  constexpr char sourcePath[] = "/books/three-page-checkpoint-gate.pdf";
+  const std::vector<uint8_t> fixture = makeTwoPageTextPdf(false, true);
+  ASSERT_FALSE(fixture.empty());
+
+  PreparationHarness harness;
+  harness.storage.setMaximumReadHandles(1);
+  harness.storage.addFile(sourcePath, fixture, 1234, true);
+  PdfPreparation preparation;
+  ASSERT_TRUE(preparation.begin(harness.config(sourcePath)).ok());
+
+  const PdfStepResult result = runToTerminal(preparation, harness);
+
+  ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error) << '@' << result.status.offset;
+  const std::string journalPath = std::string(preparation.cacheRoot()) + "/gen_" +
+                                  std::to_string(preparation.generation()) + "/resume.journal";
+  EXPECT_EQ(std::count_if(harness.storage.openObservations().begin(), harness.storage.openObservations().end(),
+                          [&](const PdfTestOpenObservation& observation) {
+                            return observation.path == journalPath && observation.mode == PdfCacheOpenMode::Write;
+                          }),
+            3);
+  EXPECT_EQ(harness.storage.openHandleCount(), 0U);
+}
+
 TEST(PdfPreparation, RecreatedInstanceResumesTheSameGenerationAfterOneVerifiedPage) {
   constexpr char sourcePath[] = "/books/two-page-resume.pdf";
   const std::vector<uint8_t> fixture = makeTwoPageTextPdf();

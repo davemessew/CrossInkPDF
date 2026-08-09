@@ -108,11 +108,14 @@ class PdfXrefTable {
   static constexpr uint8_t kSampleIndexLookupThreshold = 4;
   static constexpr uint16_t kSampleIndexMinimumRecords = 128;
   static constexpr uint8_t kVictimEntries = 24;
+  static constexpr uint8_t kAppendBatchEntries = kLookupWindowEntries + kVictimEntries;
 
   void initializeSampleIndex();
   void configureBinaryLookup(PdfXrefLookupState* state) const;
   void rememberVictim(const PdfXrefEntry& entry, uint32_t ordinal) const;
   bool newestObjectAlreadySeen(uint32_t objectNumber);
+  PdfXrefEntry* lookupWindowEntries() const { return entryStorage_; }
+  PdfXrefEntry* victimEntries() const { return entryStorage_ + kLookupWindowEntries; }
 
   PdfFixedRecordStore records_{};
   uint32_t entryCount_ = 0;
@@ -130,8 +133,10 @@ class PdfXrefTable {
   uint8_t* seenObjectsSecond_ = nullptr;
   size_t seenObjectsFirstBytes_ = 0;
   size_t seenObjectsSecondBytes_ = 0;
-  mutable PdfXrefEntry lookupWindow_[kLookupWindowEntries]{};
-  mutable PdfXrefEntry victimEntries_[kVictimEntries]{};
+  // Parsing and lookup are phase-disjoint. During append, use the complete
+  // cache storage as one larger SD write batch; after finalization, split it
+  // back into the lookup window and victim cache without adding RAM.
+  mutable PdfXrefEntry entryStorage_[kAppendBatchEntries]{};
   mutable uint32_t sampleObjectNumbers_[kSampleIndexEntries]{};
   mutable uint32_t victimOrdinals_[kVictimEntries]{};
   mutable uint32_t lookupWindowFirstOrdinal_ = 0;
@@ -153,7 +158,7 @@ class PdfXrefTable {
   bool newestObjectDense_ = false;
 };
 
-static_assert(sizeof(PdfXrefEntry) * 16U == 384U, "xref read-ahead window must stay at 384 bytes");
+static_assert(sizeof(PdfXrefEntry) * 40U == 960U, "xref entry cache and append batch must stay at 960 bytes");
 static_assert(sizeof(uint32_t) * 56U + sizeof(PdfXrefEntry) * 24U + sizeof(uint32_t) * 24U == 896U,
               "sampled and victim xref indexes must stay within 896 bytes");
 

@@ -497,16 +497,16 @@ TEST(PdfXrefNewestObjectFilterContract, SegmentedBoundariesResetAndDetachStayWit
   EXPECT_TRUE(std::all_of(tail.begin(), tail.end(), [](const uint8_t value) { return value == 0x3cU; }));
 }
 
-TEST(PdfXrefAppendBatchContract, FortyNineSequentialEntriesUseThreePhysicalWritesInExactOrder) {
+TEST(PdfXrefAppendBatchContract, FortyNineSequentialEntriesUseTwoPhysicalWritesInExactOrder) {
   BatchedXrefStore records;
   PdfXrefTable table(records.fixed());
 
   for (uint32_t object = 0; object < 49U; ++object) {
     ASSERT_TRUE(table.appendNewest({object, 0, PdfXrefEntryType::Uncompressed, 0, object * 10ULL, 0}).ok());
   }
-  EXPECT_EQ(records.physicalWrites, 2U);
+  EXPECT_EQ(records.physicalWrites, 1U);
   ASSERT_TRUE(table.flushPendingWrites().ok());
-  EXPECT_EQ(records.physicalWrites, 3U);
+  EXPECT_EQ(records.physicalWrites, 2U);
   EXPECT_EQ(records.recordsWritten, 49U);
   EXPECT_EQ(table.entryCount(), 49U);
   for (uint32_t object = 0; object < 49U; ++object) {
