@@ -4686,11 +4686,45 @@ PdfStatus PdfPreparation::sealPreparedPageSpool() {
   return status;
 }
 
+void PdfPreparation::resetPageRecordReadWindow() {
+  if (navigation_ == nullptr) {
+    return;
+  }
+  constexpr size_t boundaryBytes = PdfOutlineLimits::MaxEntries * sizeof(uint16_t);
+  constexpr size_t headerBytes = 12U;
+  constexpr uint8_t recordCapacity = 8U;
+  static_assert(std::is_trivially_copyable_v<PdfPageInfo>);
+  static_assert(boundaryBytes + headerBytes + recordCapacity * sizeof(PdfPageInfo) <=
+                sizeof(NavigationWorkspace::outlineEntries));
+  auto* const window = reinterpret_cast<uint8_t*>(navigation_->outlineEntries) + boundaryBytes;
+  std::memset(window, 0, headerBytes);
+}
+
 PdfStatus PdfPreparation::loadPageRecord(const uint32_t index) {
   if (navigation_ == nullptr || index >= pageCount_) {
     return PdfStatus::failure(PdfError::InvalidArgument, index);
   }
   if (loadedPageIndex_ == index) {
+    return PdfStatus::success();
+  }
+  const bool sequentialPageLoop = phase_ == PdfPreparationPhase::BeginPage ||
+                                  (phase_ == PdfPreparationPhase::ResolveNavigation &&
+                                   navigationTask_ == NavigationTask::Complete);
+  constexpr size_t boundaryBytes = PdfOutlineLimits::MaxEntries * sizeof(uint16_t);
+  constexpr size_t windowHeaderBytes = 12U;
+  constexpr uint8_t windowRecordCapacity = 8U;
+  constexpr uint32_t windowMagic = 0x50575231U;
+  auto* const window = reinterpret_cast<uint8_t*>(navigation_->outlineEntries) + boundaryBytes;
+  uint32_t storedMagic = 0;
+  uint32_t windowFirst = 0;
+  std::memcpy(&storedMagic, window, sizeof(storedMagic));
+  std::memcpy(&windowFirst, window + sizeof(storedMagic), sizeof(windowFirst));
+  const uint8_t windowCount = window[8];
+  if (sequentialPageLoop && storedMagic == windowMagic && index >= windowFirst &&
+      index - windowFirst < windowCount) {
+    const size_t recordOffset = windowHeaderBytes + static_cast<size_t>(index - windowFirst) * sizeof(PdfPageInfo);
+    std::memcpy(&navigation_->pageScratch, window + recordOffset, sizeof(PdfPageInfo));
+    loadedPageIndex_ = index;
     return PdfStatus::success();
   }
   const bool sourceWasOpen = sourceHandle_.valid();
@@ -4724,7 +4758,18 @@ PdfStatus PdfPreparation::loadPageRecord(const uint32_t index) {
       status = pageSpool_.open(path, PdfCacheOpenMode::Read, pageCount_);
     }
   }
-  if (status) {
+  if (status && sequentialPageLoop) {
+    const uint8_t count = static_cast<uint8_t>(
+        std::min<uint32_t>(windowRecordCapacity, pageCount_ - index));
+    status = pageSpool_.readRecords(index, window + windowHeaderBytes, count);
+    if (status) {
+      std::memcpy(window, &windowMagic, sizeof(windowMagic));
+      std::memcpy(window + sizeof(windowMagic), &index, sizeof(index));
+      window[8] = count;
+      std::memset(window + 9, 0, windowHeaderBytes - 9U);
+      std::memcpy(&navigation_->pageScratch, window + windowHeaderBytes, sizeof(PdfPageInfo));
+    }
+  } else if (status) {
     status = pdfReadRecord(pageSpool_.store(), index, &navigation_->pageScratch);
   }
   if (openedHere && pageSpool_.isOpen()) {
@@ -5123,12 +5168,20 @@ PdfStatus PdfPreparation::beginXrefSpool(const uint32_t knownRecordCapacity) {
   uint64_t capacity64 = knownRecordCapacity;
   constexpr uint64_t bytesPerStagedRecord = 2ULL * sizeof(PdfXrefEntry);
   if (capacity64 == 0) {
-    uint64_t usedCacheBytes = 0;
-    if (!pdfCheckedAdd(cacheBudget_.requiredBytes, cacheBudget_.optionalBytes, &usedCacheBytes)) {
-      return PdfStatus::failure(PdfError::LimitExceeded);
+    // Xref spools are temporary and are removed before the prepared product is
+    // published. Bound them by real free SD space, not by the smaller
+    // persistent-cache budget derived from source size; incremental PDFs may
+    // legitimately need one compacted revision plus one incoming revision.
+    uint64_t availableBytes = PDF_CACHE_MAX_BYTES;
+    if (cacheCapacity_.free.known) {
+      uint64_t reserve = PDF_CACHE_MIN_FREE_RESERVE_BYTES;
+      if (cacheCapacity_.total.known) {
+        const uint64_t fivePercent =
+            cacheCapacity_.total.value / 20U + (cacheCapacity_.total.value % 20U != 0 ? 1U : 0U);
+        reserve = std::max(reserve, fivePercent);
+      }
+      availableBytes = cacheCapacity_.free.value > reserve ? cacheCapacity_.free.value - reserve : 0;
     }
-    const uint64_t availableBytes =
-        usedCacheBytes < cacheBudget_.limit ? cacheBudget_.limit - usedCacheBytes : 0;
     capacity64 =
         std::min<uint64_t>(PdfLimits::MaxXrefStagingRecords, availableBytes / bytesPerStagedRecord);
   }
@@ -5648,6 +5701,10 @@ PdfStepResult PdfPreparation::stepSortXref(PdfWorkBudget& budget) {
   auto* const outputBatch = rightBatch + kXrefSortInputBatchRecords;
 
   if (xrefSortStage_ == XrefSortStage::Idle) {
+    const PdfStatus flushStatus = xref_->flushPendingWrites();
+    if (!flushStatus) {
+      return PdfStepResult::failure(flushStatus);
+    }
     xrefSortTotal_ = xref_->entryCount();
     xrefSortHasInfo_ = xref_->info(&xrefSortInfo_);
     xrefSortHasSecurity_ = xref_->security(&xrefSortSecurity_);
@@ -19858,6 +19915,7 @@ PdfStepResult PdfPreparation::step() {
         return pause();
       }
       if (navigationTask_ == NavigationTask::Complete) {
+        resetPageRecordReadWindow();
         currentPageIndex_ = resumeAfterPage_ ? durableResumePage_ : 0;
         if (currentPageIndex_ > pageCount_) {
           return fail(PdfStatus::failure(PdfError::Malformed, currentPageIndex_));

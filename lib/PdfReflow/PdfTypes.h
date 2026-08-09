@@ -78,12 +78,17 @@ struct PdfByteSink {
 struct PdfFixedRecordStore {
   using ReadFn = PdfStatus (*)(void* context, uint32_t ordinal, void* record, size_t recordSize);
   using WriteFn = PdfStatus (*)(void* context, uint32_t ordinal, const void* record, size_t recordSize);
+  using WriteManyFn = PdfStatus (*)(void* context, uint32_t ordinal, const void* records, uint32_t count,
+                                    size_t recordSize);
 
   void* context = nullptr;
   uint32_t capacity = 0;
   size_t recordSize = 0;
   ReadFn read = nullptr;
   WriteFn write = nullptr;
+  // Optional. Session spools use this to coalesce sequential fixed records
+  // into one physical SD write; memory stores retain the one-record fallback.
+  WriteManyFn writeMany = nullptr;
 
   constexpr bool valid() const { return recordSize != 0 && read != nullptr && write != nullptr; }
 };

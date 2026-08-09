@@ -157,6 +157,25 @@ PdfStatus pdfWriteRecord(const PdfFixedRecordStore& store, const uint32_t ordina
   return store.write(store.context, ordinal, record, store.recordSize);
 }
 
+PdfStatus pdfWriteRecords(const PdfFixedRecordStore& store, const uint32_t ordinal, const void* records,
+                          const uint32_t count) {
+  if (!store.valid() || records == nullptr || count == 0 || ordinal > store.capacity ||
+      count > store.capacity - ordinal || store.recordSize > std::numeric_limits<size_t>::max() / count) {
+    return PdfStatus::failure(PdfError::InvalidArgument, ordinal);
+  }
+  if (store.writeMany != nullptr) {
+    return store.writeMany(store.context, ordinal, records, count, store.recordSize);
+  }
+  const auto* source = static_cast<const uint8_t*>(records);
+  for (uint32_t index = 0; index < count; ++index) {
+    const PdfStatus status = pdfWriteRecord(store, ordinal + index, source + static_cast<size_t>(index) * store.recordSize);
+    if (!status) {
+      return status;
+    }
+  }
+  return PdfStatus::success();
+}
+
 PdfByteSource pdfByteStoreSource(PdfByteStore& store) {
   if (!store.valid()) {
     return {};

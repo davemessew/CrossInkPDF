@@ -679,6 +679,7 @@ class PdfPreparation {
   PdfStatus finishPageDiscoverySpool();
   PdfStatus finishPreparedPageSpool();
   PdfStatus sealPreparedPageSpool();
+  void resetPageRecordReadWindow();
   PdfStatus loadPageRecord(uint32_t index);
   PdfStatus loadAnnotationOverflowBatch(uint16_t count);
   PdfStepResult stepLoadContentOverflowBatch(PdfWorkBudget& budget, uint8_t count);

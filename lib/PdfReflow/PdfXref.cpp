@@ -115,11 +115,26 @@ PdfStatus PdfXrefTable::configureNewestObjectFilter(uint8_t* const first, const 
   // Existing compacted records are deliberately not reloaded into scarce RAM.
   // Older revisions may append, then the next boundary compacts exactly again.
   sectionCompactionRequired_ = entryCount_ != 0;
+  newestObjectDense_ = false;
   return PdfStatus::success();
 }
 
 bool PdfXrefTable::newestObjectAlreadySeen(const uint32_t objectNumber) {
   const size_t totalBytes = seenObjectsFirstBytes_ + seenObjectsSecondBytes_;
+  if (newestObjectDense_) {
+    if (objectNumber >= totalBytes * 8U) {
+      sectionCompactionRequired_ = true;
+      return false;
+    }
+    const size_t byteOffset = objectNumber >> 3U;
+    uint8_t* const destination = byteOffset < seenObjectsFirstBytes_
+                                     ? seenObjectsFirst_ + byteOffset
+                                     : seenObjectsSecond_ + (byteOffset - seenObjectsFirstBytes_);
+    const uint8_t mask = static_cast<uint8_t>(1U << (objectNumber & 7U));
+    const bool seen = (*destination & mask) != 0;
+    *destination = static_cast<uint8_t>(*destination | mask);
+    return seen;
+  }
   const size_t slotCount = totalBytes / kNewestObjectSlotBytes;
   if (seenObjectsFirst_ == nullptr || slotCount == 0) {
     return false;
@@ -177,10 +192,12 @@ void PdfXrefTable::reset() {
   sampleBuildCount_ = 0;
   lookupMissCount_ = 0;
   victimCount_ = 0;
+  appendBatchCount_ = 0;
   hasLastLookupOrdinal_ = false;
   sampleIndexReady_ = false;
   sampleIndexDisabled_ = false;
   sectionCompactionRequired_ = false;
+  newestObjectDense_ = false;
   if (seenObjectsFirst_ != nullptr) {
     std::memset(seenObjectsFirst_, 0, seenObjectsFirstBytes_);
   }
@@ -198,6 +215,34 @@ PdfStatus PdfXrefTable::preflightAppend(const uint32_t count) const {
     return PdfStatus::failure(PdfError::InsufficientStorage, requiredRecords * sizeof(PdfXrefEntry));
   }
   return PdfStatus::success();
+}
+
+void PdfXrefTable::prepareNewestObjectRange(const uint32_t firstObject, const uint32_t count) {
+  const uint64_t end = static_cast<uint64_t>(firstObject) + count;
+  const uint64_t bitCapacity = static_cast<uint64_t>(seenObjectsFirstBytes_ + seenObjectsSecondBytes_) * 8U;
+  if (seenObjectsFirst_ != nullptr && end <= bitCapacity && (entryCount_ == 0 || newestObjectDense_)) {
+    newestObjectDense_ = true;
+  }
+}
+
+PdfStatus PdfXrefTable::preflightAppendRange(const uint32_t firstObject, const uint32_t count) const {
+  if (!newestObjectDense_) {
+    return preflightAppend(count);
+  }
+  const uint64_t end = static_cast<uint64_t>(firstObject) + count;
+  const size_t totalBytes = seenObjectsFirstBytes_ + seenObjectsSecondBytes_;
+  if (count == 0 || end > static_cast<uint64_t>(totalBytes) * 8U) {
+    return preflightAppend(count);
+  }
+  uint32_t unseen = 0;
+  for (uint32_t object = firstObject; object < end; ++object) {
+    const size_t byteOffset = object >> 3U;
+    const uint8_t* const source = byteOffset < seenObjectsFirstBytes_
+                                      ? seenObjectsFirst_ + byteOffset
+                                      : seenObjectsSecond_ + (byteOffset - seenObjectsFirstBytes_);
+    unseen += (*source & static_cast<uint8_t>(1U << (object & 7U))) == 0 ? 1U : 0U;
+  }
+  return unseen == 0 ? PdfStatus::success() : preflightAppend(unseen);
 }
 
 void PdfXrefTable::initializeSampleIndex() {
@@ -271,13 +316,34 @@ PdfStatus PdfXrefTable::appendNewest(const PdfXrefEntry& entry) {
     return PdfStatus::failure(PdfError::InsufficientStorage,
                               (static_cast<uint64_t>(entryCount_) + 1U) * sizeof(PdfXrefEntry));
   }
-  const PdfStatus status = pdfWriteRecord(records_, entryCount_, &entry);
-  if (status.ok()) {
-    if (entryCount_ != 0 && entry.objectNumber <= lastAppendedObject_) {
-      appendOrderStrict_ = false;
+  if (entryCount_ != 0 && entry.objectNumber <= lastAppendedObject_) {
+    appendOrderStrict_ = false;
+  }
+  lastAppendedObject_ = entry.objectNumber;
+  if (records_.writeMany == nullptr) {
+    const PdfStatus status = pdfWriteRecord(records_, entryCount_, &entry);
+    if (status) {
+      ++entryCount_;
     }
-    lastAppendedObject_ = entry.objectNumber;
-    ++entryCount_;
+    return status;
+  }
+  victimEntries_[appendBatchCount_++] = entry;
+  ++entryCount_;
+  return appendBatchCount_ == kVictimEntries ? flushPendingWrites() : PdfStatus::success();
+}
+
+PdfStatus PdfXrefTable::flushPendingWrites() {
+  if (appendBatchCount_ == 0) {
+    return PdfStatus::success();
+  }
+  if (!records_.valid() || records_.recordSize != sizeof(PdfXrefEntry) ||
+      appendBatchCount_ > entryCount_) {
+    return PdfStatus::failure(PdfError::InvalidArgument, appendBatchCount_);
+  }
+  const uint32_t first = entryCount_ - appendBatchCount_;
+  const PdfStatus status = pdfWriteRecords(records_, first, victimEntries_, appendBatchCount_);
+  if (status) {
+    appendBatchCount_ = 0;
   }
   return status;
 }
@@ -294,14 +360,16 @@ PdfStatus PdfXrefTable::adoptCompactedRecords(const PdfFixedRecordStore& records
   lastAppendedObject_ = lastObjectNumber;
   lookupWindowCount_ = 0;
   victimCount_ = 0;
+  appendBatchCount_ = 0;
   sampleIndexReady_ = false;
   sampleIndexDisabled_ = false;
   sectionCompactionRequired_ = false;
+  newestObjectDense_ = false;
   return PdfStatus::success();
 }
 
 PdfStatus PdfXrefTable::adoptSortedRecords(const uint32_t count) {
-  if (finalized_ || entryCount_ != 0 || count == 0 || !records_.valid() ||
+  if (finalized_ || entryCount_ != 0 || appendBatchCount_ != 0 || count == 0 || !records_.valid() ||
       records_.recordSize != sizeof(PdfXrefEntry) || count > records_.capacity) {
     return PdfStatus::failure(PdfError::InvalidArgument, count);
   }
@@ -320,6 +388,10 @@ PdfStatus PdfXrefTable::finalize(const PdfFixedRecordStore scratch, PdfXrefEntry
   if (!records_.valid() || records_.recordSize != sizeof(PdfXrefEntry) || mergeBuffer == nullptr ||
       mergeCapacity < PdfLimits::XrefMergeEntries) {
     return PdfStatus::failure(PdfError::InvalidArgument, mergeCapacity);
+  }
+  const PdfStatus flushStatus = flushPendingWrites();
+  if (!flushStatus) {
+    return flushStatus;
   }
   if (entryCount_ == 0) {
     finalized_ = true;
@@ -1180,7 +1252,9 @@ PdfStepResult PdfXrefParser::step(PdfWorkBudget& budget) {
             end > PdfLimits::MaxIndirectObjectNumber + 1ULL) {
           return fail(PdfStatus::failure(PdfError::LimitExceeded, lexer_.tokenOffset()));
         }
-        const PdfStatus storageStatus = table_.preflightAppend(static_cast<uint32_t>(value));
+        table_.prepareNewestObjectRange(subsectionStart_, static_cast<uint32_t>(value));
+        const PdfStatus storageStatus =
+            table_.preflightAppendRange(subsectionStart_, static_cast<uint32_t>(value));
         if (!storageStatus.ok()) {
           return fail(storageStatus);
         }
@@ -1505,7 +1579,11 @@ PdfStatus PdfXrefParser::configureXrefStream(const uint16_t rootIndex) {
     xrefRangeRemaining_ = xrefExpectedEntries_;
   }
 
-  const PdfStatus storageStatus = table_.preflightAppend(xrefExpectedEntries_);
+  if (!xrefIndexSeen_) {
+    table_.prepareNewestObjectRange(0, xrefExpectedEntries_);
+  }
+  const PdfStatus storageStatus = !xrefIndexSeen_ ? table_.preflightAppendRange(0, xrefExpectedEntries_)
+                                                  : table_.preflightAppend(xrefExpectedEntries_);
   if (!storageStatus.ok()) {
     return storageStatus;
   }

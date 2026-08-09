@@ -53,6 +53,8 @@ class PdfFixedRecordSpool {
  private:
   static PdfStatus readRecord(void* context, uint32_t ordinal, void* record, size_t recordSize);
   static PdfStatus writeRecord(void* context, uint32_t ordinal, const void* record, size_t recordSize);
+  static PdfStatus writeRecords(void* context, uint32_t ordinal, const void* records, uint32_t count,
+                                size_t recordSize);
 
   const PdfCacheIo* io_ = nullptr;
   PdfCacheHandle handle_{};

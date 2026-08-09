@@ -168,7 +168,7 @@ void PdfFixedRecordSpool::abortClose() {
 }
 
 PdfFixedRecordStore PdfFixedRecordSpool::store() {
-  return {this, capacity_, recordSize_, readRecord, writeRecord};
+  return {this, capacity_, recordSize_, readRecord, writeRecord, writeRecords};
 }
 
 PdfStatus PdfFixedRecordSpool::readRecord(void* context, const uint32_t ordinal, void* record,
@@ -219,6 +219,18 @@ PdfStatus PdfFixedRecordSpool::writeRecord(void* context, const uint32_t ordinal
   ++spool.recordCount_;
   ++spool.writeOperations_;
   return PdfStatus::success();
+}
+
+PdfStatus PdfFixedRecordSpool::writeRecords(void* context, const uint32_t ordinal, const void* records,
+                                            const uint32_t count, const size_t recordSize) {
+  if (context == nullptr || records == nullptr || count == 0) {
+    return PdfStatus::failure(PdfError::InvalidArgument, ordinal);
+  }
+  auto& spool = *static_cast<PdfFixedRecordSpool*>(context);
+  if (recordSize != spool.recordSize_ || ordinal != spool.recordCount_) {
+    return PdfStatus::failure(PdfError::InvalidOffset, ordinal);
+  }
+  return spool.appendRecords(records, count);
 }
 
 PdfStatus PdfMutableRecordSpool::configure(const PdfCacheIo* const io, const size_t recordSize,

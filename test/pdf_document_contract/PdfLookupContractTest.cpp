@@ -143,6 +143,47 @@ struct CountingXrefStore {
   SliceIoMetrics* metrics = nullptr;
 };
 
+struct BatchedXrefStore {
+  static PdfStatus read(void* context, const uint32_t ordinal, void* record, const size_t recordSize) {
+    if (context == nullptr || record == nullptr || recordSize != sizeof(PdfXrefEntry)) {
+      return PdfStatus::failure(PdfError::InvalidArgument, ordinal);
+    }
+    auto& store = *static_cast<BatchedXrefStore*>(context);
+    if (ordinal >= store.entries.size()) {
+      return PdfStatus::failure(PdfError::InvalidOffset, ordinal);
+    }
+    std::memcpy(record, &store.entries[ordinal], recordSize);
+    return PdfStatus::success();
+  }
+
+  static PdfStatus write(void* context, const uint32_t ordinal, const void* record, const size_t recordSize) {
+    return writeMany(context, ordinal, record, 1, recordSize);
+  }
+
+  static PdfStatus writeMany(void* context, const uint32_t ordinal, const void* records, const uint32_t count,
+                             const size_t recordSize) {
+    if (context == nullptr || records == nullptr || count == 0 || recordSize != sizeof(PdfXrefEntry)) {
+      return PdfStatus::failure(PdfError::InvalidArgument, ordinal);
+    }
+    auto& store = *static_cast<BatchedXrefStore*>(context);
+    if (ordinal > store.entries.size() || count > store.entries.size() - ordinal) {
+      return PdfStatus::failure(PdfError::InvalidOffset, ordinal);
+    }
+    std::memcpy(store.entries.data() + ordinal, records, static_cast<size_t>(count) * recordSize);
+    ++store.physicalWrites;
+    store.recordsWritten += count;
+    return PdfStatus::success();
+  }
+
+  PdfFixedRecordStore fixed() {
+    return {this, static_cast<uint32_t>(entries.size()), sizeof(PdfXrefEntry), read, write, writeMany};
+  }
+
+  std::array<PdfXrefEntry, 64> entries{};
+  uint32_t physicalWrites = 0;
+  uint32_t recordsWritten = 0;
+};
+
 std::vector<uint8_t> loadXrefStreamFixture() {
   const std::filesystem::path path = std::filesystem::path(__FILE__).parent_path().parent_path() /
                                      "pdf_reflow_core" / "fixtures" / "xref_stream_objstm.pdf";
@@ -454,6 +495,24 @@ TEST(PdfXrefNewestObjectFilterContract, SegmentedBoundariesResetAndDetachStayWit
   table.reset();
   EXPECT_TRUE(std::all_of(primary.begin(), primary.end(), [](const uint8_t value) { return value == 0x3cU; }));
   EXPECT_TRUE(std::all_of(tail.begin(), tail.end(), [](const uint8_t value) { return value == 0x3cU; }));
+}
+
+TEST(PdfXrefAppendBatchContract, FortyNineSequentialEntriesUseThreePhysicalWritesInExactOrder) {
+  BatchedXrefStore records;
+  PdfXrefTable table(records.fixed());
+
+  for (uint32_t object = 0; object < 49U; ++object) {
+    ASSERT_TRUE(table.appendNewest({object, 0, PdfXrefEntryType::Uncompressed, 0, object * 10ULL, 0}).ok());
+  }
+  EXPECT_EQ(records.physicalWrites, 2U);
+  ASSERT_TRUE(table.flushPendingWrites().ok());
+  EXPECT_EQ(records.physicalWrites, 3U);
+  EXPECT_EQ(records.recordsWritten, 49U);
+  EXPECT_EQ(table.entryCount(), 49U);
+  for (uint32_t object = 0; object < 49U; ++object) {
+    EXPECT_EQ(records.entries[object].objectNumber, object);
+    EXPECT_EQ(records.entries[object].offset, object * 10ULL);
+  }
 }
 
 TEST(PdfXrefNewestObjectFilterContract, RejectsMisalignedCallerOwnedSpan) {

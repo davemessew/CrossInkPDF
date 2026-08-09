@@ -64,7 +64,10 @@ class PdfXrefTable {
   void detachNewestObjectFilter();
   void reset();
   PdfStatus preflightAppend(uint32_t count) const;
+  PdfStatus preflightAppendRange(uint32_t firstObject, uint32_t count) const;
+  void prepareNewestObjectRange(uint32_t firstObject, uint32_t count);
   PdfStatus appendNewest(const PdfXrefEntry& entry);
+  PdfStatus flushPendingWrites();
   bool sectionCompactionRequired() const { return sectionCompactionRequired_; }
   PdfStatus adoptCompactedRecords(const PdfFixedRecordStore& records, uint32_t count,
                                   uint32_t lastObjectNumber);
@@ -139,10 +142,12 @@ class PdfXrefTable {
   mutable uint8_t sampleBuildCount_ = 0;
   mutable uint8_t lookupMissCount_ = 0;
   mutable uint8_t victimCount_ = 0;
+  uint8_t appendBatchCount_ = 0;
   mutable bool hasLastLookupOrdinal_ = false;
   mutable bool sampleIndexReady_ = false;
   mutable bool sampleIndexDisabled_ = false;
   bool sectionCompactionRequired_ = false;
+  bool newestObjectDense_ = false;
 };
 
 static_assert(sizeof(PdfXrefEntry) * 16U == 384U, "xref read-ahead window must stay at 384 bytes");
