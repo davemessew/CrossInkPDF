@@ -1,3 +1,15 @@
+## [v1.5.0.5] - 2026-08-09
+
+### Changed
+
+- PDF first-open preparation now uses larger sequential reads, keeps page and section writers open across related work, and batches xref, font, navigation, and checkpoint storage operations to reduce SD-card waits.
+- PDF token parsing reuses the existing fixed workspace and avoids repeated copies, reducing processor work without adding RAM or borrowing the display framebuffer.
+
+### Fixed
+
+- Large PDFs spend substantially less time in the late preparation stages that previously appeared to pause near 86 and 90 percent.
+- Link-heavy, font-heavy, multi-revision, and passwordless RC4 PDFs now finish preparation with fewer repeated file opens, reads, closes, and syncs.
+
 ## [v1.5.0.4] - 2026-08-09
 
 ### Changed
