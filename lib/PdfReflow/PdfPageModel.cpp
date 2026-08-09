@@ -14,6 +14,7 @@ PdfStatus PdfPageModel::reset() {
   runCount_ = 0;
   imageCount_ = 0;
   warnings_ = PdfPageWarning::None;
+  overflowSeparator_ = OverflowSeparator::None;
   runPending_ = false;
   return PdfStatus::success();
 }
@@ -26,6 +27,7 @@ PdfStatus PdfPageModel::beginTextRun(const PdfTextRun& run) {
   workspace_.runs[runCount_].textOffset = static_cast<uint32_t>(textLength_);
   workspace_.runs[runCount_].textLength = 0;
   pendingTextStart_ = textLength_;
+  overflowSeparator_ = OverflowSeparator::None;
   runPending_ = true;
   return PdfStatus::success();
 }
@@ -46,18 +48,15 @@ PdfStatus PdfPageModel::beginOverflowTextRun(const PdfTextRun& run, uint16_t* co
     return PdfStatus::failure(PdfError::InvalidArgument, runCount_);
   }
   PdfTextRun& previous = workspace_.runs[runCount_ - 1U];
-  if (((previous.flags ^ run.flags) & PdfTextHidden) != 0 ||
+  if (((previous.flags ^ run.flags) & (PdfTextHidden | PdfTextLight | PdfTextBold)) != 0 ||
       static_cast<uint64_t>(previous.textOffset) + previous.textLength != textLength_) {
     return PdfStatus::failure(PdfError::LimitExceeded, runCount_);
   }
   previous.flags |= static_cast<uint16_t>(run.flags & PdfTextActualText);
-  if (textLength_ != 0 && workspace_.text[textLength_ - 1U] != ' ') {
-    if (textLength_ >= workspace_.textCapacity || previous.textLength == UINT32_MAX) {
-      return PdfStatus::failure(PdfError::LimitExceeded, textLength_);
-    }
-    workspace_.text[textLength_++] = ' ';
-    ++previous.textLength;
-  }
+  const bool tightContinuation = (run.flags & PdfTextArrayTightContinuation) != 0;
+  const bool explicitGap = (run.flags & PdfTextArrayExplicitGap) != 0;
+  overflowSeparator_ = explicitGap ? OverflowSeparator::Explicit
+                                   : (tightContinuation ? OverflowSeparator::None : OverflowSeparator::Inferred);
   previous.xMin = std::min(previous.xMin, run.xMin);
   previous.xMax = std::max(previous.xMax, run.xMax);
   previous.yMin = std::min(previous.yMin, run.yMin);
@@ -67,13 +66,40 @@ PdfStatus PdfPageModel::beginOverflowTextRun(const PdfTextRun& run, uint16_t* co
 }
 
 PdfStatus PdfPageModel::appendOverflowText(const uint8_t* const text, const size_t length) {
-  if (runPending_ || runCount_ == 0 || text == nullptr || length > workspace_.textCapacity - textLength_) {
+  if (runPending_ || runCount_ == 0 || text == nullptr) {
     return PdfStatus::failure(PdfError::LimitExceeded, textLength_);
   }
   PdfTextRun& previous = workspace_.runs[runCount_ - 1U];
-  if (static_cast<uint64_t>(previous.textOffset) + previous.textLength != textLength_ ||
-      length > UINT32_MAX - previous.textLength) {
+  if (static_cast<uint64_t>(previous.textOffset) + previous.textLength != textLength_) {
     return PdfStatus::failure(PdfError::LimitExceeded, textLength_);
+  }
+
+  const bool currentSoftHyphen = length == 2U && text[0] == 0xC2U && text[1] == 0xADU;
+  const bool currentUnicodeHyphen = length == 3U && text[0] == 0xE2U && text[1] == 0x80U &&
+                                    (text[2] == 0x90U || text[2] == 0x91U);
+  const bool previousSoftHyphen = textLength_ >= 2U && workspace_.text[textLength_ - 2U] == 0xC2U &&
+                                  workspace_.text[textLength_ - 1U] == 0xADU;
+  const bool previousUnicodeHyphen = textLength_ >= 3U && workspace_.text[textLength_ - 3U] == 0xE2U &&
+                                     workspace_.text[textLength_ - 2U] == 0x80U &&
+                                     (workspace_.text[textLength_ - 1U] == 0x90U ||
+                                      workspace_.text[textLength_ - 1U] == 0x91U);
+  const bool inferredWordJoin = currentSoftHyphen || currentUnicodeHyphen || previousSoftHyphen ||
+                                previousUnicodeHyphen;
+  const bool addSeparator = overflowSeparator_ == OverflowSeparator::Explicit ||
+                            (overflowSeparator_ == OverflowSeparator::Inferred && !inferredWordJoin);
+  const bool insertSeparator = addSeparator && textLength_ != 0 && workspace_.text[textLength_ - 1U] != ' ';
+  overflowSeparator_ = OverflowSeparator::None;
+
+  const size_t separatorLength = insertSeparator ? 1U : 0U;
+  if (separatorLength > workspace_.textCapacity - textLength_ ||
+      length > workspace_.textCapacity - textLength_ - separatorLength ||
+      separatorLength > UINT32_MAX - previous.textLength ||
+      length > UINT32_MAX - previous.textLength - separatorLength) {
+    return PdfStatus::failure(PdfError::LimitExceeded, textLength_);
+  }
+  if (insertSeparator) {
+    workspace_.text[textLength_++] = ' ';
+    ++previous.textLength;
   }
   std::memcpy(workspace_.text + textLength_, text, length);
   textLength_ += length;
@@ -138,23 +164,52 @@ PdfStatus PdfPageModel::finishTextRun() {
     const int64_t originAdvance = static_cast<int64_t>(current.baselineX) - previous.baselineX;
     const bool wideAbsolutePosition = (current.flags & PdfTextPositionReset) != 0 &&
                                       originAdvance > lineHeight * 4;
-    constexpr uint16_t mergeRelevantFlags = PdfTextHidden | PdfTextActualText | PdfTextExplicitWhitespace;
+    constexpr uint16_t mergeRelevantFlags =
+        PdfTextHidden | PdfTextExplicitWhitespace | PdfTextLight | PdfTextBold;
+    const bool isolatedSoftHyphen = current.textLength == 2U &&
+                                    workspace_.text[current.textOffset] == 0xC2U &&
+                                    workspace_.text[current.textOffset + 1U] == 0xADU;
+    const bool isolatedUnicodeHyphen = current.textLength == 3U &&
+                                       workspace_.text[current.textOffset] == 0xE2U &&
+                                       workspace_.text[current.textOffset + 1U] == 0x80U &&
+                                        (workspace_.text[current.textOffset + 2U] == 0x90U ||
+                                         workspace_.text[current.textOffset + 2U] == 0x91U);
     if (previous.fontId == current.fontId &&
         (previous.flags & mergeRelevantFlags) == (current.flags & mergeRelevantFlags) &&
-        !wideAbsolutePosition &&
+        (!wideAbsolutePosition || isolatedSoftHyphen || isolatedUnicodeHyphen) &&
         baselineDifference >= -65536 && baselineDifference <= 65536 &&
         baselineGap <= maximumMergeGap &&
         previousTextEnd == current.textOffset && current.textLength <= UINT32_MAX - previous.textLength &&
         currentEndX - previous.baselineX >= INT32_MIN && currentEndX - previous.baselineX <= INT32_MAX &&
         currentEndY - previous.baseline >= INT32_MIN && currentEndY - previous.baseline <= INT32_MAX) {
-      const int64_t wordGap = std::max<int64_t>(32768, lineHeight * 3 / 8);
+      const int64_t wordGap = std::max<int64_t>(32768, lineHeight / 8);
       const uint8_t currentFirst = workspace_.text[current.textOffset];
       const bool currentJoinsPunctuation = currentFirst == '-' || currentFirst == ',' || currentFirst == '.' ||
                                            currentFirst == ';' || currentFirst == ':' || currentFirst == '!' ||
                                            currentFirst == '?' || currentFirst == ')' || currentFirst == ']' ||
                                            currentFirst == '}';
+      const bool previousSoftHyphen = previousTextEnd >= 2U &&
+                                      workspace_.text[previousTextEnd - 2U] == 0xC2U &&
+                                      workspace_.text[previousTextEnd - 1U] == 0xADU;
+      const bool previousUnicodeHyphen = previousTextEnd >= 3U &&
+                                         workspace_.text[previousTextEnd - 3U] == 0xE2U &&
+                                         workspace_.text[previousTextEnd - 2U] == 0x80U &&
+                                         (workspace_.text[previousTextEnd - 1U] == 0x90U ||
+                                          workspace_.text[previousTextEnd - 1U] == 0x91U);
+      const bool previousJoinsWord = previousSoftHyphen || previousUnicodeHyphen ||
+                                     (workspace_.text[current.textOffset - 1U] == '-' &&
+                                      (baselineGap <= lineHeight / 4 ||
+                                       (currentFirst >= '0' && currentFirst <= '9')));
       bool splitAllCapsGlyph = false;
-      if (current.textLength == 1U && currentFirst >= 'B' && currentFirst <= 'Z' && currentFirst != 'I') {
+      bool currentAllCapsFragment = current.textLength >= 1U && current.textLength <= 2U;
+      for (uint32_t index = 0; currentAllCapsFragment && index < current.textLength; ++index) {
+        const uint8_t value = workspace_.text[current.textOffset + index];
+        currentAllCapsFragment = value >= 'A' && value <= 'Z';
+      }
+      if (currentAllCapsFragment &&
+          (current.textLength != 1U || (currentFirst != 'A' && currentFirst != 'I')) &&
+          baselineGap <= lineHeight / 4 &&
+          (current.flags & PdfTextArrayTightContinuation) != 0) {
         bool hasUppercase = false;
         bool hasLowercase = false;
         for (uint64_t offset = previous.textOffset; offset < previousTextEnd; ++offset) {
@@ -164,10 +219,13 @@ PdfStatus PdfPageModel::finishTextRun() {
         }
         splitAllCapsGlyph = hasUppercase && !hasLowercase;
       }
-      const bool insertSpace = (current.flags & PdfTextExplicitWhitespace) == 0 && baselineGap > wordGap &&
-                               !currentJoinsPunctuation && !splitAllCapsGlyph &&
-                               workspace_.text[current.textOffset - 1U] != ' ' &&
-                               workspace_.text[current.textOffset] != ' ';
+      const bool charactersNeedSpace = workspace_.text[current.textOffset - 1U] != ' ' &&
+                                       workspace_.text[current.textOffset] != ' ';
+      const bool explicitArrayGap = (current.flags & PdfTextArrayExplicitGap) != 0;
+      const bool inferredGap = (current.flags & PdfTextArrayTightContinuation) == 0 &&
+                               (current.flags & PdfTextExplicitWhitespace) == 0 && baselineGap > wordGap &&
+                               !currentJoinsPunctuation && !previousJoinsWord && !splitAllCapsGlyph;
+      const bool insertSpace = charactersNeedSpace && (explicitArrayGap || inferredGap);
       if (insertSpace) {
         if (textLength_ >= workspace_.textCapacity || current.textLength == UINT32_MAX - previous.textLength) {
           ++runCount_;

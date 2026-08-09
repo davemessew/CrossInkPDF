@@ -95,6 +95,7 @@ constexpr uint16_t kPreparationReadingOrderLimit = 256;
 constexpr uint8_t kReadingOrderHistogramBins = 64;
 constexpr int16_t kUnknownTextOrigin = INT16_MIN;
 constexpr int16_t kMappedLinkOrigin = INT16_MIN + 1;
+constexpr int16_t kFullWidthTableOrigin = INT16_MIN + 2;
 constexpr uint16_t kExtractedTextOffsetMask = 0x1fffU;
 constexpr uint16_t kExtractedExplicitWhitespace = 0x2000U;
 constexpr uint16_t kExtractedHeading = 0x8000U;
@@ -102,6 +103,9 @@ constexpr uint16_t kExtractedDropCap = 0x4000U;
 constexpr uint16_t kExtractedTextLengthMask = 0x3fffU;
 constexpr uint16_t kExtractedJoinsPrevious = 0x4000U;
 constexpr uint16_t kExtractedNewBlock = 0x8000U;
+constexpr uint16_t kExtractedLineXMask = 0x3fffU;
+constexpr uint16_t kExtractedLightText = 0x4000U;
+constexpr uint16_t kExtractedTableCell = 0x8000U;
 static_assert(PdfLimits::PageTextBytes <= kExtractedTextOffsetMask + 1U);
 static_assert(PdfLimits::PageTextBytes <= kExtractedTextLengthMask);
 constexpr uint32_t kWarningOptionalImageOmitted = PDF_CACHE_WARNING_OPTIONAL_CONTENT_OMITTED;
@@ -155,9 +159,171 @@ struct PreparedFontDescriptor {
   PreparedFontDescriptorState state = PreparedFontDescriptorState::Empty;
   bool cid = false;
   uint8_t scopeIndex = 0;
+  PdfBaseEncoding baseEncoding = PdfBaseEncoding::Standard;
+  bool bold = false;
 };
 
 static_assert(sizeof(PreparedFontDescriptor) == 64);
+
+bool preparedFontIsBold(const PdfObjectArena& arena, const uint16_t fontDictionaryIndex) {
+  uint16_t baseFontIndex = PDF_INVALID_INDEX;
+  if (!pdfDictionaryFind(arena, fontDictionaryIndex, "BaseFont", &baseFontIndex) ||
+      baseFontIndex >= arena.valueCount || arena.values[baseFontIndex].kind != PdfValueKind::Name) {
+    return false;
+  }
+  const PdfValue& baseFont = arena.values[baseFontIndex];
+  if (static_cast<uint32_t>(baseFont.textOffset) + baseFont.textLength > arena.textLength) {
+    return false;
+  }
+  const uint8_t* const name = arena.text + baseFont.textOffset;
+  constexpr const char* markers[] = {"Bold", "SemiBold", "Semibold", "Demi", "Black", "Heavy"};
+  for (const char* const marker : markers) {
+    const size_t markerLength = std::strlen(marker);
+    if (baseFont.textLength < markerLength) {
+      continue;
+    }
+    for (size_t offset = 0; offset <= static_cast<size_t>(baseFont.textLength) - markerLength; ++offset) {
+      if (std::memcmp(name + offset, marker, markerLength) == 0) {
+        return true;
+      }
+    }
+  }
+  return baseFont.textLength >= 3U && name[baseFont.textLength - 3U] == '-' &&
+         name[baseFont.textLength - 2U] == 'B' && name[baseFont.textLength - 1U] == 'd';
+}
+
+bool extractedTextStartsLowercase(const uint8_t* const text, const size_t length) {
+  if (text == nullptr) {
+    return false;
+  }
+  size_t offset = 0;
+  while (offset < length) {
+    uint32_t scalar = 0;
+    if (!pdfDecodeUtf8Scalar(text, length, &offset, &scalar)) {
+      return false;
+    }
+    if (scalar == ' ' || scalar == '\t' || scalar == '\r' || scalar == '\n' || scalar == '\'' ||
+        scalar == '"' || scalar == '(' || scalar == '[' || scalar == '{' || scalar == 0x2018U ||
+        scalar == 0x201CU) {
+      continue;
+    }
+    return scalar >= 'a' && scalar <= 'z';
+  }
+  return false;
+}
+
+bool extractedTextEndsOpenSentence(const uint8_t* const text, size_t length) {
+  if (text == nullptr) {
+    return false;
+  }
+  while (length != 0U) {
+    const uint8_t last = text[length - 1U];
+    if (last == ' ' || last == '\t' || last == '\r' || last == '\n' || last == '\'' || last == '"' ||
+        last == ')' || last == ']' || last == '}') {
+      --length;
+      continue;
+    }
+    if (length >= 3U && text[length - 3U] == 0xe2U && text[length - 2U] == 0x80U &&
+        (last == 0x99U || last == 0x9dU)) {
+      length -= 3U;
+      continue;
+    }
+    break;
+  }
+  if (length == 0U) {
+    return false;
+  }
+  const uint8_t last = text[length - 1U];
+  if (last == '.' || last == '!' || last == '?') {
+    return false;
+  }
+  return !(length >= 3U && text[length - 3U] == 0xe2U && text[length - 2U] == 0x80U && last == 0xa6U);
+}
+
+bool preparedFontBaseEncodingFromName(const PdfObjectArena& arena, const uint16_t valueIndex,
+                                      PdfBaseEncoding* const result) {
+  if (result == nullptr || valueIndex >= arena.valueCount ||
+      arena.values[valueIndex].kind != PdfValueKind::Name) {
+    return false;
+  }
+  const PdfValue& value = arena.values[valueIndex];
+  if (static_cast<uint32_t>(value.textOffset) + value.textLength > arena.textLength) {
+    return false;
+  }
+  const uint8_t* const name = arena.text + value.textOffset;
+  if (value.textLength == 15 && std::memcmp(name, "WinAnsiEncoding", 15) == 0) {
+    *result = PdfBaseEncoding::WinAnsi;
+    return true;
+  }
+  if (value.textLength == 16 && std::memcmp(name, "MacRomanEncoding", 16) == 0) {
+    *result = PdfBaseEncoding::MacRoman;
+    return true;
+  }
+  if (value.textLength == 16 && std::memcmp(name, "StandardEncoding", 16) == 0) {
+    *result = PdfBaseEncoding::Standard;
+    return true;
+  }
+  return false;
+}
+
+PdfBaseEncoding preparedFontBaseEncoding(const PdfObjectArena& arena, const uint16_t fontDictionaryIndex) {
+  PdfBaseEncoding result = PdfBaseEncoding::Standard;
+  bool customBaseEncoding = false;
+  uint16_t baseFontIndex = PDF_INVALID_INDEX;
+  if (pdfDictionaryFind(arena, fontDictionaryIndex, "BaseFont", &baseFontIndex) &&
+      baseFontIndex < arena.valueCount && arena.values[baseFontIndex].kind == PdfValueKind::Name) {
+    const PdfValue& baseFont = arena.values[baseFontIndex];
+    if (static_cast<uint32_t>(baseFont.textOffset) + baseFont.textLength <= arena.textLength) {
+      const uint8_t* const name = arena.text + baseFont.textOffset;
+      constexpr char kTeXMath[] = "TeX_CM_Maths_Symbols";
+      constexpr char kAdvP4[] = "AdvP4C4E74";
+      constexpr char kAdvP4Diacritics[] = "AdvP4C4E59";
+      constexpr char kAdvPsMath[] = "AdvPSMP10";
+      if (baseFont.textLength >= sizeof(kTeXMath) - 1U &&
+          std::memcmp(name + baseFont.textLength - (sizeof(kTeXMath) - 1U), kTeXMath,
+                      sizeof(kTeXMath) - 1U) == 0) {
+        result = PdfBaseEncoding::TeXMathSymbols;
+        customBaseEncoding = true;
+      } else if (baseFont.textLength >= sizeof(kAdvP4) - 1U &&
+                 std::memcmp(name + baseFont.textLength - (sizeof(kAdvP4) - 1U), kAdvP4,
+                             sizeof(kAdvP4) - 1U) == 0) {
+        result = PdfBaseEncoding::AdvP4C4E74;
+        customBaseEncoding = true;
+      } else if (baseFont.textLength >= sizeof(kAdvP4Diacritics) - 1U &&
+                 std::memcmp(name + baseFont.textLength - (sizeof(kAdvP4Diacritics) - 1U),
+                             kAdvP4Diacritics, sizeof(kAdvP4Diacritics) - 1U) == 0) {
+        result = PdfBaseEncoding::AdvP4C4E59;
+        customBaseEncoding = true;
+      } else if (baseFont.textLength >= sizeof(kAdvPsMath) - 1U &&
+                 std::memcmp(name + baseFont.textLength - (sizeof(kAdvPsMath) - 1U), kAdvPsMath,
+                             sizeof(kAdvPsMath) - 1U) == 0) {
+        result = PdfBaseEncoding::AdvPSMP10;
+        customBaseEncoding = true;
+      }
+    }
+  }
+  // These embedded fonts use ordinary encoding names for their byte transport,
+  // but their glyph programs are not Latin. Keep the font-specific mapping.
+  if (customBaseEncoding) {
+    return result;
+  }
+  uint16_t encodingIndex = PDF_INVALID_INDEX;
+  if (!pdfDictionaryFind(arena, fontDictionaryIndex, "Encoding", &encodingIndex) ||
+      encodingIndex >= arena.valueCount) {
+    return result;
+  }
+  if (preparedFontBaseEncodingFromName(arena, encodingIndex, &result)) {
+    return result;
+  }
+  if (arena.values[encodingIndex].kind != PdfValueKind::Dictionary) {
+    return result;
+  }
+  uint16_t baseIndex = PDF_INVALID_INDEX;
+  if (pdfDictionaryFind(arena, encodingIndex, "BaseEncoding", &baseIndex)) {
+    (void)preparedFontBaseEncodingFromName(arena, baseIndex, &result);
+  }
+  return result;
+}
 
 enum class PreparedFontStage : uint8_t {
   Idle,
@@ -1512,6 +1678,7 @@ struct PdfPreparation::ExtractedBlockRecord {
   uint16_t textLength = 0;
   int16_t x = kUnknownTextOrigin;
   int16_t y = kUnknownTextOrigin;
+  uint16_t lineX = UINT16_MAX;
 };
 
 struct PdfPreparation::ReadingOrderWorkspace {
@@ -1521,8 +1688,6 @@ struct PdfPreparation::ReadingOrderWorkspace {
   ExtractedBlockRecord cycleRecord;
   CompactTextPlacement sortValue;
   uint16_t scanIndex;
-  uint16_t tableStart;
-  uint16_t tableEnd;
   uint16_t sortGap;
   uint16_t sortIndex;
   uint16_t sortCursor;
@@ -1543,6 +1708,8 @@ struct PdfPreparation::ReadingOrderWorkspace {
   bool runActive;
   bool clusterOverflow;
   bool lexicalFallback;
+  bool sourceOrderBands;
+  bool tableSeen;
   bool sortHolding;
   bool cycleActive;
 };
@@ -1635,10 +1802,10 @@ struct PreparedFontRuntime {
 };
 
 constexpr uint16_t kObservedGlyphInvalid = UINT16_MAX;
+constexpr uint16_t kObservedGlyphCapacity = 768;
 constexpr uint16_t kObservedCodeSpaceCapacity =
     PdfPreparedContentResources::MaxFonts * 16U;
-constexpr uint16_t kObservedGlyphHashCapacity =
-    PdfLimits::MaxPageUniqueGlyphs * 2U;
+constexpr uint16_t kObservedGlyphHashCapacity = 1024;
 
 struct ObservedCodeSpace {
   uint32_t first;
@@ -1661,8 +1828,9 @@ struct ObservedGlyphCollection {
 };
 
 struct ObservedGlyphWorkspace {
-  alignas(PdfCMapRecord) uint8_t phase[sizeof(PdfCMapRecord) * PdfLimits::MaxPageUniqueGlyphs];
-  ObservedGlyphTuple tuples[PdfLimits::MaxPageUniqueGlyphs];
+  alignas(PdfCMapRecord) uint8_t phase[std::max(sizeof(PdfCMapRecord) * PdfLimits::MaxPageUniqueGlyphs,
+                                               sizeof(ObservedGlyphCollection))];
+  ObservedGlyphTuple tuples[kObservedGlyphCapacity];
   uint16_t fontHead[PdfPreparedContentResources::MaxFonts];
   uint16_t fontTail[PdfPreparedContentResources::MaxFonts];
   uint16_t codeSpaceCount;
@@ -1703,7 +1871,7 @@ PdfStatus addObservedGlyphTuple(ObservedGlyphWorkspace* const workspace, const u
   for (uint16_t probe = 0; probe < kObservedGlyphHashCapacity; ++probe) {
     const uint16_t tupleIndex = collection->hash[slot];
     if (tupleIndex == kObservedGlyphInvalid) {
-      if (workspace->tupleCount >= PdfLimits::MaxPageUniqueGlyphs) {
+      if (workspace->tupleCount >= kObservedGlyphCapacity) {
         return PdfStatus::failure(PdfError::LimitExceeded, workspace->tupleCount);
       }
       const uint16_t added = workspace->tupleCount++;
@@ -2113,10 +2281,13 @@ PdfStatus PdfPreparation::begin(const PdfPreparationConfig& config) {
   imageRepetitionEntryCount_ = 0;
   continueAfterImageDecode_ = false;
   sectionEmitStage_ = SectionEmitStage::Idle;
+  sectionEmitTableCellX_ = 0;
   sectionOpenPrepared_ = false;
   sectionClosePrepared_ = false;
   sectionCloseNewSection_ = false;
   pendingSectionFinish_ = false;
+  sectionEmitTableOpen_ = false;
+  sectionEmitTableHasCell_ = false;
   pendingSectionFinishStage_ = PendingSectionFinishStage::Idle;
   rasterRuntimeActive_ = false;
   maskDecodeRuntimeActive_ = false;
@@ -4381,7 +4552,10 @@ PdfStatus PdfPreparation::initializeParserStorage() {
   static_assert(std::is_trivially_copyable_v<NavigationWorkspace>,
                 "navigation workspace must remain safe for bounded bytewise suspend/restore");
   static_assert(sizeof(NavigationWorkspace) <= PdfLimits::UzlibDictionaryBytes);
-  static_assert(sizeof(ExtractedBlockRecord) <= 8);
+  // Exactly 256 ten-byte records fit the decoder-output tail reserved for
+  // extracted blocks; lineX prevents fragments from one text line being
+  // mistaken for separate columns without growing the fixed workspace.
+  static_assert(sizeof(ExtractedBlockRecord) <= 10);
   static_assert(PreparedContentOverlay::DictionaryEnd <= PreparedContentOverlay::NativeDictionaryBytes);
   static_assert(PreparedContentOverlay::DecoderEnd <= PreparedContentOverlay::NativeDecoderOutputBytes);
   static_assert(PreparedContentOverlay::OperandEnd <= PdfLimits::OperandOrderHistogramBytes);
@@ -10870,6 +11044,7 @@ PdfStatus PdfPreparation::beginNextFontObject() {
     const FontResolutionCacheEntry* const cached = findFontResolution(reference);
     if (cached == nullptr) {
       imageResolveTask_ = ImageResolveTask::FontObject;
+      resolver_->setSkipUnusedPageResources(true);
       return resolver_->begin(reference);
     }
     descriptor.source = cached->streamOffset;
@@ -10879,6 +11054,8 @@ PdfStatus PdfPreparation::beginNextFontObject() {
     descriptor.filterCount = cached->filterCount;
     descriptor.state = cached->fallback ? PreparedFontDescriptorState::Fallback : PreparedFontDescriptorState::Stream;
     descriptor.cid = cached->cid;
+    descriptor.baseEncoding = cached->baseEncoding;
+    descriptor.bold = cached->bold;
     ++runtime->fontResolveIndex;
   }
   imageResolveTask_ = ImageResolveTask::None;
@@ -11018,6 +11195,8 @@ PdfStatus PdfPreparation::finishImageResolution() {
         return PdfStatus::failure(PdfError::Malformed, resolved.rootIndex);
       }
       PreparedFontDescriptor& descriptor = runtime->fonts[runtime->fontResolveIndex];
+      descriptor.baseEncoding = preparedFontBaseEncoding(arena_, resolved.rootIndex);
+      descriptor.bold = preparedFontIsBold(arena_, resolved.rootIndex);
       uint16_t subtypeIndex = PDF_INVALID_INDEX;
       if (pdfDictionaryFind(arena_, resolved.rootIndex, "Subtype", &subtypeIndex) &&
           subtypeIndex < arena_.valueCount && arena_.values[subtypeIndex].kind == PdfValueKind::Name) {
@@ -11028,7 +11207,9 @@ PdfStatus PdfPreparation::finishImageResolution() {
       uint16_t toUnicodeIndex = PDF_INVALID_INDEX;
       if (!pdfDictionaryFind(arena_, resolved.rootIndex, "ToUnicode", &toUnicodeIndex)) {
         descriptor.state = PreparedFontDescriptorState::Fallback;
-        rememberFontResolution({descriptor.reference, 0, {}, 0, {}, 0, descriptor.cid, true});
+        rememberFontResolution(
+            {descriptor.reference, 0, {}, 0, {}, 0, descriptor.baseEncoding, descriptor.cid, true,
+             descriptor.bold});
         ++runtime->fontResolveIndex;
         return beginNextFontObject();
       }
@@ -11066,7 +11247,9 @@ PdfStatus PdfPreparation::finishImageResolution() {
       cached.streamLength = descriptor.length;
       std::copy_n(descriptor.filters, descriptor.filterCount, cached.filters);
       cached.filterCount = descriptor.filterCount;
+      cached.baseEncoding = descriptor.baseEncoding;
       cached.cid = descriptor.cid;
+      cached.bold = descriptor.bold;
       rememberFontResolution(cached);
       ++runtime->fontResolveIndex;
       return beginNextFontObject();
@@ -14761,7 +14944,13 @@ PdfStepResult PdfPreparation::parsePreparedFonts(PdfWorkBudget& budget) {
         PdfFontMap({nullptr, 0, {}, nullptr, nullptr, glyphStart,
                     static_cast<uint16_t>(remainingGlyphs != 0 ? remainingGlyphs : 1U)});
     const bool cid = runtime->descriptorIndex < content->fontCount && content->fonts[runtime->descriptorIndex].cid;
-    PdfStatus status = finalFont->beginMaterialized(static_cast<uint16_t>(runtime->currentFont + 1U), cid);
+    const bool bold =
+        runtime->descriptorIndex < content->fontCount && content->fonts[runtime->descriptorIndex].bold;
+    const PdfBaseEncoding baseEncoding = runtime->descriptorIndex < content->fontCount
+                                             ? content->fonts[runtime->descriptorIndex].baseEncoding
+                                             : PdfBaseEncoding::Standard;
+    PdfStatus status =
+        finalFont->beginMaterialized(static_cast<uint16_t>(runtime->currentFont + 1U), cid, bold);
     if (!status) {
       destroyTemporaryFont();
       finalFont->~PdfFontMap();
@@ -14771,6 +14960,14 @@ PdfStepResult PdfPreparation::parsePreparedFonts(PdfWorkBudget& budget) {
     runtime->currentCode = hasTuples ? firstTuple : kObservedGlyphInvalid;
     runtime->spillCapacity = 0;
     if (runtime->decoded[runtime->currentFont].length != 0 && hasTuples) {
+      auto* const encoding = new (runtime->encodingStorage) PdfSimpleEncoding({&runtime->difference, 1});
+      runtime->encodingConstructed = true;
+      status = encoding->begin(baseEncoding);
+      if (!status) {
+        destroyTemporaryFont();
+        finalFont->~PdfFontMap();
+        return PdfStepResult::failure(status);
+      }
       const PdfFixedRecordStore observer{this, PdfLimits::MaxCMapRanges, sizeof(PdfCMapRecord), nullptr,
                                          observePreparedFontRecord};
       auto* const cmap = new (runtime->cmapStorage)
@@ -14790,7 +14987,7 @@ PdfStepResult PdfPreparation::parsePreparedFonts(PdfWorkBudget& budget) {
 
     auto* const encoding = new (runtime->encodingStorage) PdfSimpleEncoding({&runtime->difference, 1});
     runtime->encodingConstructed = true;
-    status = encoding->begin(PdfBaseEncoding::Standard);
+    status = encoding->begin(baseEncoding);
     auto* const sourceFont = new (runtime->sourceFontStorage) PdfFontMap({&runtime->width, 1});
     runtime->sourceFontConstructed = true;
     if (status) {
@@ -14813,7 +15010,10 @@ PdfStepResult PdfPreparation::parsePreparedFonts(PdfWorkBudget& budget) {
         destroyTemporaryFont();
         auto* const encoding = new (runtime->encodingStorage) PdfSimpleEncoding({&runtime->difference, 1});
         runtime->encodingConstructed = true;
-        PdfStatus status = encoding->begin(PdfBaseEncoding::Standard);
+        const PdfBaseEncoding baseEncoding = runtime->descriptorIndex < content->fontCount
+                                                 ? content->fonts[runtime->descriptorIndex].baseEncoding
+                                                 : PdfBaseEncoding::Standard;
+        PdfStatus status = encoding->begin(baseEncoding);
         auto* const sourceFont = new (runtime->sourceFontStorage) PdfFontMap({&runtime->width, 1});
         runtime->sourceFontConstructed = true;
         const bool cid = runtime->descriptorIndex < content->fontCount &&
@@ -14902,10 +15102,19 @@ PdfStepResult PdfPreparation::parsePreparedFonts(PdfWorkBudget& budget) {
         fallback.sourceCode = tuple.code;
         fallback.sourceLength = tuple.length;
         fallback.width = 500;
-        size_t fallbackLength = 0;
-        PdfStatus status = pdfAppendUtf8Scalar(0xFFFDU, fallback.unicode.bytes,
-                                               sizeof(fallback.unicode.bytes), &fallbackLength);
-        fallback.unicode.length = static_cast<uint8_t>(fallbackLength);
+        PdfStatus status = PdfStatus::failure(PdfError::UnsupportedEncoding, tuple.code);
+        const bool cid = runtime->descriptorIndex < content->fontCount &&
+                         content->fonts[runtime->descriptorIndex].cid;
+        if (!cid && tuple.length == 1 && runtime->encodingConstructed) {
+          status = reinterpret_cast<PdfSimpleEncoding*>(runtime->encodingStorage)
+                       ->decode(static_cast<uint8_t>(tuple.code), &fallback.unicode);
+        }
+        if (!status && status.error == PdfError::UnsupportedEncoding) {
+          size_t fallbackLength = 0;
+          status = pdfAppendUtf8Scalar(0xFFFDU, fallback.unicode.bytes,
+                                       sizeof(fallback.unicode.bytes), &fallbackLength);
+          fallback.unicode.length = static_cast<uint8_t>(fallbackLength);
+        }
         if (status) {
           status = finalFont->addMaterializedGlyph(fallback);
         }
@@ -15173,13 +15382,31 @@ PdfStatus PdfPreparation::beginContentInterpretation() {
                           materializedGlyphCount,
                       static_cast<uint16_t>(PdfLimits::MaxPageUniqueGlyphs - materializedGlyphCount)});
       ++constructedFontCount;
-      status = finalFonts[fontIndex].beginMaterialized(static_cast<uint16_t>(fontIndex + 1U), false);
       PdfEncodingDifference difference{};
       PdfSimpleEncoding encoding({&difference, 1});
       PdfFontWidthRecord width{};
       PdfFontMap sourceFont({&width, 1});
+      PdfBaseEncoding baseEncoding = PdfBaseEncoding::Standard;
+      bool bold = false;
+      const uint8_t observedNameLength = pageText_[kObservedFontNameLengthsOffset + fontIndex];
+      const uint8_t observedScope = pageText_[kObservedFontScopesOffset + fontIndex];
+      const uint8_t* const observedName =
+          pageText_.get() + kObservedFontNamesOffset +
+          static_cast<size_t>(fontIndex) * PdfPreparedContentResources::MaxNameBytes;
+      for (uint8_t descriptorIndex = 0; descriptorIndex < runtime->fontCount; ++descriptorIndex) {
+        const PreparedFontDescriptor& descriptor = runtime->fonts[descriptorIndex];
+        if (descriptor.scopeIndex == observedScope && descriptor.nameLength == observedNameLength &&
+            std::memcmp(descriptor.name, observedName, observedNameLength) == 0) {
+          baseEncoding = descriptor.baseEncoding;
+          bold = descriptor.bold;
+          break;
+        }
+      }
       if (status) {
-        status = encoding.begin(PdfBaseEncoding::Standard);
+        status = finalFonts[fontIndex].beginMaterialized(static_cast<uint16_t>(fontIndex + 1U), false, bold);
+      }
+      if (status) {
+        status = encoding.begin(baseEncoding);
       }
       if (status) {
         status = sourceFont.begin(static_cast<uint16_t>(fontIndex + 1U), false, nullptr, &encoding, 500);
@@ -15534,7 +15761,6 @@ PdfStatus PdfPreparation::finishContentInterpretation() {
   if (hiddenTextBytes > visibleTextBytes * 4U) {
     hasVisibleText = false;
   }
-
   const auto usableRun = [&](const PdfTextRun& run) {
     return (hasVisibleText ? (run.flags & PdfTextHidden) == 0 : true) && run.textLength != 0 &&
            run.textOffset <= textLength && run.textLength <= textLength - run.textOffset;
@@ -15652,6 +15878,7 @@ PdfStatus PdfPreparation::finishContentInterpretation() {
   auto* const converted = reinterpret_cast<ExtractedBlockRecord*>(decoderOutput_.get());
   size_t compactTextLength = 0;
   uint16_t convertedCount = 0;
+  const PdfTextRun* previousConvertedRun = nullptr;
   for (uint16_t index = 0; index < runCount; ++index) {
     const PdfTextRun& run = runs[index];
     if ((hasVisibleText && (run.flags & PdfTextHidden) != 0) || run.textLength == 0 || run.textOffset > textLength ||
@@ -15664,42 +15891,293 @@ PdfStatus PdfPreparation::finishContentInterpretation() {
     if (compactTextLength != run.textOffset) {
       std::memmove(pageText_.get() + compactTextLength, pageText_.get() + run.textOffset, run.textLength);
     }
-    ExtractedBlockRecord& block = converted[convertedCount++];
-    uint16_t encodedTextOffset = static_cast<uint16_t>(compactTextLength);
-    if ((run.flags & PdfTextExplicitWhitespace) != 0) {
-      encodedTextOffset |= kExtractedExplicitWhitespace;
-    }
+    const int64_t explicitWhitespaceGap =
+        previousConvertedRun == nullptr ? INT64_MAX : static_cast<int64_t>(run.xMin) - previousConvertedRun->xMax;
+    const int64_t baselineDifference = previousConvertedRun == nullptr
+                                           ? INT64_MAX
+                                           : std::abs(static_cast<int64_t>(run.baseline) -
+                                                      previousConvertedRun->baseline);
+    const bool nearbyInlineFragment =
+        previousConvertedRun != nullptr && baselineDifference <= 3LL * 65536 &&
+        explicitWhitespaceGap >= -static_cast<int64_t>(bodyTextHeight) * 65536 &&
+        explicitWhitespaceGap <= static_cast<int64_t>(std::max<uint16_t>(1U, bodyTextHeight / 2U)) * 65536;
+    const bool sourceControlsSpacing =
+        nearbyInlineFragment &&
+        (((run.flags & PdfTextExplicitWhitespace) != 0 && baselineDifference <= 65536) ||
+         baselineDifference > 65536);
     const uint8_t* const runText = pageText_.get() + compactTextLength;
     uint16_t letterCount = 0;
     uint16_t lowercaseCount = 0;
+    bool firstLetterUpper = false;
+    bool sawLetter = false;
+    bool hasHyphen = false;
+    bool hasEquationOperator = false;
     for (uint32_t textIndex = 0; textIndex < run.textLength; ++textIndex) {
       const uint8_t value = runText[textIndex];
       if ((value >= 'A' && value <= 'Z') || (value >= 'a' && value <= 'z')) {
+        if (!sawLetter) {
+          firstLetterUpper = value >= 'A' && value <= 'Z';
+          sawLetter = true;
+        }
         ++letterCount;
         lowercaseCount = static_cast<uint16_t>(lowercaseCount + (value >= 'a' && value <= 'z' ? 1U : 0U));
+      } else {
+        hasHyphen = hasHyphen || value == '-';
+        hasEquationOperator = hasEquationOperator || value == '=' || value == '<' || value == '>';
       }
     }
+    size_t visibleTextLength = run.textLength;
+    while (visibleTextLength != 0U &&
+           (runText[visibleTextLength - 1U] == ' ' || runText[visibleTextLength - 1U] == '\t' ||
+            runText[visibleTextLength - 1U] == '\r' || runText[visibleTextLength - 1U] == '\n')) {
+      --visibleTextLength;
+    }
+    if (visibleTextLength == 0U) {
+      continue;
+    }
+    ExtractedBlockRecord& block = converted[convertedCount++];
+    uint16_t encodedTextOffset = static_cast<uint16_t>(compactTextLength);
+    if (sourceControlsSpacing) {
+      encodedTextOffset |= kExtractedExplicitWhitespace;
+    }
+    const uint8_t terminalCharacter = visibleTextLength == 0U ? 0U : runText[visibleTextLength - 1U];
+    const bool sentenceTerminal = terminalCharacter == '.' || terminalCharacter == '!' ||
+                                  terminalCharacter == '?' || terminalCharacter == ':' || terminalCharacter == ';';
     const uint16_t height = runHeightPoints(run);
     const int64_t runCenter = (static_cast<int64_t>(run.xMin) + run.xMax) / (2 * 65536);
     const int64_t pageCenter = currentPageWidth_ / 2;
     const int64_t centerDistance = runCenter >= pageCenter ? runCenter - pageCenter : pageCenter - runCenter;
-    const bool allCapsHeading = run.textLength <= 128U && letterCount >= 3U && lowercaseCount == 0;
-    const bool tallHeading = run.textLength <= 160U && letterCount >= 2U && height * 2U >= bodyTextHeight * 3U;
-    const bool centeredTitle = sectionBoundaryPage && run.textLength <= 48U && height >= 14U &&
+    const int64_t baselineY = static_cast<int64_t>(run.baseline) / 65536;
+    const bool interiorLine = baselineY > currentPageHeight_ / 16U && baselineY < currentPageHeight_ * 15U / 16U;
+    const bool horizontalLine =
+        std::abs(static_cast<int64_t>(run.baselineDx)) >= std::abs(static_cast<int64_t>(run.baselineDy)) * 4U;
+    size_t headingPrefixEnd = 0;
+    while (headingPrefixEnd < visibleTextLength && runText[headingPrefixEnd] >= '0' &&
+           runText[headingPrefixEnd] <= '9') {
+      ++headingPrefixEnd;
+    }
+    while (headingPrefixEnd + 1U < visibleTextLength && runText[headingPrefixEnd] == '.' &&
+           runText[headingPrefixEnd + 1U] >= '0' && runText[headingPrefixEnd + 1U] <= '9') {
+      ++headingPrefixEnd;
+      while (headingPrefixEnd < visibleTextLength && runText[headingPrefixEnd] >= '0' &&
+             runText[headingPrefixEnd] <= '9') {
+        ++headingPrefixEnd;
+      }
+    }
+    const bool numberedHeading = visibleTextLength <= 80U && letterCount >= 3U && headingPrefixEnd != 0U &&
+                                  headingPrefixEnd + 1U < visibleTextLength && runText[headingPrefixEnd] == '.' &&
+                                  runText[headingPrefixEnd + 1U] >= 'A' && runText[headingPrefixEnd + 1U] <= 'Z' &&
+                                  height >= bodyTextHeight;
+    const auto headingTextEquals = [&](const char* const literal) {
+      const size_t length = std::strlen(literal);
+      return visibleTextLength == length && std::memcmp(runText, literal, length) == 0;
+    };
+    const bool commonShortHeading = headingTextEquals("ABSTRACT") || headingTextEquals("CONTENTS") ||
+                                    headingTextEquals("METHODS") || headingTextEquals("OVERVIEW") ||
+                                    headingTextEquals("RESULTS") || headingTextEquals("SUMMARY");
+    const bool allCapsHeading = visibleTextLength >= 6U && visibleTextLength <= 80U &&
+                                 (letterCount >= 10U || commonShortHeading) &&
+                                 (!hasHyphen || letterCount >= 10U) && !hasEquationOperator &&
+                                 lowercaseCount == 0 && letterCount * 2U >= visibleTextLength &&
+                                 height >= bodyTextHeight;
+    const bool tallHeadingTypography = (run.flags & PdfTextBold) != 0U || lowercaseCount == 0U ||
+                                       visibleTextLength <= 48U;
+    const bool tallHeading = visibleTextLength <= 80U && letterCount >= 6U && firstLetterUpper &&
+                             !hasEquationOperator && letterCount * 3U >= visibleTextLength &&
+                             tallHeadingTypography &&
+                             (height * 4U >= bodyTextHeight * 7U ||
+                              (visibleTextLength <= 32U && height * 5U >= bodyTextHeight * 8U));
+    const bool boldHeading = visibleTextLength <= 80U && letterCount >= 3U && firstLetterUpper &&
+                             !sentenceTerminal && !hasEquationOperator &&
+                             letterCount * 3U >= visibleTextLength && height >= bodyTextHeight &&
+                             (run.flags & PdfTextBold) != 0U &&
+                             height * 5U >= bodyTextHeight * 6U;
+    const bool centeredTitle = sectionBoundaryPage && visibleTextLength <= 64U && height >= 14U &&
                                (bodyTextHeightCount < 3U || height > bodyTextHeight) &&
                                centerDistance <= std::max<uint16_t>(1, currentPageWidth_ / 12U);
+    const int64_t runWidth = (static_cast<int64_t>(run.xMax) - run.xMin + 65535) / 65536;
+    const bool centeredShortHeading =
+        visibleTextLength >= 8U && visibleTextLength <= 40U && letterCount >= 6U && firstLetterUpper &&
+        !sentenceTerminal && !hasHyphen && !hasEquationOperator && height >= bodyTextHeight &&
+        (run.flags & PdfTextLight) != 0U &&
+        baselineY > currentPageHeight_ / 8U && baselineY < currentPageHeight_ * 7U / 8U &&
+        runWidth >= currentPageWidth_ / 8U && runWidth <= currentPageWidth_ / 3U &&
+        centerDistance <= std::max<uint16_t>(1, currentPageWidth_ / 32U);
     const bool dropCapOpeningLine = dropCapTargetIndex != UINT16_MAX && index != dropCapRunIndex &&
                                     index >= dropCapTargetIndex &&
                                     std::abs(static_cast<int64_t>(run.baseline) - runs[dropCapTargetIndex].baseline) <=
                                         65536;
-    if (index != dropCapRunIndex && !dropCapOpeningLine && (allCapsHeading || tallHeading || centeredTitle)) {
+    const bool contentHeadingBand = baselineY > currentPageHeight_ / 8U &&
+                                    baselineY < currentPageHeight_ * 7U / 8U;
+    const bool sectionTitleBand = sectionBoundaryPage && tallHeading && height * 4U >= bodyTextHeight * 7U;
+    const bool prominentTopHeading =
+        (tallHeading || boldHeading) && height * 3U >= bodyTextHeight * 4U;
+    const bool boldAllCapsTopHeading = allCapsHeading && (run.flags & PdfTextBold) != 0U &&
+                                       baselineY >= currentPageHeight_ * 7U / 8U;
+    bool heading = index != dropCapRunIndex && !dropCapOpeningLine && interiorLine && horizontalLine &&
+                   (contentHeadingBand || centeredTitle || sectionTitleBand || prominentTopHeading ||
+                    boldAllCapsTopHeading || (sectionBoundaryPage && allCapsHeading)) &&
+                   (allCapsHeading || numberedHeading || tallHeading || boldHeading || centeredTitle ||
+                    centeredShortHeading);
+    const bool previousHeading = convertedCount > 1U &&
+                                 (converted[convertedCount - 2U].textOffset & kExtractedHeading) != 0U;
+    bool previousNumberedHeading = false;
+    if (previousHeading) {
+      const ExtractedBlockRecord& previousBlock = converted[convertedCount - 2U];
+      const uint16_t previousOffset = previousBlock.textOffset & kExtractedTextOffsetMask;
+      const uint16_t previousLength = previousBlock.textLength & kExtractedTextLengthMask;
+      uint16_t prefixLength = 0;
+      bool sawDot = false;
+      while (prefixLength < previousLength) {
+        const uint8_t value = pageText_[previousOffset + prefixLength];
+        if (value >= '0' && value <= '9') {
+          ++prefixLength;
+          continue;
+        }
+        if (value == '.') {
+          sawDot = true;
+          ++prefixLength;
+          continue;
+        }
+        break;
+      }
+      previousNumberedHeading = sawDot && prefixLength != 0U;
+    }
+    const bool continuationAllowed = index != dropCapRunIndex && !dropCapOpeningLine && previousHeading &&
+                                     visibleTextLength != 0U && !sentenceTerminal && !hasEquationOperator;
+    const bool inlineHeadingContinuation =
+        continuationAllowed && baselineDifference <= 3LL * 65536 &&
+        explicitWhitespaceGap >=
+            -static_cast<int64_t>(bodyTextHeight) * (previousNumberedHeading ? 2LL : 1LL) * 65536 &&
+        explicitWhitespaceGap <= static_cast<int64_t>(bodyTextHeight) * 4LL * 65536 &&
+        ((height * 4U >= bodyTextHeight * 7U && letterCount >= 2U) ||
+         (visibleTextLength <= 12U && letterCount >= 2U && lowercaseCount == 0U) ||
+         (visibleTextLength <= 3U && height * 2U >= bodyTextHeight) ||
+         (previousNumberedHeading && baselineDifference <= 3LL * 65536 && visibleTextLength <= 40U &&
+          letterCount >= 2U));
+    const bool multilineHeadingContinuation =
+        continuationAllowed && baselineDifference > 3LL * 65536 &&
+        baselineDifference <= static_cast<int64_t>(bodyTextHeight) * 3LL * 65536 &&
+        visibleTextLength <= 40U && letterCount >= 3U && height * 4U >= bodyTextHeight * 7U;
+    if (inlineHeadingContinuation || multilineHeadingContinuation) {
+      heading = true;
+    }
+    if (heading && convertedCount > 1U && !previousHeading && baselineDifference <= 65536 &&
+        explicitWhitespaceGap >= -static_cast<int64_t>(bodyTextHeight) * 65536 &&
+        explicitWhitespaceGap <= static_cast<int64_t>(std::max<uint16_t>(1U, bodyTextHeight / 4U)) * 65536) {
+      // A heading cannot begin in the middle of an adjacent word or phrase.
+      heading = false;
+    }
+    bool joinsPreviousWord = false;
+    if (previousConvertedRun != nullptr && convertedCount > 1U &&
+        (run.flags & PdfTextPositionReset) != 0U && baselineDifference <= 65536 &&
+        explicitWhitespaceGap >= -static_cast<int64_t>(bodyTextHeight) * 5LL * 65536 &&
+        explicitWhitespaceGap <= static_cast<int64_t>(bodyTextHeight) * 65536 &&
+        visibleTextLength != 0U) {
+      const ExtractedBlockRecord& previousBlock = converted[convertedCount - 2U];
+      const uint16_t previousOffset = previousBlock.textOffset & kExtractedTextOffsetMask;
+      const uint16_t previousLength = previousBlock.textLength & kExtractedTextLengthMask;
+      uint16_t previousWordLength = 0;
+      bool previousLowercase = true;
+      bool previousUppercase = true;
+      while (previousWordLength < previousLength) {
+        const uint8_t value = pageText_[previousOffset + previousLength - previousWordLength - 1U];
+        if ((value < 'A' || value > 'Z') && (value < 'a' || value > 'z')) {
+          break;
+        }
+        previousLowercase = previousLowercase && value >= 'a' && value <= 'z';
+        previousUppercase = previousUppercase && value >= 'A' && value <= 'Z';
+        ++previousWordLength;
+      }
+      uint16_t currentWordLength = 0;
+      bool currentLowercase = true;
+      bool currentUppercase = true;
+      while (currentWordLength < visibleTextLength) {
+        const uint8_t value = runText[currentWordLength];
+        if ((value < 'A' || value > 'Z') && (value < 'a' || value > 'z')) {
+          break;
+        }
+        currentLowercase = currentLowercase && value >= 'a' && value <= 'z';
+        currentUppercase = currentUppercase && value >= 'A' && value <= 'Z';
+        ++currentWordLength;
+      }
+      const uint16_t combinedLength = static_cast<uint16_t>(previousWordLength + currentWordLength);
+      bool previousTitleCase = previousWordLength != 0U;
+      if (previousTitleCase) {
+        const uint8_t* const previousWord = pageText_.get() + previousOffset + previousLength - previousWordLength;
+        previousTitleCase = previousWord[0] >= 'A' && previousWord[0] <= 'Z';
+        for (uint16_t character = 1; previousTitleCase && character < previousWordLength; ++character) {
+          previousTitleCase = previousWord[character] >= 'a' && previousWord[character] <= 'z';
+        }
+      }
+      const bool wordCaseContinues = (previousLowercase && currentLowercase) ||
+                                     (previousUppercase && currentUppercase) ||
+                                     (previousTitleCase && currentLowercase) ||
+                                     (previousUppercase && previousWordLength >= 2U && currentWordLength == 2U &&
+                                      runText[0] >= 'A' && runText[0] <= 'Z' &&
+                                      runText[1] >= 'a' && runText[1] <= 'z');
+      const bool stronglyOverlapping =
+          explicitWhitespaceGap < -static_cast<int64_t>(bodyTextHeight) * 65536 / 2LL;
+      const bool shortCloseContinuation = previousWordLength >= 2U && previousWordLength <= 6U &&
+                                          currentWordLength >= 2U && currentWordLength <= 6U &&
+                                          combinedLength >= 5U && combinedLength <= 12U;
+      const bool longCloseContinuation = combinedLength >= 10U && combinedLength <= 24U;
+      joinsPreviousWord = previousWordLength != 0U && previousWordLength <= 12U &&
+                          currentWordLength != 0U && currentWordLength <= 12U && wordCaseContinues &&
+                          (stronglyOverlapping || shortCloseContinuation || longCloseContinuation);
+      uint16_t previousIdentifierLength = 0;
+      bool previousIdentifierHasLetter = false;
+      while (previousIdentifierLength < previousLength && previousIdentifierLength < 16U) {
+        const uint8_t value = pageText_[previousOffset + previousLength - previousIdentifierLength - 1U];
+        const bool letter = (value >= 'A' && value <= 'Z') || (value >= 'a' && value <= 'z');
+        const bool digit = value >= '0' && value <= '9';
+        if (!letter && !digit && value != '-') {
+          break;
+        }
+        previousIdentifierHasLetter = previousIdentifierHasLetter || letter;
+        ++previousIdentifierLength;
+      }
+      uint16_t currentDigitLength = 0;
+      while (currentDigitLength < visibleTextLength && currentDigitLength < 3U &&
+             runText[currentDigitLength] >= '0' && runText[currentDigitLength] <= '9') {
+        ++currentDigitLength;
+      }
+      const bool modelIdentifierContinuation =
+          previousIdentifierLength != 0U && previousIdentifierHasLetter &&
+          pageText_[previousOffset + previousLength - 1U] >= '0' &&
+          pageText_[previousOffset + previousLength - 1U] <= '9' &&
+          currentDigitLength != 0U &&
+          previousIdentifierLength + currentDigitLength <= 16U;
+      joinsPreviousWord = joinsPreviousWord || modelIdentifierContinuation;
+    }
+    if (inlineHeadingContinuation && visibleTextLength >= 1U && visibleTextLength <= 5U &&
+        letterCount == visibleTextLength && lowercaseCount == 0U &&
+        (visibleTextLength != 1U || (runText[0] != 'A' && runText[0] != 'I')) &&
+        explicitWhitespaceGap >= static_cast<int64_t>(bodyTextHeight) * 2LL * 65536 &&
+        explicitWhitespaceGap <= static_cast<int64_t>(bodyTextHeight) * 4LL * 65536) {
+      const ExtractedBlockRecord& previousBlock = converted[convertedCount - 2U];
+      const uint16_t previousOffset = previousBlock.textOffset & kExtractedTextOffsetMask;
+      const uint16_t previousLength = previousBlock.textLength & kExtractedTextLengthMask;
+      uint16_t previousCapitalTail = 0;
+      while (previousCapitalTail < previousLength) {
+        const uint8_t value = pageText_[previousOffset + previousLength - previousCapitalTail - 1U];
+        if (value < 'A' || value > 'Z') {
+          break;
+        }
+        ++previousCapitalTail;
+      }
+      joinsPreviousWord = joinsPreviousWord ||
+                          (previousCapitalTail >= 2U && previousCapitalTail <= 8U);
+    }
+    if (heading) {
       encodedTextOffset |= kExtractedHeading;
     }
     if (index == dropCapRunIndex || (index == dropCapTargetIndex && dropCapTargetJoinsNext)) {
       encodedTextOffset |= kExtractedDropCap;
     }
     block.textOffset = encodedTextOffset;
-    block.textLength = static_cast<uint16_t>(run.textLength);
+    block.textLength = static_cast<uint16_t>(run.textLength |
+                                             (joinsPreviousWord ? kExtractedJoinsPrevious : 0U));
     const int64_t x = static_cast<int64_t>(run.baselineX) / 65536;
     const int64_t y = static_cast<int64_t>(index == dropCapRunIndex && dropCapTargetIndex != UINT16_MAX
                                                ? runs[dropCapTargetIndex].baseline
@@ -15708,11 +16186,66 @@ PdfStatus PdfPreparation::finishContentInterpretation() {
     if (x > INT16_MIN && x <= INT16_MAX && y > INT16_MIN && y <= INT16_MAX) {
       block.x = static_cast<int16_t>(x);
       block.y = static_cast<int16_t>(y);
+      const uint16_t lineFlags = (run.flags & PdfTextLight) != 0U ? kExtractedLightText : 0U;
+      const int32_t encodedLineX = std::clamp<int32_t>(block.x, 0, kExtractedLineXMask);
+      block.lineX = static_cast<uint16_t>(encodedLineX) | lineFlags;
+      const int64_t originAdvance = previousConvertedRun == nullptr
+                                        ? INT64_MAX
+                                        : static_cast<int64_t>(run.baselineX) - previousConvertedRun->baselineX;
+      const bool adjacentBoxes =
+          explicitWhitespaceGap >= -static_cast<int64_t>(bodyTextHeight) * 2LL * 65536 &&
+          explicitWhitespaceGap <= static_cast<int64_t>(bodyTextHeight) * 2LL * 65536;
+      const bool adjacentOrigins =
+          originAdvance >= -static_cast<int64_t>(bodyTextHeight) * 2LL * 65536 &&
+          originAdvance <= static_cast<int64_t>(bodyTextHeight) * 4LL * 65536;
+      const bool sameSourceLine =
+          previousConvertedRun != nullptr && baselineDifference <= 3LL * 65536 && (adjacentBoxes || adjacentOrigins);
+      if (sameSourceLine && convertedCount > 1U) {
+        block.lineX = static_cast<uint16_t>(converted[convertedCount - 2U].lineX & kExtractedLineXMask) | lineFlags;
+      }
     }
     compactTextLength += run.textLength;
+    previousConvertedRun = &run;
   }
   if (convertedCount == 0 || compactTextLength == 0) {
     return PdfStatus::failure(PdfError::NoReadableText, currentPageIndex_);
+  }
+  for (uint16_t index = 1; index < convertedCount; ++index) {
+    ExtractedBlockRecord& previous = converted[index - 1U];
+    ExtractedBlockRecord& current = converted[index];
+    if (previous.y == kUnknownTextOrigin || current.y == kUnknownTextOrigin ||
+        std::abs(static_cast<int32_t>(previous.y) - current.y) > 2 ||
+        previous.lineX == UINT16_MAX || current.lineX == UINT16_MAX ||
+        (previous.lineX & kExtractedLineXMask) != (current.lineX & kExtractedLineXMask) ||
+        ((previous.textOffset ^ current.textOffset) & kExtractedHeading) == 0U) {
+      continue;
+    }
+    // A PDF may split one visual heading line into multiple text-show
+    // operators. Classify the complete line consistently before reordering.
+    previous.textOffset |= kExtractedHeading;
+    current.textOffset |= kExtractedHeading;
+  }
+  for (uint16_t first = 0; first < convertedCount; ++first) {
+    if ((converted[first].textOffset & kExtractedHeading) == 0U) {
+      continue;
+    }
+    const uint16_t firstOffset = converted[first].textOffset & kExtractedTextOffsetMask;
+    const uint16_t firstLength = converted[first].textLength & kExtractedTextLengthMask;
+    bool repeated = false;
+    for (uint16_t second = static_cast<uint16_t>(first + 1U); second < convertedCount; ++second) {
+      if ((converted[second].textOffset & kExtractedHeading) == 0U ||
+          (converted[second].textLength & kExtractedTextLengthMask) != firstLength) {
+        continue;
+      }
+      const uint16_t secondOffset = converted[second].textOffset & kExtractedTextOffsetMask;
+      if (std::memcmp(pageText_.get() + firstOffset, pageText_.get() + secondOffset, firstLength) == 0) {
+        converted[second].textOffset &= static_cast<uint16_t>(~kExtractedHeading);
+        repeated = true;
+      }
+    }
+    if (repeated) {
+      converted[first].textOffset &= static_cast<uint16_t>(~kExtractedHeading);
+    }
   }
   transcriptLength_ = compactTextLength;
   extractedBlockCount_ = convertedCount;
@@ -15814,8 +16347,6 @@ PdfStatus PdfPreparation::finishExtractedPage() {
   }
   auto* const order = new (operandScratch_.get()) ReadingOrderWorkspace;
   order->scanIndex = 0;
-  order->tableStart = extractedBlockCount_;
-  order->tableEnd = extractedBlockCount_;
   order->sortGap = 0;
   order->sortIndex = 0;
   order->sortCursor = 0;
@@ -15841,6 +16372,8 @@ PdfStatus PdfPreparation::finishExtractedPage() {
   order->runActive = false;
   order->clusterOverflow = false;
   order->lexicalFallback = false;
+  order->sourceOrderBands = false;
+  order->tableSeen = false;
   order->sortHolding = false;
   order->cycleActive = false;
   return PdfStatus::success();
@@ -15855,6 +16388,8 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
   auto* const blocks = reinterpret_cast<ExtractedBlockRecord*>(decoderOutput_.get());
   const uint16_t blockCount = extractedBlockCount_;
   const uint16_t pageWidth = std::max<uint16_t>(1, currentPageWidth_);
+  const bool sectionBoundaryPage =
+      currentPageIndex_ == 0 || pendingSectionBoundary_ || isSectionBoundary(currentPageIndex_);
   const auto histogramBin = [pageWidth](const int16_t x) {
     if (x <= 0) {
       return uint8_t{0};
@@ -15865,6 +16400,27 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
   const auto sameCoordinate = [](const int16_t first, const int16_t second, const int16_t tolerance) {
     const int32_t difference = static_cast<int32_t>(first) - second;
     return difference >= -tolerance && difference <= tolerance;
+  };
+  const auto isolatedDiscretionaryHyphen = [&](const ExtractedBlockRecord& block) {
+    const uint16_t textOffset = block.textOffset & kExtractedTextOffsetMask;
+    const uint16_t textLength = block.textLength & kExtractedTextLengthMask;
+    if (static_cast<uint32_t>(textOffset) + textLength > transcriptLength_) {
+      return false;
+    }
+    uint16_t begin = 0;
+    uint16_t end = textLength;
+    while (begin < end && (pageText_[textOffset + begin] == ' ' || pageText_[textOffset + begin] == '\t')) {
+      ++begin;
+    }
+    while (end > begin && (pageText_[textOffset + end - 1U] == ' ' || pageText_[textOffset + end - 1U] == '\t')) {
+      --end;
+    }
+    const uint16_t length = static_cast<uint16_t>(end - begin);
+    const uint8_t* const text = pageText_.get() + textOffset + begin;
+    return (length == 1U && text[0] == '-') ||
+           (length == 2U && text[0] == 0xc2U && text[1] == 0xadU) ||
+           (length == 3U && text[0] == 0xe2U && text[1] == 0x80U &&
+            text[2] >= 0x90U && text[2] <= 0x95U);
   };
   const auto columnFor = [&](const CompactTextPlacement& placement) {
     const uint8_t bin = histogramBin(placement.x);
@@ -15883,15 +16439,15 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
     return uint8_t{2};
   };
   const auto less = [&](const CompactTextPlacement& first, const CompactTextPlacement& second) {
-    if (order->lexicalFallback) {
+    if (order->lexicalFallback || order->sourceOrderBands) {
       return first.sourceIndex < second.sourceIndex;
     }
-    const bool firstTable = first.sourceIndex >= order->tableStart && first.sourceIndex < order->tableEnd;
-    const bool secondTable = second.sourceIndex >= order->tableStart && second.sourceIndex < order->tableEnd;
-    if (firstTable != secondTable) {
-      return first.sourceIndex < second.sourceIndex;
-    }
-    if (firstTable) {
+    const bool firstTable = blocks[first.sourceIndex].lineX != UINT16_MAX &&
+                            (blocks[first.sourceIndex].lineX & kExtractedTableCell) != 0U;
+    const bool secondTable = blocks[second.sourceIndex].lineX != UINT16_MAX &&
+                             (blocks[second.sourceIndex].lineX & kExtractedTableCell) != 0U;
+    if ((firstTable && first.x == kFullWidthTableOrigin) ||
+        (secondTable && second.x == kFullWidthTableOrigin)) {
       return first.sourceIndex < second.sourceIndex;
     }
     if (order->columnCount >= 2) {
@@ -15900,6 +16456,18 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
       if (firstColumn != secondColumn) {
         return firstColumn < secondColumn;
       }
+    }
+    if (firstTable && secondTable) {
+      return first.sourceIndex < second.sourceIndex;
+    }
+    if (firstTable || secondTable) {
+      if (!sameCoordinate(first.y, second.y, 2)) {
+        return first.y > second.y;
+      }
+      if (first.x != second.x) {
+        return first.x < second.x;
+      }
+      return first.sourceIndex < second.sourceIndex;
     }
     if (!sameCoordinate(first.y, second.y, 2)) {
       return first.y > second.y;
@@ -15915,6 +16483,16 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
     }
     if (order->clusterCount >= std::size(order->clusterCenters)) {
       order->clusterOverflow = true;
+      uint8_t weakest = 0;
+      for (uint8_t cluster = 1; cluster < order->clusterCount; ++cluster) {
+        if (order->clusterItems[cluster] < order->clusterItems[weakest]) {
+          weakest = cluster;
+        }
+      }
+      if (order->runItems > order->clusterItems[weakest]) {
+        order->clusterCenters[weakest] = static_cast<uint8_t>((order->runStart + order->runLast) / 2U);
+        order->clusterItems[weakest] = order->runItems;
+      }
       return;
     }
     const uint8_t cluster = order->clusterCount++;
@@ -15937,7 +16515,69 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
         }
         {
           const uint16_t sourceIndex = order->scanIndex;
-          int16_t orderingX = blocks[sourceIndex].x;
+          ExtractedBlockRecord& sourceBlock = blocks[sourceIndex];
+          uint16_t encodedLineX = sourceBlock.lineX;
+          bool suffixNearDiscretionaryHyphen = false;
+          const uint16_t sourceTextOffset = sourceBlock.textOffset & kExtractedTextOffsetMask;
+          const uint16_t sourceTextLength = sourceBlock.textLength & kExtractedTextLengthMask;
+          if (sourceBlock.x >= 0 && sourceBlock.y != kUnknownTextOrigin && sourceTextLength != 0U &&
+              sourceTextLength <= 12U &&
+              static_cast<uint32_t>(sourceTextOffset) + sourceTextLength <= transcriptLength_ &&
+              pageText_[sourceTextOffset] >= 'a' && pageText_[sourceTextOffset] <= 'z') {
+            for (uint16_t candidate = 0; candidate < blockCount; ++candidate) {
+              if (candidate != sourceIndex && blocks[candidate].x >= 0 &&
+                  sameCoordinate(blocks[candidate].y, sourceBlock.y, 2) &&
+                  std::abs(static_cast<int32_t>(blocks[candidate].x) - sourceBlock.x) <=
+                      static_cast<int32_t>(std::max<uint16_t>(8U, pageWidth / 12U)) &&
+                  isolatedDiscretionaryHyphen(blocks[candidate])) {
+                suffixNearDiscretionaryHyphen = true;
+                break;
+              }
+            }
+          }
+          if (encodedLineX != UINT16_MAX &&
+              (isolatedDiscretionaryHyphen(sourceBlock) || suffixNearDiscretionaryHyphen)) {
+            int16_t bestAnchorX = INT16_MIN;
+            uint16_t bestAnchor = UINT16_MAX;
+            for (uint16_t candidate = 0; candidate < blockCount; ++candidate) {
+              const ExtractedBlockRecord& anchor = blocks[candidate];
+              const uint16_t anchorOffset = anchor.textOffset & kExtractedTextOffsetMask;
+              const uint16_t anchorLength = anchor.textLength & kExtractedTextLengthMask;
+              if (candidate == sourceIndex || anchor.x < 0 || anchor.x >= sourceBlock.x ||
+                  !sameCoordinate(anchor.y, sourceBlock.y, 2) || anchor.lineX == UINT16_MAX ||
+                  anchorLength == 0U ||
+                  static_cast<uint32_t>(anchorOffset) + anchorLength > transcriptLength_ ||
+                  isolatedDiscretionaryHyphen(anchor)) {
+                continue;
+              }
+              uint16_t end = anchorLength;
+              while (end != 0U && (pageText_[anchorOffset + end - 1U] == ' ' ||
+                                   pageText_[anchorOffset + end - 1U] == '\t')) {
+                --end;
+              }
+              if (end == 0U || !((pageText_[anchorOffset + end - 1U] >= 'A' &&
+                                  pageText_[anchorOffset + end - 1U] <= 'Z') ||
+                                 (pageText_[anchorOffset + end - 1U] >= 'a' &&
+                                  pageText_[anchorOffset + end - 1U] <= 'z')) ||
+                  anchor.x <= bestAnchorX) {
+                continue;
+              }
+              bestAnchorX = anchor.x;
+              bestAnchor = candidate;
+            }
+            if (bestAnchor != UINT16_MAX) {
+              sourceBlock.lineX = static_cast<uint16_t>(blocks[bestAnchor].lineX & kExtractedLineXMask) |
+                                  static_cast<uint16_t>(sourceBlock.lineX & ~kExtractedLineXMask);
+              encodedLineX = sourceBlock.lineX;
+            }
+          }
+          int16_t orderingX = encodedLineX == UINT16_MAX
+                                  ? kUnknownTextOrigin
+                                  : static_cast<int16_t>(encodedLineX & kExtractedLineXMask);
+          if (sourceIndex != 0U && (sourceBlock.textLength & kExtractedJoinsPrevious) != 0U &&
+              sameCoordinate(sourceBlock.y, blocks[sourceIndex - 1U].y, 2)) {
+            orderingX = order->records[sourceIndex - 1U].x;
+          }
           if (sourceIndex != 0 && (blocks[sourceIndex].textOffset & kExtractedHeading) != 0 &&
               (blocks[sourceIndex - 1U].textOffset & kExtractedHeading) != 0 &&
               sameCoordinate(blocks[sourceIndex].y, blocks[sourceIndex - 1U].y, 2)) {
@@ -15962,6 +16602,7 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
           break;
         }
         order->scanIndex = 0;
+        order->cycleStart = 0;
         order->stage = ReadingOrderStage::FindTable;
         break;
 
@@ -15976,8 +16617,10 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
           const ExtractedBlockRecord& second = blocks[index + 1U];
           const ExtractedBlockRecord& third = blocks[index + 2U];
           const ExtractedBlockRecord& fourth = blocks[index + 3U];
-          const bool shortCells = first.textLength <= 8 && second.textLength <= 8 && third.textLength <= 8 &&
-                                  fourth.textLength <= 8;
+          const bool shortCells = (first.textLength & kExtractedTextLengthMask) <= 8U &&
+                                  (second.textLength & kExtractedTextLengthMask) <= 8U &&
+                                  (third.textLength & kExtractedTextLengthMask) <= 8U &&
+                                  (fourth.textLength & kExtractedTextLengthMask) <= 8U;
           const bool pairedRows = sameCoordinate(first.y, second.y, 2) && sameCoordinate(third.y, fourth.y, 2) &&
                                   !sameCoordinate(first.y, third.y, 2);
           const bool alignedColumns = first.x < second.x && third.x < fourth.x &&
@@ -15986,34 +16629,197 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
           const uint16_t semanticFlags =
               static_cast<uint16_t>(first.textOffset | second.textOffset | third.textOffset | fourth.textOffset);
           const int32_t minimumCellGap = std::max<int32_t>(8, pageWidth / 20U);
-          const bool wideRow = (semanticFlags & (kExtractedHeading | kExtractedDropCap)) == 0 &&
-                               sameCoordinate(first.y, second.y, 2) && sameCoordinate(first.y, third.y, 2) &&
-                               sameCoordinate(first.y, fourth.y, 2) &&
-                               static_cast<int32_t>(second.x) - first.x >= minimumCellGap &&
-                               static_cast<int32_t>(third.x) - second.x >= minimumCellGap &&
-                               static_cast<int32_t>(fourth.x) - third.x >= minimumCellGap &&
-                               static_cast<int32_t>(fourth.x) - first.x > static_cast<int32_t>(pageWidth / 3U);
-          if (wideRow || (shortCells && pairedRows && alignedColumns && ((blockCount - index) & 1U) == 0)) {
-            order->tableStart = index;
-            order->tableEnd = blockCount;
+          uint16_t firstRowEnd = static_cast<uint16_t>(index + 1U);
+          while (firstRowEnd < blockCount) {
+            const ExtractedBlockRecord& previous = blocks[firstRowEnd - 1U];
+            const ExtractedBlockRecord& current = blocks[firstRowEnd];
+            if (!sameCoordinate(first.y, current.y, 2) ||
+                static_cast<int32_t>(current.x) - previous.x < minimumCellGap ||
+                (previous.lineX != UINT16_MAX && current.lineX != UINT16_MAX &&
+                 (previous.lineX & kExtractedLineXMask) ==
+                     (current.lineX & kExtractedLineXMask))) {
+              break;
+            }
+            ++firstRowEnd;
+          }
+          const uint16_t firstRowCells = static_cast<uint16_t>(firstRowEnd - index);
+          bool brightHeaderRow = firstRowCells >= 3U &&
+                                 static_cast<int32_t>(blocks[firstRowEnd - 1U].x) - first.x >
+                                     static_cast<int32_t>(pageWidth / 3U);
+          for (uint16_t cell = index; brightHeaderRow && cell < firstRowEnd; ++cell) {
+            brightHeaderRow = blocks[cell].lineX != UINT16_MAX &&
+                              (blocks[cell].lineX & kExtractedLightText) != 0U;
+          }
+          bool alignedWideRows = false;
+          if (firstRowCells >= 3U && firstRowEnd + firstRowCells <= blockCount &&
+              static_cast<int32_t>(blocks[firstRowEnd - 1U].x) - first.x >
+                  static_cast<int32_t>(pageWidth / 3U)) {
+            alignedWideRows = !sameCoordinate(first.y, blocks[firstRowEnd].y, 2);
+            for (uint16_t cell = 0; alignedWideRows && cell < firstRowCells; ++cell) {
+              const ExtractedBlockRecord& current = blocks[firstRowEnd + cell];
+              alignedWideRows = sameCoordinate(current.y, blocks[firstRowEnd].y, 2) &&
+                                sameCoordinate(current.x, blocks[index + cell].x, 12);
+            }
+          }
+          bool pairedColumnTable = false;
+          if (first.x >= 0 && first.y >= 0 &&
+              (first.textOffset & (kExtractedHeading | kExtractedDropCap)) == 0U) {
+            const int32_t columnGap = std::max<int32_t>(24, pageWidth / 12U);
+            const int16_t columnTolerance = static_cast<int16_t>(
+                std::min<uint16_t>(INT16_MAX, std::max<uint16_t>(8U, pageWidth / 30U)));
+            uint16_t secondColumn = UINT16_MAX;
+            const uint16_t headerProbeEnd = std::min<uint16_t>(blockCount, static_cast<uint16_t>(index + 5U));
+            for (uint16_t probe = static_cast<uint16_t>(index + 1U); probe < headerProbeEnd; ++probe) {
+              const int32_t observedColumnGap = static_cast<int32_t>(blocks[probe].x) - first.x;
+              if (observedColumnGap >= columnGap && observedColumnGap <= static_cast<int32_t>(pageWidth / 3U) &&
+                  first.lineX != UINT16_MAX && blocks[probe].lineX != UINT16_MAX &&
+                  (first.lineX & kExtractedLineXMask) !=
+                      (blocks[probe].lineX & kExtractedLineXMask) &&
+                  (first.textLength & kExtractedTextLengthMask) <= 64U &&
+                  (blocks[probe].textLength & kExtractedTextLengthMask) <= 64U &&
+                  sameCoordinate(blocks[probe].y, first.y, 2)) {
+                secondColumn = probe;
+                break;
+              }
+            }
+            if (secondColumn != UINT16_MAX) {
+              const int16_t firstLineOrigin = static_cast<int16_t>(first.lineX & kExtractedLineXMask);
+              const int16_t secondLineOrigin =
+                  static_cast<int16_t>(blocks[secondColumn].lineX & kExtractedLineXMask);
+              uint16_t firstDataCell = UINT16_MAX;
+              const uint16_t dataProbeEnd =
+                  std::min<uint16_t>(blockCount, static_cast<uint16_t>(secondColumn + 17U));
+              for (uint16_t probe = static_cast<uint16_t>(secondColumn + 1U); probe < dataProbeEnd; ++probe) {
+                if (blocks[probe].lineX != UINT16_MAX && blocks[probe].y < first.y - 2 &&
+                    sameCoordinate(blocks[probe].x, first.x, columnTolerance) &&
+                    sameCoordinate(static_cast<int16_t>(blocks[probe].lineX & kExtractedLineXMask),
+                                   firstLineOrigin, columnTolerance)) {
+                  firstDataCell = probe;
+                  break;
+                }
+              }
+              if (firstDataCell != UINT16_MAX) {
+                uint16_t secondDataCell = UINT16_MAX;
+                for (uint16_t probe = static_cast<uint16_t>(firstDataCell + 1U); probe < dataProbeEnd; ++probe) {
+                  if (blocks[probe].lineX != UINT16_MAX && blocks[probe].y <= first.y &&
+                      sameCoordinate(blocks[probe].x, blocks[secondColumn].x, columnTolerance)) {
+                    secondDataCell = probe;
+                    break;
+                  }
+                }
+                if (secondDataCell != UINT16_MAX) {
+                  bool multilineCell = secondColumn > index + 1U || secondDataCell > firstDataCell + 1U;
+                  for (uint16_t probe = static_cast<uint16_t>(secondDataCell + 1U);
+                       !multilineCell && probe < dataProbeEnd; ++probe) {
+                    if (blocks[probe].lineX != UINT16_MAX &&
+                        sameCoordinate(static_cast<int16_t>(blocks[probe].lineX & kExtractedLineXMask),
+                                       firstLineOrigin, columnTolerance)) {
+                      break;
+                    }
+                    multilineCell = blocks[probe].lineX != UINT16_MAX &&
+                                    sameCoordinate(static_cast<int16_t>(blocks[probe].lineX & kExtractedLineXMask),
+                                                   secondLineOrigin, columnTolerance);
+                  }
+                  uint16_t nextFirstCell = UINT16_MAX;
+                  uint16_t nextSecondCell = UINT16_MAX;
+                  for (uint16_t probe = static_cast<uint16_t>(secondDataCell + 1U);
+                       probe < dataProbeEnd; ++probe) {
+                    if (blocks[probe].lineX != UINT16_MAX &&
+                        sameCoordinate(static_cast<int16_t>(blocks[probe].lineX & kExtractedLineXMask),
+                                       firstLineOrigin, columnTolerance) &&
+                        blocks[probe].y < blocks[firstDataCell].y - 2) {
+                      nextFirstCell = probe;
+                      break;
+                    }
+                  }
+                  if (nextFirstCell != UINT16_MAX) {
+                    for (uint16_t probe = static_cast<uint16_t>(nextFirstCell + 1U);
+                         probe < dataProbeEnd; ++probe) {
+                      if (blocks[probe].lineX != UINT16_MAX &&
+                          sameCoordinate(static_cast<int16_t>(blocks[probe].lineX & kExtractedLineXMask),
+                                         secondLineOrigin, columnTolerance)) {
+                        nextSecondCell = probe;
+                        break;
+                      }
+                    }
+                  }
+                  const ExtractedBlockRecord& firstData = blocks[firstDataCell];
+                  const uint16_t firstDataLength = firstData.textLength & kExtractedTextLengthMask;
+                  const uint16_t firstDataOffset = firstData.textOffset & kExtractedTextOffsetMask;
+                  const int32_t firstRowGap = static_cast<int32_t>(first.y) - firstData.y;
+                  const bool compactNumberedRow = firstDataLength != 0U && firstDataLength <= 4U &&
+                                                  firstDataOffset < transcriptLength_ &&
+                                                  pageText_[firstDataOffset] >= '0' &&
+                                                  pageText_[firstDataOffset] <= '9' &&
+                                                  firstRowGap > 2 &&
+                                                  firstRowGap <= std::max<int32_t>(24, currentPageHeight_ / 30U);
+                  pairedColumnTable = (multilineCell && nextSecondCell != UINT16_MAX) || compactNumberedRow;
+                }
+              }
+            }
+          }
+          const bool pairedShortRows = shortCells && pairedRows && alignedColumns &&
+                                       (semanticFlags & (kExtractedHeading | kExtractedDropCap)) == 0U;
+          if (brightHeaderRow || alignedWideRows || pairedColumnTable || pairedShortRows) {
+            uint16_t tableEnd = blockCount;
             const uint16_t tableBreakGap = std::max<uint16_t>(24U, currentPageHeight_ / 23U);
             for (uint16_t probe = static_cast<uint16_t>(index + 4U); probe < blockCount; ++probe) {
               const ExtractedBlockRecord& previous = blocks[probe - 1U];
               const ExtractedBlockRecord& current = blocks[probe];
               if (previous.y != kUnknownTextOrigin && current.y != kUnknownTextOrigin &&
                   std::abs(static_cast<int32_t>(previous.y) - current.y) > tableBreakGap) {
-                order->tableEnd = probe;
+                tableEnd = probe;
                 break;
               }
             }
-            order->scanIndex = 0;
-            order->stage = ReadingOrderStage::BuildHistogram;
+            const uint16_t minimumRecords = brightHeaderRow ? static_cast<uint16_t>(firstRowEnd + 2U)
+                                                             : static_cast<uint16_t>(index + 4U);
+            if (tableEnd >= minimumRecords) {
+              int16_t minimumTableX = first.x;
+              int16_t maximumTableX = first.x;
+              int16_t minimumTableY = first.y;
+              int16_t maximumTableY = first.y;
+              for (uint16_t record = index + 1U; record < tableEnd; ++record) {
+                minimumTableX = std::min(minimumTableX, blocks[record].x);
+                maximumTableX = std::max(maximumTableX, blocks[record].x);
+                minimumTableY = std::min(minimumTableY, blocks[record].y);
+                maximumTableY = std::max(maximumTableY, blocks[record].y);
+              }
+              const int32_t parallelColumnGap = std::max<int32_t>(8, pageWidth / 20U);
+              bool hasParallelContent = false;
+              for (uint16_t probe = 0; !hasParallelContent && probe < blockCount; ++probe) {
+                if (probe >= index && probe < tableEnd) {
+                  continue;
+                }
+                const ExtractedBlockRecord& other = blocks[probe];
+                const bool outsideTableColumn = other.x < minimumTableX - parallelColumnGap ||
+                                                other.x > maximumTableX + parallelColumnGap;
+                hasParallelContent = other.x >= 0 && other.y != kUnknownTextOrigin &&
+                                     outsideTableColumn && other.y >= minimumTableY && other.y <= maximumTableY;
+              }
+              const bool spansPageColumns = minimumTableX >= 0 &&
+                                            static_cast<int32_t>(maximumTableX) - minimumTableX >=
+                                                static_cast<int32_t>(pageWidth) * 2 / 5;
+              const int16_t tableOrderingX =
+                  spansPageColumns || !hasParallelContent ? kFullWidthTableOrigin : first.x;
+              for (uint16_t record = index; record < tableEnd; ++record) {
+                const uint16_t lineOrigin = blocks[record].lineX == UINT16_MAX
+                                                ? 0U
+                                                : static_cast<uint16_t>(blocks[record].lineX & kExtractedLineXMask);
+                blocks[record].lineX = static_cast<uint16_t>(lineOrigin | kExtractedTableCell |
+                                                              (record == index ? kExtractedLightText : 0U));
+                order->records[record].x = tableOrderingX;
+                order->records[record].y = first.y;
+              }
+              order->tableSeen = true;
+              order->scanIndex = tableEnd;
+            }
           }
         }
         break;
 
       case ReadingOrderStage::BuildHistogram:
-        if (order->scanIndex >= order->tableStart) {
+        if (order->scanIndex >= blockCount) {
           order->scanIndex = 0;
           order->runItems = 0;
           order->clusterCount = 0;
@@ -16022,14 +16828,31 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
           order->stage = ReadingOrderStage::AnalyzeHistogram;
           break;
         } else {
-          const CompactTextPlacement& placement = order->records[order->scanIndex++];
+          const uint16_t placementIndex = order->scanIndex++;
+          const CompactTextPlacement& placement = order->records[placementIndex];
+          if (blocks[placement.sourceIndex].lineX != UINT16_MAX &&
+              (blocks[placement.sourceIndex].lineX & kExtractedTableCell) != 0U) {
+            if (placement.x == kFullWidthTableOrigin) {
+              break;
+            }
+          }
           if ((blocks[placement.sourceIndex].textOffset & (kExtractedHeading | kExtractedDropCap)) != 0) {
             break;
+          }
+          if (placementIndex != 0 && sameCoordinate(placement.y, order->records[placementIndex - 1U].y, 2)) {
+            const ExtractedBlockRecord& previousBlock = blocks[order->records[placementIndex - 1U].sourceIndex];
+            const ExtractedBlockRecord& currentBlock = blocks[placement.sourceIndex];
+            if (previousBlock.lineX != UINT16_MAX && currentBlock.lineX != UINT16_MAX &&
+                (previousBlock.lineX & kExtractedLineXMask) ==
+                    (currentBlock.lineX & kExtractedLineXMask)) {
+              break;
+            }
           }
           const uint8_t bin = histogramBin(placement.x);
           if (order->histogram[bin] != UINT8_MAX) {
             ++order->histogram[bin];
           }
+          ++order->cycleStart;
         }
         break;
 
@@ -16060,12 +16883,62 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
           order->runActive = false;
           break;
         }
-        const uint16_t minimumColumnItems = std::max<uint16_t>(2, blockCount / 6U);
-        const bool supportedColumns = order->clusterItems[0] >= minimumColumnItems &&
+        for (uint8_t cluster = 1; cluster < order->clusterCount; ++cluster) {
+          const uint8_t center = order->clusterCenters[cluster];
+          const uint16_t items = order->clusterItems[cluster];
+          uint8_t destination = cluster;
+          while (destination != 0 && order->clusterCenters[destination - 1U] > center) {
+            order->clusterCenters[destination] = order->clusterCenters[destination - 1U];
+            order->clusterItems[destination] = order->clusterItems[destination - 1U];
+            --destination;
+          }
+          order->clusterCenters[destination] = center;
+          order->clusterItems[destination] = items;
+        }
+        uint8_t mergedClusters = 0;
+        for (uint8_t cluster = 0; cluster < order->clusterCount; ++cluster) {
+          if (mergedClusters != 0U &&
+              order->clusterCenters[cluster] <
+                  order->clusterCenters[mergedClusters - 1U] + kReadingOrderHistogramBins / 6U) {
+            const uint16_t previousItems = order->clusterItems[mergedClusters - 1U];
+            const uint16_t currentItems = order->clusterItems[cluster];
+            const uint32_t totalItems = static_cast<uint32_t>(previousItems) + currentItems;
+            order->clusterCenters[mergedClusters - 1U] = static_cast<uint8_t>(
+                (static_cast<uint32_t>(order->clusterCenters[mergedClusters - 1U]) * previousItems +
+                 static_cast<uint32_t>(order->clusterCenters[cluster]) * currentItems) /
+                totalItems);
+            order->clusterItems[mergedClusters - 1U] =
+                static_cast<uint16_t>(std::min<uint32_t>(UINT16_MAX, totalItems));
+            continue;
+          }
+          order->clusterCenters[mergedClusters] = order->clusterCenters[cluster];
+          order->clusterItems[mergedClusters] = order->clusterItems[cluster];
+          ++mergedClusters;
+        }
+        order->clusterCount = mergedClusters;
+        const uint16_t minimumColumnItems = order->tableSeen
+                                                ? std::max<uint16_t>(2U, order->cycleStart / 8U)
+                                                : std::max<uint16_t>(6U, order->cycleStart / 10U);
+        uint8_t retainedClusters = 0;
+        for (uint8_t cluster = 0; cluster < order->clusterCount; ++cluster) {
+          if (order->clusterItems[cluster] < minimumColumnItems) {
+            continue;
+          }
+          if (retainedClusters != cluster) {
+            order->clusterCenters[retainedClusters] = order->clusterCenters[cluster];
+            order->clusterItems[retainedClusters] = order->clusterItems[cluster];
+          }
+          ++retainedClusters;
+        }
+        order->clusterCount = retainedClusters;
+        const bool plausibleRightColumn =
+            order->clusterCount != 2U ||
+            order->clusterCenters[1] >= kReadingOrderHistogramBins * 2U / 5U;
+        const bool supportedColumns = plausibleRightColumn &&
+                                      order->clusterItems[0] >= minimumColumnItems &&
                                       order->clusterItems[1] >= minimumColumnItems &&
                                       (order->clusterCount < 3 || order->clusterItems[2] >= minimumColumnItems);
-        if (!order->clusterOverflow && supportedColumns &&
-            (order->clusterCount == 2 || order->clusterCount == 3)) {
+        if (supportedColumns && (order->clusterCount == 2 || order->clusterCount == 3)) {
           order->columnCount = order->clusterCount;
           order->columnSplits[0] =
               static_cast<uint8_t>((order->clusterCenters[0] + order->clusterCenters[1]) / 2U);
@@ -16075,6 +16948,35 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
           }
         } else {
           order->columnCount = 0;
+        }
+        if (order->columnCount >= 2 && order->clusterItems[0] >= 12U &&
+            order->clusterItems[1] >= 12U) {
+          const int32_t regionGap = std::max<int32_t>(24, currentPageHeight_ / 20U);
+          uint8_t previousColumn = 0;
+          int16_t previousY = 0;
+          bool hasPrevious = false;
+          for (uint16_t sourceIndex = 0; sourceIndex < blockCount; ++sourceIndex) {
+            const CompactTextPlacement& placement = order->records[sourceIndex];
+            if ((blocks[sourceIndex].textOffset & (kExtractedHeading | kExtractedDropCap)) != 0 ||
+                placement.y == kUnknownTextOrigin ||
+                static_cast<int32_t>(placement.y) <= static_cast<int32_t>(currentPageHeight_ / 8U) ||
+                static_cast<int32_t>(placement.y) >= static_cast<int32_t>(currentPageHeight_ * 7U / 8U)) {
+              continue;
+            }
+            const uint8_t currentColumn = columnFor(placement);
+            if (hasPrevious && currentColumn < previousColumn &&
+                static_cast<int32_t>(previousY) - placement.y >= regionGap) {
+              // The source already contains multiple top-to-bottom column
+              // bands (for example, a two-column abstract above a two-column
+              // article). A global column sort would move the upper right
+              // band behind the entire lower left band.
+              order->sourceOrderBands = true;
+              break;
+            }
+            hasPrevious = true;
+            previousColumn = currentColumn;
+            previousY = placement.y;
+          }
         }
         order->sortGap = static_cast<uint16_t>(blockCount / 2U);
         order->sortIndex = order->sortGap;
@@ -16190,6 +17092,13 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
           const uint16_t index = order->scanIndex++;
           const CompactTextPlacement& previous = order->records[index - 1U];
           const CompactTextPlacement& current = order->records[index];
+          const bool previousTable = blocks[index - 1U].lineX != UINT16_MAX &&
+                                     (blocks[index - 1U].lineX & kExtractedTableCell) != 0U;
+          const bool currentTable = blocks[index].lineX != UINT16_MAX &&
+                                    (blocks[index].lineX & kExtractedTableCell) != 0U;
+          if (previousTable || currentTable) {
+            break;
+          }
           const int32_t gap = static_cast<int32_t>(previous.y) - current.y;
           if (previous.y != kUnknownTextOrigin && current.y != kUnknownTextOrigin &&
               columnFor(previous) == columnFor(current) && gap > 2) {
@@ -16226,7 +17135,10 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
         if (order->scanIndex < blockCount) {
           const uint16_t index = order->scanIndex++;
           const ExtractedBlockRecord& block = blocks[index];
-          if (block.x >= 0 && (block.textOffset & (kExtractedHeading | kExtractedDropCap)) == 0) {
+          const bool tableRecord = block.lineX != UINT16_MAX &&
+                                   (block.lineX & kExtractedTableCell) != 0U;
+          if (block.x >= 0 && !tableRecord &&
+              (block.textOffset & (kExtractedHeading | kExtractedDropCap)) == 0) {
             const uint8_t column = columnFor(order->records[index]);
             order->clusterItems[column] = std::min<uint16_t>(order->clusterItems[column],
                                                              static_cast<uint16_t>(block.x));
@@ -16242,8 +17154,61 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
         if (order->applyIndex < blockCount) {
           const uint16_t index = order->applyIndex++;
           ExtractedBlockRecord& current = blocks[index];
+          const bool sourceJoinsPrevious = (current.textLength & kExtractedJoinsPrevious) != 0U;
           current.textLength &= kExtractedTextLengthMask;
-          bool newBlock = index == 0 || order->lexicalFallback;
+          const bool currentHeading = (current.textOffset & kExtractedHeading) != 0U;
+          const bool forceNewBlock = current.lineX != UINT16_MAX && currentHeading &&
+                                     (current.lineX & kExtractedLightText) != 0U;
+          bool mergeHeadingCluster = false;
+          if (index != 0U && !order->lexicalFallback && currentHeading) {
+            const ExtractedBlockRecord& previous = blocks[index - 1U];
+            const bool previousHeading = (previous.textOffset & kExtractedHeading) != 0U;
+            const bool coordinatesValid = current.x >= 0 && current.y >= 0 && previous.x >= 0 && previous.y >= 0;
+            const uint16_t previousLength = previous.textLength & kExtractedTextLengthMask;
+            const uint16_t previousOffset = previous.textOffset & kExtractedTextOffsetMask;
+            bool shortNumericLabel = previousLength != 0U && previousLength <= 3U &&
+                                     static_cast<uint32_t>(previousOffset) + previousLength <= transcriptLength_;
+            for (uint16_t character = 0; shortNumericLabel && character < previousLength; ++character) {
+              shortNumericLabel = pageText_[previousOffset + character] >= '0' &&
+                                  pageText_[previousOffset + character] <= '9';
+            }
+            const bool lineOriginsKnown = current.lineX != UINT16_MAX && previous.lineX != UINT16_MAX;
+            const uint16_t currentLineX = lineOriginsKnown ? current.lineX & kExtractedLineXMask : 0U;
+            const uint16_t previousLineX = lineOriginsKnown ? previous.lineX & kExtractedLineXMask : 0U;
+            const bool alignedSectionTitle =
+                sectionBoundaryPage && lineOriginsKnown &&
+                std::abs(static_cast<int32_t>(currentLineX) - previousLineX) <=
+                    static_cast<int32_t>(std::max<uint16_t>(4U, pageWidth / 12U));
+            const uint32_t gap = coordinatesValid
+                                     ? static_cast<uint32_t>(std::abs(static_cast<int32_t>(previous.y) - current.y))
+                                     : UINT32_MAX;
+            const bool tableRecord = current.lineX != UINT16_MAX &&
+                                     (current.lineX & kExtractedTableCell) != 0U;
+            const bool previousTableRecord = previous.lineX != UINT16_MAX &&
+                                             (previous.lineX & kExtractedTableCell) != 0U;
+            const bool centeredSectionTitle =
+                sectionBoundaryPage && lineOriginsKnown && currentLineX > pageWidth / 6U &&
+                previousLineX > pageWidth / 6U && currentLineX < pageWidth * 2U / 3U &&
+                previousLineX < pageWidth * 2U / 3U;
+            const bool nearbyNumericLabel =
+                shortNumericLabel && gap <= static_cast<uint32_t>(order->runItems) * 5U;
+            uint16_t previousVisibleLength = previousLength;
+            while (previousVisibleLength != 0U &&
+                   static_cast<uint32_t>(previousOffset) + previousVisibleLength <= transcriptLength_ &&
+                   (pageText_[previousOffset + previousVisibleLength - 1U] == ' ' ||
+                    pageText_[previousOffset + previousVisibleLength - 1U] == '\t')) {
+              --previousVisibleLength;
+            }
+            const bool leadingArticle = previousVisibleLength == 3U &&
+                                        static_cast<uint32_t>(previousOffset) + previousVisibleLength <= transcriptLength_ &&
+                                        std::memcmp(pageText_.get() + previousOffset, "THE", 3U) == 0;
+            const bool nearbyLeadingArticle = leadingArticle;
+            const bool nearbyTitleLine = (alignedSectionTitle || centeredSectionTitle) &&
+                                         gap <= static_cast<uint32_t>(order->runItems) * 2U;
+            mergeHeadingCluster = previousHeading && coordinatesValid && !tableRecord && !previousTableRecord &&
+                                  (nearbyNumericLabel || nearbyLeadingArticle || nearbyTitleLine);
+          }
+          bool newBlock = index == 0 || order->lexicalFallback || (forceNewBlock && !mergeHeadingCluster);
           bool sameLine = false;
           bool wideFourCellRow = false;
           if (blockCount >= 4U) {
@@ -16272,33 +17237,113 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
           }
           if (!newBlock) {
             const ExtractedBlockRecord& previous = blocks[index - 1U];
-            const bool currentHeading = (current.textOffset & kExtractedHeading) != 0;
+            bool currentHeading = (current.textOffset & kExtractedHeading) != 0;
             const bool previousHeading = (previous.textOffset & kExtractedHeading) != 0;
-            const uint8_t currentColumn = columnFor(order->records[index]);
-            const uint8_t previousColumn = columnFor(order->records[index - 1U]);
+            const bool previousForceNewBlock = previous.lineX != UINT16_MAX &&
+                                               previousHeading &&
+                                               (previous.lineX & kExtractedLightText) != 0U;
+            uint16_t previousLineStart = static_cast<uint16_t>(index - 1U);
+            while (previousLineStart != 0U) {
+              const uint16_t candidate = static_cast<uint16_t>(previousLineStart - 1U);
+              const ExtractedBlockRecord& candidateBlock = blocks[candidate];
+              const ExtractedBlockRecord& lineBlock = blocks[previousLineStart];
+              if (!sameCoordinate(order->records[candidate].y, order->records[previousLineStart].y, 2) ||
+                  candidateBlock.x < 0 || lineBlock.x < candidateBlock.x) {
+                break;
+              }
+              const uint16_t candidateLength = candidateBlock.textLength & kExtractedTextLengthMask;
+              const int32_t candidateReach = static_cast<int32_t>(candidateBlock.x) +
+                                             std::min<int32_t>(pageWidth / 2U, candidateLength * 4U) +
+                                             std::max<int32_t>(4, pageWidth / 50U);
+              if (lineBlock.x > candidateReach) {
+                break;
+              }
+              previousLineStart = candidate;
+            }
+            const uint8_t previousColumn = columnFor(order->records[previousLineStart]);
             const bool coordinatesValid = current.x >= 0 && current.y >= 0 && previous.x >= 0 && previous.y >= 0;
             const uint16_t gap = coordinatesValid
                                      ? static_cast<uint16_t>(std::min<int32_t>(UINT16_MAX,
                                                                                std::abs(static_cast<int32_t>(previous.y) - current.y)))
                                      : UINT16_MAX;
             sameLine = coordinatesValid && gap <= 2U;
-            const bool tableRecord = order->records[index].sourceIndex >= order->tableStart &&
-                                     order->records[index].sourceIndex < order->tableEnd;
-            const bool previousTableRecord = order->records[index - 1U].sourceIndex >= order->tableStart &&
-                                             order->records[index - 1U].sourceIndex < order->tableEnd;
-            newBlock = !coordinatesValid || tableRecord || currentColumn != previousColumn ||
-                       currentHeading != previousHeading;
+            const uint16_t previousTextLength = previous.textLength & kExtractedTextLengthMask;
+            const int32_t inlineReach = static_cast<int32_t>(previous.x) +
+                                        std::min<int32_t>(pageWidth / 2U, previousTextLength * 4U) +
+                                        std::max<int32_t>(4, pageWidth / 50U);
+            const bool inlineContinuation = sameLine && current.x >= previous.x && current.x <= inlineReach;
+            const uint8_t currentColumn = inlineContinuation ? previousColumn : columnFor(order->records[index]);
+            const bool tableRecord = current.lineX != UINT16_MAX &&
+                                     (current.lineX & kExtractedTableCell) != 0U;
+            const bool previousTableRecord = previous.lineX != UINT16_MAX &&
+                                             (previous.lineX & kExtractedTableCell) != 0U;
+            bool crossColumnContinuation = false;
+            if (coordinatesValid && !tableRecord && !previousTableRecord && currentColumn > previousColumn &&
+                static_cast<int32_t>(current.y) - previous.y >= static_cast<int32_t>(order->runItems) * 3) {
+              const uint16_t previousOffset = previous.textOffset & kExtractedTextOffsetMask;
+              const uint16_t currentOffset = current.textOffset & kExtractedTextOffsetMask;
+              const uint16_t currentTextLength = current.textLength & kExtractedTextLengthMask;
+              if (previousTextLength != 0U && currentTextLength != 0U &&
+                  static_cast<uint32_t>(previousOffset) + previousTextLength <= transcriptLength_ &&
+                  static_cast<uint32_t>(currentOffset) + currentTextLength <= transcriptLength_) {
+                const uint8_t previousEnd = pageText_[previousOffset + previousTextLength - 1U];
+                const uint8_t currentStart = pageText_[currentOffset];
+                const bool openSentence = previousEnd != '.' && previousEnd != '!' && previousEnd != '?' &&
+                                          previousEnd != ':' && previousEnd != ';';
+                crossColumnContinuation = openSentence && currentStart >= 'a' && currentStart <= 'z';
+              }
+            }
+            newBlock = !mergeHeadingCluster &&
+                       (!coordinatesValid || tableRecord || previousTableRecord ||
+                        (currentColumn != previousColumn && !crossColumnContinuation) ||
+                        currentHeading != previousHeading ||
+                        (currentHeading && previousForceNewBlock));
+            if (previousHeading && !currentHeading && coordinatesValid && !tableRecord && !previousTableRecord &&
+                currentColumn == previousColumn && gap <= static_cast<uint32_t>(order->runItems) * 2U) {
+              const uint16_t previousOffset = previous.textOffset & kExtractedTextOffsetMask;
+              const uint16_t currentOffset = current.textOffset & kExtractedTextOffsetMask;
+              const uint16_t currentLength = current.textLength & kExtractedTextLengthMask;
+              bool sentenceLikeHeading = previousTextLength >= 48U &&
+                                         static_cast<uint32_t>(previousOffset) + previousTextLength <= transcriptLength_;
+              bool headingHasComma = false;
+              uint16_t headingLowercase = 0;
+              for (uint16_t character = 0; sentenceLikeHeading && character < previousTextLength; ++character) {
+                const uint8_t value = pageText_[previousOffset + character];
+                headingHasComma = headingHasComma || value == ',';
+                headingLowercase = static_cast<uint16_t>(
+                    headingLowercase + (value >= 'a' && value <= 'z' ? 1U : 0U));
+              }
+              sentenceLikeHeading = sentenceLikeHeading && headingHasComma && headingLowercase >= 12U;
+              if (previousTextLength != 0U && currentLength != 0U &&
+                  static_cast<uint32_t>(previousOffset) + previousTextLength <= transcriptLength_ &&
+                  static_cast<uint32_t>(currentOffset) + currentLength <= transcriptLength_ &&
+                  extractedTextEndsOpenSentence(pageText_.get() + previousOffset, previousTextLength) &&
+                  (extractedTextStartsLowercase(pageText_.get() + currentOffset, currentLength) ||
+                   sentenceLikeHeading)) {
+                uint16_t headingStart = static_cast<uint16_t>(index - 1U);
+                while (headingStart != 0U &&
+                       (blocks[headingStart].textLength & kExtractedNewBlock) == 0U) {
+                  --headingStart;
+                }
+                for (uint16_t headingIndex = headingStart; headingIndex < index; ++headingIndex) {
+                  blocks[headingIndex].textOffset &= static_cast<uint16_t>(~kExtractedHeading);
+                }
+                newBlock = false;
+              }
+            }
             if (tableRecord && previousTableRecord && coordinatesValid && !currentHeading && !previousHeading) {
               const uint16_t horizontalGap = static_cast<uint16_t>(
                   std::abs(static_cast<int32_t>(current.x) - static_cast<int32_t>(previous.x)));
               const uint16_t sameCellXThreshold = std::max<uint16_t>(4U, pageWidth / 100U);
-              const bool sameTableCell = horizontalGap <= sameCellXThreshold &&
-                                         gap <= static_cast<uint32_t>(order->runItems) * 2U;
+              const bool sameTableCell =
+                  (horizontalGap <= sameCellXThreshold &&
+                   gap <= static_cast<uint32_t>(order->runItems) * 2U) ||
+                  (sourceJoinsPrevious && sameLine);
               newBlock = !sameTableCell;
             }
-            if (!newBlock && currentHeading) {
+            if (!newBlock && currentHeading && !mergeHeadingCluster) {
               newBlock = static_cast<uint32_t>(gap) * 4U > static_cast<uint32_t>(order->runItems) * 9U;
-            } else if (!newBlock && !sameLine) {
+            } else if (!newBlock && !mergeHeadingCluster && !sameLine && !crossColumnContinuation) {
               const uint16_t leftEdge = order->clusterItems[currentColumn];
               const uint16_t indentThreshold = std::max<uint16_t>(6, order->runItems / 2U);
               const uint16_t horizontalShift = static_cast<uint16_t>(
@@ -16310,15 +17355,16 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
                                     horizontalShift > indentThreshold;
               newBlock = static_cast<uint32_t>(gap) * 2U > static_cast<uint32_t>(order->runItems) * 3U || indented;
             }
-            if (wideFourCellRow) {
+            if (wideFourCellRow && !tableRecord) {
               newBlock = !sameLine;
             }
           }
           if (newBlock) {
             current.textLength |= kExtractedNewBlock;
             ++currentPageSemanticBlockCount_;
-          } else if (sameLine && !wideFourCellRow &&
-                     (current.textOffset & kExtractedExplicitWhitespace) != 0) {
+          } else if (sameLine &&
+                     (sourceJoinsPrevious ||
+                      (!wideFourCellRow && (current.textOffset & kExtractedExplicitWhitespace) != 0))) {
             current.textLength |= kExtractedJoinsPrevious;
           }
           break;
@@ -17831,6 +18877,8 @@ PdfStepResult PdfPreparation::stepOpenSection(PdfWorkBudget& budget) {
     return PdfStepResult::failure(PdfStatus::failure(PdfError::InsufficientStorage));
   }
   const bool retainedWriter = outputWriter_.open;
+  const bool retainedSemanticParagraph = retainedWriter && semanticWriter_.blockOpen() &&
+                                         semanticWriter_.currentBlockKind() == PdfSemanticBlockKind::Paragraph;
   PdfStatus status = PdfStatus::success();
   if (retainedWriter) {
     const PdfRequiredFileRecord& file = navigation_->preparedPageScratch.file;
@@ -17852,19 +18900,24 @@ PdfStepResult PdfPreparation::stepOpenSection(PdfWorkBudget& budget) {
     sectionOpenPrepared_ = false;
     return PdfStepResult::failure(status);
   }
-  status = newSection
-               ? semanticWriter_.begin({this, writeSection}, {this, emitBlock},
-                                       {sourceWindow_.get(), PdfLimits::SourceBufferBytes}, totalWords_)
-               : semanticWriter_.resume({this, writeSection}, {this, emitBlock},
-                                        {sourceWindow_.get(), PdfLimits::SourceBufferBytes}, totalWords_,
-                                         nextAnchorOrdinal_ == 0 ? 0 : nextAnchorOrdinal_ - 1U,
-                                         nextAnchorOrdinal_ != 0);
+  status = retainedSemanticParagraph
+               ? PdfStatus::success()
+               : newSection
+                     ? semanticWriter_.begin({this, writeSection}, {this, emitBlock},
+                                             {sourceWindow_.get(), PdfLimits::SourceBufferBytes}, totalWords_)
+                     : semanticWriter_.resume({this, writeSection}, {this, emitBlock},
+                                              {sourceWindow_.get(), PdfLimits::SourceBufferBytes}, totalWords_,
+                                               nextAnchorOrdinal_ == 0 ? 0 : nextAnchorOrdinal_ - 1U,
+                                               nextAnchorOrdinal_ != 0);
   if (!status) {
     pdfAbortTrackedCacheFile(&outputWriter_);
   } else {
     sectionEmitStage_ = SectionEmitStage::Idle;
     sectionEmitEndBlock_ = currentBlockIndex_;
     sectionEmitImageIndex_ = currentPageImageStart_;
+    sectionEmitTableCellX_ = 0;
+    sectionEmitTableOpen_ = false;
+    sectionEmitTableHasCell_ = false;
   }
   sectionOpenPrepared_ = false;
   return status ? PdfStepResult::completed() : PdfStepResult::failure(status);
@@ -18166,13 +19219,36 @@ PdfStepResult PdfPreparation::emitSection(PdfWorkBudget& budget) {
       status = PdfStatus::success();
     }
     if (currentBlockIndex_ == 0) {
+      bool continuesPrevious = false;
+      if (semanticWriter_.blockOpen()) {
+        const ExtractedBlockRecord& first = blocks[0];
+        const uint16_t firstOffset = first.textOffset & kExtractedTextOffsetMask;
+        const uint16_t firstLength = first.textLength & kExtractedTextLengthMask;
+        const bool firstHeading = (first.textOffset & kExtractedHeading) != 0U;
+        const bool firstTableCell = first.lineX != UINT16_MAX &&
+                                    (first.lineX & kExtractedTableCell) != 0U;
+        continuesPrevious = (first.textLength & kExtractedNewBlock) != 0U && !firstHeading && !firstTableCell &&
+                            static_cast<uint32_t>(firstOffset) + firstLength <= transcriptLength_ &&
+                            extractedTextStartsLowercase(pageText_.get() + firstOffset, firstLength);
+        if (continuesPrevious) {
+          constexpr uint8_t separator = ' ';
+          status = semanticWriter_.writeText(&separator, 1U);
+        } else {
+          status = semanticWriter_.endBlock();
+          if (status) {
+            ++nextAnchorOrdinal_;
+          }
+        }
+      }
       currentPageFirstAnchor_ = nextAnchorOrdinal_;
       if (currentPageIndex_ + 1U < pageCount_) {
         nextPageAnchorHintIndex_ = currentPageIndex_ + 1U;
-        nextPageAnchorHint_ = nextAnchorOrdinal_ + currentPageSemanticBlockCount_;
+        nextPageAnchorHint_ = nextAnchorOrdinal_ + currentPageSemanticBlockCount_ - (continuesPrevious ? 1U : 0U);
       }
-      status = semanticWriter_.writePublisherPageBreak(currentPageIndex_, reinterpret_cast<const uint8_t*>(pageLabel),
-                                                       pageLabelLength);
+      if (status) {
+        status = semanticWriter_.writePublisherPageBreak(
+            currentPageIndex_, reinterpret_cast<const uint8_t*>(pageLabel), pageLabelLength);
+      }
     }
     if (!status) {
       return PdfStepResult::failure(status);
@@ -18191,27 +19267,108 @@ PdfStepResult PdfPreparation::emitSection(PdfWorkBudget& budget) {
     const uint16_t textOffset = record.textOffset & kExtractedTextOffsetMask;
     const uint16_t textLength = record.textLength & kExtractedTextLengthMask;
     const uint8_t* const text = pageText_.get() + textOffset;
-    const bool heading = (record.textOffset & kExtractedHeading) != 0;
+    bool heading = (record.textOffset & kExtractedHeading) != 0;
     const bool startsBlock = (record.textLength & kExtractedNewBlock) != 0;
+    const bool continuesPrevious = startsBlock && currentBlockIndex_ == 0U && semanticWriter_.blockOpen();
+    const bool tableCell = record.lineX != UINT16_MAX &&
+                           (record.lineX & kExtractedTableCell) != 0U;
+    const bool tableStart = tableCell && (record.lineX & kExtractedLightText) != 0U;
     PdfStatus status = PdfStatus::success();
-    if (startsBlock) {
-      const uint8_t headingLevel = heading && nextAnchorOrdinal_ == currentSectionFirstAnchor_ ? 1U : 2U;
-      status = semanticWriter_.beginBlock({heading ? PdfSemanticBlockKind::Heading : PdfSemanticBlockKind::Paragraph,
-                                           nextAnchorOrdinal_, static_cast<uint8_t>(heading ? headingLevel : 0U)});
-    } else if (!semanticWriter_.blockOpen() || currentBlockIndex_ == 0) {
+    if (startsBlock && !continuesPrevious) {
+      if (tableCell) {
+        const uint16_t tableCellX = static_cast<uint16_t>(record.lineX & kExtractedLineXMask);
+        if (tableStart && sectionEmitTableOpen_) {
+          status = semanticWriter_.endTableRow();
+          if (status) {
+            status = semanticWriter_.endTable();
+          }
+          if (status) {
+            sectionEmitTableOpen_ = false;
+            sectionEmitTableHasCell_ = false;
+          }
+        }
+        if (!sectionEmitTableOpen_) {
+          status = semanticWriter_.beginTable();
+          if (status) {
+            status = semanticWriter_.beginTableRow();
+          }
+          if (status) {
+            sectionEmitTableOpen_ = true;
+            sectionEmitTableHasCell_ = false;
+          }
+        } else if (sectionEmitTableHasCell_ && tableCellX <= sectionEmitTableCellX_) {
+          status = semanticWriter_.endTableRow();
+          if (status) {
+            status = semanticWriter_.beginTableRow();
+          }
+        }
+        if (status) {
+          status = semanticWriter_.beginBlock(
+              {PdfSemanticBlockKind::TableCell, nextAnchorOrdinal_, 0U});
+        }
+        if (status) {
+          sectionEmitTableCellX_ = tableCellX;
+          sectionEmitTableHasCell_ = true;
+        }
+      } else {
+        if (sectionEmitTableOpen_) {
+          status = semanticWriter_.endTableRow();
+          if (status) {
+            status = semanticWriter_.endTable();
+          }
+          if (status) {
+            sectionEmitTableOpen_ = false;
+            sectionEmitTableHasCell_ = false;
+          }
+        }
+      }
+      if (status && heading && !tableCell) {
+        uint16_t blockTextLength = 0;
+        for (uint16_t index = currentBlockIndex_; index < sectionEmitEndBlock_; ++index) {
+          if (index != currentBlockIndex_ && (blocks[index].textLength & kExtractedNewBlock) != 0) {
+            break;
+          }
+          const uint16_t fragmentLength = blocks[index].textLength & kExtractedTextLengthMask;
+          blockTextLength = static_cast<uint16_t>(
+              std::min<uint32_t>(121U, static_cast<uint32_t>(blockTextLength) + fragmentLength));
+        }
+        heading = blockTextLength <= 120U;
+      }
+      if (status && !tableCell) {
+        const uint8_t headingLevel = heading && nextAnchorOrdinal_ == currentSectionFirstAnchor_ ? 1U : 2U;
+        status = semanticWriter_.beginBlock(
+            {heading ? PdfSemanticBlockKind::Heading : PdfSemanticBlockKind::Paragraph,
+             nextAnchorOrdinal_, static_cast<uint8_t>(heading ? headingLevel : 0U)});
+      }
+    } else if (!semanticWriter_.blockOpen() || (currentBlockIndex_ == 0U && !continuesPrevious)) {
       status = PdfStatus::failure(PdfError::InvalidArgument, currentBlockIndex_);
-    } else {
+    } else if (!continuesPrevious) {
       const ExtractedBlockRecord& previous = blocks[currentBlockIndex_ - 1U];
       const uint16_t previousOffset = previous.textOffset & kExtractedTextOffsetMask;
       const uint16_t previousLength = previous.textLength & kExtractedTextLengthMask;
       const uint8_t previousEnd = previousLength == 0 ? 0 : pageText_[previousOffset + previousLength - 1U];
+      const bool previousSoftHyphen = previousLength >= 2U &&
+                                      pageText_[previousOffset + previousLength - 2U] == 0xc2U &&
+                                      previousEnd == 0xadU;
+      const bool previousUnicodeDash =
+          previousLength >= 3U && pageText_[previousOffset + previousLength - 3U] == 0xe2U &&
+          pageText_[previousOffset + previousLength - 2U] == 0x80U && previousEnd >= 0x90U &&
+          previousEnd <= 0x95U;
+      const bool previousOpeningPunctuation =
+          previousEnd == '(' || previousEnd == '[' || previousEnd == '{' ||
+          (previousLength >= 3U && pageText_[previousOffset + previousLength - 3U] == 0xe2U &&
+           pageText_[previousOffset + previousLength - 2U] == 0x80U &&
+           (previousEnd == 0x98U || previousEnd == 0x9cU));
       const uint8_t currentStart = textLength == 0 ? 0 : text[0];
       const bool currentApostrophe = currentStart == '\'' ||
-                                     (textLength >= 3U && text[0] == 0xe2U && text[1] == 0x80U && text[2] == 0x99U);
+                                      (textLength >= 3U && text[0] == 0xe2U && text[1] == 0x80U && text[2] == 0x99U);
+      const bool currentSoftHyphen = textLength >= 2U && text[0] == 0xc2U && text[1] == 0xadU;
       const bool currentPunctuation = currentApostrophe || currentStart == ',' || currentStart == '.' ||
-                                      currentStart == '-' || currentStart == ';' || currentStart == ':' || currentStart == '!' ||
-                                      currentStart == '?' || currentStart == ')' || currentStart == ']' ||
-                                      currentStart == '}';
+                                       currentStart == '-' || currentStart == ';' || currentStart == ':' || currentStart == '!' ||
+                                       currentStart == '?' || currentStart == ')' || currentStart == ']' ||
+                                       currentStart == '}' || currentSoftHyphen ||
+                                       (textLength >= 3U && text[0] == 0xe2U && text[1] == 0x80U &&
+                                        text[2] >= 0x90U && text[2] <= 0x95U);
       uint16_t currentWordLength = 0;
       while (currentWordLength < textLength) {
         const uint8_t value = text[currentWordLength];
@@ -18224,7 +19381,8 @@ PdfStepResult PdfPreparation::emitSection(PdfWorkBudget& budget) {
                                       !currentApostrophe && currentWordLength > 1U;
       const bool dropCapJoins = (previous.textOffset & kExtractedDropCap) != 0 && !standaloneDropCapI;
       const bool previousJoins = previousEnd == '-' || previousEnd == '/' || previousEnd == '(' ||
-                                 previousEnd == '[' || previousEnd == '{' || dropCapJoins;
+                                   previousEnd == '[' || previousEnd == '{' || previousSoftHyphen ||
+                                   previousUnicodeDash || previousOpeningPunctuation || dropCapJoins;
       const bool whitespacePresent = previousEnd == ' ' || previousEnd == '\t' || previousEnd == '\r' ||
                                      previousEnd == '\n' || currentStart == ' ' || currentStart == '\t' ||
                                      currentStart == '\r' || currentStart == '\n';
@@ -18243,8 +19401,31 @@ PdfStepResult PdfPreparation::emitSection(PdfWorkBudget& budget) {
       status = semanticWriter_.beginInternalLink(reinterpret_cast<const uint8_t*>(href), hrefLength);
       linked = status.ok();
     }
+    bool omitDiscretionaryHyphen = false;
+    const bool isolatedSoftHyphen = textLength == 2U && text[0] == 0xc2U && text[1] == 0xadU;
+    const bool isolatedUnicodeHyphen = textLength == 3U && text[0] == 0xe2U && text[1] == 0x80U &&
+                                       (text[2] == 0x90U || text[2] == 0x91U);
+    if (!startsBlock && (isolatedSoftHyphen || isolatedUnicodeHyphen) && currentBlockIndex_ != 0U &&
+        currentBlockIndex_ + 1U < sectionEmitEndBlock_ &&
+        (blocks[currentBlockIndex_ + 1U].textLength & kExtractedNewBlock) == 0U) {
+      const ExtractedBlockRecord& previous = blocks[currentBlockIndex_ - 1U];
+      const ExtractedBlockRecord& next = blocks[currentBlockIndex_ + 1U];
+      const uint16_t previousOffset = previous.textOffset & kExtractedTextOffsetMask;
+      const uint16_t previousLength = previous.textLength & kExtractedTextLengthMask;
+      const uint16_t nextOffset = next.textOffset & kExtractedTextOffsetMask;
+      const uint16_t nextLength = next.textLength & kExtractedTextLengthMask;
+      if (previousLength != 0U && nextLength != 0U &&
+          static_cast<uint32_t>(previousOffset) + previousLength <= transcriptLength_ &&
+          static_cast<uint32_t>(nextOffset) + nextLength <= transcriptLength_) {
+        const uint8_t previousEnd = pageText_[previousOffset + previousLength - 1U];
+        const uint8_t nextStart = pageText_[nextOffset];
+        omitDiscretionaryHyphen =
+            ((previousEnd >= 'A' && previousEnd <= 'Z') || (previousEnd >= 'a' && previousEnd <= 'z')) &&
+            ((nextStart >= 'A' && nextStart <= 'Z') || (nextStart >= 'a' && nextStart <= 'z'));
+      }
+    }
     if (status) {
-      status = semanticWriter_.writeText(text, textLength);
+      status = semanticWriter_.writeText(text, omitDiscretionaryHyphen ? 0U : textLength);
     }
     if (status && linked) {
       status = semanticWriter_.endInternalLink();
@@ -18336,17 +19517,48 @@ PdfStepResult PdfPreparation::emitSection(PdfWorkBudget& budget) {
     const bool closesBlock = currentBlockIndex_ >= sectionEmitEndBlock_ ||
                              (blocks[currentBlockIndex_].textLength & kExtractedNewBlock) != 0;
     if (closesBlock) {
-      const PdfStatus status = semanticWriter_.endBlock();
-      if (!status) {
-        return PdfStepResult::failure(status);
+      bool keepParagraphOpen = false;
+      if (currentBlockIndex_ >= sectionEmitEndBlock_ && currentPageIndex_ + 1U < pageCount_ &&
+          !isSectionBoundary(currentPageIndex_ + 1U) && semanticWriter_.currentBlockKind() == PdfSemanticBlockKind::Paragraph) {
+        const ExtractedBlockRecord& last = blocks[currentBlockIndex_ - 1U];
+        const uint16_t lastOffset = last.textOffset & kExtractedTextOffsetMask;
+        const uint16_t lastLength = last.textLength & kExtractedTextLengthMask;
+        uint16_t blockStart = static_cast<uint16_t>(currentBlockIndex_ - 1U);
+        uint16_t blockTextLength = lastLength;
+        while (blockStart != 0U && (blocks[blockStart].textLength & kExtractedNewBlock) == 0U) {
+          --blockStart;
+          blockTextLength = static_cast<uint16_t>(
+              std::min<uint32_t>(UINT16_MAX, static_cast<uint32_t>(blockTextLength) +
+                                                 (blocks[blockStart].textLength & kExtractedTextLengthMask)));
+        }
+        keepParagraphOpen = blockTextLength >= 80U &&
+                            static_cast<uint32_t>(lastOffset) + lastLength <= transcriptLength_ &&
+                            extractedTextEndsOpenSentence(pageText_.get() + lastOffset, lastLength);
       }
-      ++nextAnchorOrdinal_;
+      if (!keepParagraphOpen) {
+        const PdfStatus status = semanticWriter_.endBlock();
+        if (!status) {
+          return PdfStepResult::failure(status);
+        }
+        ++nextAnchorOrdinal_;
+      }
     }
     sectionEmitStage_ = SectionEmitStage::BeginBlock;
     continue;
   }
 
   if (sectionEmitStage_ == SectionEmitStage::Finish) {
+    if (sectionEmitTableOpen_) {
+      PdfStatus status = semanticWriter_.endTableRow();
+      if (status) {
+        status = semanticWriter_.endTable();
+      }
+      if (!status) {
+        return PdfStepResult::failure(status);
+      }
+      sectionEmitTableOpen_ = false;
+      sectionEmitTableHasCell_ = false;
+    }
     const bool closesSection = currentPageIndex_ + 1U >= pageCount_ || isSectionBoundary(currentPageIndex_ + 1U);
     const PdfStatus status = closesSection ? semanticWriter_.finish() : semanticWriter_.flush();
     if (!status) {
@@ -18391,8 +19603,8 @@ PdfStepResult PdfPreparation::stepCloseSection(PdfWorkBudget& budget) {
       }
       const uint64_t outputBytes = cumulativeSectionBytes_ + prospectiveAdded + cumulativeImageBytes_;
       const bool forced = completedPages == 1U || completedPages == pageCount_;
-      pageResumeCheckpointPending_ =
-          pdfCheckpointDue(checkpointGate_, completedPages, outputBytes, nowMs(), forced);
+      pageResumeCheckpointPending_ = !semanticWriter_.blockOpen() &&
+                                     pdfCheckpointDue(checkpointGate_, completedPages, outputBytes, nowMs(), forced);
     }
     const bool closeWriter = !pendingSectionFinish_;
     PdfStatus status = closeWriter ? pdfCloseTrackedCacheFile(&outputWriter_, &sectionRecord_)
@@ -20863,7 +22075,9 @@ PdfStepResult PdfPreparation::step() {
           if (runtime != nullptr && runtime->fontResolveIndex < runtime->fontCount) {
             PreparedFontDescriptor& descriptor = runtime->fonts[runtime->fontResolveIndex];
             descriptor.state = PreparedFontDescriptorState::Fallback;
-            rememberFontResolution({descriptor.reference, 0, {}, 0, {}, 0, descriptor.cid, true});
+            rememberFontResolution(
+                {descriptor.reference, 0, {}, 0, {}, 0, descriptor.baseEncoding, descriptor.cid, true,
+                 descriptor.bold});
             ++runtime->fontResolveIndex;
             operation = beginNextFontObject();
             return operation ? pause() : fail(operation);

@@ -30,8 +30,9 @@ struct InterpreterHarness {
   PdfPageModel model;
   PdfContentInterpreter interpreter;
 
-  explicit InterpreterHarness(const PdfRectangle pageBounds = {}, const PdfMatrix pageTransform = {})
-      : model({pageText.data(), pageText.size(), runs.data(), static_cast<uint16_t>(runs.size()), images.data(),
+  explicit InterpreterHarness(const PdfRectangle pageBounds = {}, const PdfMatrix pageTransform = {},
+                              const uint16_t runCapacity = 64U)
+      : model({pageText.data(), pageText.size(), runs.data(), runCapacity, images.data(),
                static_cast<uint16_t>(images.size())}),
         interpreter({sourceBuffer.data(), sourceBuffer.size(), operands.data(), static_cast<uint8_t>(operands.size()),
                      arrayItems.data(), static_cast<uint8_t>(arrayItems.size()), scratchText.data(),
@@ -404,6 +405,89 @@ TEST(PdfContentInterpreterTest, HandlesTextStateShowingOperatorsAndContentArrays
   EXPECT_EQ(harness.model.runCount(), 7u);
   EXPECT_GT(harness.model.runs()[4].xMin, harness.model.runs()[3].xMin);
   EXPECT_GT(harness.interpreter.operatorCount(), 10u);
+}
+
+TEST(PdfContentInterpreterTest, StreamsTextArraysLargerThanTheFixedOperandWorkspace) {
+  DefaultFont defaultFont;
+  TestResourceTable resources;
+  resources.font = &defaultFont.font;
+  std::string content = "BT /F1 10 Tf 1 0 0 1 10 20 Tm [";
+  std::string expected;
+  for (uint8_t index = 0; index < 48; ++index) {
+    content += "(a) -10 ";
+    expected += 'a';
+  }
+  content += "] TJ ET";
+  PdfTestByteSource page(bytes(content));
+  const PdfByteSource source = page.source();
+  InterpreterHarness harness;
+  ASSERT_TRUE(harness.interpreter.begin(&source, 1, resources.descriptor, harness.model).ok());
+
+  const PdfStepResult result = runInterpreter(harness.interpreter);
+
+  ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error);
+  EXPECT_EQ(transcript(harness.model), expected);
+}
+
+TEST(PdfContentInterpreterTest, UsesTjAdjustmentsInsteadOfFallbackWidthsForWordBoundaries) {
+  DefaultFont defaultFont;
+  TestResourceTable resources;
+  resources.font = &defaultFont.font;
+  PdfTestByteSource page(bytes(
+      "BT /F1 10 Tf 1 0 0 1 10 20 Tm "
+      "[(S) 13 (ynthesis) -345 (of) -333 (Azido) -334 (T) 82 (ertiary)] TJ ET"));
+  const PdfByteSource source = page.source();
+  InterpreterHarness harness;
+  ASSERT_TRUE(harness.interpreter.begin(&source, 1, resources.descriptor, harness.model).ok());
+
+  const PdfStepResult result = runInterpreter(harness.interpreter);
+
+  ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error);
+  EXPECT_EQ(transcript(harness.model), "Synthesis of Azido Tertiary");
+  ASSERT_EQ(harness.model.runCount(), 1U);
+}
+
+TEST(PdfContentInterpreterTest, PreservesSoftHyphenWordJoinAfterRunWorkspaceFills) {
+  std::array<uint8_t, 64> text{};
+  std::array<PdfTextRun, 1> runs{};
+  std::array<PdfImagePlacement, 1> images{};
+  PdfPageModel model({text.data(), text.size(), runs.data(), static_cast<uint16_t>(runs.size()), images.data(),
+                      static_cast<uint16_t>(images.size())});
+  ASSERT_TRUE(model.reset().ok());
+
+  PdfTextRun run{};
+  ASSERT_TRUE(model.beginTextRun(run).ok());
+  ASSERT_TRUE(model.appendText(reinterpret_cast<const uint8_t*>("degra"), 5U).ok());
+  ASSERT_TRUE(model.finishTextRun().ok());
+
+  uint16_t runIndex = 0;
+  ASSERT_TRUE(model.beginOverflowTextRun(run, &runIndex).ok());
+  const uint8_t softHyphen[]{0xC2U, 0xADU};
+  ASSERT_TRUE(model.appendOverflowText(softHyphen, sizeof(softHyphen)).ok());
+  ASSERT_TRUE(model.beginOverflowTextRun(run, &runIndex).ok());
+  ASSERT_TRUE(model.appendOverflowText(reinterpret_cast<const uint8_t*>("dation"), 6U).ok());
+
+  EXPECT_EQ(std::string(reinterpret_cast<const char*>(model.text()), model.textLength()),
+            std::string("degra\xC2\xAD" "dation"));
+}
+
+TEST(PdfContentInterpreterTest, RetainsActualTextSoftHyphenAfterRunWorkspaceFills) {
+  DefaultFont defaultFont;
+  TestResourceTable resources;
+  resources.font = &defaultFont.font;
+  PdfTestByteSource page(bytes(
+      "BT /F1 10 Tf 1 0 0 1 10 20 Tm (degra) Tj "
+      "/Span << /ActualText <FEFF00AD> >> BDC (-) Tj EMC "
+      "1 0 0 1 10 10 Tm (dation) Tj ET"));
+  const PdfByteSource source = page.source();
+  InterpreterHarness harness({}, {}, 1U);
+  ASSERT_TRUE(harness.interpreter.begin(&source, 1, resources.descriptor, harness.model).ok());
+
+  const PdfStepResult result = runInterpreter(harness.interpreter);
+
+  ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error);
+  ASSERT_EQ(harness.model.runCount(), 1U);
+  EXPECT_EQ(transcript(harness.model), std::string("degra\xC2\xAD" "dation"));
 }
 
 TEST(PdfContentInterpreterTest, DoesNotInventSpacesWhenTheMaterializedFontContainsRealSpaces) {

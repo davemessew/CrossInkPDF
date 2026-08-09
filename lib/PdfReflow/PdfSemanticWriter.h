@@ -80,12 +80,14 @@ class PdfSemanticWriter {
 
   uint32_t totalWords() const { return totalWords_; }
   bool blockOpen() const { return blockOpen_; }
+  PdfSemanticBlockKind currentBlockKind() const { return currentKind_; }
 
  private:
   PdfStatus append(const uint8_t* bytes, size_t length);
   PdfStatus appendLiteral(const char* literal);
   PdfStatus appendEscaped(const uint8_t* bytes, size_t length, bool attribute);
   PdfStatus flushBuffer();
+  PdfStatus flushPendingTextSpace(const uint8_t* nextText = nullptr, size_t nextLength = 0);
   PdfStatus validateUtf8(const uint8_t* bytes, size_t length) const;
   PdfStatus fail(PdfStatus status);
 
@@ -108,6 +110,15 @@ class PdfSemanticWriter {
   bool tableOpen_ = false;
   bool tableRowOpen_ = false;
   bool hasLastAnchor_ = false;
+  bool hasTextInBlock_ = false;
+  bool pendingTextSpace_ = false;
+  bool pendingTextHyphen_ = false;
+  uint16_t currentAsciiWordLength_ = 0;
+  uint16_t hyphenStemLength_ = 0;
+  uint8_t lastTextByte_ = 0;
+  // 0=inactive, 1=heading start, 2=digits, 3=dot after digits.
+  uint8_t headingNumberPrefixState_ = 0;
+  bool headingColonPending_ = false;
 };
 
 static_assert(sizeof(PdfSemanticWriter) <= 192);

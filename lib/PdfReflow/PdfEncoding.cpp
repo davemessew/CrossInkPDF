@@ -15,7 +15,10 @@ struct GlyphNamePair {
 };
 
 static constexpr uint32_t WIN_ANSI_80_TO_9F[] = {
-    0x20AC, 0,      0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160,
+    // Several long-lived PDF producers place the embedded font's bullet at
+    // 0x81 while declaring WinAnsi. Readers commonly preserve that glyph even
+    // though the original Windows table left the slot undefined.
+    0x20AC, 0x2022, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160,
     0x2039, 0x0152, 0,      0x017D, 0,      0,      0x2018, 0x2019, 0x201C, 0x201D, 0x2022,
     0x2013, 0x2014, 0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0,      0x017E, 0x0178,
 };
@@ -277,6 +280,20 @@ bool baseEncodingScalar(const PdfBaseEncoding base, const uint8_t code, uint32_t
   if (scalar == nullptr) {
     return false;
   }
+  if (base == PdfBaseEncoding::AdvPSMP10) {
+    if (code == 'c') {
+      *scalar = 0x03B3;
+      return true;
+    }
+    if (code == 'd') {
+      *scalar = 0x03B4;
+      return true;
+    }
+    if (code == 'l') {
+      *scalar = 0x03BB;
+      return true;
+    }
+  }
   if (base == PdfBaseEncoding::Standard && lookupEncodingPair(STANDARD_SPECIAL, code, scalar)) {
     return true;
   }
@@ -311,6 +328,38 @@ bool baseEncodingScalar(const PdfBaseEncoding base, const uint8_t code, uint32_t
       }
       return false;
     case PdfBaseEncoding::Standard:
+      return lookupEncodingPair(STANDARD_SPECIAL, code, scalar);
+    case PdfBaseEncoding::TeXMathSymbols:
+      if (code == 0) {
+        *scalar = 0x2212;
+        return true;
+      }
+      return lookupEncodingPair(STANDARD_SPECIAL, code, scalar);
+    case PdfBaseEncoding::AdvP4C4E74:
+      if (code == 2) {
+        *scalar = 0x00B0;
+        return true;
+      }
+      if (code == 3) {
+        *scalar = 0x223C;
+        return true;
+      }
+      if (code == 4) {
+        *scalar = 0x2248;
+        return true;
+      }
+      return lookupEncodingPair(STANDARD_SPECIAL, code, scalar);
+    case PdfBaseEncoding::AdvP4C4E59:
+      if (code == 2) {
+        *scalar = 0x030C;
+        return true;
+      }
+      if (code == 3) {
+        *scalar = 0x0301;
+        return true;
+      }
+      return lookupEncodingPair(STANDARD_SPECIAL, code, scalar);
+    case PdfBaseEncoding::AdvPSMP10:
       return lookupEncodingPair(STANDARD_SPECIAL, code, scalar);
   }
   return false;

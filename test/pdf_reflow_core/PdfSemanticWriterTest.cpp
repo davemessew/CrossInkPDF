@@ -199,3 +199,86 @@ TEST(SemanticWriterTest, NormalizesUnsupportedPhoneticsAndNoBreakSpacesForDevice
   ASSERT_EQ(harness.blocks.records.size(), 1U);
   EXPECT_EQ(harness.blocks.records[0].wordCount, 3U);
 }
+
+TEST(SemanticWriterTest, CollapsesWhitespaceAndOmitsSoftHyphensAcrossExtractionChunks) {
+  WriterHarness harness;
+  ASSERT_TRUE(harness.begin().ok());
+  ASSERT_TRUE(harness.writer.beginBlock({PdfSemanticBlockKind::Paragraph, 0, 0}).ok());
+  ASSERT_TRUE(write(harness.writer, "  inter").ok());
+  static constexpr uint8_t MIDDLE[] = {0xC2, 0xAD, 'n', 'a', 't', 'i', 'o', 'n', 'a', 'l',
+                                       ' ',  '\t', '\n', 't', 'e', 'x', 't'};
+  ASSERT_TRUE(harness.writer.writeText(MIDDLE, sizeof(MIDDLE)).ok());
+  ASSERT_TRUE(write(harness.writer, "   ").ok());
+  ASSERT_TRUE(harness.writer.endBlock().ok());
+  ASSERT_TRUE(harness.writer.finish().ok());
+
+  EXPECT_NE(harness.output().find(">international text</p>"), std::string::npos);
+  EXPECT_EQ(harness.output().find("  "), std::string::npos);
+  EXPECT_EQ(harness.output().find("\xC2\xAD"), std::string::npos);
+  ASSERT_EQ(harness.blocks.records.size(), 1U);
+  EXPECT_EQ(harness.blocks.records[0].wordCount, 2U);
+}
+
+TEST(SemanticWriterTest, RejoinsSoftHyphenAcrossSeparatedExtractionBlocks) {
+  WriterHarness harness;
+  ASSERT_TRUE(harness.begin().ok());
+  ASSERT_TRUE(harness.writer.beginBlock({PdfSemanticBlockKind::Paragraph, 0, 0}).ok());
+  static constexpr uint8_t STEM[] = {'d', 'e', 'g', 'r', 'a', 0xC2, 0xAD};
+  ASSERT_TRUE(harness.writer.writeText(STEM, sizeof(STEM)).ok());
+  ASSERT_TRUE(write(harness.writer, " ").ok());
+  ASSERT_TRUE(write(harness.writer, "dation").ok());
+  ASSERT_TRUE(harness.writer.endBlock().ok());
+  ASSERT_TRUE(harness.writer.finish().ok());
+
+  EXPECT_NE(harness.output().find(">degradation</p>"), std::string::npos) << harness.output();
+  ASSERT_EQ(harness.blocks.records.size(), 1U);
+  EXPECT_EQ(harness.blocks.records[0].wordCount, 1U);
+}
+
+TEST(SemanticWriterTest, RemovesLineBreakHyphenSpacesWithoutJoiningConjunctions) {
+  WriterHarness harness;
+  ASSERT_TRUE(harness.begin().ok());
+  ASSERT_TRUE(harness.writer.beginBlock({PdfSemanticBlockKind::Paragraph, 0, 0}).ok());
+  ASSERT_TRUE(write(harness.writer, "commer- ").ok());
+  ASSERT_TRUE(write(harness.writer, "cially and pH- ").ok());
+  ASSERT_TRUE(write(harness.writer, "and interleukin- ").ok());
+  ASSERT_TRUE(write(harness.writer, "1 Berufs- ").ok());
+  ASSERT_TRUE(write(harness.writer, "und").ok());
+  ASSERT_TRUE(harness.writer.endBlock().ok());
+  ASSERT_TRUE(harness.writer.finish().ok());
+
+  EXPECT_NE(harness.output().find(">commercially and pH- and interleukin-1 Berufs- und</p>"), std::string::npos)
+      << harness.output();
+  ASSERT_EQ(harness.blocks.records.size(), 1U);
+  EXPECT_EQ(harness.blocks.records[0].wordCount, 7U);
+}
+
+TEST(SemanticWriterTest, RejoinsSplitCapitalLettersInsideHeadings) {
+  WriterHarness harness;
+  ASSERT_TRUE(harness.begin().ok());
+  ASSERT_TRUE(harness.writer.beginBlock({PdfSemanticBlockKind::Heading, 0, 2}).ok());
+  ASSERT_TRUE(write(harness.writer, "PROCESS T O CHANGE THA ").ok());
+  ASSERT_TRUE(write(harness.writer, "T QUICKL ").ok());
+  ASSERT_TRUE(write(harness.writer, "Y").ok());
+  ASSERT_TRUE(write(harness.writer, " HABITS MA ACTUALL ").ok());
+  ASSERT_TRUE(write(harness.writer, "Y").ok());
+  ASSERT_TRUE(harness.writer.endBlock().ok());
+  ASSERT_TRUE(harness.writer.finish().ok());
+
+  EXPECT_NE(harness.output().find(">PROCESS TO CHANGE THAT QUICKLY HABITS MA ACTUALLY</h2>"),
+            std::string::npos)
+      << harness.output();
+}
+
+TEST(SemanticWriterTest, AddsMissingSpaceAfterNumberedHeadingPrefixAcrossChunks) {
+  WriterHarness harness;
+  ASSERT_TRUE(harness.begin().ok());
+  ASSERT_TRUE(harness.writer.beginBlock({PdfSemanticBlockKind::Heading, 0, 2}).ok());
+  ASSERT_TRUE(write(harness.writer, "3.6.").ok());
+  ASSERT_TRUE(write(harness.writer, "Photocatalytic:Activity").ok());
+  ASSERT_TRUE(harness.writer.endBlock().ok());
+  ASSERT_TRUE(harness.writer.finish().ok());
+
+  EXPECT_NE(harness.output().find(">3.6. Photocatalytic: Activity</h2>"), std::string::npos)
+      << harness.output();
+}

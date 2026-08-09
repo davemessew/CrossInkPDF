@@ -170,6 +170,7 @@ class PdfContentInterpreter {
   PdfStatus leaveFormOrAdvanceSource(bool* complete);
   PdfStatus showString(const uint8_t* source, size_t length);
   PdfStatus showArray(const PdfContentOperand& array);
+  PdfStatus flushTextArrayChunk();
   PdfStatus emitActualText(MarkedContentFrame& frame);
   PdfStatus emitDecodedText(const uint8_t* source, size_t length, bool actualText);
   PdfStatus finishSemanticTextRun();
@@ -203,6 +204,8 @@ class PdfContentInterpreter {
   void clearOperands();
 
   static PdfStatus pageTextWrite(void* context, const uint8_t* source, size_t requested, size_t* bytesWritten);
+  static PdfStatus pageOverflowTextWrite(void* context, const uint8_t* source, size_t requested,
+                                         size_t* bytesWritten);
 
   PdfContentInterpreterWorkspace workspace_{};
   PdfLexer lexer_;
@@ -238,6 +241,11 @@ class PdfContentInterpreter {
   uint8_t dictionaryDepth_ = 0;
   InlineKey inlineKey_ = InlineKey::None;
   bool arrayOpen_ = false;
+  bool arrayHasString_ = false;
+  bool arrayStreamed_ = false;
+  // INT32_MAX means that no preceding string exists in the current TJ array.
+  // Otherwise this is the accumulated fixed-16 TJ adjustment before the next string.
+  int32_t arrayPendingAdjustment_ = 0x7fffffff;
   bool dictionaryCapturingActualText_ = false;
   bool dictionaryHasActualText_ = false;
   bool inlineDictionary_ = false;

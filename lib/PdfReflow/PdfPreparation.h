@@ -6,6 +6,7 @@
 #include <optional>
 
 #include "PdfCacheStore.h"
+#include "PdfEncoding.h"
 #include "PdfFixedRecordSpool.h"
 #include "PdfImageBuildSpool.h"
 #include "PdfImageCache.h"
@@ -190,8 +191,10 @@ class PdfPreparation {
     uint32_t streamLength = 0;
     PdfStreamFilter filters[PdfLimits::MaxFiltersPerStream]{};
     uint8_t filterCount = 0;
+    PdfBaseEncoding baseEncoding = PdfBaseEncoding::Standard;
     bool cid = false;
     bool fallback = false;
+    bool bold = false;
   };
 
   static constexpr uint8_t FontResolutionCacheCapacity = 8;
@@ -1126,10 +1129,13 @@ class PdfPreparation {
   uint8_t imageRepetitionEntryCount_ = 0;
   bool continueAfterImageDecode_ = false;
   SectionEmitStage sectionEmitStage_ = SectionEmitStage::Idle;
+  uint16_t sectionEmitTableCellX_ = 0;
   bool sectionOpenPrepared_ = false;
   bool sectionClosePrepared_ = false;
   bool sectionCloseNewSection_ = false;
   bool pendingSectionFinish_ = false;
+  bool sectionEmitTableOpen_ = false;
+  bool sectionEmitTableHasCell_ = false;
   PendingSectionFinishStage pendingSectionFinishStage_ = PendingSectionFinishStage::Idle;
   bool rasterRuntimeActive_ = false;
   bool maskDecodeRuntimeActive_ = false;

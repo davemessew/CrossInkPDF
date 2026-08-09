@@ -12,6 +12,10 @@ enum class PdfBaseEncoding : uint8_t {
   WinAnsi,
   MacRoman,
   PdfDoc,
+  TeXMathSymbols,
+  AdvP4C4E74,
+  AdvP4C4E59,
+  AdvPSMP10,
 };
 
 struct PdfEncodingDifference {

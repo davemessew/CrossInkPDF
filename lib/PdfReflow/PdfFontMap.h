@@ -38,8 +38,8 @@ class PdfFontMap {
   explicit PdfFontMap(PdfFontMapWorkspace workspace) : workspace_(workspace) {}
 
   PdfStatus begin(uint16_t fontId, bool cid, PdfCMap* toUnicode, PdfSimpleEncoding* encoding,
-                  int32_t defaultWidth = 500);
-  PdfStatus beginMaterialized(uint16_t fontId, bool cid);
+                  int32_t defaultWidth = 500, bool bold = false);
+  PdfStatus beginMaterialized(uint16_t fontId, bool cid, bool bold = false);
   PdfStatus materializeString(PdfFontMap& sourceFont, const uint8_t* source, size_t sourceLength);
   PdfStatus addMaterializedGlyph(const PdfDecodedGlyph& glyph);
   PdfStatus addWidth(uint32_t firstCode, uint32_t lastCode, int32_t width);
@@ -54,6 +54,7 @@ class PdfFontMap {
   uint16_t materializedGlyphCount() const { return materialized() ? widthCount_ : 0; }
   bool materialized() const { return defaultWidth_ < 0; }
   bool hasExplicitWhitespace() const { return hasExplicitWhitespace_; }
+  bool bold() const { return bold_; }
   bool fullyResident() const {
     return spillCount_ == 0 && (toUnicode_ == nullptr || toUnicode_->fullyResident()) &&
            (encoding_ == nullptr || encoding_->fullyResident());
@@ -79,4 +80,5 @@ class PdfFontMap {
   bool hasPreviousWidth_ = false;
   bool hasCachedWidth_ = false;
   bool hasExplicitWhitespace_ = false;
+  bool bold_ = false;
 };

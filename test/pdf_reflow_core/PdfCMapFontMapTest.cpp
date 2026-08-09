@@ -391,6 +391,15 @@ TEST(PdfEncodingTest, AppliesDifferencesAndKeepsCommonEncodingTablesInFlash) {
   EXPECT_EQ(utf8(value), "\xEF\xAC\x81");
   ASSERT_TRUE(standard.decode(0x27, &value).ok());
   EXPECT_EQ(utf8(value), "\xE2\x80\x99");
+
+  PdfSimpleEncoding advPsMath({differences.data(), differences.size()});
+  ASSERT_TRUE(advPsMath.begin(PdfBaseEncoding::AdvPSMP10).ok());
+  ASSERT_TRUE(advPsMath.decode('c', &value).ok());
+  EXPECT_EQ(utf8(value), "\xCE\xB3");
+  ASSERT_TRUE(advPsMath.decode('d', &value).ok());
+  EXPECT_EQ(utf8(value), "\xCE\xB4");
+  ASSERT_TRUE(advPsMath.decode('l', &value).ok());
+  EXPECT_EQ(utf8(value), "\xCE\xBB");
 }
 
 TEST(PdfEncodingTest, EmptyActualTextStringIsAValidSuppression) {

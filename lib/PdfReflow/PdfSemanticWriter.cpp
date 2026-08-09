@@ -178,6 +178,78 @@ PdfStatus PdfSemanticWriter::validateUtf8(const uint8_t* const bytes, const size
   return validateUtf8Value(bytes, length);
 }
 
+PdfStatus PdfSemanticWriter::flushPendingTextSpace(const uint8_t* const nextText, const size_t nextLength) {
+  if (!pendingTextSpace_ && !pendingTextHyphen_) {
+    return PdfStatus::success();
+  }
+  if (!hasTextInBlock_ && !pendingTextHyphen_) {
+    pendingTextSpace_ = false;
+    return PdfStatus::success();
+  }
+  const auto startsAsciiWord = [&](const char* const word) {
+    const size_t length = std::strlen(word);
+    if (nextText == nullptr || nextLength < length || std::memcmp(nextText, word, length) != 0) {
+      return false;
+    }
+    if (nextLength == length) {
+      return true;
+    }
+    const uint8_t following = nextText[length];
+    return !((following >= 'A' && following <= 'Z') || (following >= 'a' && following <= 'z'));
+  };
+  const bool nextLowercase = nextText != nullptr && nextLength != 0 && nextText[0] >= 'a' && nextText[0] <= 'z';
+  const bool nextDigit = nextText != nullptr && nextLength != 0 && nextText[0] >= '0' && nextText[0] <= '9';
+  const bool conjunction = startsAsciiWord("and") || startsAsciiWord("or") || startsAsciiWord("und");
+  const bool ambiguousConjunction = nextText != nullptr && nextLength < 3U &&
+                                    (nextText[0] == 'a' || nextText[0] == 'o');
+  const bool headingLetterContinuation =
+      pendingTextSpace_ && !pendingTextHyphen_ && currentKind_ == PdfSemanticBlockKind::Heading &&
+      lastTextByte_ >= 'A' && lastTextByte_ <= 'Z' && nextText != nullptr && nextLength == 1U &&
+      nextText[0] >= 'A' && nextText[0] <= 'Z' &&
+      ((currentAsciiWordLength_ >= 1U && currentAsciiWordLength_ <= 6U && currentAsciiWordLength_ != 5U) ||
+       (currentAsciiWordLength_ == 7U && nextText[0] == 'Y')) &&
+      (currentAsciiWordLength_ == 1U || (nextText[0] != 'A' && nextText[0] != 'I'));
+  if (headingLetterContinuation) {
+    pendingTextSpace_ = false;
+    return PdfStatus::success();
+  }
+  const bool dehyphenate = pendingTextHyphen_ && pendingTextSpace_ && hyphenStemLength_ >= 3U &&
+                           nextLowercase && !conjunction && !ambiguousConjunction;
+  const bool joinNumber = pendingTextHyphen_ && pendingTextSpace_ && nextDigit;
+  PdfStatus status = PdfStatus::success();
+  if (pendingTextHyphen_ && !dehyphenate) {
+    constexpr uint8_t HYPHEN = '-';
+    status = wordCounter_.consume(&HYPHEN, 1U);
+    if (status.ok()) {
+      status = appendEscaped(&HYPHEN, 1U, false);
+    }
+    if (status.ok()) {
+      hasTextInBlock_ = true;
+      lastTextByte_ = HYPHEN;
+    }
+  }
+  pendingTextHyphen_ = false;
+  if (dehyphenate || joinNumber) {
+    pendingTextSpace_ = false;
+    return status;
+  }
+  if (!pendingTextSpace_ || !status.ok()) {
+    return status;
+  }
+  constexpr uint8_t SPACE = ' ';
+  pendingTextSpace_ = false;
+  status = wordCounter_.consume(&SPACE, 1U);
+  if (status.ok()) {
+    status = appendEscaped(&SPACE, 1U, false);
+  }
+  if (status.ok()) {
+    currentAsciiWordLength_ = 0;
+    hyphenStemLength_ = 0;
+    lastTextByte_ = SPACE;
+  }
+  return status;
+}
+
 PdfStatus PdfSemanticWriter::begin(const PdfByteSink output, const PdfSemanticBlockSink blockSink,
                                    const PdfSemanticWriterWorkspace workspace, const uint32_t initialWords) {
   output_ = output;
@@ -199,6 +271,14 @@ PdfStatus PdfSemanticWriter::begin(const PdfByteSink output, const PdfSemanticBl
   tableOpen_ = false;
   tableRowOpen_ = false;
   hasLastAnchor_ = false;
+  hasTextInBlock_ = false;
+  pendingTextSpace_ = false;
+  pendingTextHyphen_ = false;
+  currentAsciiWordLength_ = 0;
+  hyphenStemLength_ = 0;
+  lastTextByte_ = 0;
+  headingNumberPrefixState_ = 0;
+  headingColonPending_ = false;
   if (!initialized_) {
     return fail(PdfStatus::failure(PdfError::InvalidArgument));
   }
@@ -228,6 +308,14 @@ PdfStatus PdfSemanticWriter::resume(const PdfByteSink output, const PdfSemanticB
   tableOpen_ = false;
   tableRowOpen_ = false;
   hasLastAnchor_ = hasLastAnchor;
+  hasTextInBlock_ = false;
+  pendingTextSpace_ = false;
+  pendingTextHyphen_ = false;
+  currentAsciiWordLength_ = 0;
+  hyphenStemLength_ = 0;
+  lastTextByte_ = 0;
+  headingNumberPrefixState_ = 0;
+  headingColonPending_ = false;
   if (!initialized_) {
     return fail(PdfStatus::failure(PdfError::InvalidArgument));
   }
@@ -283,6 +371,14 @@ PdfStatus PdfSemanticWriter::beginBlock(const PdfSemanticBlock& block) {
   currentKind_ = block.kind;
   currentHeadingLevel_ = block.headingLevel;
   blockOpen_ = true;
+  hasTextInBlock_ = false;
+  pendingTextSpace_ = false;
+  pendingTextHyphen_ = false;
+  currentAsciiWordLength_ = 0;
+  hyphenStemLength_ = 0;
+  lastTextByte_ = 0;
+  headingNumberPrefixState_ = block.kind == PdfSemanticBlockKind::Heading ? 1U : 0U;
+  headingColonPending_ = false;
   return PdfStatus::success();
 }
 
@@ -300,6 +396,32 @@ PdfStatus PdfSemanticWriter::writeText(const uint8_t* const text, const size_t l
     }
     return status;
   };
+  const auto emitText = [&](const uint8_t* const bytes, const size_t byteCount) {
+    if (byteCount == 0) {
+      return PdfStatus::success();
+    }
+    PdfStatus status = flushPendingTextSpace(bytes, byteCount);
+    if (status.ok()) {
+      status = emit(bytes, byteCount);
+    }
+    if (status.ok()) {
+      hasTextInBlock_ = true;
+      for (size_t index = 0; index < byteCount; ++index) {
+        const uint8_t value = bytes[index];
+        if ((value >= 'A' && value <= 'Z') || (value >= 'a' && value <= 'z') ||
+            (value >= '0' && value <= '9')) {
+          if (currentAsciiWordLength_ != UINT16_MAX) {
+            ++currentAsciiWordLength_;
+          }
+        } else if (value < 0x80U) {
+          currentAsciiWordLength_ = 0;
+          hyphenStemLength_ = 0;
+        }
+        lastTextByte_ = value;
+      }
+    }
+    return status;
+  };
   size_t offset = 0;
   size_t spanStart = 0;
   while (offset < length) {
@@ -309,28 +431,72 @@ PdfStatus PdfSemanticWriter::writeText(const uint8_t* const text, const size_t l
     if (!status.ok()) {
       return fail(status);
     }
+    const bool whitespace = scalar == ' ' || scalar == '\t' || scalar == '\r' || scalar == '\n' ||
+                            scalar == 0x00A0U || (scalar >= 0x2000U && scalar <= 0x200AU) ||
+                            scalar == 0x2028U || scalar == 0x2029U || scalar == 0x202FU ||
+                            scalar == 0x205FU || scalar == 0x3000U;
+    bool insertHeadingNumberSpace = false;
+    if (headingNumberPrefixState_ == 1U) {
+      headingNumberPrefixState_ = scalar >= '0' && scalar <= '9' ? 2U : 0U;
+    } else if (headingNumberPrefixState_ == 2U) {
+      if (scalar == '.') {
+        headingNumberPrefixState_ = 3U;
+      } else if (scalar < '0' || scalar > '9') {
+        headingNumberPrefixState_ = 0U;
+      }
+    } else if (headingNumberPrefixState_ == 3U) {
+      if (scalar >= '0' && scalar <= '9') {
+        headingNumberPrefixState_ = 2U;
+      } else {
+        insertHeadingNumberSpace = (scalar >= 'A' && scalar <= 'Z') || (scalar >= 'a' && scalar <= 'z');
+        headingNumberPrefixState_ = 0U;
+      }
+    }
+    const bool insertHeadingColonSpace =
+        headingColonPending_ && ((scalar >= 'A' && scalar <= 'Z') || (scalar >= 'a' && scalar <= 'z'));
+    headingColonPending_ = false;
+    if (currentKind_ == PdfSemanticBlockKind::Heading && scalar == ':') {
+      headingColonPending_ = true;
+    }
+    if (insertHeadingNumberSpace || insertHeadingColonSpace) {
+      status = emitText(text + spanStart, scalarStart - spanStart);
+      if (!status.ok()) {
+        return fail(status);
+      }
+      pendingTextSpace_ = hasTextInBlock_;
+      spanStart = scalarStart;
+    }
     const char* replacement = nullptr;
-    if (scalar == 0x00A0U) {
-      replacement = " ";
-    } else if (scalar == 0x0259U) {
+    if (scalar == 0x0259U) {
       // The built-in reading fonts do not carry IPA schwa. Keep the PDF
       // pronunciation readable instead of rendering a replacement glyph.
       replacement = "uh";
     } else if (scalar == 0x02C8U) {
       replacement = "-";
-    } else if (isXmlScalar(scalar)) {
+    } else if (!whitespace && scalar != '-' && scalar != 0x00ADU && isXmlScalar(scalar)) {
       continue;
     }
-    status = emit(text + spanStart, scalarStart - spanStart);
-    if (status.ok() && replacement != nullptr) {
-      status = emit(reinterpret_cast<const uint8_t*>(replacement), std::strlen(replacement));
+    status = emitText(text + spanStart, scalarStart - spanStart);
+    if (status.ok() && whitespace) {
+      pendingTextSpace_ = hasTextInBlock_ || pendingTextHyphen_;
+    } else if (status.ok() && (scalar == '-' || scalar == 0x00ADU)) {
+      if (pendingTextHyphen_) {
+        status = flushPendingTextSpace(reinterpret_cast<const uint8_t*>("-"), 1U);
+      }
+      if (status.ok()) {
+        pendingTextHyphen_ = true;
+        pendingTextSpace_ = pendingTextSpace_ || scalar == 0x00ADU;
+        hyphenStemLength_ = currentAsciiWordLength_;
+      }
+    } else if (status.ok() && replacement != nullptr) {
+      status = emitText(reinterpret_cast<const uint8_t*>(replacement), std::strlen(replacement));
     }
     if (!status.ok()) {
       return fail(status);
     }
     spanStart = offset;
   }
-  const PdfStatus status = emit(text + spanStart, length - spanStart);
+  const PdfStatus status = emitText(text + spanStart, length - spanStart);
   return status.ok() ? status : fail(status);
 }
 
@@ -352,7 +518,10 @@ PdfStatus PdfSemanticWriter::writeRetainedImage(const uint8_t* const resource, c
   if (written <= 0 || static_cast<size_t>(written) >= sizeof(dimensions)) {
     return fail(PdfStatus::failure(PdfError::LimitExceeded));
   }
-  status = appendLiteral("<img src=\"");
+  status = flushPendingTextSpace();
+  if (status.ok()) {
+    status = appendLiteral("<img src=\"");
+  }
   if (status.ok()) {
     status = appendEscaped(resource, length, true);
   }
@@ -373,7 +542,10 @@ PdfStatus PdfSemanticWriter::beginInternalLink(const uint8_t* const href, const 
   if (!status.ok()) {
     return fail(status);
   }
-  status = appendLiteral("<a href=\"");
+  status = flushPendingTextSpace();
+  if (status.ok()) {
+    status = appendLiteral("<a href=\"");
+  }
   if (status.ok()) {
     status = appendEscaped(href, length, true);
   }
@@ -408,7 +580,11 @@ PdfStatus PdfSemanticWriter::endBlock() {
   if (!blockOpen_ || linkOpen_) {
     return fail(PdfStatus::failure(PdfError::InvalidArgument));
   }
-  PdfStatus status = wordCounter_.finish();
+  pendingTextSpace_ = false;
+  PdfStatus status = flushPendingTextSpace();
+  if (status.ok()) {
+    status = wordCounter_.finish();
+  }
   if (!status.ok()) {
     return fail(status);
   }
@@ -443,6 +619,7 @@ PdfStatus PdfSemanticWriter::endBlock() {
   hasLastAnchor_ = true;
   blockOpen_ = false;
   currentHeadingLevel_ = 0;
+  hasTextInBlock_ = false;
   return PdfStatus::success();
 }
 
@@ -511,7 +688,8 @@ PdfStatus PdfSemanticWriter::writePublisherPageBreak(const uint32_t sourcePageIn
   if (!status_.ok()) {
     return status_;
   }
-  if (!initialized_ || finished_ || blockOpen_ || linkOpen_ || tableOpen_ || tableRowOpen_ ||
+  const bool paragraphPageBreak = blockOpen_ && currentKind_ == PdfSemanticBlockKind::Paragraph;
+  if (!initialized_ || finished_ || (blockOpen_ && !paragraphPageBreak) || linkOpen_ || tableOpen_ || tableRowOpen_ ||
       (label == nullptr && length != 0)) {
     return fail(PdfStatus::failure(PdfError::InvalidArgument));
   }

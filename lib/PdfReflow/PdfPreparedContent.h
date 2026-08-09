@@ -115,7 +115,7 @@ struct PdfPreparedContentResourceWorkspace {
 
 class PdfPreparedContentResources {
  public:
-  static constexpr uint8_t MaxFonts = 16;
+  static constexpr uint8_t MaxFonts = 32;
   static constexpr uint8_t MaxXObjects = 16;
   static constexpr uint8_t MaxNameBytes = 32;
 

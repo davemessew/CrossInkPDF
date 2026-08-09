@@ -206,7 +206,8 @@ std::vector<uint8_t> makeTwoPageTextPdf(const bool unreadableFirst = false, cons
   return {pdf.begin(), pdf.end()};
 }
 
-std::vector<uint8_t> makeOnePageTextPdf(const std::string& contentStream, const uint16_t propertyCount = 0) {
+std::vector<uint8_t> makeOnePageTextPdf(const std::string& contentStream, const uint16_t propertyCount = 0,
+                                        const char* const baseFont = "/Helvetica") {
   std::string resources = "<< /Font << /F1 5 0 R >>";
   if (propertyCount != 0) {
     resources += " /Properties <<";
@@ -221,7 +222,7 @@ std::vector<uint8_t> makeOnePageTextPdf(const std::string& contentStream, const 
       "<< /Type /Pages /Count 1 /Kids [3 0 R] >>",
       "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources " + resources + " /Contents 4 0 R >>",
       "<< /Length " + std::to_string(contentStream.size()) + " >>\nstream\n" + contentStream + "\nendstream",
-      "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+      std::string("<< /Type /Font /Subtype /Type1 /BaseFont ") + baseFont + " >>",
   };
   std::string pdf = "%PDF-1.4\n";
   std::vector<size_t> offsets;
@@ -901,6 +902,39 @@ TEST(PdfPreparation, ReflowsVisualLinesIntoHeadingsParagraphsAndDropCaps) {
   EXPECT_EQ(preparation.totalWords(), 41U);
 }
 
+TEST(PdfPreparation, RecognizesBodySizeBoldAllCapsSubheadingsInTheTopContentBand) {
+  struct Case {
+    const char* headingContent;
+    const char* expected;
+  };
+  constexpr Case cases[] = {
+      {"1 0 0 1 72 720 Tm (THE REAL REASON HABITS MA) Tj 1 0 0 1 270 720 Tm (TTER) Tj ",
+       "THE REAL REASON HABITS MATTER"},
+      {"1 0 0 1 72 720 Tm (HOW LONG DOES IT ACTUALL Y) Tj ", "HOW LONG DOES IT ACTUALLY"},
+  };
+  for (const Case& testCase : cases) {
+    constexpr char sourcePath[] = "/books/top-band-heading.pdf";
+    const std::string content = std::string("BT /F1 12 Tf ") + testCase.headingContent +
+                                "1 0 0 1 72 650 Tm (Ordinary body paragraph text.) Tj ET";
+    PreparationHarness harness;
+    harness.storage.addFile(sourcePath, makeOnePageTextPdf(content, 0, "/Helvetica-Bold"), 1234, true);
+
+    PdfPreparation preparation;
+    ASSERT_TRUE(preparation.begin(harness.config(sourcePath)).ok());
+    const PdfStepResult result = runToTerminal(preparation, harness);
+    ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error) << "@" << result.status.offset;
+
+    const std::string sectionPath = std::string(preparation.cacheRoot()) + "/gen_" +
+                                    std::to_string(preparation.generation()) + "/sections/000000.xhtml";
+    ASSERT_TRUE(harness.storage.exists(sectionPath));
+    const std::vector<uint8_t>& bytes = harness.storage.bytes(sectionPath);
+    const std::string xhtml(bytes.begin(), bytes.end());
+    const std::string expected = std::string(">") + testCase.expected + "</h1>";
+    EXPECT_NE(xhtml.find(expected), std::string::npos) << xhtml;
+    EXPECT_NE(xhtml.find(">Ordinary body paragraph text.</p>"), std::string::npos) << xhtml;
+  }
+}
+
 TEST(PdfPreparation, DistinguishesStandaloneDropCapIFromIn) {
   struct Case {
     const char* target;
@@ -999,6 +1033,57 @@ TEST(PdfPreparation, KeepsSplitFullWidthHeadingAheadOfColumnText) {
   EXPECT_EQ(xhtml.find("<h2"), std::string::npos) << xhtml;
 }
 
+TEST(PdfPreparation, JoinsStackedChapterNumberAndTitleAtSectionStart) {
+  constexpr char sourcePath[] = "/books/stacked-chapter-title.pdf";
+  const std::string content =
+      "BT "
+      "/F1 25 Tf 1 0 0 1 300 650 Tm (1) Tj "
+      "1 0 0 1 90 600 Tm (The Surprising Power of Atomic Habits) Tj "
+      "/F1 12 Tf 1 0 0 1 72 540 Tm (Body text starts here.) Tj ET";
+  PreparationHarness harness;
+  harness.storage.addFile(sourcePath, makeOnePageTextPdf(content), 1234, true);
+
+  PdfPreparation preparation;
+  ASSERT_TRUE(preparation.begin(harness.config(sourcePath)).ok());
+  const PdfStepResult result = runToTerminal(preparation, harness);
+  ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error) << "@" << result.status.offset;
+
+  const std::string sectionPath = std::string(preparation.cacheRoot()) + "/gen_" +
+                                  std::to_string(preparation.generation()) + "/sections/000000.xhtml";
+  ASSERT_TRUE(harness.storage.exists(sectionPath));
+  const std::vector<uint8_t>& bytes = harness.storage.bytes(sectionPath);
+  const std::string xhtml(bytes.begin(), bytes.end());
+  EXPECT_NE(xhtml.find("<h1 id=\"b00000000\">1 The Surprising Power of Atomic Habits</h1>"),
+            std::string::npos)
+      << xhtml;
+  EXPECT_EQ(xhtml.find("<h2"), std::string::npos) << xhtml;
+}
+
+TEST(PdfPreparation, RejoinsAWordSplitByAnAbsoluteSameLineTextPosition) {
+  constexpr char sourcePath[] = "/books/positioned-word-split.pdf";
+  const std::string content =
+      "BT /F1 12 Tf "
+      "1 0 0 1 72 600 Tm (the system si) Tj "
+      "1 0 0 1 159 600 Tm (gnal format is readable.) Tj "
+      "1 0 0 1 72 560 Tm (XKS-G17) Tj "
+      "1 0 0 1 116 560 Tm (00 Legacy Interface Board) Tj ET";
+  PreparationHarness harness;
+  harness.storage.addFile(sourcePath, makeOnePageTextPdf(content), 1234, true);
+
+  PdfPreparation preparation;
+  ASSERT_TRUE(preparation.begin(harness.config(sourcePath)).ok());
+  const PdfStepResult result = runToTerminal(preparation, harness);
+  ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error) << "@" << result.status.offset;
+
+  const std::string sectionPath = std::string(preparation.cacheRoot()) + "/gen_" +
+                                  std::to_string(preparation.generation()) + "/sections/000000.xhtml";
+  ASSERT_TRUE(harness.storage.exists(sectionPath));
+  const std::vector<uint8_t>& bytes = harness.storage.bytes(sectionPath);
+  const std::string xhtml(bytes.begin(), bytes.end());
+  EXPECT_NE(xhtml.find(">the system signal format is readable.</p>"), std::string::npos) << xhtml;
+  EXPECT_NE(xhtml.find(">XKS-G1700 Legacy Interface Board</p>"), std::string::npos) << xhtml;
+}
+
 TEST(PdfPreparation, OrdersColumnsDownBeforePreservingRowMajorTableCells) {
   constexpr char sourcePath[] = "/books/columns-table.pdf";
   PreparationHarness harness;
@@ -1018,10 +1103,10 @@ TEST(PdfPreparation, OrdersColumnsDownBeforePreservingRowMajorTableCells) {
   const char* const expectedBlocks[] = {
       "<p id=\"b00000000\">Left one. Left two.</p>",
       "<p id=\"b00000001\">Right one. Right two.</p>",
-      "<p id=\"b00000002\">Name</p>",
-      "<p id=\"b00000003\">Value</p>",
-      "<p id=\"b00000004\">Alpha</p>",
-      "<p id=\"b00000005\">10</p>",
+      "<table><tbody><tr><td id=\"b00000002\">Name</td>",
+      "<td id=\"b00000003\">Value</td></tr><tr>",
+      "<td id=\"b00000004\">Alpha</td>",
+      "<td id=\"b00000005\">10</td></tr></tbody></table>",
   };
   size_t previous = 0;
   for (const char* const expected : expectedBlocks) {
@@ -1095,14 +1180,17 @@ TEST(PdfPreparation, SeparatesWideSameLineTableCellsWhenTheFontAlsoContainsSpace
   ASSERT_TRUE(harness.storage.exists(sectionPath));
   const std::vector<uint8_t>& bytes = harness.storage.bytes(sectionPath);
   const std::string xhtml(bytes.begin(), bytes.end());
-  EXPECT_NE(xhtml.find(">Very easy Easy Moderate Hard Very hard</p>"), std::string::npos) << xhtml;
-  EXPECT_NE(xhtml.find(">Put on shoes Walk ten minutes Walk ten thousand steps Run a 5K Run a marathon</p>"),
+  EXPECT_NE(xhtml.find("<table><tbody><tr><td id=\"b00000001\">Very easy</td>"), std::string::npos)
+      << xhtml;
+  EXPECT_NE(xhtml.find(">Very hard</td></tr><tr><td id=\"b00000006\">Put on shoes</td>"),
             std::string::npos)
       << xhtml;
-  EXPECT_NE(xhtml.find(">Open your notes</p>"), std::string::npos) << xhtml;
-  EXPECT_NE(xhtml.find(">Study for ten minutes</p>"), std::string::npos) << xhtml;
-  EXPECT_NE(xhtml.find(">Earn a degree</p>"), std::string::npos) << xhtml;
-  EXPECT_NE(xhtml.find(">Write a book</p>"), std::string::npos) << xhtml;
+  EXPECT_NE(xhtml.find(">Run a marathon</td></tr><tr><td id=\"b0000000b\">Open your notes</td>"),
+            std::string::npos)
+      << xhtml;
+  EXPECT_NE(xhtml.find(">Study for ten minutes</td>"), std::string::npos) << xhtml;
+  EXPECT_NE(xhtml.find(">Earn a degree</td>"), std::string::npos) << xhtml;
+  EXPECT_NE(xhtml.find(">Write a book</td></tr></tbody></table>"), std::string::npos) << xhtml;
   EXPECT_NE(xhtml.find(">Continue with the surrounding paragraph and join its next visual line normally.</p>"),
             std::string::npos)
       << xhtml;

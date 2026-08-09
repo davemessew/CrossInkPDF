@@ -40,6 +40,10 @@ enum PdfTextRunFlag : uint16_t {
   PdfTextActualText = 1U << 1,
   PdfTextExplicitWhitespace = 1U << 2,
   PdfTextPositionReset = 1U << 3,
+  PdfTextLight = 1U << 4,
+  PdfTextBold = 1U << 5,
+  PdfTextArrayExplicitGap = 1U << 6,
+  PdfTextArrayTightContinuation = 1U << 7,
 };
 
 struct PdfPageModelWorkspace {
@@ -83,6 +87,8 @@ class PdfPageModel {
   size_t pendingTextStart_ = 0;
   uint16_t runCount_ = 0;
   uint16_t imageCount_ = 0;
-  PdfPageWarning warnings_ = PdfPageWarning::None;
+ PdfPageWarning warnings_ = PdfPageWarning::None;
+  enum class OverflowSeparator : uint8_t { None, Inferred, Explicit };
+  OverflowSeparator overflowSeparator_ = OverflowSeparator::None;
   bool runPending_ = false;
 };

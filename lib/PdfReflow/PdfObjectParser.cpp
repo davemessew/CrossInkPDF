@@ -449,7 +449,8 @@ PdfStatus PdfObjectParser::handleToken(const PdfToken& token) {
           keyEquals("PieceInfo", 9) ||
           (skipUnusedPageResources_ &&
            (keyEquals("ExtGState", 9) || keyEquals("ColorSpace", 10) || keyEquals("Pattern", 7) ||
-            keyEquals("Shading", 7) || keyEquals("ProcSet", 7) || keyEquals("Properties", 10)));
+            keyEquals("Shading", 7) || keyEquals("ProcSet", 7) || keyEquals("Properties", 10) ||
+            keyEquals("Widths", 6)));
     }
     return status;
   }

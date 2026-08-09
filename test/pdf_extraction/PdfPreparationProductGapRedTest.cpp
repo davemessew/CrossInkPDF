@@ -176,6 +176,167 @@ std::vector<uint8_t> wideCodeSpaceSimpleFontPdf() {
   });
 }
 
+std::vector<uint8_t> multiScalarWideCodeSpaceSimpleFontPdf() {
+  static constexpr std::string_view cmap =
+      "/CIDInit /ProcSet findresource begin\n"
+      "12 dict begin\n"
+      "begincmap\n"
+      "1 begincodespacerange\n"
+      "<0000> <FFFF>\n"
+      "endcodespacerange\n"
+      "5 beginbfchar\n"
+      "<44> <0044>\n"
+      "<69> <0069>\n"
+      "<65> <0065>\n"
+      "<1F> <00660074>\n"
+      "<6E> <006E>\n"
+      "endbfchar\n"
+      "endcmap\n"
+      "end\n"
+      "end";
+  static constexpr std::string_view content =
+      "BT /F1 12 Tf 1 0 0 1 72 720 Tm <4469651F6E> Tj ET";
+  return classicPdf({
+      "<< /Type /Catalog /Pages 2 0 R >>",
+      "<< /Type /Pages /Count 1 /Kids [3 0 R] >>",
+      "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+      "/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+      streamObject(content),
+      "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /ToUnicode 6 0 R >>",
+      streamObject(cmap),
+  });
+}
+
+std::vector<uint8_t> moreThanSixteenUsedFontsPdf() {
+  static constexpr std::string_view cmap =
+      "/CIDInit /ProcSet findresource begin\n"
+      "12 dict begin\n"
+      "begincmap\n"
+      "1 begincodespacerange\n"
+      "<00> <FF>\n"
+      "endcodespacerange\n"
+      "1 beginbfchar\n"
+      "<1F> <00660074>\n"
+      "endbfchar\n"
+      "endcmap\n"
+      "end\n"
+      "end";
+  std::string resources = "<< /Font <<";
+  std::string content = "BT 1 0 0 1 72 720 Tm ";
+  std::vector<std::string> objects{
+      "<< /Type /Catalog /Pages 2 0 R >>",
+      "<< /Type /Pages /Count 1 /Kids [3 0 R] >>",
+      {},
+      {},
+  };
+  for (uint8_t index = 0; index < 17; ++index) {
+    const size_t objectNumber = objects.size() + 1U;
+    resources += " /F" + std::to_string(index) + " " + std::to_string(objectNumber) + " 0 R";
+    content += "/F" + std::to_string(index) + " 12 Tf ";
+    content += index == 16 ? "<1F> Tj " : "(A) Tj ";
+    if (index == 16) {
+      objects.push_back("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /ToUnicode " +
+                        std::to_string(objectNumber + 1U) + " 0 R >>");
+      objects.push_back(streamObject(cmap));
+    } else {
+      objects.push_back("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+    }
+  }
+  resources += " >> >>";
+  content += "ET";
+  objects[2] = "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources " +
+               resources + " /Contents 4 0 R >>";
+  objects[3] = streamObject(content);
+  return classicPdf(objects);
+}
+
+std::vector<uint8_t> partialToUnicodeWithWinAnsiFallbackPdf() {
+  static constexpr std::string_view cmap =
+      "/CIDInit /ProcSet findresource begin\n"
+      "12 dict begin\n"
+      "begincmap\n"
+      "1 begincodespacerange\n"
+      "<00> <FF>\n"
+      "endcodespacerange\n"
+      "1 beginbfchar\n"
+      "<41> <0041>\n"
+      "endbfchar\n"
+      "endcmap\n"
+      "end\n"
+      "end";
+  return classicPdf({
+      "<< /Type /Catalog /Pages 2 0 R >>",
+      "<< /Type /Pages /Count 1 /Kids [3 0 R] >>",
+      "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+      "/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+      streamObject("BT /F1 12 Tf 1 0 0 1 72 720 Tm <4195> Tj ET"),
+      "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding "
+      "/ToUnicode 6 0 R >>",
+      streamObject(cmap),
+  });
+}
+
+std::vector<uint8_t> moreThan256FallbackEquivalentGlyphsPdf() {
+  std::string resources = "<< /Font <<";
+  std::string content = "BT 1 0 0 1 72 720 Tm ";
+  std::string painted;
+  for (uint16_t code = 0x20; code <= 0x7e; ++code) {
+    char encoded[3]{};
+    std::snprintf(encoded, sizeof(encoded), "%02X", code);
+    painted += encoded;
+  }
+  std::vector<std::string> objects{
+      "<< /Type /Catalog /Pages 2 0 R >>",
+      "<< /Type /Pages /Count 1 /Kids [3 0 R] >>",
+      {},
+      {},
+  };
+  for (uint8_t index = 0; index < 3; ++index) {
+    const size_t objectNumber = objects.size() + 1U;
+    resources += " /F" + std::to_string(index) + " " + std::to_string(objectNumber) + " 0 R";
+    content += "/F" + std::to_string(index) + " 12 Tf <" + painted + "> Tj ";
+    objects.push_back("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+  }
+  resources += " >> >>";
+  content += "ET";
+  objects[2] = "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources " +
+               resources + " /Contents 4 0 R >>";
+  objects[3] = streamObject(content);
+  return classicPdf(objects);
+}
+
+std::vector<uint8_t> largeUnusedWidthsWithToUnicodePdf() {
+  static constexpr std::string_view cmap =
+      "/CIDInit /ProcSet findresource begin\n"
+      "12 dict begin\n"
+      "begincmap\n"
+      "1 begincodespacerange\n"
+      "<00> <FF>\n"
+      "endcodespacerange\n"
+      "1 beginbfchar\n"
+      "<1F> <00660074>\n"
+      "endbfchar\n"
+      "endcmap\n"
+      "end\n"
+      "end";
+  std::string widths = "[";
+  for (uint16_t index = 0; index < 220; ++index) {
+    widths += "500 ";
+  }
+  widths += "]";
+  return classicPdf({
+      "<< /Type /Catalog /Pages 2 0 R >>",
+      "<< /Type /Pages /Count 1 /Kids [3 0 R] >>",
+      "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+      "/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+      streamObject("BT /F1 12 Tf 1 0 0 1 72 720 Tm <1F> Tj ET"),
+      "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /FirstChar 0 /LastChar 219 "
+      "/Widths " + widths + " /FontDescriptor 7 0 R /ToUnicode 6 0 R >>",
+      streamObject(cmap),
+      "<< /Type /FontDescriptor /FontName /Helvetica /Flags 32 /FontBBox [0 0 1000 1000] >>",
+  });
+}
+
 std::vector<uint8_t> defaultType1EncodingPdf() {
   static constexpr std::string_view content =
       "/Artifact << /Payload <4E6F74207061696E746564> >> DP "
@@ -1266,6 +1427,51 @@ TEST(PdfPreparationProductGapRed, TreatsSimpleFontStringsAsOneByteCodesDespiteWi
   ASSERT_TRUE(completedWithSection(observation));
   EXPECT_EQ(observation.words, 1U);
   EXPECT_NE(observation.section.find(">Corporate</p>"), std::string::npos) << observation.section;
+  EXPECT_EQ(observation.section.find("\xEF\xBF\xBD"), std::string::npos) << observation.section;
+}
+
+TEST(PdfPreparationProductGapRed, PreservesMultiScalarLigaturesInWideSimpleFontCMap) {
+  const ProductObservation observation = prepareProduct(
+      "/books/product-gap-wide-simple-ligature.pdf", multiScalarWideCodeSpaceSimpleFontPdf());
+
+  ASSERT_TRUE(completedWithSection(observation));
+  EXPECT_NE(observation.section.find(">Dieftn</p>"), std::string::npos) << observation.section;
+  EXPECT_EQ(observation.section.find("\xEF\xBF\xBD"), std::string::npos) << observation.section;
+}
+
+TEST(PdfPreparationProductGapRed, PreservesTextFromMoreThanSixteenUsedFonts) {
+  const ProductObservation observation =
+      prepareProduct("/books/product-gap-many-fonts.pdf", moreThanSixteenUsedFontsPdf());
+
+  ASSERT_TRUE(completedWithSection(observation));
+  EXPECT_NE(observation.section.find("ft"), std::string::npos) << observation.section;
+  EXPECT_EQ(observation.section.find("\xEF\xBF\xBD"), std::string::npos) << observation.section;
+}
+
+TEST(PdfPreparationProductGapRed, UsesSimpleFontEncodingWhenToUnicodeIsPartial) {
+  const ProductObservation observation = prepareProduct(
+      "/books/product-gap-partial-tounicode.pdf", partialToUnicodeWithWinAnsiFallbackPdf());
+
+  ASSERT_TRUE(completedWithSection(observation));
+  EXPECT_NE(observation.section.find("A\xE2\x80\xA2"), std::string::npos) << observation.section;
+  EXPECT_EQ(observation.section.find("\xEF\xBF\xBD"), std::string::npos) << observation.section;
+}
+
+TEST(PdfPreparationProductGapRed, DoesNotSpendGlyphWorkspaceOnBuiltInFallbackMappings) {
+  const ProductObservation observation = prepareProduct(
+      "/books/product-gap-common-glyphs.pdf", moreThan256FallbackEquivalentGlyphsPdf());
+
+  ASSERT_TRUE(completedWithSection(observation));
+  EXPECT_NE(observation.section.find("ABC"), std::string::npos) << observation.section;
+  EXPECT_EQ(observation.section.find("\xEF\xBF\xBD"), std::string::npos) << observation.section;
+}
+
+TEST(PdfPreparationProductGapRed, IgnoresUnusedLargeWidthArrayAndKeepsToUnicode) {
+  const ProductObservation observation = prepareProduct(
+      "/books/product-gap-large-widths.pdf", largeUnusedWidthsWithToUnicodePdf());
+
+  ASSERT_TRUE(completedWithSection(observation));
+  EXPECT_NE(observation.section.find("ft"), std::string::npos) << observation.section;
   EXPECT_EQ(observation.section.find("\xEF\xBF\xBD"), std::string::npos) << observation.section;
 }
 

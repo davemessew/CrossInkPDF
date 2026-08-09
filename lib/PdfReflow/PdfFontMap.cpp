@@ -50,6 +50,22 @@ bool sourceCodeIsPrefix(const uint32_t prefixCode, const uint8_t prefixLength, c
   return code >> ((codeLength - prefixLength) * 8U) == prefixCode;
 }
 
+bool materializedGlyphUsesBuiltInFallback(const PdfDecodedGlyph& glyph) {
+  if (glyph.sourceLength != 1U || glyph.sourceCode > UINT8_MAX || glyph.width != 500) {
+    return false;
+  }
+  uint32_t scalar = 0;
+  if (!pdfConservativeLatinFallback(static_cast<uint8_t>(glyph.sourceCode), &scalar) &&
+      !pdfWinAnsiFallback(static_cast<uint8_t>(glyph.sourceCode), &scalar)) {
+    return false;
+  }
+  uint8_t encoded[4]{};
+  size_t encodedLength = 0;
+  const PdfStatus status = pdfAppendUtf8Scalar(scalar, encoded, sizeof(encoded), &encodedLength);
+  return status && glyph.unicode.length == encodedLength &&
+         std::memcmp(glyph.unicode.bytes, encoded, encodedLength) == 0;
+}
+
 }  // namespace
 
 PdfStatus PdfFontMap::setSourceAccess(const bool required) {
@@ -64,7 +80,7 @@ PdfStatus PdfFontMap::setSourceAccess(const bool required) {
 }
 
 PdfStatus PdfFontMap::begin(const uint16_t fontId, const bool cid, PdfCMap* const toUnicode,
-                            PdfSimpleEncoding* const encoding, const int32_t defaultWidth) {
+                            PdfSimpleEncoding* const encoding, const int32_t defaultWidth, const bool bold) {
   if (workspace_.widths == nullptr || workspace_.widthCapacity == 0 || defaultWidth < 0) {
     return PdfStatus::failure(PdfError::InvalidArgument);
   }
@@ -83,10 +99,11 @@ PdfStatus PdfFontMap::begin(const uint16_t fontId, const bool cid, PdfCMap* cons
   hasPreviousWidth_ = false;
   hasCachedWidth_ = false;
   hasExplicitWhitespace_ = false;
+  bold_ = bold;
   return setSourceAccess(true);
 }
 
-PdfStatus PdfFontMap::beginMaterialized(const uint16_t fontId, const bool cid) {
+PdfStatus PdfFontMap::beginMaterialized(const uint16_t fontId, const bool cid, const bool bold) {
   if (workspace_.materializedGlyphs == nullptr || workspace_.materializedGlyphCapacity == 0) {
     return PdfStatus::failure(PdfError::InvalidArgument);
   }
@@ -109,6 +126,7 @@ PdfStatus PdfFontMap::beginMaterialized(const uint16_t fontId, const bool cid) {
   hasPreviousWidth_ = false;
   hasCachedWidth_ = false;
   hasExplicitWhitespace_ = false;
+  bold_ = bold;
   return PdfStatus::success();
 }
 
@@ -116,6 +134,12 @@ PdfStatus PdfFontMap::addMaterializedGlyph(const PdfDecodedGlyph& glyph) {
   if (!materialized() || !sourceCodeFitsLength(glyph.sourceCode, glyph.sourceLength) || glyph.unicode.length == 0 ||
       glyph.unicode.length > sizeof(glyph.unicode.bytes) || glyph.width < 0) {
     return PdfStatus::failure(PdfError::Malformed, glyph.sourceCode);
+  }
+  if (!cid_ && materializedGlyphUsesBuiltInFallback(glyph)) {
+    if (glyph.unicode.length == 1U && glyph.unicode.bytes[0] == ' ') {
+      hasExplicitWhitespace_ = true;
+    }
+    return PdfStatus::success();
   }
 
   const uint64_t key = glyphKey(glyph.sourceCode, glyph.sourceLength);
