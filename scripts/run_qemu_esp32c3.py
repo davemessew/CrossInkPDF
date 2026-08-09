@@ -31,6 +31,7 @@ INT32_MIN = -(1 << 31)
 INT32_MAX = (1 << 31) - 1
 MAX_PREPARATION_STEPS = 100000
 MAX_CANCELLATION_STEPS = MAX_PREPARATION_STEPS + 256
+MAX_PDF_PREPARATION_IO_REQUEST_BYTES = 8192
 OUTPUT_FAILURES = (
     (re.compile(r"\bpanic\b", re.IGNORECASE), "panic"),
     (re.compile(r"Guru Meditation", re.IGNORECASE), "Guru Meditation"),
@@ -778,7 +779,7 @@ class OutputGuard:
                 or slices != summary_slices
                 or not timing_valid
                 or not 0 <= io_calls <= 32
-                or not 1 <= io_request <= 4096
+                or not 1 <= io_request <= MAX_PDF_PREPARATION_IO_REQUEST_BYTES
             ):
                 return "PDF cancellation limits exceeded"
             self.cancellation_generation = generation

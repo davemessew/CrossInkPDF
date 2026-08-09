@@ -1116,7 +1116,7 @@ class QemuRunnerTest(unittest.TestCase):
                     )
                     self.assertEqual(completed.returncode, 0)
 
-        for request, accepted in ((4096, True), (4097, False)):
+        for request, accepted in ((8192, True), (8193, False)):
             with self.subTest(max_io_request=request):
                 lines = tuple(
                     line.replace(

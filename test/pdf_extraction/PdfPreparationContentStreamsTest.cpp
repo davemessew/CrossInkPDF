@@ -338,9 +338,9 @@ PdfStepResult runToTerminal(PdfPreparation& preparation, PreparationHarness& har
     const uint64_t bytesWrittenBefore = harness.storage.bytesWrittenTotal();
     const PdfStepResult result = preparation.step();
     EXPECT_LE(harness.storage.operationCalls() - operationsBefore, 32U) << "step=" << step;
-    EXPECT_LE(harness.storage.bytesReadTotal() - bytesReadBefore, PdfLimits::SourceBufferBytes)
+    EXPECT_LE(harness.storage.bytesReadTotal() - bytesReadBefore, PdfLimits::InterpreterSourceBufferBytes)
         << "step=" << step;
-    EXPECT_LE(harness.storage.bytesWrittenTotal() - bytesWrittenBefore, PdfLimits::SourceBufferBytes)
+    EXPECT_LE(harness.storage.bytesWrittenTotal() - bytesWrittenBefore, PdfLimits::InterpreterSourceBufferBytes)
         << "step=" << step;
     ++harness.nowMs;
     if (!result.yielded()) {
@@ -361,9 +361,9 @@ PdfStepResult stepWithPublicBounds(PdfPreparation& preparation, PreparationHarne
       std::chrono::steady_clock::now() - startedAt);
   EXPECT_LE(elapsed.count(), 8) << "step=" << step;
   EXPECT_LE(harness.storage.operationCalls() - operationsBefore, 32U) << "step=" << step;
-  EXPECT_LE(harness.storage.bytesReadTotal() - bytesReadBefore, PdfLimits::SourceBufferBytes)
+  EXPECT_LE(harness.storage.bytesReadTotal() - bytesReadBefore, PdfLimits::InterpreterSourceBufferBytes)
       << "step=" << step;
-  EXPECT_LE(harness.storage.bytesWrittenTotal() - bytesWrittenBefore, PdfLimits::SourceBufferBytes)
+  EXPECT_LE(harness.storage.bytesWrittenTotal() - bytesWrittenBefore, PdfLimits::InterpreterSourceBufferBytes)
       << "step=" << step;
   ++harness.nowMs;
   return result;
@@ -578,8 +578,8 @@ TEST(PdfPreparationContentStreams, BoundsMultiChunkFlateDecodeAndKeepsOnePdfRead
                                  << " offset=" << result.status.offset;
   EXPECT_EQ(preparation.totalWords(), 2U);
   EXPECT_NE(preparedSection(preparation, harness).find("Chunked decode"), std::string::npos);
-  EXPECT_LE(harness.storage.maximumReadRequest(), PdfLimits::SourceBufferBytes);
-  EXPECT_LE(harness.storage.maximumWriteRequest(), PdfLimits::SourceBufferBytes);
+  EXPECT_LE(harness.storage.maximumReadRequest(), PdfLimits::InterpreterSourceBufferBytes);
+  EXPECT_LE(harness.storage.maximumWriteRequest(), PdfLimits::InterpreterSourceBufferBytes);
   EXPECT_EQ(openModesForPath(harness.storage, contentStorePath(preparation)),
             (std::vector<PdfCacheOpenMode>{PdfCacheOpenMode::WriteTruncate, PdfCacheOpenMode::Read}));
   EXPECT_EQ(harness.storage.openHandleCount(), 0U);

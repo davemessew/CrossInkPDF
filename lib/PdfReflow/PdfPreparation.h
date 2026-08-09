@@ -871,6 +871,15 @@ class PdfPreparation {
   uint32_t nowMs() const;
   void setPhase(PdfPreparationPhase phase, uint8_t progressPercent);
 
+  struct WorkspaceAlias {
+    uint8_t* pointer = nullptr;
+
+    explicit operator bool() const { return pointer != nullptr; }
+    uint8_t* get() const { return pointer; }
+    uint8_t& operator[](const size_t index) const { return pointer[index]; }
+    void reset(uint8_t* const value = nullptr) { pointer = value; }
+  };
+
   PdfPreparationConfig config_{};
   char sourcePath_[512]{};
   char cacheRoot_[PDF_CACHE_PATH_CAPACITY]{};
@@ -893,7 +902,7 @@ class PdfPreparation {
   std::optional<PdfResourceTracker> resources_;
   std::unique_ptr<uint8_t[]> dictionary_;
   std::unique_ptr<uint8_t[]> sourceWindow_;
-  std::unique_ptr<uint8_t[]> decoderOutput_;
+  WorkspaceAlias decoderOutput_;
   std::unique_ptr<uint8_t[]> pageText_;
   std::unique_ptr<uint8_t[]> runRecords_;
   std::unique_ptr<uint8_t[]> operandScratch_;
@@ -1100,6 +1109,7 @@ class PdfPreparation {
   uint32_t navigationSpoolCrc32_ = 0;
   uint32_t navigationSpoolReadCrc32_ = 0;
   uint32_t navigationSpoolBytes_ = 0;
+  uint16_t preparedContentBufferedBytes_ = 0;
   uint8_t navigationSpoolWriteCount_ = 0;
   uint8_t navigationSpoolReadCount_ = 0;
   uint8_t maskSpoolWriteCount_ = 0;

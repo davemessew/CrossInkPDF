@@ -23,10 +23,10 @@ constexpr uint32_t kSliceMilliseconds = 5;
 // operation allowance avoids hundreds of thousands of needless scheduler
 // round-trips while parsing operator-heavy pages.
 constexpr uint32_t kSliceOperations = 256;
-// Decoder output can expand into row-oriented cache writes. Keeping the input
-// allowance below the public 4 KiB ceiling prevents one decoded slice from
-// emitting more than one 4 KiB aggregate output chunk.
-constexpr size_t kSliceBytes = 3U * 1024U;
+// Final content interpretation reuses the adjacent decoder buffer for one
+// larger sequential SD read. This changes no fixed workspace allocation;
+// operation and wall-time budgets still bound each public step.
+constexpr size_t kSliceBytes = PdfLimits::InterpreterSourceBufferBytes;
 constexpr uint16_t kArenaValueCount = 184;
 constexpr uint16_t kArenaDictionaryCount = 128;
 constexpr uint16_t kArenaArrayCount = 136;
@@ -615,9 +615,10 @@ bool asciiEqualInsensitive(const char* const value, const char* const expected, 
   return true;
 }
 
-bool tokenEquals(const PdfToken& token, const char* const value) {
-  const size_t length = std::strlen(value);
-  return token.length == length && std::memcmp(token.bytes, value, length) == 0;
+template <size_t Length>
+bool tokenEquals(const PdfToken& token, const char (&value)[Length]) {
+  static_assert(Length != 0);
+  return token.length == Length - 1U && std::memcmp(token.bytes, value, Length - 1U) == 0;
 }
 
 bool keyEquals(const char* const key, const uint8_t keyLength, const char* const shortName,
@@ -1807,8 +1808,21 @@ struct PdfPreparation::PreparedContentOverlay {
   // Native host pointers widen the overlay-only object graph. Firmware stays
   // at the fixed PdfLimits capacities; host/simulator allocation adds only the
   // ABI delta needed to construct the same objects without overlap.
+#if UINTPTR_MAX > UINT32_MAX
+  static constexpr size_t NativeDictionaryRanges =
+      alignOverlay(DictionaryEnd, alignof(PdfByteRange));
+  static constexpr size_t NativeDictionarySources =
+      alignOverlay(NativeDictionaryRanges + PdfPreparedContentStreams::MaxSources * sizeof(PdfByteRange),
+                   alignof(PdfByteSource));
+  static constexpr size_t NativeDictionaryFonts =
+      alignOverlay(NativeDictionarySources + PdfPreparedContentStreams::MaxSources * sizeof(PdfByteSource),
+                   alignof(PdfPreparedFontResource));
   static constexpr size_t NativeDictionaryBytes =
-      std::max(PdfLimits::UzlibDictionaryBytes, DictionaryEnd);
+      std::max(PdfLimits::UzlibDictionaryBytes,
+               NativeDictionaryFonts + PdfPreparedContentResources::MaxFonts * sizeof(PdfPreparedFontResource));
+#else
+  static constexpr size_t NativeDictionaryBytes = PdfLimits::UzlibDictionaryBytes;
+#endif
   static constexpr size_t NativeDecoderOutputBytes =
       std::max(PdfLimits::DecoderOutputBytes, DecoderEnd);
 #if UINTPTR_MAX > UINT32_MAX
@@ -2072,6 +2086,7 @@ PdfStatus PdfPreparation::begin(const PdfPreparationConfig& config) {
   navigationSpoolCrc32_ = 0;
   navigationSpoolReadCrc32_ = 0;
   navigationSpoolBytes_ = 0;
+  preparedContentBufferedBytes_ = 0;
   navigationSpoolWriteCount_ = 0;
   navigationSpoolReadCount_ = 0;
   maskSpoolWriteCount_ = 0;
@@ -2830,6 +2845,7 @@ PdfStepResult PdfPreparation::cancel() {
       navigationSpoolOffset_ = 0;
       navigationSpoolCrc32_ = 0;
       navigationSpoolReadCrc32_ = 0;
+      preparedContentBufferedBytes_ = 0;
       navigationSpoolStage_ = NavigationSpoolStage::None;
     }
     inlineNavigationSpoolHandle_ = {};
@@ -3180,7 +3196,7 @@ PdfStatus PdfPreparation::readSource(void* context, const uint64_t offset, uint8
   }
   auto& source = *static_cast<SourceContext*>(context);
   if (source.io == nullptr || source.handle == nullptr || !source.handle->valid() || offset > source.size ||
-      requested > PdfLimits::SourceBufferBytes) {
+      requested > PdfLimits::InterpreterSourceBufferBytes) {
     return PdfStatus::failure(PdfError::InvalidArgument, offset);
   }
   const PdfStatus status =
@@ -3340,6 +3356,7 @@ PdfStatus PdfPreparation::resetPreparedContentStore(void* const context) {
     return PdfStatus::failure(PdfError::InvalidArgument);
   }
   self.navigationSpoolOffset_ = 0;
+  self.preparedContentBufferedBytes_ = 0;
   return PdfStatus::success();
 }
 
@@ -3373,7 +3390,7 @@ PdfStatus PdfPreparation::readPreparedContentStore(void* const context, const ui
 }
 
 PdfStatus PdfPreparation::writePreparedContentStore(void* const context, const uint8_t* const sourceBytes,
-                                                     const size_t requested, size_t* const bytesWritten) {
+                                                      const size_t requested, size_t* const bytesWritten) {
   if (context == nullptr || (sourceBytes == nullptr && requested != 0) || bytesWritten == nullptr) {
     return PdfStatus::failure(PdfError::InvalidArgument);
   }
@@ -3382,6 +3399,7 @@ PdfStatus PdfPreparation::writePreparedContentStore(void* const context, const u
   if (requested == 0) {
     return PdfStatus::success();
   }
+#if UINTPTR_MAX > UINT32_MAX
   if (self.navigationSpoolStage_ != NavigationSpoolStage::ContentStore ||
       self.navigationSpoolCrc32_ != kPreparedContentStoreWriter || !self.navigationSpoolHandle_.valid() ||
       self.navigationSpoolReadCrc32_ == 0 || self.navigationSpoolOffset_ > self.navigationSpoolReadCrc32_ ||
@@ -3389,13 +3407,42 @@ PdfStatus PdfPreparation::writePreparedContentStore(void* const context, const u
     return PdfStatus::failure(PdfError::InsufficientStorage, self.navigationSpoolOffset_);
   }
   PdfStatus status = self.config_.io.write(self.config_.io.context, self.navigationSpoolHandle_, sourceBytes,
-                                            requested, bytesWritten);
+                                           requested, bytesWritten);
   if (status && *bytesWritten > requested) {
     status = PdfStatus::failure(PdfError::Malformed, self.navigationSpoolOffset_);
     *bytesWritten = 0;
   }
   self.navigationSpoolOffset_ += *bytesWritten;
   return status;
+#else
+  constexpr size_t bufferCapacity = PdfLimits::OperandOrderHistogramBytes;
+  static_assert(bufferCapacity <= UINT16_MAX);
+  if (self.navigationSpoolStage_ != NavigationSpoolStage::ContentStore ||
+      self.navigationSpoolCrc32_ != kPreparedContentStoreWriter || !self.navigationSpoolHandle_.valid() ||
+      !self.operandScratch_ || self.preparedContentBufferedBytes_ > bufferCapacity ||
+      self.navigationSpoolReadCrc32_ == 0 || self.navigationSpoolOffset_ > self.navigationSpoolReadCrc32_ ||
+      requested > self.navigationSpoolReadCrc32_ - self.navigationSpoolOffset_) {
+    return PdfStatus::failure(PdfError::InsufficientStorage, self.navigationSpoolOffset_);
+  }
+  if (self.preparedContentBufferedBytes_ == bufferCapacity) {
+    size_t flushed = 0;
+    PdfStatus status = self.config_.io.write(self.config_.io.context, self.navigationSpoolHandle_,
+                                             self.operandScratch_.get(), bufferCapacity, &flushed);
+    if (!status || flushed != bufferCapacity) {
+      return status ? PdfStatus::failure(PdfError::IoFailure,
+                                         self.navigationSpoolOffset_ - bufferCapacity + flushed)
+                    : status;
+    }
+    self.preparedContentBufferedBytes_ = 0;
+  }
+  const size_t accepted = std::min<size_t>(requested, bufferCapacity - self.preparedContentBufferedBytes_);
+  std::memcpy(self.operandScratch_.get() + self.preparedContentBufferedBytes_, sourceBytes, accepted);
+  self.preparedContentBufferedBytes_ =
+      static_cast<uint16_t>(self.preparedContentBufferedBytes_ + accepted);
+  self.navigationSpoolOffset_ += accepted;
+  *bytesWritten = accepted;
+  return PdfStatus::success();
+#endif
 }
 
 PdfStatus PdfPreparation::resetResolverObjectStoreWindow(void* const context) {
@@ -3946,6 +3993,7 @@ void PdfPreparation::abortPreparedContentStore() {
   navigationSpoolOffset_ = 0;
   navigationSpoolCrc32_ = 0;
   navigationSpoolReadCrc32_ = 0;
+  preparedContentBufferedBytes_ = 0;
   navigationSpoolStage_ = NavigationSpoolStage::None;
   contentAppendOffset_ = 0;
   contentAppendLength_ = 0;
@@ -4193,8 +4241,8 @@ void PdfPreparation::releaseWorkspaces() {
   abortNavigationSpool();
   if (!resources_.has_value()) {
     dictionary_.reset();
-    sourceWindow_.reset();
     decoderOutput_.reset();
+    sourceWindow_.reset();
     pageText_.reset();
     runRecords_.reset();
     operandScratch_.reset();
@@ -4247,16 +4295,16 @@ bool PdfPreparation::allocateNextWorkspace() {
     case 1:
       kind = PdfResourceKind::SourceWindow;
       bytes = PdfLimits::SourceBufferBytes;
-      allocationBytes = bytes;
+      allocationBytes = PdfLimits::SourceBufferBytes + PreparedContentOverlay::NativeDecoderOutputBytes;
       sourceWindow_ = makeUniqueNoThrow<uint8_t[]>(allocationBytes);
       allocated = sourceWindow_ != nullptr;
       break;
     case 2:
       kind = PdfResourceKind::DecoderOutput;
       bytes = PdfLimits::DecoderOutputBytes;
-      allocationBytes = PreparedContentOverlay::NativeDecoderOutputBytes;
-      decoderOutput_ = makeUniqueNoThrow<uint8_t[]>(allocationBytes);
-      allocated = decoderOutput_ != nullptr;
+      decoderOutput_.reset(sourceWindow_ == nullptr ? nullptr
+                                                   : sourceWindow_.get() + PdfLimits::SourceBufferBytes);
+      allocated = static_cast<bool>(decoderOutput_);
       break;
     case 3:
       kind = PdfResourceKind::PageText;
@@ -4333,7 +4381,7 @@ PdfStatus PdfPreparation::initializeParserStorage() {
   static_assert(PreparedContentOverlay::NativePageRunBytes == PdfLimits::PageRunBytes);
   static_assert(sizeof(NavigationWorkspace) == 14592);
   static_assert(sizeof(PdfContentInterpreter) == 5632);
-  static_assert(sizeof(PdfFontMap) == 88);
+  static_assert(sizeof(PdfFontMap) == 92);
   static_assert(sizeof(PdfDecodedGlyph) == 28);
   static_assert(sizeof(PdfImagePlacement) == 40);
   static_assert(sizeof(PdfPageModel) == 40);
@@ -4346,10 +4394,10 @@ PdfStatus PdfPreparation::initializeParserStorage() {
   static_assert(sizeof(PdfContentOperand) == 16);
   static_assert(sizeof(PdfContentArrayItem) == 12);
   static_assert(PreparedContentOverlay::FontNavigationSnapshotMaxBytes == 9670);
-  static_assert(PreparedContentOverlay::FontRuntimeEnd == 8920);
-  static_assert(PreparedContentOverlay::FontRunTailCapacity == 3368);
+  static_assert(PreparedContentOverlay::FontRuntimeEnd == 9416);
+  static_assert(PreparedContentOverlay::FontRunTailCapacity == 2872);
   static_assert(PreparedContentOverlay::FontOperandCapacity == 2048);
-  static_assert(PreparedContentOverlay::FontPageTailCapacity == 4254);
+  static_assert(PreparedContentOverlay::FontPageTailCapacity == 4750);
 
   constexpr size_t dictionaryNavigationOffset = PreparedContentOverlay::DictionaryNavigation;
   constexpr size_t dictionaryInterpreterOffset = PreparedContentOverlay::DictionaryInterpreter;
@@ -4362,11 +4410,11 @@ PdfStatus PdfPreparation::initializeParserStorage() {
   static_assert(dictionaryNavigationOffset == 0);
   static_assert(dictionaryInterpreterOffset == 14592);
   static_assert(dictionaryFontsOffset == 20224);
-  static_assert(dictionaryGlyphsOffset == 21632);
-  static_assert(dictionaryImagesOffset == 28800);
-  static_assert(dictionaryPageOffset == 29120);
-  static_assert(dictionaryResourceScopesOffset == 29160);
-  static_assert(dictionaryEnd == 30112);
+  static_assert(dictionaryGlyphsOffset == 21696);
+  static_assert(dictionaryImagesOffset == 28864);
+  static_assert(dictionaryPageOffset == 29184);
+  static_assert(dictionaryResourceScopesOffset == 29224);
+  static_assert(dictionaryEnd == 30176);
   static_assert(dictionaryEnd <= PdfLimits::UzlibDictionaryBytes);
 
   constexpr size_t decoderRangesOffset = PreparedContentOverlay::DecoderRanges;
@@ -13081,6 +13129,7 @@ PdfStatus PdfPreparation::beginPreparedContentDecode() {
   navigationSpoolOffset_ = 0;
   navigationSpoolCrc32_ = kPreparedContentStoreClosed;
   navigationSpoolReadCrc32_ = 0;
+  preparedContentBufferedBytes_ = 0;
   navigationSpoolStage_ = NavigationSpoolStage::ContentStore;
   setPhase(PdfPreparationPhase::CheckContentCapacity, 70);
   return PdfStatus::success();
@@ -13391,7 +13440,8 @@ PdfStepResult PdfPreparation::checkPreparedContentCapacity(PdfWorkBudget& budget
 
 PdfStepResult PdfPreparation::openPreparedContentStore(PdfWorkBudget& budget) {
   if (navigationSpoolStage_ != NavigationSpoolStage::ContentStore || navigationSpoolPath_[0] == '\0' ||
-      navigationSpoolHandle_.valid() || !sourceHandle_.valid() || navigationSpoolReadCrc32_ == 0) {
+      navigationSpoolHandle_.valid() || !sourceHandle_.valid() || navigationSpoolReadCrc32_ == 0 ||
+      preparedContentBufferedBytes_ != 0) {
     return PdfStepResult::failure(PdfStatus::failure(PdfError::InvalidArgument));
   }
   if (!budget.consumeOperation()) {
@@ -13430,6 +13480,32 @@ PdfStepResult PdfPreparation::decodePreparedContent(PdfWorkBudget& budget) {
   }
   if (!result.complete()) {
     return result;
+  }
+  if (preparedContentBufferedBytes_ != 0) {
+    if (budget.cancelRequested()) {
+      return PdfStepResult::failure(PdfStatus::failure(PdfError::Cancelled, currentPageIndex_));
+    }
+    if (!operandScratch_ || !navigationSpoolHandle_.valid() ||
+        navigationSpoolCrc32_ != kPreparedContentStoreWriter || !budget.consumeOperation()) {
+      return operandScratch_ && navigationSpoolHandle_.valid() &&
+                     navigationSpoolCrc32_ == kPreparedContentStoreWriter
+                 ? PdfStepResult::paused()
+                 : PdfStepResult::failure(PdfStatus::failure(PdfError::InvalidArgument,
+                                                              preparedContentBufferedBytes_));
+    }
+    const size_t pending = preparedContentBufferedBytes_;
+    size_t written = 0;
+    PdfStatus status = config_.io.write(config_.io.context, navigationSpoolHandle_, operandScratch_.get(),
+                                        pending, &written);
+    if (!status || written != pending) {
+      if (status) {
+        status = PdfStatus::failure(PdfError::IoFailure,
+                                    navigationSpoolOffset_ - pending + written);
+      }
+      return PdfStepResult::failure(status);
+    }
+    preparedContentBufferedBytes_ = 0;
+    return PdfStepResult::paused();
   }
   const uint8_t count = runtime->prepared()->count();
   const PdfByteSource* const decodedSources = runtime->prepared()->sources();
@@ -13715,9 +13791,8 @@ PdfStepResult PdfPreparation::stepFormReachability(PdfWorkBudget& budget) {
     return status ? PdfStepResult::completed() : PdfStepResult::failure(status);
   };
   auto* const runtime = reinterpret_cast<PreparedContentRuntime*>(runRecords_.get());
-  while (budget.operationsRemaining != 0 && budget.bytesRemaining != 0 && !budget.stopRequested()) {
+  while (budget.operationsRemaining != 0) {
     PdfToken& token = navigation_->contentTokenScratch;
-    resetInPlace(token);
     PdfStepResult result =
         contentLexer_->next(token, budget, decoderOutput_.get(), PdfLimits::DecoderOutputBytes);
     if (result.failed()) {
@@ -15054,22 +15129,12 @@ PdfStatus PdfPreparation::beginContentInterpretation() {
   constexpr size_t dictionaryImagesOffset = PreparedContentOverlay::DictionaryImages;
   constexpr size_t dictionaryPageOffset = PreparedContentOverlay::DictionaryPage;
   constexpr size_t dictionaryResourceScopesOffset = PreparedContentOverlay::DictionaryResourceScopes;
-  constexpr size_t decoderRangesOffset = PreparedContentOverlay::DecoderRanges;
-  constexpr size_t decoderSourcesOffset = PreparedContentOverlay::DecoderSources;
-  constexpr size_t decoderFontsOffset = PreparedContentOverlay::DecoderFonts;
-  constexpr size_t decoderXObjectsOffset = PreparedContentOverlay::DecoderXObjects;
   constexpr size_t operandOperandsOffset = PreparedContentOverlay::OperandOperands;
   constexpr size_t operandArrayItemsOffset = PreparedContentOverlay::OperandArrayItems;
   constexpr size_t operandScratchTextOffset = PreparedContentOverlay::OperandScratchText;
   constexpr size_t operandMarkedTextOffset = PreparedContentOverlay::OperandMarkedText;
 
-  auto* const ranges = reinterpret_cast<PdfByteRange*>(decoderOutput_.get() + decoderRangesOffset);
-  auto* const sources = reinterpret_cast<PdfByteSource*>(decoderOutput_.get() + decoderSourcesOffset);
   const uint8_t sourceCount = navigation_->pageScratch.contentCount;
-  for (uint8_t index = 0; index < sourceCount; ++index) {
-    ranges[index] = runtime->ranges[index];
-    sources[index] = pdfByteRangeSource(ranges[index]);
-  }
 
   auto* const finalFonts = reinterpret_cast<PdfFontMap*>(dictionary_.get() + dictionaryFontsOffset);
   uint8_t constructedFontCount = runtime->fontsPrepared ? runtime->observedFontCount : 0;
@@ -15148,9 +15213,6 @@ PdfStatus PdfPreparation::beginContentInterpretation() {
     return status;
   }
 
-  auto* const fontRecords = reinterpret_cast<PdfPreparedFontResource*>(decoderOutput_.get() + decoderFontsOffset);
-  auto* const xobjectRecords =
-      reinterpret_cast<PdfPreparedXObjectResource*>(decoderOutput_.get() + decoderXObjectsOffset);
   constexpr uint8_t resourceScopeCount = PdfLimits::MaxFormDepth + 1U;
   uint8_t scopeFontCounts[resourceScopeCount]{};
   uint8_t scopeXObjectCounts[resourceScopeCount]{};
@@ -15214,6 +15276,51 @@ PdfStatus PdfPreparation::beginContentInterpretation() {
       xobjectOffset > PdfPreparedContentResources::MaxXObjects) {
     destroyFinalFonts();
     return PdfStatus::failure(PdfError::LimitExceeded, std::max(fontOffset, xobjectOffset));
+  }
+
+  const size_t dictionaryRangesOffset =
+      alignOverlay(PreparedContentOverlay::DictionaryEnd, alignof(PdfByteRange));
+  const size_t dictionarySourcesOffset =
+      alignOverlay(dictionaryRangesOffset + static_cast<size_t>(sourceCount) * sizeof(PdfByteRange),
+                   alignof(PdfByteSource));
+  const size_t dictionaryFontRecordsOffset =
+      alignOverlay(dictionarySourcesOffset + static_cast<size_t>(sourceCount) * sizeof(PdfByteSource),
+                   alignof(PdfPreparedFontResource));
+  const size_t dictionaryFontRecordsEnd =
+      dictionaryFontRecordsOffset + static_cast<size_t>(fontOffset) * sizeof(PdfPreparedFontResource);
+  const size_t dictionaryXObjectRecordsOffset =
+      alignOverlay(dictionaryFontRecordsEnd, alignof(PdfPreparedXObjectResource));
+  const size_t xobjectRecordBytes =
+      static_cast<size_t>(xobjectOffset) * sizeof(PdfPreparedXObjectResource);
+  const bool xObjectsInDictionary =
+      dictionaryXObjectRecordsOffset + xobjectRecordBytes <=
+      PreparedContentOverlay::NativeDictionaryBytes;
+  const size_t decoderXObjectRecordsOffset =
+      xObjectsInDictionary
+          ? PdfLimits::DecoderOutputBytes
+          : (PdfLimits::DecoderOutputBytes - xobjectRecordBytes) &
+                ~(alignof(PdfPreparedXObjectResource) - 1U);
+  if (dictionaryFontRecordsEnd > PreparedContentOverlay::NativeDictionaryBytes ||
+      (!xObjectsInDictionary &&
+       decoderXObjectRecordsOffset + xobjectRecordBytes > PdfLimits::DecoderOutputBytes)) {
+    destroyFinalFonts();
+    return PdfStatus::failure(PdfError::InsufficientMemory, dictionaryFontRecordsEnd);
+  }
+  const size_t interpreterSourceBufferBytes =
+      PdfLimits::SourceBufferBytes + decoderXObjectRecordsOffset;
+
+  auto* const ranges =
+      reinterpret_cast<PdfByteRange*>(dictionary_.get() + dictionaryRangesOffset);
+  auto* const sources =
+      reinterpret_cast<PdfByteSource*>(dictionary_.get() + dictionarySourcesOffset);
+  auto* const fontRecords = reinterpret_cast<PdfPreparedFontResource*>(
+      dictionary_.get() + dictionaryFontRecordsOffset);
+  auto* const xobjectRecords = reinterpret_cast<PdfPreparedXObjectResource*>(
+      xObjectsInDictionary ? dictionary_.get() + dictionaryXObjectRecordsOffset
+                           : decoderOutput_.get() + decoderXObjectRecordsOffset);
+  for (uint8_t index = 0; index < sourceCount; ++index) {
+    ranges[index] = runtime->ranges[index];
+    sources[index] = pdfByteRangeSource(ranges[index]);
   }
 
   auto* const resourceScopes = reinterpret_cast<PdfPreparedContentResources*>(
@@ -15310,7 +15417,7 @@ PdfStatus PdfPreparation::beginContentInterpretation() {
                     PdfLimits::PageRunCount,
                     reinterpret_cast<PdfImagePlacement*>(dictionary_.get() + dictionaryImagesOffset), 8});
   auto* const interpreter = new (dictionary_.get() + dictionaryInterpreterOffset) PdfContentInterpreter(
-      {sourceWindow_.get(), PdfLimits::SourceBufferBytes,
+      {sourceWindow_.get(), interpreterSourceBufferBytes,
        reinterpret_cast<PdfContentOperand*>(operandScratch_.get() + operandOperandsOffset), 16,
        reinterpret_cast<PdfContentArrayItem*>(operandScratch_.get() + operandArrayItemsOffset), 32,
        operandScratch_.get() + operandScratchTextOffset, 768, operandScratch_.get() + operandMarkedTextOffset, 512,
@@ -15501,6 +15608,7 @@ PdfStepResult PdfPreparation::cleanupPreparedContentStore(PdfWorkBudget& budget)
   navigationSpoolOffset_ = 0;
   navigationSpoolCrc32_ = 0;
   navigationSpoolReadCrc32_ = 0;
+  preparedContentBufferedBytes_ = 0;
   navigationSpoolStage_ = NavigationSpoolStage::None;
   contentAppendOffset_ = 0;
   contentAppendLength_ = 0;
@@ -20530,8 +20638,11 @@ PdfStepResult PdfPreparation::step() {
         }
         return pause();
       }
-      while (budget.operationsRemaining != 0 && budget.bytesRemaining != 0 && !budget.stopRequested()) {
+      while (budget.operationsRemaining != 0) {
         if (inlineImageAwaitingData_) {
+          if (budget.stopRequested()) {
+            return pause();
+          }
           const PdfStepResult inlineResult = finishInlineImageData(budget);
           if (inlineResult.failed()) {
             return fail(inlineResult.status);
@@ -20545,7 +20656,6 @@ PdfStepResult PdfPreparation::step() {
           return fail(PdfStatus::failure(PdfError::InvalidArgument));
         }
         PdfToken& token = navigation_->contentTokenScratch;
-        resetInPlace(token);
         const PdfStepResult result =
             contentLexer_->next(token, budget, decoderOutput_.get(), PdfLimits::DecoderOutputBytes);
         if (cancelRequested_) {

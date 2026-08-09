@@ -10,9 +10,10 @@ namespace {
 constexpr uint64_t OPERATOR_PAGE_LIMIT = std::numeric_limits<uint64_t>::max();
 constexpr uint64_t OPERATOR_DOCUMENT_LIMIT = OPERATOR_PAGE_LIMIT - 1;
 
-bool tokenEquals(const PdfToken& token, const char* expected) {
-  const size_t length = std::strlen(expected);
-  return token.length == length && std::memcmp(token.bytes, expected, length) == 0;
+template <size_t Length>
+bool tokenEquals(const PdfToken& token, const char (&expected)[Length]) {
+  static_assert(Length != 0);
+  return token.length == Length - 1U && std::memcmp(token.bytes, expected, Length - 1U) == 0;
 }
 
 bool parseFixed(const PdfToken& token, int32_t* value) {
@@ -191,15 +192,32 @@ bool translate(PdfMatrix* matrix, const PdfFixed16 x, const PdfFixed16 y) {
 }
 
 bool isVectorOperator(const PdfToken& token) {
-  static constexpr const char* OPERATORS[] = {
-      "m", "l", "c", "v", "y", "h", "re", "S", "s", "f", "F", "f*", "B", "B*", "b", "b*", "n", "W", "W*",
-  };
-  for (const char* op : OPERATORS) {
-    if (tokenEquals(token, op)) {
-      return true;
+  if (token.length == 1U) {
+    switch (token.bytes[0]) {
+      case 'm':
+      case 'l':
+      case 'c':
+      case 'v':
+      case 'y':
+      case 'h':
+      case 'S':
+      case 's':
+      case 'f':
+      case 'F':
+      case 'B':
+      case 'b':
+      case 'n':
+      case 'W':
+        return true;
+      default:
+        return false;
     }
   }
-  return false;
+  return token.length == 2U &&
+         ((token.bytes[0] == 'r' && token.bytes[1] == 'e') ||
+          ((token.bytes[0] == 'f' || token.bytes[0] == 'B' || token.bytes[0] == 'b' ||
+            token.bytes[0] == 'W') &&
+           token.bytes[1] == '*'));
 }
 
 }  // namespace
@@ -211,7 +229,8 @@ PdfStatus PdfContentInterpreter::begin(const PdfByteSource* const contentSources
                                        const PdfContentResources& resources, PdfPageModel& pageModel) {
   if (contentSources == nullptr || contentSourceCount == 0 ||
       contentSourceCount > PdfLimits::MaxContentStreamsPerPage || workspace_.sourceBuffer == nullptr ||
-      workspace_.sourceBufferSize == 0 || workspace_.sourceBufferSize > PdfLimits::SourceBufferBytes ||
+      workspace_.sourceBufferSize == 0 ||
+      workspace_.sourceBufferSize > PdfLimits::InterpreterSourceBufferBytes ||
       workspace_.operands == nullptr || workspace_.operandCapacity == 0 || workspace_.arrayItems == nullptr ||
       workspace_.arrayItemCapacity == 0 || workspace_.scratchText == nullptr || workspace_.scratchTextCapacity == 0 ||
       workspace_.markedText == nullptr || workspace_.markedTextCapacity == 0) {
@@ -287,8 +306,11 @@ PdfStepResult PdfContentInterpreter::step(PdfWorkBudget& budget) {
   if (phase_ == Phase::Failed) {
     return PdfStepResult::failure(failure_);
   }
-  while (budget.operationsRemaining != 0 && budget.bytesRemaining != 0 && !budget.stopRequested()) {
+  while (budget.operationsRemaining != 0) {
     if (phase_ == Phase::InlineImageData) {
+      if (budget.stopRequested()) {
+        break;
+      }
       if (resources_ == nullptr || resources_->finishInlineImage == nullptr) {
         return fail(PdfStatus::failure(PdfError::UnsupportedFilter, lexer_.position()));
       }

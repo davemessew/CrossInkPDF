@@ -52,8 +52,18 @@ class PdfLexer {
     WhitespaceEI,
   };
 
-  ByteResult peek(uint8_t& byte, PdfWorkBudget& budget, PdfStatus& status);
-  void consume();
+  ByteResult peek(uint8_t& byte, PdfWorkBudget& budget, PdfStatus& status) {
+    if (bufferPosition_ < bufferedBytes_) {
+      byte = sourceBuffer_[bufferPosition_];
+      return ByteResult::Available;
+    }
+    return refill(byte, budget, status);
+  }
+  ByteResult refill(uint8_t& byte, PdfWorkBudget& budget, PdfStatus& status);
+  void consume() {
+    ++bufferPosition_;
+    ++position_;
+  }
   bool append(uint8_t byte, PdfStatus& status);
   bool appendString(uint8_t byte, uint8_t* stringBuffer, size_t stringBufferSize, PdfStatus& status);
   PdfStepResult finish(PdfToken& token, PdfTokenKind kind);

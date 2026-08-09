@@ -14,6 +14,7 @@
 #include <PdfHalReflowDocument.h>
 #include <PdfHiddenText.h>
 #include <PdfLayoutWordIndex.h>
+#include <PdfLimits.h>
 #include <PdfPageTree.h>
 #include <PdfPreparation.h>
 #include <PdfReaderProgressState.h>
@@ -83,6 +84,7 @@ constexpr uint32_t kMaximumCancellationSliceMilliseconds = 8;
 constexpr uint32_t kMaximumCancellationSliceMicroseconds = 8000;
 constexpr uint32_t kMaximumCancellationSliceOperations = 32;
 constexpr size_t kMaximumIoRequestBytes = 4U * 1024U;
+constexpr size_t kMaximumPreparationIoRequestBytes = PdfLimits::InterpreterSourceBufferBytes;
 constexpr uint32_t kQemuSlowAtomicWriteMicroseconds = 30000;
 // LittleFS may spend one flash erase cycle creating a directory entry in QEMU.
 // Keep the non-I/O slice ceiling at 8 ms, but allow that indivisible storage
@@ -1261,7 +1263,8 @@ bool preparePdf(const char* path, GfxRenderer& renderer, uint32_t* steps = nullp
       !pdfAcceptanceObserveFramebuffer(framebufferBefore, changedPointer,
                                        state.pdfFramebufferGuardControls,
                                        state.pdfFramebufferGuardRejections);
-  const bool accepted = result.complete() && traced.maximumRequest <= kMaximumIoRequestBytes && framebufferUnchanged &&
+  const bool accepted = result.complete() && traced.maximumRequest <= kMaximumPreparationIoRequestBytes &&
+                        framebufferUnchanged &&
                         changedHashRejected && changedPointerRejected;
   return accepted;
 }
@@ -2115,7 +2118,7 @@ bool checkPdfCancellation(GfxRenderer& renderer, PersistentAcceptanceState* pers
         recordQemuSlowAtomic(slowAtomicTotals, slice, elapsedUs, sliceTrace, nonIoUs);
     const bool timingViolation = timingExceeded && !slowAtomicAllowed;
     const bool otherLimitExceeded = ioCalls > kMaximumCancellationSliceOperations ||
-                                    traced.maximumRequest > kMaximumIoRequestBytes ||
+                                    traced.maximumRequest > kMaximumPreparationIoRequestBytes ||
                                     preparation->generation() != persistent->generation;
 #ifdef CROSSINK_QEMU_TIMING_DIAGNOSTIC
     if (timingExceeded) {
@@ -2832,7 +2835,7 @@ bool rejectPdfFixture(const char* path, GfxRenderer& renderer) {
     rejected = result.failed() && result.status.error != PdfError::BudgetExhausted &&
                result.status.error != PdfError::IoFailure && result.status.error != PdfError::InsufficientMemory;
   }
-  if (!rejected || traced.maximumRequest > kMaximumIoRequestBytes) {
+  if (!rejected || traced.maximumRequest > kMaximumPreparationIoRequestBytes) {
     return false;
   }
   TracedPdfCacheIo verifyIo;
