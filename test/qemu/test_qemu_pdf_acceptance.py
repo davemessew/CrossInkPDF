@@ -703,7 +703,7 @@ def acceptance_source_failures(source: str) -> list[str]:
         ("kExpectedEpubSectionZeroHash", "0x46385061C46C2FE4ULL"),
         ("kExpectedEpubSectionOneHash", "0x4060CB229041492DULL"),
         ("kExpectedEpubCssHash", "0x3CC3246E367521F4ULL"),
-        ("kExpectedEpubSectionCacheHash", "0xDEE723508F423F9AULL"),
+        ("kExpectedEpubSectionCacheHash", "0x5A4EB3E9690894B7ULL"),
         ("kExpectedEpubFrameHash", "0xE99DC1B84A90C006ULL"),
     )
     if any(

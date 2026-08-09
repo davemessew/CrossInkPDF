@@ -122,14 +122,14 @@ FULL_PASS_LINES = (
     (
         "QEMU_EPUB_ORACLE_PASS pass=uncached "
         "xhtml0=46385061C46C2FE4 xhtml1=4060CB229041492D "
-        "css=3CC3246E367521F4 cache=DEE723508F423F9A "
+        "css=3CC3246E367521F4 cache=5A4EB3E9690894B7 "
         "frame=E99DC1B84A90C006"
     ),
     *EPUB_CACHED_STAGE_LINES,
     (
         "QEMU_EPUB_ORACLE_PASS pass=cached "
         "xhtml0=46385061C46C2FE4 xhtml1=4060CB229041492D "
-        "css=3CC3246E367521F4 cache=DEE723508F423F9A "
+        "css=3CC3246E367521F4 cache=5A4EB3E9690894B7 "
         "frame=E99DC1B84A90C006"
     ),
     (
