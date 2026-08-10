@@ -33,13 +33,24 @@ struct PdfDecodedGlyph {
   int32_t width = 0;
 };
 
+// Estimate a source-layout advance when a PDF omits or cannot retain its font
+// width table. This affects only spacing reconstruction; reflowed text still
+// renders with the reader's selected device font and size.
+int32_t pdfEstimateGlyphWidth(const PdfUtf8Value& unicode);
+
+enum class PdfMaterializedFallback : uint8_t {
+  Fixed500,
+  EstimatedIdentity,
+};
+
 class PdfFontMap {
  public:
   explicit PdfFontMap(PdfFontMapWorkspace workspace) : workspace_(workspace) {}
 
   PdfStatus begin(uint16_t fontId, bool cid, PdfCMap* toUnicode, PdfSimpleEncoding* encoding,
                   int32_t defaultWidth = 500, bool bold = false);
-  PdfStatus beginMaterialized(uint16_t fontId, bool cid, bool bold = false);
+  PdfStatus beginMaterialized(uint16_t fontId, bool cid, bool bold = false,
+                              PdfMaterializedFallback fallback = PdfMaterializedFallback::Fixed500);
   PdfStatus materializeString(PdfFontMap& sourceFont, const uint8_t* source, size_t sourceLength);
   PdfStatus addMaterializedGlyph(const PdfDecodedGlyph& glyph);
   PdfStatus addWidth(uint32_t firstCode, uint32_t lastCode, int32_t width);
@@ -53,6 +64,7 @@ class PdfFontMap {
   uint16_t widthCount() const { return widthCount_; }
   uint16_t materializedGlyphCount() const { return materialized() ? widthCount_ : 0; }
   bool materialized() const { return defaultWidth_ < 0; }
+  bool estimatedIdentityFallback() const { return defaultWidth_ == -2; }
   bool hasExplicitWhitespace() const { return hasExplicitWhitespace_; }
   bool bold() const { return bold_; }
   bool fullyResident() const {

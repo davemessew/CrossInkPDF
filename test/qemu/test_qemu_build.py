@@ -103,9 +103,12 @@ class QemuBuildContractTest(unittest.TestCase):
         self.assertEqual(section["extends"].strip(), "base")
         self.assertEqual(section["upload_protocol"].strip(), "custom")
         self.assertEqual(section["board_build.filesystem"].strip(), "littlefs")
-        self.assertEqual(
-            section["lib_ignore"].strip(), "crossink-hardware-hal"
-        )
+        qemu_ignored = {
+            name.strip()
+            for name in section["lib_ignore"].splitlines()
+            if name.strip()
+        }
+        self.assertEqual(qemu_ignored, {"BLE", "crossink-hardware-hal"})
 
         hardware_hal = json.loads(
             HARDWARE_HAL_MANIFEST.read_text(encoding="utf-8")

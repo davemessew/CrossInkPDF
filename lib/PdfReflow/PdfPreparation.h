@@ -195,6 +195,11 @@ class PdfPreparation {
     bool cid = false;
     bool fallback = false;
     bool bold = false;
+    uint32_t decodedOffset = 0;
+    uint32_t decodedLength = 0;
+    uint32_t mappedOffset = 0;
+    uint16_t mappedCount = 0;
+    uint8_t canonicalCodeLength = 0;
   };
 
   static constexpr uint8_t FontResolutionCacheCapacity = 8;
@@ -207,6 +212,9 @@ class PdfPreparation {
     PageLabels,
     OutlineRoot,
     OutlineNode,
+    NamedDestinationTreeParent,
+    NamedDestinationTreeCandidate,
+    NamedDestinationTreeValue,
     Annotation,
     Complete,
   };
@@ -750,6 +758,14 @@ class PdfPreparation {
   PdfStatus finishPageTree();
   PdfStatus beginNavigationDiscovery();
   PdfStatus finishNavigationObject();
+  PdfStatus beginNamedDestinationLookup(bool outline);
+  PdfStatus finishNamedDestinationTreeParent();
+  PdfStatus finishNamedDestinationTreeCandidate();
+  PdfStatus finishNamedDestinationTreeValue();
+  PdfStatus finishCurrentOutlineNode(const PdfStatus& destinationStatus,
+                                     const PdfResolvedDestination& destination);
+  PdfStatus finishCurrentAnnotation(const PdfStatus& destinationStatus,
+                                    const PdfResolvedDestination& destination);
   PdfStepResult stepStartNextNavigationObject(PdfWorkBudget& budget);
   PdfStatus flushOutlineBatch();
   PdfStatus readNavigationRecord(uint32_t index, PdfOutlineEntry* record);
@@ -762,6 +778,9 @@ class PdfPreparation {
   uint32_t pageReferenceLookupCapacity() const;
   void rememberPageReference(uint32_t pageIndex, PdfObjectReference reference);
   PdfObjectReference recalledPageReference(uint32_t pageIndex) const;
+  bool recallNamedDestination(const PdfRawDestination& named, PdfResolvedDestination* destination);
+  void rememberNamedDestination(const PdfRawDestination& named,
+                                const PdfResolvedDestination& destination);
   PdfStatus resolveDestination(const PdfRawDestination& raw, PdfResolvedDestination* destination);
   PdfStatus beginCurrentPageImages();
   PdfStatus skipCurrentUnreadablePage();
@@ -775,8 +794,17 @@ class PdfPreparation {
   PdfStatus collectFontCandidates(uint16_t dictionaryIndex, uint8_t scopeIndex);
   PdfStatus beginNextImageObject();
   PdfStatus beginNextFontObject();
+  uint8_t* preparedFontName(uint8_t index);
+  const uint8_t* preparedFontName(uint8_t index) const;
   const FontResolutionCacheEntry* findFontResolution(PdfObjectReference reference);
+  const FontResolutionCacheEntry* findDecodedFontResolution(PdfObjectReference reference) const;
+  const FontResolutionCacheEntry* findMappedFontResolution(PdfObjectReference reference) const;
   void rememberFontResolution(const FontResolutionCacheEntry& entry);
+  void rememberDecodedFontResolution(PdfObjectReference reference, uint32_t offset, uint32_t length);
+  void rememberMappedFontResolution(PdfObjectReference reference, uint32_t offset, uint16_t count);
+  uint8_t canonicalPreparedFontCodeLength(PdfObjectReference reference) const;
+  void rememberCanonicalPreparedFontCodeLength(PdfObjectReference reference, uint8_t length);
+  void resetDecodedFontStore();
   PdfStepResult cacheCurrentPageImage(PdfWorkBudget& budget);
   PdfStatus appendDeferredImageRecord(uint8_t candidateIndex, uint32_t tagOffset, uint16_t tagLength);
   PdfStatus appendImageFileRecord(const PdfRequiredFileRecord& record);
@@ -831,6 +859,8 @@ class PdfPreparation {
   PdfStatus beginObservedJournalSpill(const PdfToken* retryToken = nullptr);
   PdfStepResult stepObservedJournalSpill(PdfWorkBudget& budget);
   uint8_t* preparedNavigationSpillBytes(size_t offset, size_t* contiguousBytes);
+  uint8_t* contentNavigationSnapshotStorageBytes(size_t offset, size_t* contiguousBytes);
+  uint8_t* preparedContentWriteBuffer(size_t* capacity);
   PdfStatus prepareFontNavigationSnapshot();
   void resetFontNavigationSnapshot();
   uint8_t* fontNavigationSnapshotStorageBytes(size_t offset, size_t* contiguousBytes);
@@ -996,6 +1026,7 @@ class PdfPreparation {
   bool pendingSectionBoundary_ = false;
   uint16_t outlineVisitedCount_ = 0;
   bool synthesizedOutline_ = false;
+  bool namedDestinationTree_ = false;
   int16_t currentOutlineParent_ = -1;
   uint8_t currentOutlineParentLevel_ = 0;
   uint8_t outlineBatchCount_ = 0;
@@ -1033,8 +1064,10 @@ class PdfPreparation {
   static constexpr uint8_t ResolverObjectStreamCacheCapacity = 8;
   ResolverObjectStreamCacheEntry resolverObjectStreamCache_[ResolverObjectStreamCacheCapacity]{};
   uint8_t resolverObjectStreamCacheCount_ = 0;
+  uint32_t decodedFontStoreBytes_ = 0;
   FontResolutionCacheEntry fontResolutionCache_[FontResolutionCacheCapacity]{};
   uint8_t fontResolutionCacheCount_ = 0;
+  bool decodedFontStoreReady_ = false;
   uint8_t imageCandidateCount_ = 0;
   uint8_t xObjectCandidateCount_ = 0;
   uint8_t formScopeCount_ = 0;
@@ -1114,6 +1147,7 @@ class PdfPreparation {
   uint32_t navigationSpoolReadCrc32_ = 0;
   uint32_t navigationSpoolBytes_ = 0;
   uint16_t preparedContentBufferedBytes_ = 0;
+  bool preparedContentFlushedThisStep_ = false;
   uint8_t navigationSpoolWriteCount_ = 0;
   uint8_t navigationSpoolReadCount_ = 0;
   uint8_t maskSpoolWriteCount_ = 0;

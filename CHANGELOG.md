@@ -1,3 +1,16 @@
+## [v1.5.0.7] - 2026-08-10
+
+### Changed
+
+- PDF preparation keeps font-to-Unicode mapping and navigation work inside the fixed 63,488-byte workspace, reducing repeated SD-card reads without borrowing the display framebuffer.
+- Font information from a PDF is used only to recover characters, word spacing, and document structure. The prepared book still uses the reader font and size selected in CrossInk.
+
+### Fixed
+
+- Cancelling preparation near the final section close now saves a complete checkpoint and resumes instead of restarting or failing at 90 percent.
+- Headings, paragraphs, drop caps, tables, and multi-column text now keep a more natural reading order with cleaner line joins and spacing.
+- More PDF character maps and font dictionaries now preserve Unicode text instead of producing question marks or replacement glyphs.
+
 ## [v1.5.0.6] - 2026-08-09
 
 ### Changed

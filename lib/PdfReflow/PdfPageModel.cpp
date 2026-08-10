@@ -15,6 +15,7 @@ PdfStatus PdfPageModel::reset() {
   imageCount_ = 0;
   warnings_ = PdfPageWarning::None;
   overflowSeparator_ = OverflowSeparator::None;
+  duplicateOverlayOffset_ = UINT16_MAX;
   runPending_ = false;
   return PdfStatus::success();
 }
@@ -151,6 +152,59 @@ PdfStatus PdfPageModel::finishTextRun() {
   if (runCount_ != 0) {
     PdfTextRun& previous = workspace_.runs[runCount_ - 1U];
     const PdfTextRun& current = workspace_.runs[runCount_];
+    constexpr uint16_t duplicateRelevantFlags =
+        PdfTextHidden | PdfTextActualText | PdfTextLight | PdfTextBold;
+    constexpr int64_t duplicateCoordinateTolerance = 512;
+    const auto duplicateCoordinate = [](const int32_t left, const int32_t right) {
+      constexpr int64_t tolerance = duplicateCoordinateTolerance;
+      const int64_t difference = static_cast<int64_t>(left) - right;
+      return difference >= -tolerance && difference <= tolerance;
+    };
+    const bool duplicateGeometry =
+        previous.fontId == current.fontId &&
+        (previous.flags & duplicateRelevantFlags) == (current.flags & duplicateRelevantFlags) &&
+        duplicateCoordinate(previous.baseline, current.baseline) &&
+        static_cast<int64_t>(current.xMin) >= static_cast<int64_t>(previous.xMin) - duplicateCoordinateTolerance &&
+        static_cast<int64_t>(current.xMax) <= static_cast<int64_t>(previous.xMax) + duplicateCoordinateTolerance &&
+        duplicateCoordinate(previous.yMin, current.yMin) && duplicateCoordinate(previous.yMax, current.yMax);
+    if (duplicateOverlayOffset_ != UINT16_MAX) {
+      const uint32_t duplicateEnd = static_cast<uint32_t>(duplicateOverlayOffset_) + current.textLength;
+      if (duplicateGeometry && duplicateEnd <= previous.textLength &&
+          std::memcmp(workspace_.text + previous.textOffset + duplicateOverlayOffset_,
+                      workspace_.text + current.textOffset, current.textLength) == 0) {
+        duplicateOverlayOffset_ = duplicateEnd == previous.textLength
+                                      ? UINT16_MAX
+                                      : static_cast<uint16_t>(duplicateEnd);
+        textLength_ = pendingTextStart_;
+        return PdfStatus::success();
+      }
+      duplicateOverlayOffset_ = UINT16_MAX;
+    }
+    const bool exactPaintDuplicate =
+        previous.textLength == current.textLength && previous.fontId == current.fontId &&
+        (previous.flags & duplicateRelevantFlags) == (current.flags & duplicateRelevantFlags) &&
+        duplicateCoordinate(previous.xMin, current.xMin) && duplicateCoordinate(previous.yMin, current.yMin) &&
+        duplicateCoordinate(previous.xMax, current.xMax) && duplicateCoordinate(previous.yMax, current.yMax) &&
+        duplicateCoordinate(previous.baselineX, current.baselineX) &&
+        duplicateCoordinate(previous.baseline, current.baseline) &&
+        duplicateCoordinate(previous.baselineDx, current.baselineDx) &&
+        duplicateCoordinate(previous.baselineDy, current.baselineDy) &&
+        std::memcmp(workspace_.text + previous.textOffset, workspace_.text + current.textOffset,
+                    current.textLength) == 0;
+    if (exactPaintDuplicate) {
+      textLength_ = pendingTextStart_;
+      return PdfStatus::success();
+    }
+    const bool fragmentedPaintDuplicate =
+        duplicateGeometry && current.textLength < previous.textLength && previous.textLength <= UINT16_MAX &&
+        (current.flags & PdfTextPositionReset) != 0 && duplicateCoordinate(previous.baselineX, current.baselineX) &&
+        std::memcmp(workspace_.text + previous.textOffset, workspace_.text + current.textOffset,
+                    current.textLength) == 0;
+    if (fragmentedPaintDuplicate) {
+      duplicateOverlayOffset_ = static_cast<uint16_t>(current.textLength);
+      textLength_ = pendingTextStart_;
+      return PdfStatus::success();
+    }
     const int64_t baselineDifference = static_cast<int64_t>(current.baseline) - previous.baseline;
     const uint64_t previousTextEnd = static_cast<uint64_t>(previous.textOffset) + previous.textLength;
     const int64_t previousBaselineEnd = static_cast<int64_t>(previous.baselineX) + previous.baselineDx;
@@ -160,12 +214,23 @@ PdfStatus PdfPageModel::finishTextRun() {
     const int64_t lineHeight =
         std::max(static_cast<int64_t>(previous.yMax) - previous.yMin,
                  static_cast<int64_t>(current.yMax) - current.yMin);
+    const int64_t previousHeight = static_cast<int64_t>(previous.yMax) - previous.yMin;
+    const int64_t currentHeight = static_cast<int64_t>(current.yMax) - current.yMin;
+    const int64_t minimumHeight = std::min(previousHeight, currentHeight);
+    const int64_t verticalOverlap =
+        std::min<int64_t>(previous.yMax, current.yMax) - std::max<int64_t>(previous.yMin, current.yMin);
+    const int64_t absoluteBaselineDifference =
+        baselineDifference < 0 ? -baselineDifference : baselineDifference;
+    const bool overlappingInlineFragment =
+        minimumHeight > 0 && verticalOverlap > 0 && verticalOverlap * 2 >= minimumHeight &&
+        absoluteBaselineDifference <= std::max<int64_t>(65536, minimumHeight / 2) &&
+        baselineGap >= -std::max<int64_t>(65536, minimumHeight / 2);
     const int64_t maximumMergeGap = std::max<int64_t>(65536, lineHeight * 2);
-    const int64_t originAdvance = static_cast<int64_t>(current.baselineX) - previous.baselineX;
-    const bool wideAbsolutePosition = (current.flags & PdfTextPositionReset) != 0 &&
-                                      originAdvance > lineHeight * 4;
-    constexpr uint16_t mergeRelevantFlags =
-        PdfTextHidden | PdfTextExplicitWhitespace | PdfTextLight | PdfTextBold;
+    const bool wideAbsolutePosition =
+        (current.flags & PdfTextPositionReset) != 0 && baselineGap > lineHeight * 4;
+    constexpr uint16_t mergeRelevantFlags = PdfTextHidden | PdfTextExplicitWhitespace;
+    constexpr uint16_t weightFlags = PdfTextLight | PdfTextBold;
+    const uint16_t weightDifference = (previous.flags ^ current.flags) & weightFlags;
     const bool isolatedSoftHyphen = current.textLength == 2U &&
                                     workspace_.text[current.textOffset] == 0xC2U &&
                                     workspace_.text[current.textOffset + 1U] == 0xADU;
@@ -174,15 +239,16 @@ PdfStatus PdfPageModel::finishTextRun() {
                                        workspace_.text[current.textOffset + 1U] == 0x80U &&
                                         (workspace_.text[current.textOffset + 2U] == 0x90U ||
                                          workspace_.text[current.textOffset + 2U] == 0x91U);
-    if (previous.fontId == current.fontId &&
+    if ((previous.fontId == current.fontId || overlappingInlineFragment) &&
         (previous.flags & mergeRelevantFlags) == (current.flags & mergeRelevantFlags) &&
+        (weightDifference == 0U || overlappingInlineFragment) &&
         (!wideAbsolutePosition || isolatedSoftHyphen || isolatedUnicodeHyphen) &&
-        baselineDifference >= -65536 && baselineDifference <= 65536 &&
+        (absoluteBaselineDifference <= 65536 || overlappingInlineFragment) &&
         baselineGap <= maximumMergeGap &&
         previousTextEnd == current.textOffset && current.textLength <= UINT32_MAX - previous.textLength &&
         currentEndX - previous.baselineX >= INT32_MIN && currentEndX - previous.baselineX <= INT32_MAX &&
         currentEndY - previous.baseline >= INT32_MIN && currentEndY - previous.baseline <= INT32_MAX) {
-      const int64_t wordGap = std::max<int64_t>(32768, lineHeight / 8);
+      const int64_t wordGap = std::max<int64_t>(32768, lineHeight / 3);
       const uint8_t currentFirst = workspace_.text[current.textOffset];
       const bool currentJoinsPunctuation = currentFirst == '-' || currentFirst == ',' || currentFirst == '.' ||
                                            currentFirst == ';' || currentFirst == ':' || currentFirst == '!' ||
@@ -222,10 +288,36 @@ PdfStatus PdfPageModel::finishTextRun() {
       const bool charactersNeedSpace = workspace_.text[current.textOffset - 1U] != ' ' &&
                                        workspace_.text[current.textOffset] != ' ';
       const bool explicitArrayGap = (current.flags & PdfTextArrayExplicitGap) != 0;
+      const auto asciiLetter = [](const uint8_t value) {
+        return (value >= 'A' && value <= 'Z') || (value >= 'a' && value <= 'z');
+      };
+      uint64_t previousWordStart = previousTextEnd;
+      while (previousWordStart > previous.textOffset &&
+             asciiLetter(workspace_.text[previousWordStart - 1U])) {
+        --previousWordStart;
+      }
+      const uint64_t previousWordLength = previousTextEnd - previousWordStart;
+      const bool repeatedWordGap =
+          (current.flags & PdfTextExplicitWhitespace) != 0 &&
+          (current.flags & PdfTextArrayTightContinuation) == 0 && baselineGap > wordGap &&
+          previousWordLength >= 4U && current.textLength >= 2U &&
+          asciiLetter(workspace_.text[current.textOffset]) &&
+          asciiLetter(workspace_.text[current.textOffset + 1U]) &&
+          workspace_.text[previousWordStart] == workspace_.text[current.textOffset] &&
+          workspace_.text[previousWordStart + 1U] == workspace_.text[current.textOffset + 1U];
       const bool inferredGap = (current.flags & PdfTextArrayTightContinuation) == 0 &&
                                (current.flags & PdfTextExplicitWhitespace) == 0 && baselineGap > wordGap &&
                                !currentJoinsPunctuation && !previousJoinsWord && !splitAllCapsGlyph;
-      const bool insertSpace = charactersNeedSpace && (explicitArrayGap || inferredGap);
+      const int64_t positionedContinuationGap = std::max(wordGap, lineHeight + lineHeight / 4);
+      const bool positionedWordContinuation =
+          asciiLetter(workspace_.text[previousTextEnd - 1U]) && asciiLetter(currentFirst) &&
+          baselineGap <= positionedContinuationGap;
+      const bool positionedGap = (current.flags & PdfTextPositionReset) != 0 &&
+                                 (current.flags & PdfTextArrayTightContinuation) == 0 &&
+                                 baselineGap > wordGap && !currentJoinsPunctuation &&
+                                 !previousJoinsWord && !splitAllCapsGlyph && !positionedWordContinuation;
+      const bool insertSpace =
+          charactersNeedSpace && (explicitArrayGap || inferredGap || positionedGap || repeatedWordGap);
       if (insertSpace) {
         if (textLength_ >= workspace_.textCapacity || current.textLength == UINT32_MAX - previous.textLength) {
           ++runCount_;
@@ -238,15 +330,20 @@ PdfStatus PdfPageModel::finishTextRun() {
         ++previous.textLength;
       }
       previous.textLength += current.textLength;
+      if (weightDifference != 0U) {
+        previous.flags &= static_cast<uint16_t>(~weightFlags);
+      }
       previous.xMin = std::min(previous.xMin, current.xMin);
       previous.xMax = std::max(previous.xMax, current.xMax);
       previous.yMin = std::min(previous.yMin, current.yMin);
       previous.yMax = std::max(previous.yMax, current.yMax);
       previous.baselineDx = static_cast<int32_t>(currentEndX - previous.baselineX);
       previous.baselineDy = static_cast<int32_t>(currentEndY - previous.baseline);
+      duplicateOverlayOffset_ = UINT16_MAX;
       return PdfStatus::success();
     }
   }
+  duplicateOverlayOffset_ = UINT16_MAX;
   ++runCount_;
   return PdfStatus::success();
 }
@@ -256,6 +353,7 @@ void PdfPageModel::abortTextRun() {
     return;
   }
   textLength_ = pendingTextStart_;
+  duplicateOverlayOffset_ = UINT16_MAX;
   runPending_ = false;
 }
 
@@ -263,6 +361,7 @@ PdfStatus PdfPageModel::appendImage(const PdfImagePlacement& image) {
   if (runPending_ || imageCount_ >= workspace_.imageCapacity) {
     return PdfStatus::failure(PdfError::LimitExceeded, imageCount_);
   }
+  duplicateOverlayOffset_ = UINT16_MAX;
   workspace_.images[imageCount_++] = image;
   return PdfStatus::success();
 }

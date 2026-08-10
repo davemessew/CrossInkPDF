@@ -18,6 +18,16 @@
 #include "PdfTestCacheIo.h"
 
 struct PdfPreparationTestAccess {
+  struct LiveNavigationShape {
+    uint16_t snapshotBytes = 0;
+    uint16_t pageWindowBytes = 0;
+    uint16_t linkCount = 0;
+    uint8_t xObjectCount = 0;
+    uint8_t pageLabelCount = 0;
+    uint8_t imageCacheEntryCount = 0;
+    uint8_t imageCandidateCount = 0;
+  };
+
   static uint8_t snapshotStage(const PdfPreparation& preparation) {
     return static_cast<uint8_t>(preparation.inlineNavigationSpillStage_);
   }
@@ -30,6 +40,56 @@ struct PdfPreparationTestAccess {
   static uint8_t* runRecords(PdfPreparation& preparation) { return preparation.runRecords_.get(); }
   static uint8_t* operandScratch(PdfPreparation& preparation) { return preparation.operandScratch_.get(); }
   static bool placementActive(const PdfPreparation& preparation) { return preparation.placement_ != nullptr; }
+  static size_t compactSnapshotBytes(const PdfPreparation& preparation) {
+    return preparation.fontNavigationSnapshotBytes_;
+  }
+  static LiveNavigationShape liveNavigationShape(const PdfPreparation& preparation) {
+    return {
+        preparation.fontNavigationSnapshotBytes_,
+        preparation.fontNavigationPageWindowBytes_,
+        preparation.fontNavigationLinkCount_,
+        preparation.fontNavigationXObjectCount_,
+        preparation.fontNavigationPageLabelCount_,
+        preparation.fontNavigationImageCacheEntryCount_,
+        preparation.fontNavigationImageCandidateCount_,
+    };
+  }
+  static std::vector<uint8_t> liveNavigationBytes(PdfPreparation& preparation,
+                                                  const LiveNavigationShape shape) {
+    std::vector<uint8_t> bytes;
+    if (preparation.navigation_ == nullptr || shape.snapshotBytes == 0) {
+      return bytes;
+    }
+    const LiveNavigationShape saved = liveNavigationShape(preparation);
+    preparation.fontNavigationSnapshotBytes_ = shape.snapshotBytes;
+    preparation.fontNavigationPageWindowBytes_ = shape.pageWindowBytes;
+    preparation.fontNavigationLinkCount_ = shape.linkCount;
+    preparation.fontNavigationXObjectCount_ = shape.xObjectCount;
+    preparation.fontNavigationPageLabelCount_ = shape.pageLabelCount;
+    preparation.fontNavigationImageCacheEntryCount_ = shape.imageCacheEntryCount;
+    preparation.fontNavigationImageCandidateCount_ = shape.imageCandidateCount;
+    bytes.reserve(shape.snapshotBytes);
+    size_t offset = 0;
+    while (offset < shape.snapshotBytes) {
+      size_t contiguous = 0;
+      uint8_t* const source = preparation.fontNavigationSnapshotFieldBytes(
+          preparation.navigation_, offset, &contiguous);
+      if (source == nullptr || contiguous == 0 || contiguous > shape.snapshotBytes - offset) {
+        bytes.clear();
+        break;
+      }
+      bytes.insert(bytes.end(), source, source + contiguous);
+      offset += contiguous;
+    }
+    preparation.fontNavigationSnapshotBytes_ = saved.snapshotBytes;
+    preparation.fontNavigationPageWindowBytes_ = saved.pageWindowBytes;
+    preparation.fontNavigationLinkCount_ = saved.linkCount;
+    preparation.fontNavigationXObjectCount_ = saved.xObjectCount;
+    preparation.fontNavigationPageLabelCount_ = saved.pageLabelCount;
+    preparation.fontNavigationImageCacheEntryCount_ = saved.imageCacheEntryCount;
+    preparation.fontNavigationImageCandidateCount_ = saved.imageCandidateCount;
+    return bytes;
+  }
   static bool runtimeConstructed(const PdfPreparation& preparation) {
     return preparation.preparedContentRuntimeConstructed();
   }
@@ -744,7 +804,7 @@ TEST(PdfPreparationContentStreams, ChecksFreshFreeSpaceAndCleansFailedTemporaryS
   }
 }
 
-TEST(PdfPreparationContentStreams, RoundTripsEveryNavigationByteWithoutTouchingLiveOverlays) {
+TEST(PdfPreparationContentStreams, RoundTripsLiveNavigationStateWithoutTouchingRuntime) {
   const std::string content = "BT /F1 12 Tf 72 720 Td (Snapshot round trip) Tj ET";
   const std::string encoded = zlibStored(content);
   const std::vector<uint8_t> pdf = onePagePdf("4 0 R", {streamObject(encoded, "FlateDecode")});
@@ -759,20 +819,24 @@ TEST(PdfPreparationContentStreams, RoundTripsEveryNavigationByteWithoutTouchingL
   uint32_t step = 0;
   ASSERT_TRUE(advanceToPhase(preparation, harness, PdfPreparationPhase::SuspendContentNavigation, &step));
 
-  const size_t navigationBytes = PdfPreparationTestAccess::navigationBytes(preparation);
+  ASSERT_TRUE(stepWithPublicBounds(preparation, harness, step++).yielded());
+  ASSERT_EQ(PdfPreparationTestAccess::snapshotStage(preparation), 1U);
+  ASSERT_EQ(PdfPreparationTestAccess::snapshotOffset(preparation), 0U);
+  const PdfPreparationTestAccess::LiveNavigationShape navigationShape =
+      PdfPreparationTestAccess::liveNavigationShape(preparation);
+  const std::vector<uint8_t> originalNavigation =
+      PdfPreparationTestAccess::liveNavigationBytes(preparation, navigationShape);
   const size_t runtimePrefixBytes = PdfPreparationTestAccess::runtimePrefixBytes(preparation);
   const size_t placementPrefixBytes = PdfPreparationTestAccess::placementPrefixBytes(preparation);
-  ASSERT_NE(navigationBytes, 0U);
+  ASSERT_FALSE(originalNavigation.empty());
+  EXPECT_EQ(originalNavigation.size(), PdfPreparationTestAccess::compactSnapshotBytes(preparation));
   ASSERT_NE(runtimePrefixBytes, 0U);
   ASSERT_EQ(placementPrefixBytes, 0U);
   ASSERT_FALSE(PdfPreparationTestAccess::placementActive(preparation));
 #if UINTPTR_MAX == UINT32_MAX
-  EXPECT_EQ(navigationBytes, 16920U);
   EXPECT_EQ(runtimePrefixBytes, 5288U);
   EXPECT_EQ(placementPrefixBytes, 0U);
 #endif
-  const std::vector<uint8_t> originalNavigation =
-      copyBytes(PdfPreparationTestAccess::dictionary(preparation), navigationBytes);
   const std::vector<uint8_t> runtimeBeforeSuspend =
       copyBytes(PdfPreparationTestAccess::runRecords(preparation), runtimePrefixBytes);
   const std::vector<uint8_t> placementBeforeSuspend =
@@ -798,8 +862,7 @@ TEST(PdfPreparationContentStreams, RoundTripsEveryNavigationByteWithoutTouchingL
 
   ASSERT_EQ(preparation.phase(), PdfPreparationPhase::OpenDecodedContent);
   EXPECT_EQ(PdfPreparationTestAccess::snapshotStage(preparation), 0U);
-  EXPECT_EQ(copyBytes(PdfPreparationTestAccess::dictionary(preparation), navigationBytes),
-            originalNavigation);
+  EXPECT_EQ(PdfPreparationTestAccess::liveNavigationBytes(preparation, navigationShape), originalNavigation);
   EXPECT_EQ(copyBytes(PdfPreparationTestAccess::runRecords(preparation), runtimePrefixBytes),
             runtimeBeforeRestore);
   EXPECT_EQ(copyBytes(PdfPreparationTestAccess::operandScratch(preparation), placementPrefixBytes),

@@ -352,7 +352,7 @@ PdfStatus PdfPreparedContentResources::addFont(const uint8_t* const name, const 
     return PdfStatus::failure(PdfError::LimitExceeded, materializedGlyphCount);
   }
   PdfPreparedFontResource& resource = fonts_[fontCount_++];
-  std::memcpy(resource.name, name, length);
+  resource.name = name;
   resource.nameLength = static_cast<uint8_t>(length);
   resource.font = font;
   return PdfStatus::success();

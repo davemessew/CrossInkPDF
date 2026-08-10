@@ -104,7 +104,7 @@ class PdfXrefTable {
   // Sparse resource lookups often form accidental pairs. Require a sustained
   // forward run before paying for a full window; any cache hit restores trust.
   static constexpr uint8_t kLocalityStreakRequired = 3;
-  static constexpr uint8_t kSampleIndexEntries = 56;
+  static constexpr uint8_t kSampleIndexEntries = UINT8_MAX;
   static constexpr uint8_t kSampleIndexLookupThreshold = 4;
   static constexpr uint16_t kSampleIndexMinimumRecords = 128;
   static constexpr uint8_t kVictimEntries = 24;
@@ -159,8 +159,8 @@ class PdfXrefTable {
 };
 
 static_assert(sizeof(PdfXrefEntry) * 40U == 960U, "xref entry cache and append batch must stay at 960 bytes");
-static_assert(sizeof(uint32_t) * 56U + sizeof(PdfXrefEntry) * 24U + sizeof(uint32_t) * 24U == 896U,
-              "sampled and victim xref indexes must stay within 896 bytes");
+static_assert(sizeof(uint32_t) * UINT8_MAX + sizeof(PdfXrefEntry) * 24U + sizeof(uint32_t) * 24U == 1692U,
+              "sampled and victim xref indexes must stay within 1692 bytes");
 
 class PdfXrefParser {
  public:

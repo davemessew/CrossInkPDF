@@ -85,7 +85,7 @@ static_assert(sizeof(PdfPreparedContentStreams) <= PdfLimits::PageRunBytes,
               "prepared content stream state must fit the fixed page-run phase overlay");
 
 struct PdfPreparedFontResource {
-  uint8_t name[32]{};
+  const uint8_t* name = nullptr;
   PdfFontMap* font = nullptr;
   uint8_t nameLength = 0;
 };

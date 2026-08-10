@@ -113,6 +113,19 @@ struct PdfKeyTreeNode {
   uint16_t kidCount = 0;
 };
 
+struct PdfNameTreeNode {
+  uint16_t kidsArrayIndex = PDF_INVALID_INDEX;
+  uint16_t kidCount = 0;
+  uint16_t namesArrayIndex = PDF_INVALID_INDEX;
+  uint16_t nameCount = 0;
+};
+
+enum class PdfNameTreeRelation : int8_t {
+  Before = -1,
+  Within = 0,
+  After = 1,
+};
+
 struct PdfKeyTreeSource {
   using InspectFn = PdfStatus (*)(void* context, PdfObjectReference reference, uint16_t* kidCount);
   using ReadKidFn = PdfStatus (*)(void* context, PdfObjectReference parent, uint16_t ordinal,
@@ -159,6 +172,19 @@ static_assert(sizeof(PdfKeyTreeWalkRuntime) <= 64, "key-tree traversal state mus
 PdfStatus pdfReadKeyTreeNode(const PdfObjectArena& arena, uint16_t rootIndex, PdfKeyTreeNode* node);
 PdfStatus pdfReadKeyTreeKid(const PdfObjectArena& arena, const PdfKeyTreeNode& node, uint16_t ordinal,
                             PdfObjectReference* child);
+PdfStatus pdfReadNameTreeNode(const PdfObjectArena& arena, uint16_t rootIndex, PdfNameTreeNode* node);
+PdfStatus pdfReadNameTreeKid(const PdfObjectArena& arena, const PdfNameTreeNode& node, uint16_t ordinal,
+                            PdfObjectReference* child);
+PdfStatus pdfReadNameTreeLimits(const PdfObjectArena& arena, uint16_t rootIndex, char* first,
+                                size_t firstCapacity, uint8_t* firstLength, char* last,
+                                size_t lastCapacity, uint8_t* lastLength);
+PdfStatus pdfCompareNameTreeLimits(const PdfObjectArena& arena, uint16_t rootIndex, const uint8_t* name,
+                                   size_t nameLength, PdfNameTreeRelation* relation);
+PdfStatus pdfResolveNameTreeLeaf(const PdfObjectArena& arena, uint16_t rootIndex, const uint8_t* name,
+                                 size_t nameLength, PdfRawDestination* destination,
+                                 PdfObjectReference* indirectDestination);
+PdfStatus pdfReadRawDestination(const PdfObjectArena& arena, uint16_t rootIndex,
+                                PdfRawDestination* destination);
 PdfStatus pdfBeginKeyTreeWalk(PdfObjectReference root, const PdfFixedRecordStore& frames,
                               PdfKeyTreeWalkRuntime* runtime);
 PdfStepResult pdfStepKeyTreeWalk(const PdfKeyTreeSource& source, const PdfFixedRecordStore& frames,
@@ -175,6 +201,7 @@ struct PdfCatalogNavigation {
   bool hasPages = false;
   bool hasOutlines = false;
   bool hasNamedDestinations = false;
+  bool namedDestinationsContainer = false;
   bool hasPageLabels = false;
   bool hasMetadata = false;
 };
@@ -222,6 +249,8 @@ struct PdfRawLinkAnnotation {
 };
 
 PdfStatus pdfReadCatalogNavigation(const PdfObjectArena& arena, uint16_t rootIndex, PdfCatalogNavigation* catalog);
+PdfStatus pdfReadNamedDestinationsReference(const PdfObjectArena& arena, uint16_t rootIndex,
+                                            PdfObjectReference* destinations);
 PdfStatus pdfReadOutlineRoot(const PdfObjectArena& arena, uint16_t rootIndex, PdfObjectReference* first);
 PdfStatus pdfReadOutlineNode(const PdfObjectArena& arena, uint16_t rootIndex, PdfRawOutlineNode* node);
 PdfStatus pdfReadNamedDestinations(const PdfObjectArena& arena, uint16_t rootIndex,

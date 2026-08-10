@@ -1227,7 +1227,6 @@ bool preparePdf(const char* path, GfxRenderer& renderer, uint32_t* steps = nullp
   }
   if (result.yielded()) {
     for (uint32_t step = 1; step < kMaximumPreparationSteps; ++step) {
-      esp_rom_printf("QEMU_PDF_SLICE\n");
       result = stepTrackedPdfPreparation(*preparation);
       if (steps != nullptr) {
         ++*steps;

@@ -1067,12 +1067,12 @@ TEST(PdfPreparedContentResources, RejectsMoreThanGlobalPageGlyphBudgetAcrossFont
   PdfFontMap sourceFont1({sourceWidths1.data(), static_cast<uint16_t>(sourceWidths1.size())});
   PdfFontMap sourceFont2({sourceWidths2.data(), static_cast<uint16_t>(sourceWidths2.size())});
   PdfFontMap sourceFont3({sourceWidths3.data(), static_cast<uint16_t>(sourceWidths3.size())});
-  ASSERT_TRUE(sourceFont1.begin(31, false, nullptr, nullptr, 500).ok());
-  ASSERT_TRUE(sourceFont2.begin(32, false, nullptr, nullptr, 500).ok());
-  ASSERT_TRUE(sourceFont3.begin(33, false, nullptr, nullptr, 500).ok());
-  ASSERT_TRUE(sourceFont1.addWidth(0, 255, 500).ok());
-  ASSERT_TRUE(sourceFont2.addWidth(0, 255, 500).ok());
-  ASSERT_TRUE(sourceFont3.addWidth(0, 255, 500).ok());
+  ASSERT_TRUE(sourceFont1.begin(31, false, nullptr, nullptr, 501).ok());
+  ASSERT_TRUE(sourceFont2.begin(32, false, nullptr, nullptr, 501).ok());
+  ASSERT_TRUE(sourceFont3.begin(33, false, nullptr, nullptr, 501).ok());
+  ASSERT_TRUE(sourceFont1.addWidth(0, 255, 501).ok());
+  ASSERT_TRUE(sourceFont2.addWidth(0, 255, 501).ok());
+  ASSERT_TRUE(sourceFont3.addWidth(0, 255, 501).ok());
 
   std::array<PdfDecodedGlyph, 95> glyphs1{};
   std::array<PdfDecodedGlyph, 95> glyphs2{};

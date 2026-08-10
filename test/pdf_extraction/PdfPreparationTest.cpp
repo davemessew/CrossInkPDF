@@ -163,10 +163,14 @@ std::vector<uint8_t> loadFixture(const char* name) {
   return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
 }
 
-std::vector<uint8_t> makeTwoPageTextPdf(const bool unreadableFirst = false, const bool includeThird = false) {
+std::vector<uint8_t> makeTwoPageTextPdf(const bool unreadableFirst = false, const bool includeThird = false,
+                                        const char* const secondPageContent = nullptr,
+                                        const char* const baseFont = "/Helvetica") {
   const std::string firstStream =
       unreadableFirst ? "q Q" : "BT /F1 12 Tf 72 720 Td (First durable page) Tj ET";
-  const std::string secondStream = "BT /F1 12 Tf 72 720 Td (Second resumed page) Tj ET";
+  const std::string secondStream = secondPageContent != nullptr
+                                       ? secondPageContent
+                                       : "BT /F1 12 Tf 72 720 Td (Second resumed page) Tj ET";
   const std::string thirdStream = "BT /F1 12 Tf 72 720 Td (Third durable page) Tj ET";
   std::vector<std::string> objects = {
       "<< /Type /Catalog /Pages 2 0 R >>",
@@ -176,7 +180,7 @@ std::vector<uint8_t> makeTwoPageTextPdf(const bool unreadableFirst = false, cons
       "<< /Length " + std::to_string(firstStream.size()) + " >>\nstream\n" + firstStream + "\nendstream",
       "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 7 0 R >> >> /Contents 6 0 R >>",
       "<< /Length " + std::to_string(secondStream.size()) + " >>\nstream\n" + secondStream + "\nendstream",
-      "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+      std::string("<< /Type /Font /Subtype /Type1 /BaseFont ") + baseFont + " >>",
   };
   if (includeThird) {
     objects.push_back(
@@ -324,6 +328,31 @@ std::vector<uint8_t> makeManyContentStreamsPdf(const uint8_t streamCount) {
   }
   objects.push_back("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
   return assembleClassicPdf(objects);
+}
+
+std::vector<uint8_t> makeNamedDestinationTreeOutlinePdf() {
+  const std::string firstContent = "BT /F1 12 Tf 72 720 Td (First named page) Tj ET";
+  const std::string secondContent = "BT /F1 12 Tf 72 720 Td (Second named page) Tj ET";
+  return assembleClassicPdf({
+      "<< /Type /Catalog /Pages 2 0 R /Outlines 8 0 R /Names 16 0 R >>",
+      "<< /Type /Pages /Count 2 /Kids [3 0 R 5 0 R] >>",
+      "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 7 0 R >> >> "
+      "/Contents 4 0 R >>",
+      "<< /Length " + std::to_string(firstContent.size()) + ">>\nstream\n" + firstContent + "\nendstream",
+      "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 7 0 R >> >> "
+      "/Contents 6 0 R >>",
+      "<< /Length " + std::to_string(secondContent.size()) + ">>\nstream\n" + secondContent + "\nendstream",
+      "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+      "<< /Type /Outlines /Count 2 /First 9 0 R /Last 10 0 R >>",
+      "<< /Title (First named chapter) /Dest (A) /Parent 8 0 R /Next 10 0 R >>",
+      "<< /Title (Second named chapter) /Dest (Z) /Parent 8 0 R /Prev 9 0 R >>",
+      "<< /Kids [12 0 R 13 0 R] >>",
+      "<< /Limits [(A) (M)] /Names [(A) 14 0 R (M) 14 0 R] >>",
+      "<< /Limits [(N) (Z)] /Names [(N) 15 0 R (Z) 15 0 R] >>",
+      "<< /D [3 0 R /Fit] >>",
+      "<< /D [5 0 R /Fit] >>",
+      "<< /Dests 11 0 R >>",
+  });
 }
 
 std::vector<uint8_t> makeIndirectSeparationImagePdf() {
@@ -857,6 +886,36 @@ TEST(PdfPreparation, SourceFontSizeDoesNotChangePreparedSemanticXhtml) {
   EXPECT_EQ(xhtml.find("<h1"), std::string::npos);
 }
 
+TEST(PdfPreparation, KeepsHierarchicalNumberedHeadingsSeparateAtBodySize) {
+  constexpr char sourcePath[] = "/books/numbered-headings.pdf";
+  const std::string content =
+      "BT "
+      "/F1 14 Tf 1 0 0 1 72 720 Tm (2. Materials and methods) Tj "
+      "/F1 10 Tf 1 0 0 1 72 694 Tm (2.1.) Tj 1 0 0 1 98 694 Tm (Experimental materials) Tj "
+      "/F1 12 Tf 1 0 0 1 72 660 Tm (Ordinary body paragraph establishes normal text size.) Tj "
+      "1 0 0 1 72 644 Tm (More ordinary body text follows on another line.) Tj "
+      "1 0 0 1 72 628 Tm (A third ordinary body line completes the paragraph.) Tj "
+      "/F1 10 Tf 1 0 0 1 72 590 Tm (2.2.) Tj 1 0 0 1 98 590 Tm (H-PDINH preparation) Tj "
+      "/F1 12 Tf 1 0 0 1 72 560 Tm (The next paragraph begins here.) Tj ET";
+  PreparationHarness harness;
+  harness.storage.addFile(sourcePath, makeOnePageTextPdf(content), 1234, true);
+
+  PdfPreparation preparation;
+  ASSERT_TRUE(preparation.begin(harness.config(sourcePath)).ok());
+  const PdfStepResult result = runToTerminal(preparation, harness);
+  ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error) << "@" << result.status.offset;
+
+  const std::string sectionPath = std::string(preparation.cacheRoot()) + "/gen_" +
+                                  std::to_string(preparation.generation()) + "/sections/000000.xhtml";
+  ASSERT_TRUE(harness.storage.exists(sectionPath));
+  const std::vector<uint8_t>& bytes = harness.storage.bytes(sectionPath);
+  const std::string xhtml(bytes.begin(), bytes.end());
+  EXPECT_NE(xhtml.find(">2. Materials and methods</h1>"), std::string::npos) << xhtml;
+  EXPECT_NE(xhtml.find(">2.1. Experimental materials</h2>"), std::string::npos) << xhtml;
+  EXPECT_NE(xhtml.find(">2.2. H-PDINH preparation</h2>"), std::string::npos) << xhtml;
+  EXPECT_EQ(xhtml.find("methods 2.1."), std::string::npos) << xhtml;
+}
+
 TEST(PdfPreparation, ReflowsVisualLinesIntoHeadingsParagraphsAndDropCaps) {
   constexpr char sourcePath[] = "/books/semantic-lines.pdf";
   const std::string content =
@@ -933,6 +992,151 @@ TEST(PdfPreparation, RecognizesBodySizeBoldAllCapsSubheadingsInTheTopContentBand
     EXPECT_NE(xhtml.find(expected), std::string::npos) << xhtml;
     EXPECT_NE(xhtml.find(">Ordinary body paragraph text.</p>"), std::string::npos) << xhtml;
   }
+}
+
+TEST(PdfPreparation, KeepsTerminalPunctuationOnASecondHeadingLine) {
+  constexpr char sourcePath[] = "/books/two-line-terminal-heading.pdf";
+  const std::string content =
+      "BT "
+      "/F1 15 Tf 1 0 0 1 72 720 Tm (HOW LONG DOES IT ACTUALLY TAKE TO FORM A NEW) Tj "
+      "1 0 0 1 278 702 Tm (HABIT?) Tj "
+      "/F1 11 Tf 1 0 0 1 72 650 Tm (Ordinary body paragraph text.) Tj "
+      "1 0 0 1 72 634 Tm (More ordinary body text follows here.) Tj "
+      "1 0 0 1 72 618 Tm (Another ordinary body line follows here.) Tj "
+      "1 0 0 1 72 602 Tm (The body text establishes its normal size.) Tj ET";
+  PreparationHarness harness;
+  harness.storage.addFile(sourcePath, makeTwoPageTextPdf(false, false, content.c_str(), "/Helvetica-Bold"), 1234,
+                          true);
+
+  PdfPreparation preparation;
+  ASSERT_TRUE(preparation.begin(harness.config(sourcePath)).ok());
+  const PdfStepResult result = runToTerminal(preparation, harness);
+  ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error) << "@" << result.status.offset;
+
+  const std::string sectionPath = std::string(preparation.cacheRoot()) + "/gen_" +
+                                  std::to_string(preparation.generation()) + "/sections/000000.xhtml";
+  ASSERT_TRUE(harness.storage.exists(sectionPath));
+  const std::vector<uint8_t>& bytes = harness.storage.bytes(sectionPath);
+  const std::string xhtml(bytes.begin(), bytes.end());
+  EXPECT_NE(xhtml.find(">HOW LONG DOES IT ACTUALLY TAKE TO FORM A NEW HABIT?</h2>"), std::string::npos)
+      << xhtml;
+  EXPECT_NE(xhtml.find(">Ordinary body paragraph text."), std::string::npos) << xhtml;
+}
+
+TEST(PdfPreparation, KeepsWidelySpacedCoverTitleLinesInOneHeading) {
+  constexpr char sourcePath[] = "/books/widely-spaced-cover-title.pdf";
+  const std::string content =
+      "BT "
+      "/F1 45 Tf 1 0 0 1 45 650 Tm (Corporate) Tj "
+      "1 0 0 1 45 605 Tm (Design) Tj "
+      "1 0 0 1 45 560 Tm (Manual) Tj "
+      "/F1 11 Tf 1 0 0 1 72 500 Tm (Ordinary body paragraph text.) Tj "
+      "1 0 0 1 72 484 Tm (More ordinary body text follows here.) Tj "
+      "1 0 0 1 72 468 Tm (Another ordinary body line follows here.) Tj "
+      "1 0 0 1 72 452 Tm (The body text establishes its normal size.) Tj ET";
+  PreparationHarness harness;
+  harness.storage.addFile(sourcePath, makeOnePageTextPdf(content), 1234, true);
+
+  PdfPreparation preparation;
+  ASSERT_TRUE(preparation.begin(harness.config(sourcePath)).ok());
+  const PdfStepResult result = runToTerminal(preparation, harness);
+  ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error) << "@" << result.status.offset;
+
+  const std::string sectionPath = std::string(preparation.cacheRoot()) + "/gen_" +
+                                  std::to_string(preparation.generation()) + "/sections/000000.xhtml";
+  ASSERT_TRUE(harness.storage.exists(sectionPath));
+  const std::vector<uint8_t>& bytes = harness.storage.bytes(sectionPath);
+  const std::string xhtml(bytes.begin(), bytes.end());
+  EXPECT_NE(xhtml.find(">Corporate Design Manual</h1>"), std::string::npos) << xhtml;
+  EXPECT_EQ(xhtml.find(">Corporate</h1>"), std::string::npos) << xhtml;
+  EXPECT_EQ(xhtml.find(">Design</h2>"), std::string::npos) << xhtml;
+  EXPECT_EQ(xhtml.find(">Manual</h2>"), std::string::npos) << xhtml;
+}
+
+TEST(PdfPreparation, KeepsALongFirstPageTitleWithALowercaseSecondLineAsOneHeading) {
+  constexpr char sourcePath[] = "/books/lowercase-title-continuation.pdf";
+  const std::string content =
+      "BT "
+      "/F1 16 Tf 1 0 0 1 72 690 Tm (Novel composite materials for photodegradation under simulated) Tj "
+      "1 0 0 1 72 670 Tm (sunshine irradiation) Tj "
+      "/F1 11 Tf 1 0 0 1 72 620 Tm (Ordinary body paragraph text starts here.) Tj "
+      "1 0 0 1 72 604 Tm (More ordinary body text follows here.) Tj "
+      "1 0 0 1 72 588 Tm (The body text establishes its normal size.) Tj ET";
+  PreparationHarness harness;
+  harness.storage.addFile(sourcePath, makeOnePageTextPdf(content), 1234, true);
+
+  PdfPreparation preparation;
+  ASSERT_TRUE(preparation.begin(harness.config(sourcePath)).ok());
+  const PdfStepResult result = runToTerminal(preparation, harness);
+  ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error) << "@" << result.status.offset;
+
+  const std::string sectionPath = std::string(preparation.cacheRoot()) + "/gen_" +
+                                  std::to_string(preparation.generation()) + "/sections/000000.xhtml";
+  ASSERT_TRUE(harness.storage.exists(sectionPath));
+  const std::vector<uint8_t>& bytes = harness.storage.bytes(sectionPath);
+  const std::string xhtml(bytes.begin(), bytes.end());
+  EXPECT_NE(xhtml.find(">Novel composite materials for photodegradation under simulated sunshine "
+                       "irradiation</h1>"),
+            std::string::npos)
+      << xhtml;
+}
+
+TEST(PdfPreparation, DoesNotPromoteACenteredBodyFragmentToASectionHeading) {
+  constexpr char sourcePath[] = "/books/centered-body-fragment.pdf";
+  const std::string content =
+      "BT "
+      "/F1 15 Tf 1 0 0 1 76 700 Tm (Find updated endnotes and corrections at) Tj "
+      "1 0 0 1 244 700 Tm (atomichabits.com/endnotes) Tj "
+      "1 0 0 1 408 700 Tm (.) Tj "
+      "/F1 11 Tf 1 0 0 1 262 670 Tm (INTRODUCTION) Tj "
+      "1 0 0 1 72 640 Tm (Ordinary body paragraph text.) Tj "
+      "1 0 0 1 72 624 Tm (More ordinary body text follows here.) Tj "
+      "1 0 0 1 72 608 Tm (The body text establishes its normal size.) Tj ET";
+  PreparationHarness harness;
+  harness.storage.addFile(sourcePath, makeOnePageTextPdf(content, 0, "/Helvetica-Bold"), 1234, true);
+
+  PdfPreparation preparation;
+  ASSERT_TRUE(preparation.begin(harness.config(sourcePath)).ok());
+  const PdfStepResult result = runToTerminal(preparation, harness);
+  ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error) << "@" << result.status.offset;
+
+  const std::string sectionPath = std::string(preparation.cacheRoot()) + "/gen_" +
+                                  std::to_string(preparation.generation()) + "/sections/000000.xhtml";
+  ASSERT_TRUE(harness.storage.exists(sectionPath));
+  const std::vector<uint8_t>& bytes = harness.storage.bytes(sectionPath);
+  const std::string xhtml(bytes.begin(), bytes.end());
+  EXPECT_NE(xhtml.find("atomichabits.com/endnotes.</p>"), std::string::npos) << xhtml;
+  EXPECT_NE(xhtml.find(">INTRODUCTION</h2>"), std::string::npos) << xhtml;
+  EXPECT_EQ(xhtml.find("atomichabits.com/endnotes.</h"), std::string::npos) << xhtml;
+}
+
+TEST(PdfPreparation, RejoinsAWordSplitAtTheStartOfAHeadingFragment) {
+  constexpr char sourcePath[] = "/books/split-word-heading-fragment.pdf";
+  const std::string content =
+      "BT "
+      "/F1 15 Tf 1 0 0 1 110 720 Tm (THE MISMATCH BETWEEN IMMEDIA) Tj "
+      "1 0 0 1 355 720 Tm (TE AND DELAYED) Tj "
+      "1 0 0 1 267 702 Tm (REWARDS) Tj "
+      "/F1 11 Tf 1 0 0 1 72 650 Tm (Ordinary body paragraph text.) Tj "
+      "1 0 0 1 72 634 Tm (More ordinary body text follows here.) Tj "
+      "1 0 0 1 72 618 Tm (Another ordinary body line follows here.) Tj "
+      "1 0 0 1 72 602 Tm (The body text establishes its normal size.) Tj ET";
+  PreparationHarness harness;
+  harness.storage.addFile(sourcePath, makeTwoPageTextPdf(false, false, content.c_str(), "/Helvetica-Bold"), 1234,
+                          true);
+
+  PdfPreparation preparation;
+  ASSERT_TRUE(preparation.begin(harness.config(sourcePath)).ok());
+  const PdfStepResult result = runToTerminal(preparation, harness);
+  ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error) << "@" << result.status.offset;
+
+  const std::string sectionPath = std::string(preparation.cacheRoot()) + "/gen_" +
+                                  std::to_string(preparation.generation()) + "/sections/000000.xhtml";
+  ASSERT_TRUE(harness.storage.exists(sectionPath));
+  const std::vector<uint8_t>& bytes = harness.storage.bytes(sectionPath);
+  const std::string xhtml(bytes.begin(), bytes.end());
+  EXPECT_NE(xhtml.find(">THE MISMATCH BETWEEN IMMEDIATE AND DELAYED REWARDS</h2>"), std::string::npos)
+      << xhtml;
 }
 
 TEST(PdfPreparation, DistinguishesStandaloneDropCapIFromIn) {
@@ -1134,6 +1338,191 @@ TEST(PdfPreparation, OrdersColumnsDownBeforePreservingRowMajorTableCells) {
   EXPECT_EQ(sections[0].firstAnchorOrdinal, 0U);
 }
 
+TEST(PdfPreparation, DoesNotTreatSparseInlineFragmentsAsASecondColumn) {
+  constexpr char sourcePath[] = "/books/inline-fragments-not-columns.pdf";
+  std::string content = "BT /F1 11 Tf ";
+  for (uint8_t line = 0; line < 31U; ++line) {
+    char text[192]{};
+    const unsigned y = 760U - static_cast<unsigned>(line) * 16U;
+    const int length = line < 6U
+                           ? std::snprintf(text, sizeof(text),
+                                           "1 0 0 1 72 %u Tm (Inline left %u continues ) Tj "
+                                           "1 0 0 1 380 %u Tm (right %u.) Tj ",
+                                           y, static_cast<unsigned>(line), y, static_cast<unsigned>(line))
+                           : std::snprintf(text, sizeof(text),
+                                           "1 0 0 1 72 %u Tm (Ordinary line %u remains in the main text.) Tj ",
+                                           y, static_cast<unsigned>(line));
+    ASSERT_GT(length, 0);
+    ASSERT_LT(static_cast<size_t>(length), sizeof(text));
+    content.append(text, static_cast<size_t>(length));
+  }
+  content += "ET";
+  PreparationHarness harness;
+  harness.storage.addFile(sourcePath, makeOnePageTextPdf(content), 1234, true);
+
+  PdfPreparation preparation;
+  ASSERT_TRUE(preparation.begin(harness.config(sourcePath)).ok());
+  const PdfStepResult result = runToTerminal(preparation, harness);
+  ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error) << "@" << result.status.offset;
+
+  const std::string sectionPath = std::string(preparation.cacheRoot()) + "/gen_" +
+                                  std::to_string(preparation.generation()) + "/sections/000000.xhtml";
+  ASSERT_TRUE(harness.storage.exists(sectionPath));
+  const std::vector<uint8_t>& bytes = harness.storage.bytes(sectionPath);
+  const std::string xhtml(bytes.begin(), bytes.end());
+  const size_t left0 = xhtml.find("Inline left 0 continues");
+  const size_t right0 = xhtml.find("right 0.");
+  const size_t left1 = xhtml.find("Inline left 1 continues");
+  ASSERT_NE(left0, std::string::npos) << xhtml;
+  ASSERT_NE(right0, std::string::npos) << xhtml;
+  ASSERT_NE(left1, std::string::npos) << xhtml;
+  EXPECT_LT(left0, right0) << xhtml;
+  EXPECT_LT(right0, left1) << xhtml;
+}
+
+TEST(PdfPreparation, DoesNotTreatCenteredSingleColumnCreditsAsASecondColumn) {
+  constexpr char sourcePath[] = "/books/centered-credits-not-columns.pdf";
+  std::string content =
+      "BT /F1 11 Tf "
+      "1 0 0 1 72 620 Tm (The body begins here and) Tj "
+      "1 0 0 1 72 604 Tm (continues without) Tj "
+      "1 0 0 1 80 588 Tm (a paragraph break before) Tj "
+      "1 0 0 1 72 572 Tm (its next visual line and) Tj "
+      "1 0 0 1 80 556 Tm (finishes by) Tj "
+      "1 0 0 1 180 540 Tm (ending on its centered final line.) Tj ";
+  // Deliberately put the lower, left-aligned body into the content stream
+  // before the centered credits. Reading order must follow page geometry.
+  for (uint8_t line = 0; line < 6U; ++line) {
+    char text[96]{};
+    const int length = std::snprintf(text, sizeof(text),
+                                     "1 0 0 1 250 %u Tm (Credit line %u.) Tj ",
+                                     static_cast<unsigned>(740U - line * 16U),
+                                     static_cast<unsigned>(line));
+    ASSERT_GT(length, 0);
+    ASSERT_LT(static_cast<size_t>(length), sizeof(text));
+    content.append(text, static_cast<size_t>(length));
+  }
+  content += "ET";
+
+  PreparationHarness harness;
+  harness.storage.addFile(sourcePath, makeOnePageTextPdf(content), 1234, true);
+
+  PdfPreparation preparation;
+  ASSERT_TRUE(preparation.begin(harness.config(sourcePath)).ok());
+  const PdfStepResult result = runToTerminal(preparation, harness);
+  ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error) << "@" << result.status.offset;
+
+  const std::string sectionPath = std::string(preparation.cacheRoot()) + "/gen_" +
+                                  std::to_string(preparation.generation()) + "/sections/000000.xhtml";
+  ASSERT_TRUE(harness.storage.exists(sectionPath));
+  const std::vector<uint8_t>& bytes = harness.storage.bytes(sectionPath);
+  const std::string xhtml(bytes.begin(), bytes.end());
+  const size_t firstCredit = xhtml.find("Credit line 0.");
+  const size_t lastCredit = xhtml.find("Credit line 5.");
+  const size_t firstBody = xhtml.find("The body begins here and");
+  ASSERT_NE(firstCredit, std::string::npos) << xhtml;
+  ASSERT_NE(lastCredit, std::string::npos) << xhtml;
+  ASSERT_NE(firstBody, std::string::npos) << xhtml;
+  EXPECT_LT(firstCredit, lastCredit) << xhtml;
+  EXPECT_LT(lastCredit, firstBody) << xhtml;
+  EXPECT_NE(xhtml.find(">The body begins here and continues without a paragraph break before its next visual "
+                       "line and finishes by ending on its centered final line.</p>"),
+            std::string::npos)
+      << xhtml;
+}
+
+TEST(PdfPreparation, DoesNotTreatStyledProseFragmentsAsWideTableCells) {
+  constexpr char sourcePath[] = "/books/styled-prose-not-table.pdf";
+  const std::string content =
+      "BT /F1 11 Tf "
+      "1 0 0 1 72 720 Tm (The first three laws increase the odds that a behavior will be) Tj "
+      "1 0 0 1 72 702 Tm (performed ) Tj "
+      "/F2 11 Tf 1 0 0 1 72 702 Tm (this) Tj "
+      "/F1 11 Tf 1 0 0 1 72 702 Tm ( time. The fourth law continues ) Tj "
+      "/F2 11 Tf 1 0 0 1 425 702 Tm (make it satisfying.) Tj ET";
+  PreparationHarness harness;
+  harness.storage.addFile(
+      sourcePath,
+      assembleClassicPdf({
+          "<< /Type /Catalog /Pages 2 0 R >>",
+          "<< /Type /Pages /Count 1 /Kids [3 0 R] >>",
+          "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+          "/Resources << /Font << /F1 5 0 R /F2 6 0 R >> >> /Contents 4 0 R >>",
+          "<< /Length " + std::to_string(content.size()) + ">>\nstream\n" + content + "\nendstream",
+          "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+          "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Oblique >>",
+      }),
+      1234, true);
+
+  PdfPreparation preparation;
+  ASSERT_TRUE(preparation.begin(harness.config(sourcePath)).ok());
+  const PdfStepResult result = runToTerminal(preparation, harness);
+  ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error) << "@" << result.status.offset;
+
+  const std::string sectionPath = std::string(preparation.cacheRoot()) + "/gen_" +
+                                  std::to_string(preparation.generation()) + "/sections/000000.xhtml";
+  ASSERT_TRUE(harness.storage.exists(sectionPath));
+  const std::vector<uint8_t>& bytes = harness.storage.bytes(sectionPath);
+  const std::string xhtml(bytes.begin(), bytes.end());
+  EXPECT_NE(xhtml.find(">The first three laws increase the odds that a behavior will be performed this time. "
+                       "The fourth law continues make it satisfying.</p>"),
+            std::string::npos)
+      << xhtml;
+}
+
+TEST(PdfPreparation, KeepsALeadingSpaceStyledFragmentInItsLeftColumnLine) {
+  constexpr char sourcePath[] = "/books/styled-left-column-continuation.pdf";
+  std::string content =
+      "BT /F1 11 Tf 1 0 0 1 72 720 Tm (Designs des Kantons St.Gallen) Tj "
+      "/F2 11 Tf 1 0 0 1 250 720 Tm ( macht die ) Tj "
+      "1 0 0 1 360 720 Tm (Right column zero.) Tj ";
+  for (uint8_t row = 1; row <= 6U; ++row) {
+    char lines[160]{};
+    const unsigned y = 720U - static_cast<unsigned>(row) * 18U;
+    const int length = std::snprintf(lines, sizeof(lines),
+                                     "1 0 0 1 72 %u Tm (Left column row %u.) Tj "
+                                     "1 0 0 1 360 %u Tm (Right column row %u.) Tj ",
+                                     y, static_cast<unsigned>(row), y, static_cast<unsigned>(row));
+    ASSERT_GT(length, 0);
+    ASSERT_LT(static_cast<size_t>(length), sizeof(lines));
+    content.append(lines, static_cast<size_t>(length));
+  }
+  content += "ET";
+
+  PreparationHarness harness;
+  harness.storage.addFile(
+      sourcePath,
+      assembleClassicPdf({
+          "<< /Type /Catalog /Pages 2 0 R >>",
+          "<< /Type /Pages /Count 1 /Kids [3 0 R] >>",
+          "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+          "/Resources << /Font << /F1 5 0 R /F2 6 0 R >> >> /Contents 4 0 R >>",
+          "<< /Length " + std::to_string(content.size()) + ">>\nstream\n" + content + "\nendstream",
+          "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>",
+          "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+      }),
+      1234, true);
+
+  PdfPreparation preparation;
+  ASSERT_TRUE(preparation.begin(harness.config(sourcePath)).ok());
+  const PdfStepResult result = runToTerminal(preparation, harness);
+  ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error) << "@" << result.status.offset;
+
+  const std::string sectionPath = std::string(preparation.cacheRoot()) + "/gen_" +
+                                  std::to_string(preparation.generation()) + "/sections/000000.xhtml";
+  ASSERT_TRUE(harness.storage.exists(sectionPath));
+  const std::vector<uint8_t>& bytes = harness.storage.bytes(sectionPath);
+  const std::string xhtml(bytes.begin(), bytes.end());
+  const size_t styledLine = xhtml.find("Designs des Kantons St.Gallen macht die");
+  const size_t lastLeft = xhtml.find("Left column row 6.");
+  const size_t firstRight = xhtml.find("Right column zero.");
+  ASSERT_NE(styledLine, std::string::npos) << xhtml;
+  ASSERT_NE(lastLeft, std::string::npos) << xhtml;
+  ASSERT_NE(firstRight, std::string::npos) << xhtml;
+  EXPECT_LT(styledLine, lastLeft) << xhtml;
+  EXPECT_LT(lastLeft, firstRight) << xhtml;
+}
+
 TEST(PdfPreparation, SeparatesWideSameLineTableCellsWhenTheFontAlsoContainsSpaces) {
   constexpr char sourcePath[] = "/books/wide-table-cells.pdf";
   std::string content = "BT /F1 10 Tf ";
@@ -1196,7 +1585,7 @@ TEST(PdfPreparation, SeparatesWideSameLineTableCellsWhenTheFontAlsoContainsSpace
       << xhtml;
 }
 
-TEST(PdfPreparation, OrdersMaximumThreeColumnPageAcrossAtLeastEightBoundedSlices) {
+TEST(PdfPreparation, EmitsMaximumAlignedThreeColumnGridAsTableAcrossAtLeastFourBoundedSlices) {
   constexpr char sourcePath[] = "/books/three-columns-256.pdf";
   std::string content = "BT /F1 8 Tf\n";
   uint16_t emitted = 0;
@@ -1231,7 +1620,7 @@ TEST(PdfPreparation, OrdersMaximumThreeColumnPageAcrossAtLeastEightBoundedSlices
     ++harness.nowMs;
   }
   ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error) << '@' << result.status.offset;
-  EXPECT_GE(orderingSlices, 8U);
+  EXPECT_GE(orderingSlices, 4U);
   EXPECT_EQ(preparation.totalWords(), 256U);
 
   const std::string sectionPath = std::string(preparation.cacheRoot()) + "/gen_" +
@@ -1239,20 +1628,24 @@ TEST(PdfPreparation, OrdersMaximumThreeColumnPageAcrossAtLeastEightBoundedSlices
   ASSERT_TRUE(harness.storage.exists(sectionPath));
   const auto& sectionBytes = harness.storage.bytes(sectionPath);
   const std::string xhtml(sectionBytes.begin(), sectionBytes.end());
+  ASSERT_NE(xhtml.find("<table>"), std::string::npos) << xhtml;
   size_t previous = 0;
-  for (uint8_t column = 0; column < 3; ++column) {
-    const uint16_t rows = column == 0 ? 86U : 85U;
-    for (uint16_t row = 0; row < rows; ++row) {
+  uint16_t expectedCells = 0;
+  for (uint16_t row = 0; row < 86U && expectedCells < 256U; ++row) {
+    for (uint8_t column = 0; column < 3U && expectedCells < 256U; ++column) {
       char expected[64]{};
       const int length = std::snprintf(expected, sizeof(expected), "%c%03u", static_cast<char>('A' + column),
                                        static_cast<unsigned>(row));
       ASSERT_GT(length, 0);
       ASSERT_LT(static_cast<size_t>(length), sizeof(expected));
       const size_t position = xhtml.find(expected, previous);
-      ASSERT_NE(position, std::string::npos) << expected;
+      ASSERT_NE(position, std::string::npos) << expected << '\n' << xhtml;
       previous = position + static_cast<size_t>(length);
+      ++expectedCells;
     }
   }
+  EXPECT_EQ(expectedCells, 256U);
+  EXPECT_NE(xhtml.find("</table>", previous), std::string::npos) << xhtml;
 
   PdfTestByteSource metadataSource(
       harness.storage.bytes(std::string(preparation.cacheRoot()) + "/gen_" +
@@ -1355,6 +1748,38 @@ TEST(PdfPreparation, PreservesGeneratedNavigationInCommittedReflowCache) {
   EXPECT_EQ(selection.manifest.requiredFileCount, 6U);
   EXPECT_TRUE(harness.storage.exists(generationRoot + "/cover.bmp"));
   EXPECT_TRUE(harness.storage.exists(generationRoot + "/thumb.bmp"));
+}
+
+TEST(PdfPreparation, ResolvesOutlineDestinationsAcrossANameTreeWithoutCachingEveryName) {
+  PreparationHarness harness;
+  harness.storage.addFile("/books/name-tree-outline.pdf", makeNamedDestinationTreeOutlinePdf(), 1234, true);
+
+  PdfPreparation preparation;
+  ASSERT_TRUE(preparation.begin(harness.config("/books/name-tree-outline.pdf")).ok());
+  const PdfStepResult result = runToTerminal(preparation, harness);
+  ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error) << '@' << result.status.offset
+                                 << " phase=" << static_cast<int>(preparation.phase())
+                                 << " progress=" << static_cast<int>(preparation.progressPercent());
+
+  const std::string generationRoot =
+      std::string(preparation.cacheRoot()) + "/gen_" + std::to_string(preparation.generation());
+  EXPECT_TRUE(harness.storage.exists(generationRoot + "/sections/000000.xhtml"));
+  EXPECT_TRUE(harness.storage.exists(generationRoot + "/sections/000001.xhtml"));
+
+  PdfTestByteSource metadataSource(harness.storage.bytes(generationRoot + "/metadata.bin"));
+  PdfMetadata metadata{};
+  std::vector<PdfMetadataSection> sections;
+  const PdfMetadataSectionVisitor sectionVisitor{
+      &sections,
+      [](void* context, uint16_t, const PdfMetadataSection& section) {
+        static_cast<std::vector<PdfMetadataSection>*>(context)->push_back(section);
+        return PdfStatus::success();
+      },
+  };
+  ASSERT_TRUE(pdfDecodeMetadata(metadataSource.source(), &metadata, sectionVisitor).ok());
+  EXPECT_EQ(metadata.sectionCount, 2U);
+  EXPECT_EQ(metadata.outlineCount, 2U);
+  EXPECT_EQ(sections.size(), 2U);
 }
 
 TEST(PdfPreparation, FallsBackToDocumentRootWithoutExplicitPdfOutline) {

@@ -471,6 +471,192 @@ TEST(PdfContentInterpreterTest, PreservesSoftHyphenWordJoinAfterRunWorkspaceFill
             std::string("degra\xC2\xAD" "dation"));
 }
 
+TEST(PdfContentInterpreterTest, MergesAdjacentAbsolutePositionFragmentsAcrossAVisualLine) {
+  std::array<uint8_t, 64> text{};
+  std::array<PdfTextRun, 2> runs{};
+  std::array<PdfImagePlacement, 1> images{};
+  PdfPageModel model({text.data(), text.size(), runs.data(), static_cast<uint16_t>(runs.size()), images.data(),
+                      static_cast<uint16_t>(images.size())});
+  ASSERT_TRUE(model.reset().ok());
+
+  const auto appendRun = [&](const char* value, const int32_t xMin, const int32_t xMax) {
+    PdfTextRun run{};
+    run.fontId = 1U;
+    run.flags = PdfTextExplicitWhitespace | PdfTextPositionReset;
+    run.xMin = xMin * 65536;
+    run.xMax = xMax * 65536;
+    run.yMin = 20 * 65536;
+    run.yMax = 28 * 65536;
+    run.baselineX = run.xMin;
+    run.baseline = 20 * 65536;
+    run.baselineDx = run.xMax - run.xMin;
+    EXPECT_TRUE(model.beginTextRun(run).ok());
+    EXPECT_TRUE(model.appendText(reinterpret_cast<const uint8_t*>(value), std::strlen(value)).ok());
+    EXPECT_TRUE(model.finishTextRun().ok());
+  };
+
+  appendRun("one ", 10, 50);
+  appendRun("two ", 51, 91);
+  appendRun("three", 92, 142);
+
+  ASSERT_EQ(model.runCount(), 1U);
+  EXPECT_EQ(std::string(reinterpret_cast<const char*>(model.text()), model.textLength()), "one two three");
+}
+
+TEST(PdfContentInterpreterTest, KeepsSubscriptFragmentsInsideTheirVisualLine) {
+  std::array<uint8_t, 64> text{};
+  std::array<PdfTextRun, 2> runs{};
+  std::array<PdfImagePlacement, 1> images{};
+  PdfPageModel model({text.data(), text.size(), runs.data(), static_cast<uint16_t>(runs.size()), images.data(),
+                      static_cast<uint16_t>(images.size())});
+  ASSERT_TRUE(model.reset().ok());
+
+  const auto appendRun = [&](const char* value, const uint16_t fontId, const int32_t xMin,
+                             const int32_t xMax, const int32_t baseline) {
+    PdfTextRun run{};
+    run.fontId = fontId;
+    run.flags = PdfTextExplicitWhitespace | PdfTextPositionReset;
+    run.xMin = xMin * 65536;
+    run.xMax = xMax * 65536;
+    run.yMin = (baseline - 2) * 65536;
+    run.yMax = (baseline + 8) * 65536;
+    run.baselineX = run.xMin;
+    run.baseline = baseline * 65536;
+    run.baselineDx = run.xMax - run.xMin;
+    EXPECT_TRUE(model.beginTextRun(run).ok());
+    EXPECT_TRUE(model.appendText(reinterpret_cast<const uint8_t*>(value), std::strlen(value)).ok());
+    EXPECT_TRUE(model.finishTextRun().ok());
+  };
+
+  appendRun("H", 1U, 10, 16, 20);
+  appendRun("2", 2U, 16, 20, 18);
+  appendRun("O", 1U, 20, 26, 20);
+  appendRun("Next line", 1U, 10, 55, 6);
+
+  ASSERT_EQ(model.runCount(), 2U);
+  EXPECT_EQ(std::string(reinterpret_cast<const char*>(model.text()), model.textLength()), "H2ONext line");
+  EXPECT_EQ(model.runs()[0].textLength, 3U);
+}
+
+TEST(PdfContentInterpreterTest, MergesBoldLabelsWithRegularTextWithoutMakingTheWholeLineBold) {
+  std::array<uint8_t, 64> text{};
+  std::array<PdfTextRun, 2> runs{};
+  std::array<PdfImagePlacement, 1> images{};
+  PdfPageModel model({text.data(), text.size(), runs.data(), static_cast<uint16_t>(runs.size()), images.data(),
+                      static_cast<uint16_t>(images.size())});
+  ASSERT_TRUE(model.reset().ok());
+
+  const auto appendRun = [&](const char* value, const uint16_t fontId, const uint16_t flags,
+                             const int32_t xMin, const int32_t xMax) {
+    PdfTextRun run{};
+    run.fontId = fontId;
+    run.flags = flags | PdfTextExplicitWhitespace | PdfTextPositionReset;
+    run.xMin = xMin * 65536;
+    run.xMax = xMax * 65536;
+    run.yMin = 20 * 65536;
+    run.yMax = 30 * 65536;
+    run.baselineX = run.xMin;
+    run.baseline = 22 * 65536;
+    run.baselineDx = run.xMax - run.xMin;
+    EXPECT_TRUE(model.beginTextRun(run).ok());
+    EXPECT_TRUE(model.appendText(reinterpret_cast<const uint8_t*>(value), std::strlen(value)).ok());
+    EXPECT_TRUE(model.finishTextRun().ok());
+  };
+
+  appendRun("1. Cue:", 1U, PdfTextBold, 10, 48);
+  appendRun(" You are answering emails.", 2U, 0U, 48, 180);
+
+  ASSERT_EQ(model.runCount(), 1U);
+  EXPECT_EQ(std::string(reinterpret_cast<const char*>(model.text()), model.textLength()),
+            "1. Cue: You are answering emails.");
+  EXPECT_EQ(model.runs()[0].flags & PdfTextBold, 0U);
+}
+
+TEST(PdfContentInterpreterTest, OmitsAWholeOverpaintedTextRunWithinPdfRoundingTolerance) {
+  std::array<uint8_t, 32> text{};
+  std::array<PdfTextRun, 2> runs{};
+  std::array<PdfImagePlacement, 1> images{};
+  PdfPageModel model({text.data(), text.size(), runs.data(), static_cast<uint16_t>(runs.size()), images.data(),
+                      static_cast<uint16_t>(images.size())});
+  ASSERT_TRUE(model.reset().ok());
+
+  PdfTextRun run{};
+  run.xMin = 10 * 65536;
+  run.xMax = 50 * 65536;
+  run.yMin = 20 * 65536;
+  run.yMax = 32 * 65536;
+  run.baselineX = run.xMin;
+  run.baseline = 30 * 65536;
+  run.baselineDx = run.xMax - run.xMin;
+  ASSERT_TRUE(model.beginTextRun(run).ok());
+  ASSERT_TRUE(model.appendText(reinterpret_cast<const uint8_t*>("Welcome"), 7U).ok());
+  ASSERT_TRUE(model.finishTextRun().ok());
+  PdfTextRun overpaint = run;
+  overpaint.xMin += 128;
+  overpaint.xMax -= 128;
+  overpaint.yMin += 192;
+  overpaint.yMax += 192;
+  overpaint.baselineX += 128;
+  overpaint.baseline += 192;
+  overpaint.baselineDx -= 256;
+  ASSERT_TRUE(model.beginTextRun(overpaint).ok());
+  ASSERT_TRUE(model.appendText(reinterpret_cast<const uint8_t*>("Welcome"), 7U).ok());
+  ASSERT_TRUE(model.finishTextRun().ok());
+
+  ASSERT_EQ(model.runCount(), 1U);
+  EXPECT_EQ(std::string(reinterpret_cast<const char*>(model.text()), model.textLength()), "Welcome");
+}
+
+TEST(PdfContentInterpreterTest, OmitsAFragmentedOverpaintOfAnExistingTextRun) {
+  std::array<uint8_t, 32> text{};
+  std::array<PdfTextRun, 4> runs{};
+  std::array<PdfImagePlacement, 1> images{};
+  PdfPageModel model({text.data(), text.size(), runs.data(), static_cast<uint16_t>(runs.size()), images.data(),
+                      static_cast<uint16_t>(images.size())});
+  ASSERT_TRUE(model.reset().ok());
+
+  PdfTextRun run{};
+  run.xMin = 10 * 65536;
+  run.xMax = 17 * 65536;
+  run.yMin = 20 * 65536;
+  run.yMax = 32 * 65536;
+  run.baselineX = run.xMin;
+  run.baseline = 20 * 65536;
+  run.baselineDx = run.xMax - run.xMin;
+  run.flags = PdfTextExplicitWhitespace | PdfTextLight;
+  ASSERT_TRUE(model.beginTextRun(run).ok());
+  ASSERT_TRUE(model.appendText(reinterpret_cast<const uint8_t*>("Welcome"), 7U).ok());
+  ASSERT_TRUE(model.finishTextRun().ok());
+
+  PdfTextRun fragment = run;
+  fragment.xMax = 11 * 65536;
+  fragment.baselineDx = 1 * 65536;
+  fragment.flags = PdfTextPositionReset | PdfTextExplicitWhitespace | PdfTextLight;
+  ASSERT_TRUE(model.beginTextRun(fragment).ok());
+  ASSERT_TRUE(model.appendText(reinterpret_cast<const uint8_t*>("W"), 1U).ok());
+  ASSERT_TRUE(model.finishTextRun().ok());
+
+  fragment.flags = PdfTextArrayTightContinuation | PdfTextLight;
+  fragment.xMin = 11 * 65536;
+  fragment.xMax = 13 * 65536;
+  fragment.baselineX = fragment.xMin;
+  fragment.baselineDx = 2 * 65536;
+  ASSERT_TRUE(model.beginTextRun(fragment).ok());
+  ASSERT_TRUE(model.appendText(reinterpret_cast<const uint8_t*>("el"), 2U).ok());
+  ASSERT_TRUE(model.finishTextRun().ok());
+
+  fragment.xMin = 13 * 65536;
+  fragment.xMax = 17 * 65536;
+  fragment.baselineX = fragment.xMin;
+  fragment.baselineDx = 4 * 65536;
+  ASSERT_TRUE(model.beginTextRun(fragment).ok());
+  ASSERT_TRUE(model.appendText(reinterpret_cast<const uint8_t*>("come"), 4U).ok());
+  ASSERT_TRUE(model.finishTextRun().ok());
+
+  ASSERT_EQ(model.runCount(), 1U);
+  EXPECT_EQ(std::string(reinterpret_cast<const char*>(model.text()), model.textLength()), "Welcome");
+}
+
 TEST(PdfContentInterpreterTest, RetainsActualTextSoftHyphenAfterRunWorkspaceFills) {
   DefaultFont defaultFont;
   TestResourceTable resources;
@@ -515,6 +701,49 @@ TEST(PdfContentInterpreterTest, DoesNotInventSpacesWhenTheMaterializedFontContai
   ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error);
   ASSERT_EQ(harness.model.runCount(), 1U);
   EXPECT_EQ(transcript(harness.model), "Penguin supports");
+}
+
+TEST(PdfContentInterpreterTest, SeparatesRepeatedWordAcrossGeometricGapWhenTheFontContainsSpaces) {
+  std::array<uint8_t, 64> text{};
+  std::array<PdfTextRun, 3> runs{};
+  std::array<PdfImagePlacement, 1> images{};
+  PdfPageModel model({text.data(), text.size(), runs.data(), static_cast<uint16_t>(runs.size()), images.data(),
+                      static_cast<uint16_t>(images.size())});
+  ASSERT_TRUE(model.reset().ok());
+
+  PdfTextRun run{};
+  run.xMin = 10 * 65536;
+  run.xMax = 73 * 65536;
+  run.yMin = 20 * 65536;
+  run.yMax = 30 * 65536;
+  run.baselineX = run.xMin;
+  run.baseline = run.yMin;
+  run.baselineDx = run.xMax - run.xMin;
+  run.flags = PdfTextExplicitWhitespace;
+  ASSERT_TRUE(model.beginTextRun(run).ok());
+  ASSERT_TRUE(model.appendText(reinterpret_cast<const uint8_t*>("Continue Delay"), 14U).ok());
+  ASSERT_TRUE(model.finishTextRun().ok());
+
+  run.xMin = 80 * 65536;
+  run.xMax = 90 * 65536;
+  run.baselineX = run.xMin;
+  run.baselineDx = run.xMax - run.xMin;
+  ASSERT_TRUE(model.beginTextRun(run).ok());
+  ASSERT_TRUE(model.appendText(reinterpret_cast<const uint8_t*>("De"), 2U).ok());
+  ASSERT_TRUE(model.finishTextRun().ok());
+
+  run.xMin = 90 * 65536;
+  run.xMax = 130 * 65536;
+  run.baselineX = run.xMin;
+  run.baselineDx = run.xMax - run.xMin;
+  run.flags = PdfTextExplicitWhitespace | PdfTextArrayTightContinuation;
+  ASSERT_TRUE(model.beginTextRun(run).ok());
+  ASSERT_TRUE(model.appendText(reinterpret_cast<const uint8_t*>("lay time"), 8U).ok());
+  ASSERT_TRUE(model.finishTextRun().ok());
+
+  ASSERT_EQ(model.runCount(), 1U);
+  EXPECT_EQ(std::string(reinterpret_cast<const char*>(model.text()), model.textLength()),
+            "Continue Delay Delay time");
 }
 
 TEST(PdfContentInterpreterTest, UsesOnlyLargePositionalGapsAsMissingWordSpaces) {

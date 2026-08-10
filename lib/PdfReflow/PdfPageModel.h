@@ -87,8 +87,9 @@ class PdfPageModel {
   size_t pendingTextStart_ = 0;
   uint16_t runCount_ = 0;
   uint16_t imageCount_ = 0;
- PdfPageWarning warnings_ = PdfPageWarning::None;
+  PdfPageWarning warnings_ = PdfPageWarning::None;
   enum class OverflowSeparator : uint8_t { None, Inferred, Explicit };
   OverflowSeparator overflowSeparator_ = OverflowSeparator::None;
+  uint16_t duplicateOverlayOffset_ = UINT16_MAX;
   bool runPending_ = false;
 };

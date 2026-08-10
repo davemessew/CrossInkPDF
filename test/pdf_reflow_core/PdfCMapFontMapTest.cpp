@@ -583,3 +583,29 @@ TEST(PdfFontMapTest, KeepsUnmaterializedSimpleAsciiReadableAfterTheGlyphBudgetIs
   EXPECT_EQ(utf8(decoded.unicode), "\xC3\xBC");
   EXPECT_EQ(decoded.width, 500);
 }
+
+TEST(PdfFontMapTest, KeepsIdentityCMapGlyphsOutOfTheMaterializedBudget) {
+  std::array<PdfDecodedGlyph, 1> glyphs{};
+  PdfFontMapWorkspace workspace{};
+  workspace.materializedGlyphs = glyphs.data();
+  workspace.materializedGlyphCapacity = static_cast<uint16_t>(glyphs.size());
+  PdfFontMap font(workspace);
+  ASSERT_TRUE(font.beginMaterialized(1, true, false,
+                                     PdfMaterializedFallback::EstimatedIdentity)
+                  .ok());
+
+  PdfDecodedGlyph identity{};
+  identity.sourceCode = 'A';
+  identity.sourceLength = 1;
+  identity.unicode.bytes[0] = 'A';
+  identity.unicode.length = 1;
+  identity.width = pdfEstimateGlyphWidth(identity.unicode);
+  ASSERT_TRUE(font.addMaterializedGlyph(identity).ok());
+  EXPECT_EQ(font.materializedGlyphCount(), 0U);
+
+  const uint8_t encoded = 'A';
+  PdfDecodedGlyph decoded{};
+  ASSERT_TRUE(font.decodeNext(&encoded, 1, &decoded).ok());
+  EXPECT_EQ(utf8(decoded.unicode), "A");
+  EXPECT_EQ(decoded.width, 667);
+}

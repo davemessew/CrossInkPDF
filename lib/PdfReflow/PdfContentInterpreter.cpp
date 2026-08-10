@@ -1579,10 +1579,9 @@ PdfStatus PdfContentInterpreter::emitDecodedText(const uint8_t* const source, co
       for (uint8_t index = 0; index < glyph.sourceLength; ++index) {
         glyph.sourceCode = (glyph.sourceCode << 8U) | source[offset + index];
       }
-      glyph.unicode.bytes[0] = 0xEF;
-      glyph.unicode.bytes[1] = 0xBF;
-      glyph.unicode.bytes[2] = 0xBD;
-      glyph.unicode.length = 3;
+      // Keep layout movement but do not inject U+FFFD into reflowed text. A
+      // missing PDF character map cannot be repaired by the device font.
+      glyph.unicode.length = 0;
       glyph.width = 500;
       status = PdfStatus::success();
     }

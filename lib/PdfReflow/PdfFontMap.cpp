@@ -50,8 +50,82 @@ bool sourceCodeIsPrefix(const uint32_t prefixCode, const uint8_t prefixLength, c
   return code >> ((codeLength - prefixLength) * 8U) == prefixCode;
 }
 
-bool materializedGlyphUsesBuiltInFallback(const PdfDecodedGlyph& glyph) {
-  if (glyph.sourceLength != 1U || glyph.sourceCode > UINT8_MAX || glyph.width != 500) {
+int32_t estimatedScalarWidth(const uint32_t scalar) {
+  static constexpr uint16_t kAsciiWidths[] = {
+      278, 278, 355, 556, 556, 889, 667, 191, 333, 333, 389, 584, 278, 333, 278, 278,
+      556, 556, 556, 556, 556, 556, 556, 556, 556, 556, 278, 278, 584, 584, 584, 556,
+      1015, 667, 667, 722, 722, 667, 611, 778, 722, 278, 500, 667, 556, 833, 722, 778,
+      667, 778, 722, 667, 611, 722, 667, 944, 667, 667, 611, 278, 278, 278, 469, 556,
+      333, 556, 556, 500, 556, 556, 278, 556, 556, 222, 222, 500, 222, 833, 556, 556,
+      556, 556, 333, 500, 278, 556, 500, 722, 500, 500, 500, 334, 260, 334, 584,
+  };
+  static_assert(sizeof(kAsciiWidths) / sizeof(kAsciiWidths[0]) == 0x7fU - 0x20U);
+  if (scalar >= 0x20U && scalar < 0x7fU) {
+    return kAsciiWidths[scalar - 0x20U];
+  }
+  if (scalar < 0x20U || scalar == 0x7fU || scalar == 0x200bU || scalar == 0x200cU ||
+      scalar == 0x200dU || scalar == 0x2060U || (scalar >= 0x0300U && scalar <= 0x036fU) ||
+      (scalar >= 0x1dc0U && scalar <= 0x1dffU) || (scalar >= 0x20d0U && scalar <= 0x20ffU) ||
+      (scalar >= 0xfe00U && scalar <= 0xfe0fU) || (scalar >= 0xfe20U && scalar <= 0xfe2fU) ||
+      (scalar >= 0xe0100U && scalar <= 0xe01efU)) {
+    return 0;
+  }
+  if (scalar == 0x00a0U || scalar == 0x1680U || (scalar >= 0x2000U && scalar <= 0x200aU) ||
+      scalar == 0x202fU || scalar == 0x205fU || scalar == 0x3000U) {
+    return scalar == 0x3000U ? 1000 : 278;
+  }
+  if ((scalar >= 0x1100U && scalar <= 0x11ffU) || (scalar >= 0x2e80U && scalar <= 0x9fffU) ||
+      (scalar >= 0xac00U && scalar <= 0xd7ffU) || (scalar >= 0xf900U && scalar <= 0xfaffU) ||
+      (scalar >= 0xff01U && scalar <= 0xff60U) || (scalar >= 0x1f000U && scalar <= 0x1faffU) ||
+      (scalar >= 0x20000U && scalar <= 0x323afU)) {
+    return 1000;
+  }
+  switch (scalar) {
+    case 0x2010U:
+    case 0x2011U:
+      return 333;
+    case 0x2012U:
+    case 0x2013U:
+      return 556;
+    case 0x2014U:
+    case 0x2026U:
+      return 1000;
+    case 0x2018U:
+    case 0x2019U:
+    case 0x201aU:
+    case 0x201bU:
+      return 222;
+    case 0x201cU:
+    case 0x201dU:
+    case 0x201eU:
+    case 0x201fU:
+      return 333;
+    case 0x2022U:
+      return 350;
+    default:
+      return 556;
+  }
+}
+
+int32_t estimatedGlyphWidth(const PdfUtf8Value& unicode) {
+  if (unicode.length == 0 || unicode.length > sizeof(unicode.bytes)) {
+    return 500;
+  }
+  size_t offset = 0;
+  int32_t width = 0;
+  while (offset < unicode.length) {
+    uint32_t scalar = 0;
+    if (!pdfDecodeUtf8Scalar(unicode.bytes, unicode.length, &offset, &scalar)) {
+      return 500;
+    }
+    width += estimatedScalarWidth(scalar);
+  }
+  return width;
+}
+
+bool materializedGlyphUsesBuiltInFallback(const PdfDecodedGlyph& glyph, const bool estimatedWidth) {
+  const int32_t fallbackWidth = estimatedWidth ? estimatedGlyphWidth(glyph.unicode) : 500;
+  if (glyph.sourceLength != 1U || glyph.sourceCode > UINT8_MAX || glyph.width != fallbackWidth) {
     return false;
   }
   uint32_t scalar = 0;
@@ -67,6 +141,8 @@ bool materializedGlyphUsesBuiltInFallback(const PdfDecodedGlyph& glyph) {
 }
 
 }  // namespace
+
+int32_t pdfEstimateGlyphWidth(const PdfUtf8Value& unicode) { return estimatedGlyphWidth(unicode); }
 
 PdfStatus PdfFontMap::setSourceAccess(const bool required) {
   if (workspace_.setSourceAccess != nullptr) {
@@ -103,7 +179,8 @@ PdfStatus PdfFontMap::begin(const uint16_t fontId, const bool cid, PdfCMap* cons
   return setSourceAccess(true);
 }
 
-PdfStatus PdfFontMap::beginMaterialized(const uint16_t fontId, const bool cid, const bool bold) {
+PdfStatus PdfFontMap::beginMaterialized(const uint16_t fontId, const bool cid, const bool bold,
+                                        const PdfMaterializedFallback fallback) {
   if (workspace_.materializedGlyphs == nullptr || workspace_.materializedGlyphCapacity == 0) {
     return PdfStatus::failure(PdfError::InvalidArgument);
   }
@@ -118,7 +195,7 @@ PdfStatus PdfFontMap::beginMaterialized(const uint16_t fontId, const bool cid, c
   cid_ = cid;
   toUnicode_ = nullptr;
   encoding_ = nullptr;
-  defaultWidth_ = -1;
+  defaultWidth_ = fallback == PdfMaterializedFallback::EstimatedIdentity ? -2 : -1;
   widthCount_ = 0;
   spillCount_ = 0;
   previousWidthLast_ = 0;
@@ -135,7 +212,8 @@ PdfStatus PdfFontMap::addMaterializedGlyph(const PdfDecodedGlyph& glyph) {
       glyph.unicode.length > sizeof(glyph.unicode.bytes) || glyph.width < 0) {
     return PdfStatus::failure(PdfError::Malformed, glyph.sourceCode);
   }
-  if (!cid_ && materializedGlyphUsesBuiltInFallback(glyph)) {
+  if ((!cid_ || estimatedIdentityFallback()) &&
+      materializedGlyphUsesBuiltInFallback(glyph, estimatedIdentityFallback())) {
     if (glyph.unicode.length == 1U && glyph.unicode.bytes[0] == ' ') {
       hasExplicitWhitespace_ = true;
     }
@@ -433,7 +511,8 @@ PdfStatus PdfFontMap::decodeNext(const uint8_t* const source, const size_t sourc
   }
   if (materialized()) {
     const PdfStatus status = findMaterializedGlyph(source, sourceLength, glyph);
-    if (status.ok() || cid_ || status.error != PdfError::UnsupportedEncoding) {
+    if (status.ok() || (cid_ && !estimatedIdentityFallback()) ||
+        status.error != PdfError::UnsupportedEncoding) {
       return status;
     }
     uint32_t scalar = 0;
@@ -450,7 +529,7 @@ PdfStatus PdfFontMap::decodeNext(const uint8_t* const source, const size_t sourc
       return encodeStatus;
     }
     glyph->unicode.length = static_cast<uint8_t>(encodedLength);
-    glyph->width = 500;
+    glyph->width = estimatedIdentityFallback() ? estimatedGlyphWidth(glyph->unicode) : 500;
     return PdfStatus::success();
   }
   *glyph = {};
