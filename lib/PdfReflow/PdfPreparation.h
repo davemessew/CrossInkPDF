@@ -1279,6 +1279,7 @@ class PdfPreparation {
   uint8_t coverFileCount_ = 0;
   uint8_t typographyAssetIndex_ = 0;
   uint16_t typographyRow_ = 0;
+  uint16_t typographyBufferedRows_ = 0;
   PdfCacheHandle typographySourceHandle_{};
   uint64_t coverImageContentHash_ = 0;
   uint32_t coverImageSourceCrc32_ = 0;

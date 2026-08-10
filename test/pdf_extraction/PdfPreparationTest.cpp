@@ -457,8 +457,12 @@ struct PreparationHarness {
   PdfResourceSnapshot resources{128U * 1024U, 96U * 1024U, 8U * 1024U};
   uint32_t nowMs = 0;
   size_t resourceEvents = 0;
+  bool advanceOnClockRead = false;
 
-  static uint32_t now(void* context) { return static_cast<PreparationHarness*>(context)->nowMs; }
+  static uint32_t now(void* context) {
+    auto& harness = *static_cast<PreparationHarness*>(context);
+    return harness.advanceOnClockRead ? harness.nowMs++ : harness.nowMs;
+  }
 
   static PdfResourceSnapshot measure(void* context) { return static_cast<PreparationHarness*>(context)->resources; }
 
@@ -592,6 +596,24 @@ TEST(PdfPreparation, ConvertsMinimalFixtureIntoCommittedDeviceStyleXhtml) {
   EXPECT_EQ(selection.manifest.requiredFileCount, 5U);
   EXPECT_TRUE(harness.storage.exists(generationRoot + "/cover.bmp"));
   EXPECT_TRUE(harness.storage.exists(generationRoot + "/thumb.bmp"));
+}
+
+TEST(PdfPreparation, CompletesTypographyCoverRowsAcrossTimeSliceYields) {
+  PreparationHarness harness;
+  harness.addFixture();
+  harness.advanceOnClockRead = true;
+
+  PdfPreparation preparation;
+  ASSERT_TRUE(preparation.begin(harness.config()).ok());
+  const PdfStepResult result = runToTerminal(preparation, harness, 100000);
+
+  ASSERT_TRUE(result.complete()) << static_cast<int>(result.status.error) << '@' << result.status.offset;
+  const std::string generationRoot =
+      std::string(preparation.cacheRoot()) + "/gen_" + std::to_string(preparation.generation());
+  ASSERT_TRUE(harness.storage.exists(generationRoot + "/cover.bmp"));
+  ASSERT_TRUE(harness.storage.exists(generationRoot + "/thumb.bmp"));
+  EXPECT_EQ(harness.storage.bytes(generationRoot + "/cover.bmp").size(), 62U + 32U * 400U);
+  EXPECT_EQ(harness.storage.bytes(generationRoot + "/thumb.bmp").size(), 62U + 12U * 160U);
 }
 
 TEST(PdfPreparation, CompactsCollidedIncrementalXrefBeforeFollowingPrev) {

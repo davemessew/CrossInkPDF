@@ -2570,6 +2570,7 @@ PdfStatus PdfPreparation::begin(const PdfPreparationConfig& config) {
   coverFileCount_ = 0;
   typographyAssetIndex_ = 0;
   typographyRow_ = 0;
+  typographyBufferedRows_ = 0;
   typographySourceHandle_ = {};
   coverImageContentHash_ = 0;
   coverImageSourceCrc32_ = 0;
@@ -9976,6 +9977,7 @@ PdfStepResult PdfPreparation::stepResumeAfterEmitSections(PdfWorkBudget&) {
   navigationRecordsPrepared_ = true;
   typographyAssetIndex_ = 0;
   typographyRow_ = 0;
+  typographyBufferedRows_ = 0;
   typographyAssetStage_ =
       coverImageRecordAvailable_ ? TypographyAssetStage::OpenSource : TypographyAssetStage::BeginAsset;
   if (imageBuildSpool_.recordCount() == 0) {
@@ -10139,6 +10141,7 @@ PdfStepResult PdfPreparation::stepRestoreResumeRecords(PdfWorkBudget& budget) {
     navigationRecordsPrepared_ = true;
     typographyAssetIndex_ = 0;
     typographyRow_ = 0;
+    typographyBufferedRows_ = 0;
     typographyAssetStage_ =
         coverImageRecordAvailable_ ? TypographyAssetStage::OpenSource : TypographyAssetStage::BeginAsset;
     resumeRecordRestoreStage_ = ResumeRecordRestoreStage::Complete;
@@ -21474,6 +21477,7 @@ PdfStepResult PdfPreparation::stepPrepareNavigationRecords(PdfWorkBudget& budget
     coverFileCount_ = 0;
     typographyAssetIndex_ = 0;
     typographyRow_ = 0;
+    typographyBufferedRows_ = 0;
     typographyAssetStage_ =
         coverImageRecordAvailable_ ? TypographyAssetStage::OpenSource : TypographyAssetStage::BeginAsset;
     runtime.stage = NavigationRecordStage::Complete;
@@ -21565,6 +21569,7 @@ PdfStepResult PdfPreparation::stepTypographyAssets(PdfWorkBudget& budget) {
           coverImageSourceJpeg_ = false;
           typographyAssetIndex_ = 0;
           typographyRow_ = 0;
+          typographyBufferedRows_ = 0;
           typographyAssetStage_ = TypographyAssetStage::CloseSource;
           return PdfStepResult::paused();
         }
@@ -21636,6 +21641,7 @@ PdfStepResult PdfPreparation::stepTypographyAssets(PdfWorkBudget& budget) {
       }
     }
     typographyRow_ = 0;
+    typographyBufferedRows_ = 0;
     typographySourceLoadedRow_ = UINT16_MAX;
     if (coverImageRecordAvailable_) {
       const uint64_t widthLimitedHeight =
@@ -21763,24 +21769,27 @@ PdfStepResult PdfPreparation::stepTypographyAssets(PdfWorkBudget& budget) {
       return PdfStepResult::paused();
     }
     constexpr size_t kMaximumTypographyWriteBytes = 3U * 1024U;
-    const size_t maximumBuffered =
-        std::min({PdfLimits::PageTextBytes, budget.bytesRemaining, kMaximumTypographyWriteBytes});
-    size_t buffered = 0;
-    while (typographyRow_ < height && buffered + rowBytes <= maximumBuffered && budget.operationsRemaining > 1U &&
-           !budget.stopRequested()) {
-      if (!budget.consumeOperation()) {
-        break;
+    size_t buffered = static_cast<size_t>(typographyBufferedRows_) * rowBytes;
+    if (typographyBufferedRows_ == 0) {
+      const size_t maximumBuffered =
+          std::min({PdfLimits::PageTextBytes, budget.bytesRemaining, kMaximumTypographyWriteBytes});
+      while (static_cast<uint32_t>(typographyRow_) + typographyBufferedRows_ < height &&
+             buffered + rowBytes <= maximumBuffered && budget.operationsRemaining > 1U && !budget.stopRequested()) {
+        if (!budget.consumeOperation()) {
+          break;
+        }
+        const uint16_t row = static_cast<uint16_t>(typographyRow_ + typographyBufferedRows_);
+        uint8_t* const outputRow = pageText_.get() + buffered;
+        std::memset(outputRow, 0xff, rowBytes);
+        const uint8_t titleScale = width >= 200 ? 3 : 1;
+        const uint8_t authorScale = width >= 200 ? 2 : 1;
+        renderCoverTextRow(outputRow, width, row, metadata_.title, metadata_.titleLength,
+                           static_cast<uint16_t>(height / 5U), titleScale, width >= 200 ? 4 : 5);
+        renderCoverTextRow(outputRow, width, row, metadata_.author, metadata_.authorLength,
+                           static_cast<uint16_t>(height * 3U / 4U), authorScale, 2);
+        buffered += rowBytes;
+        ++typographyBufferedRows_;
       }
-      uint8_t* const outputRow = pageText_.get() + buffered;
-      std::memset(outputRow, 0xff, rowBytes);
-      const uint8_t titleScale = width >= 200 ? 3 : 1;
-      const uint8_t authorScale = width >= 200 ? 2 : 1;
-      renderCoverTextRow(outputRow, width, typographyRow_, metadata_.title, metadata_.titleLength,
-                         static_cast<uint16_t>(height / 5U), titleScale, width >= 200 ? 4 : 5);
-      renderCoverTextRow(outputRow, width, typographyRow_, metadata_.author, metadata_.authorLength,
-                         static_cast<uint16_t>(height * 3U / 4U), authorScale, 2);
-      buffered += rowBytes;
-      ++typographyRow_;
     }
     if (buffered == 0 || !budget.consumeOperation() || budget.takeBytes(buffered) != buffered) {
       return PdfStepResult::paused();
@@ -21790,6 +21799,8 @@ PdfStepResult PdfPreparation::stepTypographyAssets(PdfWorkBudget& budget) {
       pdfAbortTrackedCacheFile(&outputWriter_);
       return PdfStepResult::failure(status);
     }
+    typographyRow_ = static_cast<uint16_t>(typographyRow_ + typographyBufferedRows_);
+    typographyBufferedRows_ = 0;
     return PdfStepResult::paused();
   }
 
@@ -21813,6 +21824,7 @@ PdfStepResult PdfPreparation::stepTypographyAssets(PdfWorkBudget& budget) {
   ++coverFileCount_;
   ++typographyAssetIndex_;
   typographyRow_ = 0;
+  typographyBufferedRows_ = 0;
   typographyAssetStage_ = typographyAssetIndex_ < std::size(kWidths) ? TypographyAssetStage::BeginAsset
                           : coverImageRecordAvailable_               ? TypographyAssetStage::CloseSource
                                                                      : TypographyAssetStage::Complete;

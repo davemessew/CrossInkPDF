@@ -1,3 +1,9 @@
+## [v1.5.0.8] - 2026-08-11
+
+### Fixed
+
+- Slow SD-card operations can no longer leave the generated PDF cover and thumbnail as header-only files, which caused an otherwise completed PDF to be reported as damaged after 90 percent.
+
 ## [v1.5.0.7] - 2026-08-10
 
 ### Changed
