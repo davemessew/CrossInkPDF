@@ -33,7 +33,12 @@ constexpr char GUIDE_DOT_UTF8[] = "\xc2\xb7";
 constexpr uint32_t GUIDE_DOT_CODEPOINT = 0x00B7;
 constexpr size_t FOCUS_READING_PERCENT = 43;
 constexpr size_t LAYOUT_ARENA_SLAB_BYTES = 4096;
+constexpr size_t PDF_LAYOUT_ARENA_SLAB_BYTES = 1024;
 constexpr size_t INITIAL_TOKEN_VECTOR_RESERVE = 16;
+// The PDF parser bounds its active window so the string-object array never
+// needs more than 384 entries (9 KiB on ESP32). Text bytes remain owned by the
+// strings and the unfinished final line is carried into the next layout pass.
+constexpr size_t PDF_LAYOUT_TOKEN_VECTOR_RESERVE = 384;
 
 bool mayContainRtlBytes(const char* str) {
   for (const auto* p = reinterpret_cast<const unsigned char*>(str); *p; ++p) {
@@ -453,6 +458,11 @@ void ParsedText::reserveTokenCapacity(const size_t additionalTokens) {
   }
 
   size_t newCapacity = words.capacity() == 0 ? INITIAL_TOKEN_VECTOR_RESERVE : words.capacity() * 2;
+  if (boundedTokenGrowth && words.capacity() == 32 && requiredSize <= PDF_LAYOUT_TOKEN_VECTOR_RESERVE) {
+    // Avoid a late contiguous growth allocation after the PDF session, font,
+    // page, and semantic sidecar state have fragmented the small device heap.
+    newCapacity = PDF_LAYOUT_TOKEN_VECTOR_RESERVE;
+  }
   if (newCapacity < requiredSize) {
     newCapacity = requiredSize;
   }
@@ -680,9 +690,10 @@ bool ParsedText::layoutAndExtractLinesImpl(const GfxRenderer& renderer, const in
   }
 
   Arena layoutArena;
-  if (!layoutArena.init(LAYOUT_ARENA_SLAB_BYTES)) {
+  constexpr size_t layoutArenaSlabBytes = SemanticWordTracking ? PDF_LAYOUT_ARENA_SLAB_BYTES : LAYOUT_ARENA_SLAB_BYTES;
+  if (!layoutArena.init(layoutArenaSlabBytes)) {
     LOG_ERR("PTX", "Failed to allocate layout scratch arena (%u bytes)",
-            static_cast<unsigned>(LAYOUT_ARENA_SLAB_BYTES));
+            static_cast<unsigned>(layoutArenaSlabBytes));
     return false;
   }
 

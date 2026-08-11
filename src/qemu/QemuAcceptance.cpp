@@ -40,6 +40,7 @@
 #include <string>
 
 #include "CrossPointSettings.h"
+#include "CrossPointState.h"
 #include "Epub/Page.h"
 #include "Epub/Section.h"
 #include "GfxRenderer.h"
@@ -47,6 +48,8 @@
 #include "Memory.h"
 #include "PdfAcceptanceFramebufferGuard.h"
 #include "BookmarkStore.h"
+#include "activities/RenderLock.h"
+#include "activities/reader/EpubReaderActivity.h"
 #include "activities/reader/EpubReaderUtils.h"
 #include "activities/reader/ReaderUtils.h"
 #include "components/UITheme.h"
@@ -1388,7 +1391,7 @@ bool exportPdfXhtml(const PdfReflowDocument& document) {
   return QemuSemihost::close(output) && success;
 }
 
-bool runExternalPdf(GfxRenderer& renderer) {
+bool runExternalPdf(MappedInputManager& input, GfxRenderer& renderer) {
   uint64_t inputBytes = 0;
   if (!checkRamBudget() || !importHostPdf(&inputBytes)) {
     esp_rom_printf("QEMU_PDF_SD_FAIL stage=import bytes=%llu\n", static_cast<unsigned long long>(inputBytes));
@@ -1454,6 +1457,42 @@ bool runExternalPdf(GfxRenderer& renderer) {
     return false;
   }
   (void)exportPdfXhtml(*document);
+
+  PdfStatus readerStatus{};
+  auto readerDocument = loadPdfHalReflowDocumentNoThrow(SD_PDF_PATH, REFLOW_CACHE_DIRECTORY, &readerStatus);
+  auto reader = readerDocument
+                    ? makeUniqueNoThrow<EpubReaderActivity>(renderer, input, std::move(readerDocument))
+                    : nullptr;
+  if (!reader || !readerStatus) {
+    esp_rom_printf("QEMU_PDF_SD_FAIL stage=reader_allocate error=%u\n",
+                   static_cast<unsigned>(readerStatus.error));
+    return false;
+  }
+  APP_STATE.hasPendingAlert.store(false, std::memory_order_release);
+  reader->onEnter();
+  constexpr size_t READER_HEAP_PRESSURE_BYTES = 72U * 1024U;
+  auto readerPressure = makeUniqueNoThrow<uint8_t[]>(READER_HEAP_PRESSURE_BYTES);
+  if (!readerPressure) {
+    esp_rom_printf("QEMU_PDF_SD_FAIL stage=reader_pressure\n");
+    return false;
+  }
+  const uint32_t readerFree = ESP.getFreeHeap();
+  const uint32_t readerMaxAlloc = ESP.getMaxAllocHeap();
+  reader->render(RenderLock{});
+  const bool readerAlert = APP_STATE.hasPendingAlert.load(std::memory_order_acquire);
+  esp_rom_printf("QEMU_PDF_READER_LAYOUT alert=%u pressure=%u free_before=%lu max_before=%lu free_after=%lu "
+                 "max_after=%lu\n",
+                 readerAlert ? 1U : 0U, static_cast<unsigned>(READER_HEAP_PRESSURE_BYTES),
+                 static_cast<unsigned long>(readerFree), static_cast<unsigned long>(readerMaxAlloc),
+                 static_cast<unsigned long>(ESP.getFreeHeap()), static_cast<unsigned long>(ESP.getMaxAllocHeap()));
+  reader->onExit();
+  reader.reset();
+  if (readerAlert) {
+    esp_rom_printf("QEMU_PDF_SD_FAIL stage=reader_layout\n");
+    return false;
+  }
+  readerPressure.reset();
+
   for (int sectionIndex = 0; sectionIndex < document->getSectionCount(); ++sectionIndex) {
     Section section(document, sectionIndex, renderer, "_qemu_external");
     ReaderRenderSpec spec = SETTINGS.readerRenderSpec(layout.width, layout.height, EpubRenderMode::Light);
@@ -3771,7 +3810,7 @@ void qemuAcceptanceBegin(MappedInputManager& input, GfxRenderer& renderer) {
   pinReaderSettings(renderer);
 
   if (hostPdfAvailable()) {
-    state.phase = runExternalPdf(renderer) ? AcceptancePhase::Finished : AcceptancePhase::Failed;
+    state.phase = runExternalPdf(input, renderer) ? AcceptancePhase::Finished : AcceptancePhase::Failed;
     return;
   }
 

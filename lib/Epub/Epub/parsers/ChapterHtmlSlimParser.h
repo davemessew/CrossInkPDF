@@ -284,6 +284,7 @@ class ChapterHtmlSlimParser {
   bool beginPaginationTextBlock(const char* anchor, size_t anchorLength);
   bool trackPaginationTextLine(const TextBlock& line);
   bool usesSemanticLayout() const;
+  bool shouldRetainAnchor(const std::string& anchor) const;
   void completeCurrentPage();
   void makePages();
   int effectiveLineHeight() const;

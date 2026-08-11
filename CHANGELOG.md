@@ -1,3 +1,10 @@
+## [v1.5.0.13] - 2026-08-12
+
+### Fixed
+
+- PDF chapters now stream text through smaller scratch blocks, preventing the “Chapter needs too much memory” error on fragmented device heap.
+- PDF images are no longer discarded by the EPUB image-memory estimate while the chapter is being paginated.
+
 ## [v1.5.0.12] - 2026-08-11
 
 ### Fixed

@@ -33,6 +33,18 @@ constexpr uint32_t EPUB_INLINE_IMAGE_MIN_FREE = 72U * 1024U;
 constexpr uint32_t EPUB_INLINE_IMAGE_MIN_MAX_ALLOC = 48U * 1024U;
 constexpr uint32_t EPUB_TEXT_LAYOUT_MIN_FREE = 44U * 1024U;
 constexpr uint32_t EPUB_TEXT_LAYOUT_MIN_MAX_ALLOC = 32U * 1024U;
+// PDF layout already spools its page LUT and semantic word positions to SD.
+// The layout arena uses growable 1 KiB slabs. Its token vectors are
+// right-sized before heap fragmentation instead of requesting a late 12-18
+// KiB growth block. Requiring an unrelated 32 KiB
+// contiguous block rejects viable chapters after the PDF reader session and
+// SD font are resident.
+// Six further 1 KiB arena slabs plus 2 KiB for page/text bookkeeping. The
+// separate max-allocation check guarantees that either slab can be acquired.
+constexpr uint32_t PDF_TEXT_LAYOUT_MIN_FREE = 8U * 1024U;
+// Arena adds a small allocation header to each slab; 16 bytes covers that
+// header and allocator alignment without requiring a much larger block.
+constexpr uint32_t PDF_TEXT_LAYOUT_MIN_MAX_ALLOC = 1024U + 16U;
 constexpr uint32_t EPUB_INLINE_IMAGE_SD_FONT_RELEASE_MIN_FREE = 120U * 1024U;
 constexpr uint32_t EPUB_INLINE_IMAGE_SD_FONT_RELEASE_MIN_MAX_ALLOC = 80U * 1024U;
 constexpr uint32_t OPTIONAL_EPUB_REBUILD_MIN_FREE = 96U * 1024U;
