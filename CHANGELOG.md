@@ -1,3 +1,9 @@
+## [v1.5.0.12] - 2026-08-11
+
+### Fixed
+
+- Dense PDF pages now spill excess extracted text to the SD card instead of allocating a second large RAM buffer. This fixes the immediate out-of-memory error on the *Corporate Design Manual* while preserving identical reflowed output.
+
 ## [v1.5.0.11] - 2026-08-11
 
 ### Changed

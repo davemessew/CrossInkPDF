@@ -47,8 +47,7 @@ enum PdfTextRunFlag : uint16_t {
 };
 
 struct PdfPageModelWorkspace {
-  using GrowTextFn = PdfStatus (*)(void* context, const uint8_t* currentText, size_t currentLength,
-                                   size_t requiredCapacity, uint8_t** grownText, size_t* grownCapacity);
+  using SpillTextFn = PdfStatus (*)(void* context, size_t logicalOffset, const uint8_t* text, size_t length);
 
   uint8_t* text = nullptr;
   size_t textCapacity = 0;
@@ -56,8 +55,8 @@ struct PdfPageModelWorkspace {
   uint16_t runCapacity = 0;
   PdfImagePlacement* images = nullptr;
   uint16_t imageCapacity = 0;
-  void* growTextContext = nullptr;
-  GrowTextFn growText = nullptr;
+  void* spillTextContext = nullptr;
+  SpillTextFn spillText = nullptr;
 };
 
 class PdfPageModel {
@@ -87,7 +86,9 @@ class PdfPageModel {
   PdfPageWarning warnings() const { return warnings_; }
 
  private:
-  PdfStatus ensureTextCapacity(size_t requiredCapacity);
+  PdfStatus appendStoredText(const uint8_t* text, size_t length);
+  void rememberTextTail(const uint8_t* text, size_t length);
+  void rollbackPendingText();
 
   PdfPageModelWorkspace workspace_{};
   size_t textLength_ = 0;
@@ -98,5 +99,9 @@ class PdfPageModel {
   enum class OverflowSeparator : uint8_t { None, Inferred, Explicit };
   OverflowSeparator overflowSeparator_ = OverflowSeparator::None;
   uint16_t duplicateOverlayOffset_ = UINT16_MAX;
+  uint8_t textTail_[3]{};
+  uint8_t pendingTextTail_[3]{};
+  uint8_t textTailLength_ = 0;
+  uint8_t pendingTextTailLength_ = 0;
   bool runPending_ = false;
 };

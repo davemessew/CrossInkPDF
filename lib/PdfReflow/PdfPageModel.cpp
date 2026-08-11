@@ -16,30 +16,59 @@ PdfStatus PdfPageModel::reset() {
   warnings_ = PdfPageWarning::None;
   overflowSeparator_ = OverflowSeparator::None;
   duplicateOverlayOffset_ = UINT16_MAX;
+  textTailLength_ = 0;
+  pendingTextTailLength_ = 0;
   runPending_ = false;
   return PdfStatus::success();
 }
 
-PdfStatus PdfPageModel::ensureTextCapacity(const size_t requiredCapacity) {
-  if (requiredCapacity <= workspace_.textCapacity) {
-    return PdfStatus::success();
+void PdfPageModel::rememberTextTail(const uint8_t* const text, const size_t length) {
+  if (length == 0) {
+    return;
   }
-  if (workspace_.growText == nullptr) {
+  if (length >= sizeof(textTail_)) {
+    std::memcpy(textTail_, text + length - sizeof(textTail_), sizeof(textTail_));
+    textTailLength_ = sizeof(textTail_);
+    return;
+  }
+  const size_t retained = std::min<size_t>(textTailLength_, sizeof(textTail_) - length);
+  if (retained != 0) {
+    std::memmove(textTail_, textTail_ + textTailLength_ - retained, retained);
+  }
+  std::memcpy(textTail_ + retained, text, length);
+  textTailLength_ = static_cast<uint8_t>(retained + length);
+}
+
+PdfStatus PdfPageModel::appendStoredText(const uint8_t* const text, const size_t length) {
+  if ((text == nullptr && length != 0) || length > std::numeric_limits<size_t>::max() - textLength_) {
     return PdfStatus::failure(PdfError::LimitExceeded, textLength_);
   }
-  uint8_t* grownText = nullptr;
-  size_t grownCapacity = 0;
-  const PdfStatus status = workspace_.growText(workspace_.growTextContext, workspace_.text, textLength_,
-                                               requiredCapacity, &grownText, &grownCapacity);
-  if (!status) {
-    return status;
+  const size_t resident = textLength_ < workspace_.textCapacity
+                              ? std::min(length, workspace_.textCapacity - textLength_)
+                              : 0U;
+  if (resident != 0) {
+    std::memcpy(workspace_.text + textLength_, text, resident);
   }
-  if (grownText == nullptr || grownCapacity < requiredCapacity) {
-    return PdfStatus::failure(PdfError::InsufficientMemory, requiredCapacity);
+  const size_t spilled = length - resident;
+  if (spilled != 0) {
+    if (workspace_.spillText == nullptr) {
+      return PdfStatus::failure(PdfError::LimitExceeded, textLength_ + length);
+    }
+    const PdfStatus status = workspace_.spillText(workspace_.spillTextContext, textLength_ + resident,
+                                                  text + resident, spilled);
+    if (!status) {
+      return status;
+    }
   }
-  workspace_.text = grownText;
-  workspace_.textCapacity = grownCapacity;
+  rememberTextTail(text, length);
+  textLength_ += length;
   return PdfStatus::success();
+}
+
+void PdfPageModel::rollbackPendingText() {
+  textLength_ = pendingTextStart_;
+  std::memcpy(textTail_, pendingTextTail_, sizeof(textTail_));
+  textTailLength_ = pendingTextTailLength_;
 }
 
 PdfStatus PdfPageModel::beginTextRun(const PdfTextRun& run) {
@@ -50,6 +79,8 @@ PdfStatus PdfPageModel::beginTextRun(const PdfTextRun& run) {
   workspace_.runs[runCount_].textOffset = static_cast<uint32_t>(textLength_);
   workspace_.runs[runCount_].textLength = 0;
   pendingTextStart_ = textLength_;
+  std::memcpy(pendingTextTail_, textTail_, sizeof(textTail_));
+  pendingTextTailLength_ = textTailLength_;
   overflowSeparator_ = OverflowSeparator::None;
   runPending_ = true;
   return PdfStatus::success();
@@ -60,12 +91,10 @@ PdfStatus PdfPageModel::appendText(const uint8_t* const text, const size_t lengt
       length > std::numeric_limits<uint32_t>::max() - (textLength_ - pendingTextStart_)) {
     return PdfStatus::failure(PdfError::LimitExceeded, textLength_);
   }
-  const PdfStatus capacityStatus = ensureTextCapacity(textLength_ + length);
-  if (!capacityStatus) {
-    return capacityStatus;
+  const PdfStatus appendStatus = appendStoredText(text, length);
+  if (!appendStatus) {
+    return appendStatus;
   }
-  std::memcpy(workspace_.text + textLength_, text, length);
-  textLength_ += length;
   workspace_.runs[runCount_].textLength = static_cast<uint32_t>(textLength_ - pendingTextStart_);
   return PdfStatus::success();
 }
@@ -107,17 +136,18 @@ PdfStatus PdfPageModel::appendOverflowText(const uint8_t* const text, const size
   const bool currentSoftHyphen = length == 2U && text[0] == 0xC2U && text[1] == 0xADU;
   const bool currentUnicodeHyphen = length == 3U && text[0] == 0xE2U && text[1] == 0x80U &&
                                     (text[2] == 0x90U || text[2] == 0x91U);
-  const bool previousSoftHyphen = textLength_ >= 2U && workspace_.text[textLength_ - 2U] == 0xC2U &&
-                                  workspace_.text[textLength_ - 1U] == 0xADU;
-  const bool previousUnicodeHyphen = textLength_ >= 3U && workspace_.text[textLength_ - 3U] == 0xE2U &&
-                                     workspace_.text[textLength_ - 2U] == 0x80U &&
-                                     (workspace_.text[textLength_ - 1U] == 0x90U ||
-                                      workspace_.text[textLength_ - 1U] == 0x91U);
+  const bool previousSoftHyphen = textTailLength_ >= 2U && textTail_[textTailLength_ - 2U] == 0xC2U &&
+                                  textTail_[textTailLength_ - 1U] == 0xADU;
+  const bool previousUnicodeHyphen = textTailLength_ >= 3U && textTail_[textTailLength_ - 3U] == 0xE2U &&
+                                     textTail_[textTailLength_ - 2U] == 0x80U &&
+                                     (textTail_[textTailLength_ - 1U] == 0x90U ||
+                                      textTail_[textTailLength_ - 1U] == 0x91U);
   const bool inferredWordJoin = currentSoftHyphen || currentUnicodeHyphen || previousSoftHyphen ||
                                 previousUnicodeHyphen;
   const bool addSeparator = overflowSeparator_ == OverflowSeparator::Explicit ||
                             (overflowSeparator_ == OverflowSeparator::Inferred && !inferredWordJoin);
-  const bool insertSeparator = addSeparator && textLength_ != 0 && workspace_.text[textLength_ - 1U] != ' ';
+  const bool insertSeparator =
+      addSeparator && textLength_ != 0 && textTailLength_ != 0 && textTail_[textTailLength_ - 1U] != ' ';
   overflowSeparator_ = OverflowSeparator::None;
 
   const size_t separatorLength = insertSeparator ? 1U : 0U;
@@ -127,16 +157,18 @@ PdfStatus PdfPageModel::appendOverflowText(const uint8_t* const text, const size
       length > UINT32_MAX - previous.textLength - separatorLength) {
     return PdfStatus::failure(PdfError::LimitExceeded, textLength_);
   }
-  const PdfStatus capacityStatus = ensureTextCapacity(textLength_ + separatorLength + length);
-  if (!capacityStatus) {
-    return capacityStatus;
-  }
   if (insertSeparator) {
-    workspace_.text[textLength_++] = ' ';
+    constexpr uint8_t separator = ' ';
+    const PdfStatus status = appendStoredText(&separator, 1U);
+    if (!status) {
+      return status;
+    }
     ++previous.textLength;
   }
-  std::memcpy(workspace_.text + textLength_, text, length);
-  textLength_ += length;
+  const PdfStatus appendStatus = appendStoredText(text, length);
+  if (!appendStatus) {
+    return appendStatus;
+  }
   previous.textLength += static_cast<uint32_t>(length);
   return PdfStatus::success();
 }
@@ -179,7 +211,7 @@ PdfStatus PdfPageModel::finishTextRun() {
   }
   runPending_ = false;
   if (workspace_.runs[runCount_].textLength == 0) {
-    textLength_ = pendingTextStart_;
+    rollbackPendingText();
     return PdfStatus::success();
   }
   if (runCount_ != 0) {
@@ -200,6 +232,13 @@ PdfStatus PdfPageModel::finishTextRun() {
         static_cast<int64_t>(current.xMin) >= static_cast<int64_t>(previous.xMin) - duplicateCoordinateTolerance &&
         static_cast<int64_t>(current.xMax) <= static_cast<int64_t>(previous.xMax) + duplicateCoordinateTolerance &&
         duplicateCoordinate(previous.yMin, current.yMin) && duplicateCoordinate(previous.yMax, current.yMax);
+    const bool currentTextResident =
+        static_cast<uint64_t>(current.textOffset) + current.textLength <= workspace_.textCapacity;
+    if (!currentTextResident) {
+      duplicateOverlayOffset_ = UINT16_MAX;
+      ++runCount_;
+      return PdfStatus::success();
+    }
     if (duplicateOverlayOffset_ != UINT16_MAX) {
       const uint32_t duplicateEnd = static_cast<uint32_t>(duplicateOverlayOffset_) + current.textLength;
       if (duplicateGeometry && duplicateEnd <= previous.textLength &&
@@ -208,7 +247,7 @@ PdfStatus PdfPageModel::finishTextRun() {
         duplicateOverlayOffset_ = duplicateEnd == previous.textLength
                                       ? UINT16_MAX
                                       : static_cast<uint16_t>(duplicateEnd);
-        textLength_ = pendingTextStart_;
+        rollbackPendingText();
         return PdfStatus::success();
       }
       duplicateOverlayOffset_ = UINT16_MAX;
@@ -225,7 +264,7 @@ PdfStatus PdfPageModel::finishTextRun() {
         std::memcmp(workspace_.text + previous.textOffset, workspace_.text + current.textOffset,
                     current.textLength) == 0;
     if (exactPaintDuplicate) {
-      textLength_ = pendingTextStart_;
+      rollbackPendingText();
       return PdfStatus::success();
     }
     const bool fragmentedPaintDuplicate =
@@ -235,7 +274,7 @@ PdfStatus PdfPageModel::finishTextRun() {
                     current.textLength) == 0;
     if (fragmentedPaintDuplicate) {
       duplicateOverlayOffset_ = static_cast<uint16_t>(current.textLength);
-      textLength_ = pendingTextStart_;
+      rollbackPendingText();
       return PdfStatus::success();
     }
     const int64_t baselineDifference = static_cast<int64_t>(current.baseline) - previous.baseline;
@@ -389,7 +428,7 @@ void PdfPageModel::abortTextRun() {
   if (!runPending_) {
     return;
   }
-  textLength_ = pendingTextStart_;
+  rollbackPendingText();
   duplicateOverlayOffset_ = UINT16_MAX;
   runPending_ = false;
 }

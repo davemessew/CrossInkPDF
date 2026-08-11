@@ -858,9 +858,14 @@ class PdfPreparation {
   PdfStepResult stepContentInterpretation(PdfWorkBudget& budget);
   PdfStatus finishContentInterpretation();
   void destroyContentInterpretation();
-  static PdfStatus growPageText(void* context, const uint8_t* currentText, size_t currentLength,
-                                size_t requiredCapacity, uint8_t** grownText, size_t* grownCapacity);
-  void restoreFixedPageText();
+  static PdfStatus spillPageText(void* context, size_t logicalOffset, const uint8_t* text, size_t length);
+  PdfStatus flushPageTextSpillBuffer();
+  PdfStatus materializePageText(size_t textLength, uint8_t** text);
+  PdfStatus storeTranscript(const uint8_t* text, size_t textLength, const ExtractedBlockRecord* blocks,
+                            uint16_t blockCount);
+  const uint8_t* transcriptData(size_t offset, size_t length) const;
+  uint8_t transcriptByte(size_t offset) const;
+  void abortPageTextSpill();
   PdfStatus observeFontAlias();
   void clearPendingObservedCodes();
   void commitPendingObservedCodes();
@@ -946,11 +951,17 @@ class PdfPreparation {
   std::unique_ptr<uint8_t[]> sourceWindow_;
   WorkspaceAlias decoderOutput_;
   std::unique_ptr<uint8_t[]> pageText_;
-  std::unique_ptr<uint8_t[]> fixedPageTextBackup_;
-  size_t pageTextCapacity_ = PdfLimits::PageTextBytes;
   std::unique_ptr<uint8_t[]> runRecords_;
   std::unique_ptr<uint8_t[]> operandScratch_;
   std::unique_ptr<XObjectWorkspace> xObjectWorkspace_;
+
+  static constexpr size_t PageTextSpillBufferBytes = 512U;
+  PdfCacheHandle pageTextSpillHandle_{};
+  char pageTextSpillPath_[PDF_CACHE_PATH_CAPACITY]{};
+  uint64_t pageTextSpillCommittedBytes_ = 0;
+  uint16_t pageTextSpillBufferedBytes_ = 0;
+  uint8_t pageTextSpillBuffer_[PageTextSpillBufferBytes]{};
+  size_t transcriptSplitOffset_ = 0;
 
   PdfCacheHandle sourceHandle_{};
   PdfCacheFileMetadata sourceMetadata_{};
