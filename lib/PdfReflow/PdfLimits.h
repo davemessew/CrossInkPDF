@@ -47,10 +47,7 @@ inline constexpr size_t UzlibDictionaryBytes = 32768;
 inline constexpr size_t SourceBufferBytes = 4096;
 inline constexpr size_t DecoderOutputBytes = 4096;
 inline constexpr size_t InterpreterSourceBufferBytes = SourceBufferBytes + DecoderOutputBytes;
-// Dense text pages in otherwise ordinary PDFs can exceed 8 KiB after Unicode
-// decoding. Keep the complete page transcript in owned PDF memory so the
-// reflow path never silently drops the tail of a page.
-inline constexpr size_t PageTextBytes = 20 * 1024;
+inline constexpr size_t PageTextBytes = 8192;
 inline constexpr size_t PageRunCount = 256;
 inline constexpr size_t PageRunBytes = PageRunCount * 48;
 inline constexpr size_t OperandOrderHistogramBytes = 2048;
@@ -59,7 +56,7 @@ inline constexpr size_t TotalWorkspaceBytes = UzlibDictionaryBytes + SourceBuffe
 inline constexpr size_t MaxIndividualWorkspaceBytes = UzlibDictionaryBytes;
 
 static_assert(PageRunBytes <= 12288);
-static_assert(TotalWorkspaceBytes <= 76 * 1024);
+static_assert(TotalWorkspaceBytes <= 63488);
 static_assert(MaxIndividualWorkspaceBytes <= 32768);
 
 }  // namespace PdfLimits

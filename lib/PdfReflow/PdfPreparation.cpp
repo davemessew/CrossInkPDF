@@ -639,6 +639,7 @@ enum class PreparedXObjectKind : uint8_t {
 constexpr uint8_t kPreparedFormPending = UINT8_MAX - 1U;
 
 struct PreparedXObjectCandidate {
+  PdfPreparation* owner = nullptr;
   PdfObjectReference reference{};
   uint64_t streamOffset = 0;
   uint32_t streamLength = 0;
@@ -649,7 +650,6 @@ struct PreparedXObjectCandidate {
   uint8_t ownerScopeIndex = 0;
   uint8_t scopeIndex = 0;
   uint8_t preparedSourceIndex = UINT8_MAX;
-  uint8_t workspaceIndex = UINT8_MAX;
   uint8_t nameLength = 0;
   uint8_t filterCount = 0;
   PreparedXObjectKind kind = PreparedXObjectKind::Unresolved;
@@ -1815,34 +1815,50 @@ void stableSortPreparationXrefRun(PdfXrefEntry* const entries, PdfXrefEntry* con
 }  // namespace
 
 struct PdfPreparation::XObjectWorkspace {
-  static constexpr size_t ScopeCount = PdfPreparedContentResources::MaxXObjects + 1U;
-  static constexpr size_t RecordBytes =
-      PdfPreparedContentResources::MaxXObjects * sizeof(PdfPreparedXObjectResource);
-  static constexpr size_t ScopeOffset = alignOverlay(RecordBytes, alignof(PdfPreparedContentResources));
-  static constexpr size_t ScopeBytes = ScopeCount * sizeof(PdfPreparedContentResources);
-  static constexpr size_t FontCountOffset = ScopeOffset + ScopeBytes;
-  static constexpr size_t XObjectCountOffset = FontCountOffset + ScopeCount;
-  static constexpr size_t ParentOffset = XObjectCountOffset + ScopeCount;
-  static constexpr size_t FontOffsetOffset = ParentOffset + ScopeCount;
-  static constexpr size_t XObjectOffsetOffset = FontOffsetOffset + ScopeCount;
-  static constexpr size_t ResourceBytes = XObjectOffsetOffset + ScopeCount;
-
   PdfPreparation* owner = nullptr;
-  PreparedXObjectCandidate candidates[PdfPreparedContentResources::MaxXObjects]{};
-  alignas(PdfPreparedContentResources) uint8_t resourceStorage[ResourceBytes]{};
+  std::unique_ptr<PreparedXObjectCandidate[]> overflowCandidates;
+  std::unique_ptr<uint8_t[]> resourceStorage;
+  size_t resourceBytes = 0;
+  size_t scopeOffset = 0;
+  size_t fontCountOffset = 0;
+  size_t xObjectCountOffset = 0;
+  size_t parentOffset = 0;
+  size_t fontOffsetOffset = 0;
+  size_t xObjectOffsetOffset = 0;
+
+  bool prepareResources(const uint8_t xobjectCapacity, const uint8_t scopeCapacity) {
+    const size_t recordBytes = static_cast<size_t>(xobjectCapacity) * sizeof(PdfPreparedXObjectResource);
+    scopeOffset = alignOverlay(recordBytes, alignof(PdfPreparedContentResources));
+    fontCountOffset = scopeOffset + static_cast<size_t>(scopeCapacity) * sizeof(PdfPreparedContentResources);
+    xObjectCountOffset = fontCountOffset + scopeCapacity;
+    parentOffset = xObjectCountOffset + scopeCapacity;
+    fontOffsetOffset = parentOffset + scopeCapacity;
+    xObjectOffsetOffset = fontOffsetOffset + scopeCapacity;
+    const size_t required = xObjectOffsetOffset + scopeCapacity;
+    if (required > resourceBytes) {
+      auto replacement = makeUniqueNoThrow<uint8_t[]>(required);
+      if (!replacement) {
+        return false;
+      }
+      resourceStorage = std::move(replacement);
+      resourceBytes = required;
+    }
+    std::memset(resourceStorage.get(), 0, required);
+    return true;
+  }
 
   PdfPreparedXObjectResource* records() {
-    return reinterpret_cast<PdfPreparedXObjectResource*>(resourceStorage);
+    return reinterpret_cast<PdfPreparedXObjectResource*>(resourceStorage.get());
   }
 
   PdfPreparedContentResources* scopes() {
-    return reinterpret_cast<PdfPreparedContentResources*>(resourceStorage + ScopeOffset);
+    return reinterpret_cast<PdfPreparedContentResources*>(resourceStorage.get() + scopeOffset);
   }
-  uint8_t* scopeFontCounts() { return resourceStorage + FontCountOffset; }
-  uint8_t* scopeXObjectCounts() { return resourceStorage + XObjectCountOffset; }
-  uint8_t* scopeParents() { return resourceStorage + ParentOffset; }
-  uint8_t* scopeFontOffsets() { return resourceStorage + FontOffsetOffset; }
-  uint8_t* scopeXObjectOffsets() { return resourceStorage + XObjectOffsetOffset; }
+  uint8_t* scopeFontCounts() { return resourceStorage.get() + fontCountOffset; }
+  uint8_t* scopeXObjectCounts() { return resourceStorage.get() + xObjectCountOffset; }
+  uint8_t* scopeParents() { return resourceStorage.get() + parentOffset; }
+  uint8_t* scopeFontOffsets() { return resourceStorage.get() + fontOffsetOffset; }
+  uint8_t* scopeXObjectOffsets() { return resourceStorage.get() + xObjectOffsetOffset; }
 };
 
 struct PdfPreparation::RasterBatchWorkspace {
@@ -1953,9 +1969,19 @@ struct PdfPreparation::NavigationWorkspace {
   PdfImageObjectDescriptor baseDescriptorScratch{};
   uint16_t linkCount = 0;
 
-  auto& xObjectCandidates() { return phaseScratch.xObjects.owner->xObjectWorkspace_->candidates; }
-  const auto& xObjectCandidates() const {
-    return phaseScratch.xObjects.owner->xObjectWorkspace_->candidates;
+  PreparedXObjectCandidate* xObjectCandidates() {
+    if (phaseScratch.xObjects.owner != nullptr && phaseScratch.xObjects.owner->xObjectWorkspace_ != nullptr &&
+        phaseScratch.xObjects.owner->xObjectWorkspace_->overflowCandidates != nullptr) {
+      return phaseScratch.xObjects.owner->xObjectWorkspace_->overflowCandidates.get();
+    }
+    return phaseScratch.xObjects.legacyCandidates;
+  }
+  const PreparedXObjectCandidate* xObjectCandidates() const {
+    if (phaseScratch.xObjects.owner != nullptr && phaseScratch.xObjects.owner->xObjectWorkspace_ != nullptr &&
+        phaseScratch.xObjects.owner->xObjectWorkspace_->overflowCandidates != nullptr) {
+      return phaseScratch.xObjects.owner->xObjectWorkspace_->overflowCandidates.get();
+    }
+    return phaseScratch.xObjects.legacyCandidates;
   }
 };
 
@@ -2257,10 +2283,17 @@ struct PdfPreparation::PreparedContentOverlay {
                 PdfLimits::DecoderOutputBytes);
 #endif
 #if UINTPTR_MAX > UINT32_MAX
-  static constexpr size_t NativePageRunBytes = std::max(
-      PdfLimits::PageRunBytes,
-      alignOverlay(sizeof(PreparedContentRuntime), alignof(uint32_t)) + sizeof(NavigationWorkspace) -
-          PdfLimits::PageTextBytes - PdfLimits::OperandOrderHistogramBytes);
+  static constexpr size_t NativeContentRunBytes =
+      alignOverlay(sizeof(PreparedContentRuntime), alignof(uint32_t)) + sizeof(NavigationWorkspace) >
+              PdfLimits::PageTextBytes + PdfLimits::OperandOrderHistogramBytes
+          ? alignOverlay(sizeof(PreparedContentRuntime), alignof(uint32_t)) + sizeof(NavigationWorkspace) -
+                PdfLimits::PageTextBytes - PdfLimits::OperandOrderHistogramBytes
+          : 0U;
+  // Native pointers widen the font-resume overlay too. Keep that ABI-only
+  // padding out of the ESP32-C3 allocation while making the host validation
+  // exercise the same non-overlapping object graph.
+  static constexpr size_t NativePageRunBytes =
+      512U + std::max(PdfLimits::PageRunBytes, NativeContentRunBytes);
 #else
   static constexpr size_t NativePageRunBytes = PdfLimits::PageRunBytes;
 #endif
@@ -3724,21 +3757,13 @@ PdfStatus PdfPreparation::readPreparedFormContent(void* const context, const uin
     return PdfStatus::failure(PdfError::InvalidArgument, offset);
   }
   const auto& candidate = *static_cast<const PreparedXObjectCandidate*>(context);
-  if (candidate.workspaceIndex >= PdfPreparedContentResources::MaxXObjects ||
-      candidate.kind != PreparedXObjectKind::Form ||
+  if (candidate.owner == nullptr || candidate.kind != PreparedXObjectKind::Form ||
       candidate.preparedSourceIndex >= kPreparedFormPending || offset > candidate.streamLength ||
       requested > candidate.streamLength - offset || candidate.streamOffset > UINT64_MAX - offset) {
     return PdfStatus::failure(PdfError::InvalidOffset, offset);
   }
-  const auto* const candidateBytes = reinterpret_cast<const uint8_t*>(&candidate);
-  const size_t candidateOffset = offsetof(PdfPreparation::XObjectWorkspace, candidates) +
-                                 static_cast<size_t>(candidate.workspaceIndex) * sizeof(PreparedXObjectCandidate);
-  const auto* const workspace =
-      reinterpret_cast<const PdfPreparation::XObjectWorkspace*>(candidateBytes - candidateOffset);
-  if (workspace->owner == nullptr || &workspace->candidates[candidate.workspaceIndex] != &candidate) {
-    return PdfStatus::failure(PdfError::InvalidArgument, offset);
-  }
-  return readPreparedContentStore(workspace->owner, candidate.streamOffset + offset, destination, requested, bytesRead);
+  return readPreparedContentStore(candidate.owner, candidate.streamOffset + offset, destination, requested,
+                                  bytesRead);
 }
 
 PdfStepResult PdfPreparation::replayPreparedInlineImage(void* const context, const PdfByteSource& source,
@@ -4157,11 +4182,7 @@ PdfStatus PdfPreparation::observePreparedFontRecord(void* const context, const u
       runtime->currentFont >= PdfPreparedContentResources::MaxFonts) {
     return PdfStatus::failure(PdfError::InvalidArgument, ordinal);
   }
-  if (!self.xObjectWorkspace_) {
-    return PdfStatus::failure(PdfError::InsufficientMemory, ordinal);
-  }
-  auto* const workspace =
-      reinterpret_cast<ObservedGlyphWorkspace*>(self.xObjectWorkspace_->resourceStorage);
+  auto* const workspace = reinterpret_cast<ObservedGlyphWorkspace*>(self.dictionary_.get());
   const auto& candidate = *static_cast<const PdfCMapRecord*>(record);
   auto* const records = observedMatchedRecords(workspace);
   uint16_t tupleIndex = workspace->fontHead[runtime->currentFont];
@@ -4895,7 +4916,7 @@ PdfStatus PdfPreparation::initializeParserStorage() {
   static_assert(PreparedContentOverlay::ContentRuntimeEnd == 6000);
   static_assert(PreparedContentOverlay::ContentRunTailCapacity == 5008);
   static_assert(PreparedContentOverlay::ContentPageTailCapacity == 950);
-  static_assert(PreparedContentOverlay::ContentWriteBufferMinCapacity == 19530);
+  static_assert(PreparedContentOverlay::ContentWriteBufferMinCapacity == 7242);
   static_assert(PreparedContentOverlay::FontRuntimeEnd == 10640);
   static_assert(PreparedContentOverlay::FontRunTailCapacity == 368);
   static_assert(PreparedContentOverlay::FontOperandCapacity == 2048);
@@ -11745,9 +11766,18 @@ PdfStatus PdfPreparation::collectImageCandidates(const uint16_t dictionaryIndex,
 #endif
         return PdfStatus::failure(PdfError::InsufficientMemory, xObjectCandidateCount_);
       }
+      if (xObjectCandidateCount_ == std::size(navigation_->phaseScratch.xObjects.legacyCandidates) &&
+          xObjectWorkspace_->overflowCandidates == nullptr) {
+        auto overflow = makeUniqueNoThrow<PreparedXObjectCandidate[]>(PdfPreparedContentResources::MaxXObjects);
+        if (!overflow) {
+          return PdfStatus::failure(PdfError::InsufficientMemory, xObjectCandidateCount_);
+        }
+        std::copy_n(navigation_->phaseScratch.xObjects.legacyCandidates, xObjectCandidateCount_, overflow.get());
+        xObjectWorkspace_->overflowCandidates = std::move(overflow);
+      }
       PreparedXObjectCandidate& candidate = navigation_->xObjectCandidates()[xObjectCandidateCount_++];
       candidate = {};
-      candidate.workspaceIndex = static_cast<uint8_t>(xObjectCandidateCount_ - 1U);
+      candidate.owner = this;
       candidate.reference = {value.objectNumber, value.generation};
       candidate.nameLength = static_cast<uint8_t>(entry.keyLength);
       std::memcpy(candidate.name, arena_.text + entry.keyOffset, entry.keyLength);
@@ -14428,16 +14458,16 @@ uint8_t* PdfPreparation::preparedNavigationSpillBytes(const size_t offset, size_
       pageSpillBytes + runTailBytes + PdfLimits::OperandOrderHistogramBytes;
   static_assert(operandSpillOffset + operandSpillBytes <= PdfLimits::OperandOrderHistogramBytes);
 #if UINTPTR_MAX == UINT32_MAX
-  static_assert(PdfLimits::PageTextBytes == 20480);
+  static_assert(PdfLimits::PageTextBytes == 8192);
   static_assert(sizeof(PreparedContentRuntime) == 6000);
   static_assert(runtimeEnd == 6000);
   static_assert(nativeRunTailBytes == 5008);
   static_assert(sizeof(PlacementWorkspace) == 508);
   static_assert(operandSpillOffset == 0);
-  static_assert(pageSpillBytes == sizeof(NavigationWorkspace));
-  static_assert(runTailBytes == 0);
-  static_assert(operandSpillBytes == 0);
-  static_assert(operandSpillOffset + operandSpillBytes == 0);
+  static_assert(pageSpillBytes == 8192);
+  static_assert(runTailBytes == 5008);
+  static_assert(operandSpillBytes == 1992);
+  static_assert(operandSpillOffset + operandSpillBytes == 1992);
 #endif
   static_assert(spillCapacity >= sizeof(NavigationWorkspace),
                 "phase-dead workspaces must retain navigation during Flate decode");
@@ -15786,11 +15816,7 @@ PdfStepResult PdfPreparation::decodePreparedFonts(PdfWorkBudget& budget) {
     }
     runtime->spillBase = runtime->fileEnd;
     runtime->spillCapacity = 0;
-    if (!xObjectWorkspace_) {
-      return PdfStepResult::failure(PdfStatus::failure(PdfError::InsufficientMemory));
-    }
-    auto* const glyphWorkspace =
-        new (xObjectWorkspace_->resourceStorage) ObservedGlyphWorkspace{};
+    auto* const glyphWorkspace = new (dictionary_.get()) ObservedGlyphWorkspace{};
     auto* const collection = new (glyphWorkspace->phase) ObservedGlyphCollection{};
     std::fill_n(collection->hash, kObservedGlyphHashCapacity, kObservedGlyphInvalid);
     std::fill_n(glyphWorkspace->fontHead, PdfPreparedContentResources::MaxFonts, kObservedGlyphInvalid);
@@ -15805,10 +15831,9 @@ PdfStepResult PdfPreparation::decodePreparedFonts(PdfWorkBudget& budget) {
 }
 
 PdfStepResult PdfPreparation::parsePreparedFonts(PdfWorkBudget& budget) {
-  static_assert(sizeof(ObservedGlyphWorkspace) <= XObjectWorkspace::ResourceBytes,
-                "observed glyph workspace must fit phase-dead XObject RAM");
+  static_assert(sizeof(ObservedGlyphWorkspace) <= PdfLimits::UzlibDictionaryBytes,
+                "observed glyph workspace must fit the phase-dead dictionary");
   if (!runRecords_ || !dictionary_ || !pageText_ || !sourceWindow_ ||
-      !xObjectWorkspace_ ||
       inlineNavigationSpillStage_ != InlineNavigationSpillStage::FontReading ||
       !inlineNavigationSpoolHandle_.valid()) {
     return PdfStepResult::failure(PdfStatus::failure(PdfError::InvalidArgument));
@@ -15818,8 +15843,7 @@ PdfStepResult PdfPreparation::parsePreparedFonts(PdfWorkBudget& budget) {
   constexpr size_t dictionaryGlyphsOffset = PreparedContentOverlay::DictionaryGlyphs;
   auto* const content = reinterpret_cast<PreparedContentRuntime*>(runRecords_.get());
   auto* const runtime = reinterpret_cast<PreparedFontRuntime*>(runRecords_.get() + fontRuntimeOffset);
-  auto* const glyphWorkspace =
-      reinterpret_cast<ObservedGlyphWorkspace*>(xObjectWorkspace_->resourceStorage);
+  auto* const glyphWorkspace = reinterpret_cast<ObservedGlyphWorkspace*>(dictionary_.get());
 
   const auto destroyTemporaryFont = [runtime]() {
     if (runtime->sourceFontConstructed) {
@@ -17103,6 +17127,10 @@ PdfStatus PdfPreparation::beginContentInterpretation() {
   if (resourceScopeCount > PdfPreparedContentResources::MaxXObjects + 1U) {
     destroyFinalFonts();
     return PdfStatus::failure(PdfError::InsufficientMemory, resourceScopeCount);
+  }
+  if (!xObjectWorkspace_->prepareResources(xObjectCandidateCount_, resourceScopeCount)) {
+    destroyFinalFonts();
+    return PdfStatus::failure(PdfError::InsufficientMemory, xObjectCandidateCount_);
   }
   uint8_t* const scopeFontCounts = xObjectWorkspace_->scopeFontCounts();
   uint8_t* const scopeXObjectCounts = xObjectWorkspace_->scopeXObjectCounts();

@@ -1,3 +1,9 @@
+## [v1.5.0.10] - 2026-08-11
+
+### Fixed
+
+- PDF preparation no longer reserves a large Form XObject table for every document. Ordinary books such as *Atomic Habits* now fit the Xteink's available memory when opened.
+
 ## [v1.5.0.9] - 2026-08-11
 
 ### Changed

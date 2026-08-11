@@ -13,6 +13,7 @@
 #include "Epub/converters/ImageDecoderFactory.h"
 #include "GfxRenderer.h"
 #include "HalStorage.h"
+#include "Memory.h"
 #include "PdfPreparation.h"
 #include "PdfReflowDocument.h"
 #include "PdfTestCacheIo.h"
@@ -134,7 +135,8 @@ TEST(PdfPreparedCacheRendering, PreparedCacheReopensPaginatesSerializesAndRender
     Storage.addFile(image.localPath, preparedPixels);
     FsFile serialized;
     ASSERT_TRUE(Storage.openFileForWrite("TEST", kSerializedBlockPath, serialized));
-    ImageBlock block(image.localPath, static_cast<int16_t>(image.width), static_cast<int16_t>(image.height));
+    ImageBlock block(image.localPath, kSourcePath, static_cast<int16_t>(image.width),
+                     static_cast<int16_t>(image.height));
     ASSERT_TRUE(block.serialize(serialized));
     ASSERT_TRUE(serialized.close());
 
@@ -171,13 +173,40 @@ TEST(PdfPreparedCacheRendering, PreparedCacheReopensPaginatesSerializesAndRender
   EXPECT_EQ(reopenedImage.height, image.height);
 
   GfxRenderer renderer;
-  ImageBlock reopenedBlock(reopenedImage.localPath, static_cast<int16_t>(reopenedImage.width),
+  ImageBlock reopenedBlock(reopenedImage.localPath, kSourcePath, static_cast<int16_t>(reopenedImage.width),
                            static_cast<int16_t>(reopenedImage.height));
   renderer.clear();
   reopenedBlock.render(renderer, 0, 0);
   EXPECT_EQ(framebufferHash(renderer), firstHash);
   EXPECT_EQ(harness.storage.openCallsForPath(kSourcePath), sourceOpensAfterReopenBoundary);
   EXPECT_EQ(harness.storage.openHandleCount(), 0U);
+}
+
+TEST(PdfPreparedCacheRendering, OrdinaryPdfFitsDevicePreparationHeap) {
+  PreparationHarness harness;
+  harness.storage.addFile(kSourcePath, loadFixture("flate_gray_caption.pdf"), 1234, true);
+  harness.storage.setMaximumReadHandles(1);
+
+  TestMemory::resetArrayProbe();
+  TestMemory::observeArrays = true;
+  TestMemory::beginFirmwareBudget(88U * 1024U, 0);
+  const auto resetBudget = ScopedCleanup([] {
+    TestMemory::disableFirmwareBudget();
+    TestMemory::resetArrayProbe();
+  });
+  auto preparation = makeUniqueNoThrow<PdfPreparation>();
+  ASSERT_NE(preparation, nullptr);
+  ASSERT_TRUE(preparation->begin(harness.config()).ok());
+
+  const PdfStepResult result = runToTerminal(*preparation, harness);
+  ASSERT_TRUE(result.complete())
+      << static_cast<unsigned>(result.status.error) << "@" << result.status.offset
+      << " peak=" << TestMemory::firmwarePeakBytes << " prep=" << sizeof(PdfPreparation)
+      << " arrays=" << TestMemory::arraySizes[0] << ',' << TestMemory::arraySizes[1] << ','
+      << TestMemory::arraySizes[2] << ',' << TestMemory::arraySizes[3] << ','
+      << TestMemory::arraySizes[4] << ',' << TestMemory::arraySizes[5];
+  EXPECT_FALSE(TestMemory::firmwareBudgetExceeded);
+  EXPECT_LE(TestMemory::firmwarePeakBytes, 88U * 1024U);
 }
 
 TEST(PdfPreparedCacheRendering, PreparedJpegIdentityAndDimensionsAreValidatedOnceBeforePagination) {

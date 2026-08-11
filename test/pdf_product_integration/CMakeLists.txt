@@ -141,6 +141,7 @@ add_executable(PdfPreparedCacheRenderingTest
 )
 
 target_include_directories(PdfPreparedCacheRenderingTest BEFORE PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/allocation_stubs
   ${CMAKE_CURRENT_SOURCE_DIR}/image_stubs
   ${CMAKE_CURRENT_SOURCE_DIR}/stubs
 )
