@@ -406,8 +406,10 @@ void ChapterHtmlSlimParser::markCurrentPageFromCurrentElement() {
 }
 
 bool ChapterHtmlSlimParser::finishPaginationTextBlock() {
-  return paginationHooks_.vtable == nullptr || paginationHooks_.vtable->finishTextBlock == nullptr ||
-         paginationHooks_.vtable->finishTextBlock(paginationHooks_.context, currentPage.get());
+  const bool success = paginationHooks_.vtable == nullptr || paginationHooks_.vtable->finishTextBlock == nullptr ||
+                       paginationHooks_.vtable->finishTextBlock(paginationHooks_.context, currentPage.get());
+  paginationHookFailed = paginationHookFailed || !success;
+  return success;
 }
 
 bool ChapterHtmlSlimParser::beginPaginationTextBlock() {
@@ -415,13 +417,17 @@ bool ChapterHtmlSlimParser::beginPaginationTextBlock() {
 }
 
 bool ChapterHtmlSlimParser::beginPaginationTextBlock(const char* const anchor, const size_t anchorLength) {
-  return paginationHooks_.vtable == nullptr || paginationHooks_.vtable->beginTextBlock == nullptr ||
-         paginationHooks_.vtable->beginTextBlock(paginationHooks_.context, anchor, anchorLength);
+  const bool success = paginationHooks_.vtable == nullptr || paginationHooks_.vtable->beginTextBlock == nullptr ||
+                       paginationHooks_.vtable->beginTextBlock(paginationHooks_.context, anchor, anchorLength);
+  paginationHookFailed = paginationHookFailed || !success;
+  return success;
 }
 
 bool ChapterHtmlSlimParser::trackPaginationTextLine(const TextBlock& line) {
-  return paginationHooks_.vtable == nullptr || paginationHooks_.vtable->trackTextLine == nullptr ||
-         paginationHooks_.vtable->trackTextLine(paginationHooks_.context, &line);
+  const bool success = paginationHooks_.vtable == nullptr || paginationHooks_.vtable->trackTextLine == nullptr ||
+                       paginationHooks_.vtable->trackTextLine(paginationHooks_.context, &line);
+  paginationHookFailed = paginationHookFailed || !success;
+  return success;
 }
 
 bool ChapterHtmlSlimParser::usesSemanticLayout() const { return paginationHooks_.vtable != nullptr; }
@@ -2194,7 +2200,11 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
       // TODO: Parse data-* attributes to extract actual href
     }
 
-    if (isInternalLink) {
+    // PDF reflow keeps chapter/index navigation in its own metadata. The EPUB
+    // footnote-link IDs share TextBlock flag bits with PDF semantic word
+    // tracking, so encoding both corrupts the fixed word index for linked
+    // contents pages.
+    if (isInternalLink && !self->usesSemanticLayout()) {
       // Flush buffer before style change
       if (self->partWordBufferIndex > 0) {
         self->flushPartWordBuffer();
@@ -2756,6 +2766,10 @@ void XMLCALL ChapterHtmlSlimParser::characterData(void* userData, const XML_Char
       static_cast<size_t>(self->currentTextRunBytes) + static_cast<size_t>(self->partWordBufferIndex) >
           self->textRunBytesBeforeLayoutLimit()) {
     self->flushPartWordBuffer();
+    // The byte budget can cut an Expat character-data chunk in the middle of
+    // a word. Keep the next token joined unless the next input is whitespace
+    // (which clears this flag) or a new block (which also clears it).
+    self->nextWordContinues = true;
   }
   self->flushLongTextRunIfNeeded();
 }
@@ -3124,6 +3138,7 @@ void ChapterHtmlSlimParser::releaseInputFile() {
 
 bool ChapterHtmlSlimParser::beginParse() {
   malformedMarkupTruncated = false;
+  paginationHookFailed = false;
   parseFileOffset_ = 0;
   parseFileSize_ = 0;
   // Runs before the render pass opens the file, so only one reader is ever open at a time.

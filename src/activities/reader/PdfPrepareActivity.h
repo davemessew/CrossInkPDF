@@ -53,6 +53,7 @@ class PdfPrepareActivity final : public Activity {
   std::unique_ptr<PdfPreparation> preparation_;
   std::unique_ptr<ReflowDocument> pendingDocument_;
   PdfPreparationPaintGate paintGate_;
+  uint32_t warningFlags_ = 0;
   State state_ = State::Preparing;
   PdfStatus initialFailure_{};
   PdfStatus failure_{};

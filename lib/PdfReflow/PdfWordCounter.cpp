@@ -10,6 +10,11 @@ bool isInternalConnector(const uint32_t scalar) {
   return scalar == '\'' || scalar == '-' || scalar == 0x2010 || scalar == 0x2011 || scalar == 0x2019;
 }
 
+bool isCombiningMark(const uint32_t scalar) {
+  return (scalar >= 0x0300 && scalar <= 0x036F) || (scalar >= 0x1DC0 && scalar <= 0x1DFF) ||
+         (scalar >= 0x20D0 && scalar <= 0x20FF) || (scalar >= 0xFE20 && scalar <= 0xFE2F);
+}
+
 bool isXmlScalar(const uint32_t scalar) {
   return scalar == 0x09 || scalar == 0x0A || scalar == 0x0D || (scalar >= 0x20 && scalar <= 0xD7FF) ||
          (scalar >= 0xE000 && scalar <= 0xFFFD) || (scalar >= 0x10000 && scalar <= 0x10FFFF);
@@ -49,6 +54,9 @@ PdfStatus PdfWordCounter::addWord(const uint64_t offset) {
 PdfStatus PdfWordCounter::consumeScalar(const uint32_t scalar, const uint64_t offset) {
   if (!pdfIsUnicodeScalar(scalar) || !isXmlScalar(scalar)) {
     return fail(PdfStatus::failure(PdfError::Malformed, offset));
+  }
+  if (isCombiningMark(scalar)) {
+    return PdfStatus::success();
   }
   if (pdfIsCjkReadingUnit(scalar)) {
     inWord_ = false;

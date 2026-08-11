@@ -1,3 +1,16 @@
+## [v1.5.0.11] - 2026-08-11
+
+### Changed
+
+- PDF preparation progress now follows the current page through the text-processing stages instead of appearing to stop near 86 percent.
+- Preparation warnings now distinguish images, navigation, drawing text, font fallback, and merged chapters.
+
+### Fixed
+
+- Text-heavy PDF pages can temporarily grow their text buffer instead of failing with a misleading chapter memory error at 8 KB. Ordinary pages keep the same fixed workspace.
+- PDF word indexing now matches device pagination across links, tables, combining marks, retained images, and long text runs.
+- PDF chapters preserve cleaner Unicode, spacing, word joins, and semantic table layout when rendered with the reader's configured font.
+
 ## [v1.5.0.10] - 2026-08-11
 
 ### Fixed

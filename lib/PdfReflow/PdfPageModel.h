@@ -47,12 +47,17 @@ enum PdfTextRunFlag : uint16_t {
 };
 
 struct PdfPageModelWorkspace {
+  using GrowTextFn = PdfStatus (*)(void* context, const uint8_t* currentText, size_t currentLength,
+                                   size_t requiredCapacity, uint8_t** grownText, size_t* grownCapacity);
+
   uint8_t* text = nullptr;
   size_t textCapacity = 0;
   PdfTextRun* runs = nullptr;
   uint16_t runCapacity = 0;
   PdfImagePlacement* images = nullptr;
   uint16_t imageCapacity = 0;
+  void* growTextContext = nullptr;
+  GrowTextFn growText = nullptr;
 };
 
 class PdfPageModel {
@@ -82,6 +87,8 @@ class PdfPageModel {
   PdfPageWarning warnings() const { return warnings_; }
 
  private:
+  PdfStatus ensureTextCapacity(size_t requiredCapacity);
+
   PdfPageModelWorkspace workspace_{};
   size_t textLength_ = 0;
   size_t pendingTextStart_ = 0;

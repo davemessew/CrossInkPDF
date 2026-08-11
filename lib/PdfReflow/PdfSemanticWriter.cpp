@@ -528,6 +528,9 @@ PdfStatus PdfSemanticWriter::writeRetainedImage(const uint8_t* const resource, c
   if (status.ok()) {
     status = appendLiteral(dimensions);
   }
+  if (status.ok() && hasTextInBlock_) {
+    pendingTextSpace_ = true;
+  }
   return status.ok() ? status : fail(status);
 }
 

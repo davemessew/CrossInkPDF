@@ -1453,8 +1453,10 @@ bool ParsedText::extractLine(Arena& scratchArena, const size_t breakIndex, const
       // PDF semantic flags share the upper flag bits with EPUB link IDs.
       // Semantic layout uses PDF anchors/navigation instead of Page footnote
       // IDs, so strip the EPUB-only bits before recording join/split state.
-      uint8_t wordFlags =
-          static_cast<uint8_t>(wordBackgroundBlack[sourceIndex] & ~TextBlock::WORD_FLAG_LINK_ID_MASK);
+      uint8_t wordFlags = static_cast<uint8_t>(
+          wordBackgroundBlack[sourceIndex] &
+          (TextBlock::WORD_FLAG_BACKGROUND_BLACK | TextBlock::WORD_FLAG_INSERTED_HYPHEN |
+           TextBlock::WORD_FLAG_SEMANTIC_ATTACHES | TextBlock::WORD_FLAG_SEMANTIC_SPLIT_CONTINUATION));
       if (continuesVec[sourceIndex]) {
         wordFlags |= TextBlock::WORD_FLAG_SEMANTIC_ATTACHES;
       }

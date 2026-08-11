@@ -9,6 +9,11 @@
 
 constexpr size_t PDF_CACHE_REQUIRED_PATH_CAPACITY = 96;
 inline constexpr uint32_t PDF_CACHE_WARNING_OPTIONAL_CONTENT_OMITTED = 1U << 0U;
+inline constexpr uint32_t PDF_CACHE_WARNING_IMAGES_OMITTED = 1U << 1U;
+inline constexpr uint32_t PDF_CACHE_WARNING_NAVIGATION_INCOMPLETE = 1U << 2U;
+inline constexpr uint32_t PDF_CACHE_WARNING_DRAWING_TEXT_OMITTED = 1U << 3U;
+inline constexpr uint32_t PDF_CACHE_WARNING_FONT_FALLBACK = 1U << 4U;
+inline constexpr uint32_t PDF_CACHE_WARNING_CHAPTERS_MERGED = 1U << 5U;
 
 struct PdfRequiredFileRecord {
   char path[PDF_CACHE_REQUIRED_PATH_CAPACITY]{};

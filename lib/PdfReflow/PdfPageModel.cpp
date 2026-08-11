@@ -20,6 +20,28 @@ PdfStatus PdfPageModel::reset() {
   return PdfStatus::success();
 }
 
+PdfStatus PdfPageModel::ensureTextCapacity(const size_t requiredCapacity) {
+  if (requiredCapacity <= workspace_.textCapacity) {
+    return PdfStatus::success();
+  }
+  if (workspace_.growText == nullptr) {
+    return PdfStatus::failure(PdfError::LimitExceeded, textLength_);
+  }
+  uint8_t* grownText = nullptr;
+  size_t grownCapacity = 0;
+  const PdfStatus status = workspace_.growText(workspace_.growTextContext, workspace_.text, textLength_,
+                                               requiredCapacity, &grownText, &grownCapacity);
+  if (!status) {
+    return status;
+  }
+  if (grownText == nullptr || grownCapacity < requiredCapacity) {
+    return PdfStatus::failure(PdfError::InsufficientMemory, requiredCapacity);
+  }
+  workspace_.text = grownText;
+  workspace_.textCapacity = grownCapacity;
+  return PdfStatus::success();
+}
+
 PdfStatus PdfPageModel::beginTextRun(const PdfTextRun& run) {
   if (runPending_ || runCount_ >= workspace_.runCapacity || textLength_ > std::numeric_limits<uint32_t>::max()) {
     return PdfStatus::failure(PdfError::LimitExceeded, runCount_);
@@ -34,9 +56,13 @@ PdfStatus PdfPageModel::beginTextRun(const PdfTextRun& run) {
 }
 
 PdfStatus PdfPageModel::appendText(const uint8_t* const text, const size_t length) {
-  if (!runPending_ || text == nullptr || length > workspace_.textCapacity - textLength_ ||
+  if (!runPending_ || text == nullptr || length > std::numeric_limits<size_t>::max() - textLength_ ||
       length > std::numeric_limits<uint32_t>::max() - (textLength_ - pendingTextStart_)) {
     return PdfStatus::failure(PdfError::LimitExceeded, textLength_);
+  }
+  const PdfStatus capacityStatus = ensureTextCapacity(textLength_ + length);
+  if (!capacityStatus) {
+    return capacityStatus;
   }
   std::memcpy(workspace_.text + textLength_, text, length);
   textLength_ += length;
@@ -95,11 +121,15 @@ PdfStatus PdfPageModel::appendOverflowText(const uint8_t* const text, const size
   overflowSeparator_ = OverflowSeparator::None;
 
   const size_t separatorLength = insertSeparator ? 1U : 0U;
-  if (separatorLength > workspace_.textCapacity - textLength_ ||
-      length > workspace_.textCapacity - textLength_ - separatorLength ||
+  if (separatorLength > std::numeric_limits<size_t>::max() - textLength_ ||
+      length > std::numeric_limits<size_t>::max() - textLength_ - separatorLength ||
       separatorLength > UINT32_MAX - previous.textLength ||
       length > UINT32_MAX - previous.textLength - separatorLength) {
     return PdfStatus::failure(PdfError::LimitExceeded, textLength_);
+  }
+  const PdfStatus capacityStatus = ensureTextCapacity(textLength_ + separatorLength + length);
+  if (!capacityStatus) {
+    return capacityStatus;
   }
   if (insertSeparator) {
     workspace_.text[textLength_++] = ' ';

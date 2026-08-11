@@ -1448,7 +1448,32 @@ bool runExternalPdf(GfxRenderer& renderer) {
                    static_cast<unsigned>(phase), static_cast<unsigned long>(steps));
     return false;
   }
+  ReaderLayout layout;
+  if (!computeReaderLayout(renderer, &layout)) {
+    esp_rom_printf("QEMU_PDF_SD_FAIL stage=layout_geometry\n");
+    return false;
+  }
   (void)exportPdfXhtml(*document);
+  for (int sectionIndex = 0; sectionIndex < document->getSectionCount(); ++sectionIndex) {
+    Section section(document, sectionIndex, renderer, "_qemu_external");
+    ReaderRenderSpec spec = SETTINGS.readerRenderSpec(layout.width, layout.height, EpubRenderMode::Light);
+    spec.fontId = SETTINGS.getReaderFontId();
+    spec.embeddedStyle = false;
+    bool imagesSuppressed = false;
+    bool lowMemory = false;
+    const bool built = section.createSectionFile(spec, nullptr, &imagesSuppressed, &lowMemory);
+    esp_rom_printf(
+        "QEMU_PDF_SD_LAYOUT section=%d built=%u low_memory=%u pages=%u images_suppressed=%u free=%lu "
+        "max_alloc=%lu\n",
+        sectionIndex, built ? 1U : 0U, lowMemory ? 1U : 0U, static_cast<unsigned>(section.pageCount),
+        imagesSuppressed ? 1U : 0U, static_cast<unsigned long>(ESP.getFreeHeap()),
+        static_cast<unsigned long>(ESP.getMaxAllocHeap()));
+    sampleRuntime();
+    if (!built || lowMemory || section.pageCount == 0U) {
+      esp_rom_printf("QEMU_PDF_SD_FAIL stage=layout section=%d\n", sectionIndex);
+      return false;
+    }
+  }
   const uint32_t elapsed = millis() - startedAt;
   esp_rom_printf(
       "QEMU_PDF_SD_RESULT bytes=%llu elapsed_ms=%lu steps=%lu sections=%d words=%lu prepared_words=%lu "

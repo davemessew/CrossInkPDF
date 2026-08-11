@@ -858,6 +858,9 @@ class PdfPreparation {
   PdfStepResult stepContentInterpretation(PdfWorkBudget& budget);
   PdfStatus finishContentInterpretation();
   void destroyContentInterpretation();
+  static PdfStatus growPageText(void* context, const uint8_t* currentText, size_t currentLength,
+                                size_t requiredCapacity, uint8_t** grownText, size_t* grownCapacity);
+  void restoreFixedPageText();
   PdfStatus observeFontAlias();
   void clearPendingObservedCodes();
   void commitPendingObservedCodes();
@@ -943,6 +946,8 @@ class PdfPreparation {
   std::unique_ptr<uint8_t[]> sourceWindow_;
   WorkspaceAlias decoderOutput_;
   std::unique_ptr<uint8_t[]> pageText_;
+  std::unique_ptr<uint8_t[]> fixedPageTextBackup_;
+  size_t pageTextCapacity_ = PdfLimits::PageTextBytes;
   std::unique_ptr<uint8_t[]> runRecords_;
   std::unique_ptr<uint8_t[]> operandScratch_;
   std::unique_ptr<XObjectWorkspace> xObjectWorkspace_;

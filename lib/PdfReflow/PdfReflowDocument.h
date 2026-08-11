@@ -41,9 +41,8 @@ class PdfReflowDocument : public ReflowDocument {
                        const uint64_t* cacheHashOverride = nullptr);
   PdfStatus loadCompletedCache();
   PdfStatus lastStatus() const { return status_; }
-  bool optionalContentWasSkipped() const {
-    return (manifest_.warningFlags & PDF_CACHE_WARNING_OPTIONAL_CONTENT_OMITTED) != 0;
-  }
+  uint32_t warningFlags() const { return manifest_.warningFlags; }
+  bool optionalContentWasSkipped() const { return manifest_.warningFlags != 0; }
 
   ReflowDocumentFormat getFormat() const override { return ReflowDocumentFormat::Pdf; }
   const char* getStoreFormatKey() const override { return "pdf"; }

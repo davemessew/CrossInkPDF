@@ -9,6 +9,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
+#include <array>
 #include <cstdio>
 
 #include "EpubReaderActivity.h"
@@ -178,7 +179,8 @@ void PdfPrepareActivity::finishPreparation() {
     setFailure(status);
     return;
   }
-  if (document->optionalContentWasSkipped()) {
+  warningFlags_ = document->warningFlags();
+  if (warningFlags_ != 0) {
     pendingDocument_ = std::move(document);
     state_ = State::Warning;
     requestUpdate();
@@ -254,8 +256,27 @@ void PdfPrepareActivity::render(RenderLock&&) {
     const auto labels = mappedInput.mapLabels(tr(STR_CANCEL), "", "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
   } else if (state_ == State::Warning) {
-    renderer.drawCenteredText(UI_10_FONT_ID, height / 2 - 12, tr(STR_PDF_OPTIONAL_CONTENT_SKIPPED), true,
-                              EpdFontFamily::BOLD);
+    std::array<StrId, 5> messages{};
+    size_t messageCount = 0;
+    const auto addWarning = [&](const uint32_t flag, const StrId message) {
+      if ((warningFlags_ & flag) != 0 && messageCount < messages.size()) {
+        messages[messageCount++] = message;
+      }
+    };
+    addWarning(PDF_CACHE_WARNING_DRAWING_TEXT_OMITTED, StrId::STR_PDF_DRAWING_TEXT_SKIPPED);
+    addWarning(PDF_CACHE_WARNING_FONT_FALLBACK, StrId::STR_PDF_FONT_FALLBACK);
+    addWarning(PDF_CACHE_WARNING_IMAGES_OMITTED, StrId::STR_PDF_IMAGES_SKIPPED);
+    addWarning(PDF_CACHE_WARNING_NAVIGATION_INCOMPLETE, StrId::STR_PDF_NAVIGATION_INCOMPLETE);
+    addWarning(PDF_CACHE_WARNING_CHAPTERS_MERGED, StrId::STR_PDF_CHAPTERS_MERGED);
+    if (messageCount == 0) {
+      messages[messageCount++] = StrId::STR_PDF_OPTIONAL_CONTENT_SKIPPED;
+    }
+    const int messageGap = 24;
+    int messageY = height / 2 - 12 - static_cast<int>((messageCount - 1U) * messageGap / 2U);
+    for (size_t index = 0; index < messageCount; ++index) {
+      renderer.drawCenteredText(UI_10_FONT_ID, messageY, I18N.get(messages[index]), true, EpdFontFamily::BOLD);
+      messageY += messageGap;
+    }
     const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_CONTINUE_READING), "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
   } else {

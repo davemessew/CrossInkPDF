@@ -124,6 +124,7 @@ class ChapterHtmlSlimParser {
   int imageCounter = 0;
   bool lowMemoryImageFallback = false;
   bool lowMemoryAbort = false;
+  bool paginationHookFailed = false;
   bool attemptedTextLayoutFontCacheRelease = false;
   EpubRenderMode renderMode = EpubRenderMode::CrossInkDefault;
   std::string previewAnchor;
@@ -293,7 +294,9 @@ class ChapterHtmlSlimParser {
   void startPreviewAtAnchor();
   void stopPreviewIfPageLimitReached();
   bool usesSimpleCssLookup() const { return renderMode != EpubRenderMode::CrossInkDefault; }
-  bool flattensTables() const { return renderMode != EpubRenderMode::CrossInkDefault; }
+  bool flattensTables() const {
+    return renderMode != EpubRenderMode::CrossInkDefault && !usesSemanticLayout();
+  }
   bool isLightMode() const { return renderMode == EpubRenderMode::Light; }
   bool honorsPublisherDecorations() const { return renderMode != EpubRenderMode::Light; }
   void pushCssAncestor(int depth, const char* tag, std::string_view classAttr);
@@ -373,7 +376,7 @@ class ChapterHtmlSlimParser {
   void addLineToPage(std::shared_ptr<TextBlock> line);
   const std::vector<std::pair<std::string, uint16_t>>& getAnchors() const { return anchorData; }
   bool wasLowMemoryFallbackTriggered() const { return lowMemoryImageFallback; }
-  bool wasLowMemoryAbortTriggered() const { return lowMemoryAbort; }
+  bool wasLowMemoryAbortTriggered() const { return lowMemoryAbort && !paginationHookFailed; }
 #ifdef SIMULATOR
   static void setSimulatorFault(const ChapterHtmlSlimParserSimulatorFault fault) { simulatorFault_ = fault; }
 #endif

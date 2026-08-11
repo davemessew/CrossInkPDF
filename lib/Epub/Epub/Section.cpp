@@ -303,9 +303,13 @@ struct Section::PdfPageBuildContext {
   bool appendPage(const PdfLayoutPageRecord& page) {
     const PdfStatus status = writer.append(pageRange, page);
     if (!status) {
-      LOG_ERR("SCT", "Failed PDF semantic page %u (%u): range=%lu-%lu", writer.pageCount(),
-              static_cast<unsigned>(status.error), static_cast<unsigned long>(pageRange.firstGlobalWordOrdinal),
-              static_cast<unsigned long>(pageRange.lastGlobalWordOrdinal));
+      LOG_ERR("SCT", "Failed PDF semantic page %u (%u): range=%lu-%lu section=%lu-%lu cursor=%lu",
+              writer.pageCount(), static_cast<unsigned>(status.error),
+              static_cast<unsigned long>(pageRange.firstGlobalWordOrdinal),
+              static_cast<unsigned long>(pageRange.lastGlobalWordOrdinal),
+              static_cast<unsigned long>(sectionFirstWordOrdinal),
+              static_cast<unsigned long>(sectionFirstWordOrdinal + sectionWordCount),
+              static_cast<unsigned long>(nextGlobalWordOrdinal));
       return false;
     }
     pageRange = {};
@@ -317,7 +321,10 @@ struct Section::PdfPageBuildContext {
     const PdfStatus status = writer.finish();
     sectionBinding.token = writer.pairToken();
     if (!status || sectionBinding.token == 0 || !sidecarFile.sync()) {
-      LOG_ERR("SCT", "Failed to finalize PDF semantic sidecar (%u)", static_cast<unsigned>(status.error));
+      LOG_ERR("SCT", "Failed to finalize PDF semantic sidecar (%u) at word %llu (layout=%lu expected=%lu)",
+              static_cast<unsigned>(status.error), static_cast<unsigned long long>(status.offset),
+              static_cast<unsigned long>(nextGlobalWordOrdinal),
+              static_cast<unsigned long>(sectionFirstWordOrdinal + sectionWordCount));
       return false;
     }
     sidecarFile.close();
