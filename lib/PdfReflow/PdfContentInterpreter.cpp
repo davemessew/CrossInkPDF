@@ -16,7 +16,7 @@ bool tokenEquals(const PdfToken& token, const char (&expected)[Length]) {
   return token.length == Length - 1U && std::memcmp(token.bytes, expected, Length - 1U) == 0;
 }
 
-bool parseFixed(const PdfToken& token, int32_t* value) {
+bool parseWideFixed(const PdfToken& token, int64_t* value) {
   if (value == nullptr || (token.kind != PdfTokenKind::Integer && token.kind != PdfTokenKind::Real) ||
       token.length == 0) {
     return false;
@@ -30,7 +30,7 @@ bool parseFixed(const PdfToken& token, int32_t* value) {
   if (position == token.length) {
     return false;
   }
-  int64_t whole = 0;
+  uint64_t whole = 0;
   int64_t fraction = 0;
   int64_t scale = 1;
   bool decimal = false;
@@ -47,7 +47,8 @@ bool parseFixed(const PdfToken& token, int32_t* value) {
     digitSeen = true;
     const uint8_t digit = static_cast<uint8_t>(byte - '0');
     if (!decimal) {
-      if (whole > (static_cast<int64_t>(INT32_MAX) / 65536 + 1)) {
+      constexpr uint64_t MaxWhole = static_cast<uint64_t>(INT64_MAX) / 65536U;
+      if (whole > (MaxWhole - digit) / 10U) {
         return false;
       }
       whole = whole * 10 + digit;
@@ -59,12 +60,94 @@ bool parseFixed(const PdfToken& token, int32_t* value) {
   if (!digitSeen) {
     return false;
   }
-  int64_t raw = whole * 65536 + (fraction * 65536 + scale / 2) / scale;
-  if (negative) {
-    raw = -raw;
+  const int64_t fractionalRaw = (fraction * 65536 + scale / 2) / scale;
+  const uint64_t wholeRaw = whole * 65536U;
+  if (wholeRaw > static_cast<uint64_t>(INT64_MAX) - static_cast<uint64_t>(fractionalRaw)) {
+    return false;
+  }
+  const int64_t raw = static_cast<int64_t>(wholeRaw + static_cast<uint64_t>(fractionalRaw));
+  *value = negative ? -raw : raw;
+  return true;
+}
+
+bool parseFixed(const PdfToken& token, int32_t* value) {
+  int64_t raw = 0;
+  if (value == nullptr || !parseWideFixed(token, &raw)) {
+    return false;
   }
   *value = static_cast<int32_t>(std::clamp<int64_t>(raw, INT32_MIN, INT32_MAX));
   return true;
+}
+
+bool checkedAdd64(const int64_t left, const int64_t right, int64_t* const result) {
+  if (result == nullptr || (right > 0 && left > INT64_MAX - right) ||
+      (right < 0 && left < INT64_MIN - right)) {
+    return false;
+  }
+  *result = left + right;
+  return true;
+}
+
+bool checkedMultiply64(const int64_t left, const int64_t right, int64_t* const result) {
+  if (result == nullptr) {
+    return false;
+  }
+  if (left == 0 || right == 0) {
+    *result = 0;
+    return true;
+  }
+  if ((left == -1 && right == INT64_MIN) || (right == -1 && left == INT64_MIN)) {
+    return false;
+  }
+  if ((left > 0 && right > 0 && left > INT64_MAX / right) ||
+      (left > 0 && right < 0 && right < INT64_MIN / left) ||
+      (left < 0 && right > 0 && left < INT64_MIN / right) ||
+      (left < 0 && right < 0 && left < INT64_MAX / right)) {
+    return false;
+  }
+  *result = left * right;
+  return true;
+}
+
+bool multiplyFixedWide(const int32_t left, const int64_t right, int64_t* const result) {
+  const int64_t whole = right / 65536;
+  const int64_t remainder = right % 65536;
+  int64_t wholeProduct = 0;
+  if (!checkedMultiply64(left, whole, &wholeProduct)) {
+    return false;
+  }
+  const int64_t fractionalProduct = static_cast<int64_t>(left) * remainder;
+  const int64_t fractional = fractionalProduct >= 0
+                                 ? (fractionalProduct + 32768) / 65536
+                                 : -(((-fractionalProduct) + 32768) / 65536);
+  return checkedAdd64(wholeProduct, fractional, result);
+}
+
+bool concatenateWide(const PdfMatrix& current, const PdfContentOperand* const next, PdfMatrix* const result) {
+  if (next == nullptr || result == nullptr) {
+    return false;
+  }
+  const auto component = [&next](const int32_t leftFirst, const uint8_t rightFirst,
+                                 const int32_t leftSecond, const uint8_t rightSecond, const int32_t add,
+                                 PdfFixed16* const output) {
+    int64_t first = 0;
+    int64_t second = 0;
+    int64_t sum = 0;
+    if (output == nullptr || !multiplyFixedWide(leftFirst, next[rightFirst].wideNumber(), &first) ||
+        !multiplyFixedWide(leftSecond, next[rightSecond].wideNumber(), &second) ||
+        !checkedAdd64(first, second, &sum) || !checkedAdd64(sum, add, &sum) || sum < INT32_MIN || sum > INT32_MAX) {
+      return false;
+    }
+    output->raw = static_cast<int32_t>(sum);
+    return true;
+  };
+  PdfMatrix value;
+  return component(current.a.raw, 0, current.c.raw, 1, 0, &value.a) &&
+         component(current.b.raw, 0, current.d.raw, 1, 0, &value.b) &&
+         component(current.a.raw, 2, current.c.raw, 3, 0, &value.c) &&
+         component(current.b.raw, 2, current.d.raw, 3, 0, &value.d) &&
+         component(current.a.raw, 4, current.c.raw, 5, current.e.raw, &value.e) &&
+         component(current.b.raw, 4, current.d.raw, 5, current.f.raw, &value.f) && (*result = value, true);
 }
 
 bool fixedNegate(const PdfFixed16 value, PdfFixed16* result) {
@@ -454,9 +537,11 @@ PdfStatus PdfContentInterpreter::pushTextOperand(const PdfContentOperandKind kin
 PdfStatus PdfContentInterpreter::pushNumberOperand(const PdfToken& token) {
   PdfContentOperand operand;
   operand.kind = PdfContentOperandKind::Number;
-  if (!parseFixed(token, &operand.number)) {
+  int64_t raw = 0;
+  if (!parseWideFixed(token, &raw)) {
     return failStatus(PdfError::Malformed);
   }
+  operand.setNumber(raw);
   return pushOperand(operand);
 }
 
@@ -940,10 +1025,10 @@ PdfStatus PdfContentInterpreter::processGraphicsOperator(const PdfToken& token) 
     if (operandCount_ != 1 || workspace_.operands[0].kind != PdfContentOperandKind::Name) {
       return failStatus(PdfError::Malformed);
     }
-    // ExtGState can make content fully transparent or otherwise invisible.
-    // Until production resolves the resource, suppress paint semantics inside
-    // this graphics state rather than exposing content a PDF viewer may hide.
-    graphics_.visibilityRepresentable = false;
+    // ExtGState commonly carries ordinary transparency, overprint, or blend
+    // settings. Without resolving the dictionary, treating every gs operator
+    // as invisible drops valid text and text-bearing Form XObjects. Preserve
+    // text; explicit hidden text rendering modes remain handled separately.
     return PdfStatus::success();
   }
   if (tokenEquals(token, "g") || tokenEquals(token, "rg") || tokenEquals(token, "k")) {
@@ -975,11 +1060,8 @@ PdfStatus PdfContentInterpreter::processGraphicsOperator(const PdfToken& token) 
       return failStatus(PdfError::Malformed);
     }
   }
-  const PdfMatrix matrix{{workspace_.operands[0].number}, {workspace_.operands[1].number},
-                         {workspace_.operands[2].number}, {workspace_.operands[3].number},
-                         {workspace_.operands[4].number}, {workspace_.operands[5].number}};
   PdfMatrix combined;
-  if (!concatenate(graphics_.ctm, matrix, &combined)) {
+  if (!concatenateWide(graphics_.ctm, workspace_.operands, &combined)) {
     return failStatus(PdfError::LimitExceeded);
   }
   graphics_.ctm = combined;
@@ -1153,25 +1235,13 @@ PdfStatus PdfContentInterpreter::processMarkedContentOperator(const PdfToken& to
         actualText = &workspace_.operands[index];
       }
     }
-    const PdfContentOperand& tag = workspace_.operands[0];
-    const auto tagEquals = [this, &tag](const char* const expected) {
-      const size_t length = std::strlen(expected);
-      return tag.textLength == length &&
-             std::memcmp(workspace_.scratchText + tag.textOffset, expected, length) == 0;
-    };
-    return pushMarkedContent(actualText, tagEquals("Artifact") || tagEquals("OC"));
+    return pushMarkedContent(actualText, false);
   }
   if (tokenEquals(token, "BMC")) {
     if (operandCount_ != 1 || workspace_.operands[0].kind != PdfContentOperandKind::Name) {
       return failStatus(PdfError::Malformed);
     }
-    const PdfContentOperand& tag = workspace_.operands[0];
-    const auto tagEquals = [this, &tag](const char* const expected) {
-      const size_t length = std::strlen(expected);
-      return tag.textLength == length &&
-             std::memcmp(workspace_.scratchText + tag.textOffset, expected, length) == 0;
-    };
-    return pushMarkedContent(nullptr, tagEquals("Artifact") || tagEquals("OC"));
+    return pushMarkedContent(nullptr, false);
   }
   if (tokenEquals(token, "EMC")) {
     if (operandCount_ != 0 || markedDepth_ == 0) {
@@ -1505,6 +1575,7 @@ PdfStatus PdfContentInterpreter::emitActualText(MarkedContentFrame& frame) {
   PdfStatus status = overflow ? pageModel_->beginOverflowTextRun(run, &runIndex) : pageModel_->beginTextRun(run);
   if (!status.ok()) {
     if (overflow && status.error == PdfError::LimitExceeded) {
+      textCapacityReached_ = true;
       frame.runIndex = UINT16_MAX;
       return PdfStatus::success();
     }
@@ -1565,6 +1636,7 @@ PdfStatus PdfContentInterpreter::emitDecodedText(const uint8_t* const source, co
   PdfStatus status = overflow ? pageModel_->beginOverflowTextRun(run, &runIndex) : pageModel_->beginTextRun(run);
   if (!status.ok()) {
     if (overflow && status.error == PdfError::LimitExceeded) {
+      textCapacityReached_ = true;
       return advanceVisualText(source, length);
     }
     return status;

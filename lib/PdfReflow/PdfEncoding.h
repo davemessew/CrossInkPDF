@@ -16,6 +16,8 @@ enum class PdfBaseEncoding : uint8_t {
   AdvP4C4E74,
   AdvP4C4E59,
   AdvPSMP10,
+  Wingdings,
+  Wingdings3,
 };
 
 struct PdfEncodingDifference {

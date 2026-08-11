@@ -6,7 +6,7 @@
 
 constexpr uint32_t PDF_MIN_FREE_HEAP_BYTES = 64U * 1024U;
 constexpr uint32_t PDF_MIN_LARGEST_BLOCK_BYTES = 48U * 1024U;
-constexpr uint32_t PDF_MAX_OWNED_HEAP_BYTES = 80U * 1024U;
+constexpr uint32_t PDF_MAX_OWNED_HEAP_BYTES = 96U * 1024U;
 constexpr uint32_t PDF_MIN_STACK_MARGIN_BYTES = 1024U;
 constexpr size_t PDF_RESOURCE_SLOT_COUNT = 6;
 

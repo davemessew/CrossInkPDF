@@ -765,6 +765,37 @@ TEST(PdfContentInterpreterTest, UsesOnlyLargePositionalGapsAsMissingWordSpaces) 
   EXPECT_EQ(transcript(harness.model), "Acknow Notes");
 }
 
+TEST(PdfContentInterpreterTest, SeparatesCompactWordsInHiddenOcrText) {
+  std::array<uint8_t, 32> text{};
+  std::array<PdfTextRun, 2> runs{};
+  std::array<PdfImagePlacement, 1> images{};
+  PdfPageModel model({text.data(), text.size(), runs.data(), static_cast<uint16_t>(runs.size()), images.data(),
+                      static_cast<uint16_t>(images.size())});
+  ASSERT_TRUE(model.reset().ok());
+
+  const auto appendRun = [&](const char* value, const int32_t xMin, const int32_t xMax) {
+    PdfTextRun run{};
+    run.fontId = 1U;
+    run.flags = PdfTextHidden;
+    run.xMin = xMin;
+    run.xMax = xMax;
+    run.yMin = 20 * 65536;
+    run.yMax = 31 * 65536;
+    run.baselineX = xMin;
+    run.baseline = 20 * 65536;
+    run.baselineDx = xMax - xMin;
+    EXPECT_TRUE(model.beginTextRun(run).ok());
+    EXPECT_TRUE(model.appendText(reinterpret_cast<const uint8_t*>(value), std::strlen(value)).ok());
+    EXPECT_TRUE(model.finishTextRun().ok());
+  };
+
+  appendRun("a", 10 * 65536, 15 * 65536);
+  appendRun("sample", 17 * 65536 + 32768, 47 * 65536);
+
+  ASSERT_EQ(model.runCount(), 1U);
+  EXPECT_EQ(std::string(reinterpret_cast<const char*>(model.text()), model.textLength()), "a sample");
+}
+
 TEST(PdfContentInterpreterTest, ResolvesFormAndActualTextBeforeVisualGlyphs) {
   DefaultFont defaultFont;
   PdfTestByteSource page(

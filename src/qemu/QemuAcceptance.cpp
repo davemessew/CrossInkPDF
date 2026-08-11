@@ -23,6 +23,7 @@
 #include <PdfSavedItemsStore.h>
 #include <PdfSemanticWriter.h>
 #include <QemuHalControl.h>
+#include <QemuSemihost.h>
 #include <esp_rom_sys.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -31,6 +32,7 @@
 #include <array>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -76,8 +78,16 @@ constexpr char PDF_CACHE_GENERATION_TWO[] = "/qemu/pdf_cache_accept/gen_2";
 constexpr char PDF_CACHE_METADATA_PATH[] = "/qemu/pdf_cache_accept/gen_1/metadata.bin";
 constexpr char PDF_CACHE_PARTIAL_PATH[] = "/qemu/pdf_cache_accept/gen_2/partial.bin";
 constexpr char PDF_EXPECTED_TEXT[] = "Hello PDF";
+constexpr char HOST_PDF_PATH[] = "qemu_input.pdf";
+constexpr char HOST_PDF_XHTML_PATH[] = "qemu_output.xhtml";
+constexpr char SD_PDF_PATH[] = "/qemu/input.pdf";
 constexpr uint32_t EXPECTED_FRAME_BYTES = 48000;
 constexpr uint32_t EXPECTED_FRAME_CRC32 = 0x0F7C8C45;
+constexpr uint32_t kEsp32C3FirmwareRamCeilingBytes = 380U * 1024U;
+// The ESP32-C3 linker reserves part of SRAM for ROM/IDF use. The remaining
+// data, BSS, and heap region is just over 320 KiB on the physical device. Keep
+// QEMU on that same memory map instead of silently accepting a smaller model.
+constexpr uint32_t kEsp32C3MinimumFirmwareVisibleRamBytes = 320U * 1024U;
 constexpr uint32_t kMaximumPreparationSteps = 100000;
 constexpr uint16_t kMaximumCancellationSlices = 256;
 constexpr uint32_t kMaximumCancellationSliceMilliseconds = 8;
@@ -970,6 +980,47 @@ void fail(const char* component, const char* reason) {
   state.phase = AcceptancePhase::Failed;
 }
 
+extern "C" uint8_t _data_start;
+extern "C" uint8_t _data_end;
+extern "C" uint8_t _bss_start;
+extern "C" uint8_t _bss_end;
+extern "C" uint8_t _noinit_start;
+extern "C" uint8_t _noinit_end;
+
+bool checkRamBudget() {
+  const uintptr_t dataStart = reinterpret_cast<uintptr_t>(&_data_start);
+  const uintptr_t dataEnd = reinterpret_cast<uintptr_t>(&_data_end);
+  const uintptr_t bssStart = reinterpret_cast<uintptr_t>(&_bss_start);
+  const uintptr_t bssEnd = reinterpret_cast<uintptr_t>(&_bss_end);
+  const uintptr_t noinitStart = reinterpret_cast<uintptr_t>(&_noinit_start);
+  const uintptr_t noinitEnd = reinterpret_cast<uintptr_t>(&_noinit_end);
+  if (dataEnd < dataStart || bssEnd < bssStart || noinitEnd < noinitStart) {
+    fail("RAM", "linker_symbols");
+    return false;
+  }
+
+  const uint64_t staticBytes = static_cast<uint64_t>(dataEnd - dataStart) +
+                               static_cast<uint64_t>(bssEnd - bssStart) +
+                               static_cast<uint64_t>(noinitEnd - noinitStart);
+  const uint32_t heapBytes = ESP.getHeapSize();
+  const uint64_t firmwareVisibleBytes = staticBytes + heapBytes;
+  if (firmwareVisibleBytes < kEsp32C3MinimumFirmwareVisibleRamBytes) {
+    fail("RAM", "below_device_map");
+    return false;
+  }
+  if (firmwareVisibleBytes > kEsp32C3FirmwareRamCeilingBytes) {
+    fail("RAM", "ceiling");
+    return false;
+  }
+
+  esp_rom_printf("QEMU_RAM_PASS limit=%lu visible=%llu static=%llu heap=%lu framebuffer=%lu\n",
+                 static_cast<unsigned long>(kEsp32C3FirmwareRamCeilingBytes),
+                 static_cast<unsigned long long>(firmwareVisibleBytes),
+                 static_cast<unsigned long long>(staticBytes), static_cast<unsigned long>(heapBytes),
+                 static_cast<unsigned long>(EXPECTED_FRAME_BYTES));
+  return true;
+}
+
 uint32_t stackMarginBytes() {
   // ESP-IDF reports this high-water mark in bytes (unlike upstream FreeRTOS).
   return static_cast<uint32_t>(uxTaskGetStackHighWaterMark(nullptr));
@@ -1266,6 +1317,151 @@ bool preparePdf(const char* path, GfxRenderer& renderer, uint32_t* steps = nullp
                         framebufferUnchanged &&
                         changedHashRejected && changedPointerRejected;
   return accepted;
+}
+
+std::shared_ptr<PdfReflowDocument> loadPdfDocument(const char* path);
+
+bool hostPdfAvailable() {
+  const int input = QemuSemihost::openRead(HOST_PDF_PATH);
+  if (input < 0) {
+    return false;
+  }
+  return QemuSemihost::close(input);
+}
+
+bool importHostPdf(uint64_t* const importedBytes) {
+  if (importedBytes == nullptr) {
+    return false;
+  }
+  *importedBytes = 0;
+  const int input = QemuSemihost::openRead(HOST_PDF_PATH);
+  const int64_t inputLength = QemuSemihost::length(input);
+  if (input < 0 || inputLength < 0) {
+    QemuSemihost::close(input);
+    return false;
+  }
+  HalFile output = Storage.open(SD_PDF_PATH, static_cast<oflag_t>(O_WRONLY | O_CREAT | O_TRUNC));
+  if (!output) {
+    QemuSemihost::close(input);
+    return false;
+  }
+
+  static uint8_t copyBuffer[512];
+  bool success = true;
+  while (success && *importedBytes < static_cast<uint64_t>(inputLength)) {
+    const size_t requested = static_cast<size_t>(std::min<uint64_t>(sizeof(copyBuffer),
+                                                                    inputLength - *importedBytes));
+    const size_t read = QemuSemihost::read(input, copyBuffer, requested);
+    success = read == requested && output.write(copyBuffer, read) == read;
+    *importedBytes += read;
+  }
+  success = success && output.sync();
+  success = output.close() && success;
+  success = QemuSemihost::close(input) && success;
+  return success;
+}
+
+class SemihostPrint final : public Print {
+ public:
+  explicit SemihostPrint(const int handle) : handle_(handle) {}
+
+  size_t write(const uint8_t byte) override { return write(&byte, 1); }
+  size_t write(const uint8_t* const buffer, const size_t size) override {
+    return QemuSemihost::write(handle_, buffer, size);
+  }
+
+ private:
+  int handle_ = -1;
+};
+
+bool exportPdfXhtml(const PdfReflowDocument& document) {
+  const int output = QemuSemihost::openReadWrite(HOST_PDF_XHTML_PATH);
+  if (output < 0 || !QemuSemihost::seek(output, 0)) {
+    QemuSemihost::close(output);
+    return false;
+  }
+  SemihostPrint sink(output);
+  bool success = true;
+  for (int section = 0; success && section < document.getSectionCount(); ++section) {
+    success = document.streamSection(section, sink, 512);
+  }
+  return QemuSemihost::close(output) && success;
+}
+
+bool runExternalPdf(GfxRenderer& renderer) {
+  uint64_t inputBytes = 0;
+  if (!checkRamBudget() || !importHostPdf(&inputBytes)) {
+    esp_rom_printf("QEMU_PDF_SD_FAIL stage=import bytes=%llu\n", static_cast<unsigned long long>(inputBytes));
+    return false;
+  }
+
+  const uint32_t startedAt = millis();
+  const PdfAcceptanceFramebufferSnapshot framebufferBefore = qemuFramebufferSnapshot(renderer);
+  TracedPdfCacheIo traced;
+  auto preparation = makeUniqueNoThrow<PdfPreparation>();
+  if (!preparation) {
+    esp_rom_printf("QEMU_PDF_SD_FAIL stage=allocate bytes=%llu\n", static_cast<unsigned long long>(inputBytes));
+    return false;
+  }
+
+  PdfStatus status = beginTrackedPdfPreparation(*preparation, preparationConfig(traced, SD_PDF_PATH, renderer));
+  PdfStepResult result = PdfStepResult::failure(status);
+  uint32_t steps = 0;
+  uint8_t lastPhase = static_cast<uint8_t>(preparation->phase());
+  uint8_t lastProgress = preparation->progressPercent();
+  if (status) {
+    do {
+      lastPhase = static_cast<uint8_t>(preparation->phase());
+      lastProgress = preparation->progressPercent();
+      result = stepTrackedPdfPreparation(*preparation);
+      ++steps;
+      sampleRuntime();
+      yieldAfterPdfPreparationStep(result);
+    } while (result.yielded());
+  }
+
+  const uint8_t progress = preparation->progressPercent();
+  const uint8_t phase = static_cast<uint8_t>(preparation->phase());
+  const uint32_t preparedWords = preparation->totalWords();
+  const size_t peakWorkspace = preparation->resourcePeakBytes();
+  const PdfStatus terminalStatus = result.status;
+  preparation.reset();
+
+  const PdfAcceptanceFramebufferSnapshot framebufferAfter = qemuFramebufferSnapshot(renderer);
+  const bool framebufferUnchanged = framebufferBefore.pointer == framebufferAfter.pointer &&
+                                    framebufferBefore.bytes == framebufferAfter.bytes &&
+                                    framebufferBefore.hash == framebufferAfter.hash;
+  if (!result.complete() || !framebufferUnchanged || QemuHalControl::storageReaderCount() != 0) {
+    esp_rom_printf(
+        "QEMU_PDF_SD_FAIL stage=prepare error=%u offset=%llu progress=%u phase=%u last_progress=%u last_phase=%u "
+        "steps=%lu readers=%lu\n",
+        static_cast<unsigned>(terminalStatus.error), static_cast<unsigned long long>(terminalStatus.offset),
+        static_cast<unsigned>(progress), static_cast<unsigned>(phase), static_cast<unsigned>(lastProgress),
+        static_cast<unsigned>(lastPhase), static_cast<unsigned long>(steps),
+        static_cast<unsigned long>(QemuHalControl::storageReaderCount()));
+    return false;
+  }
+
+  const std::shared_ptr<PdfReflowDocument> document = loadPdfDocument(SD_PDF_PATH);
+  if (!document) {
+    esp_rom_printf("QEMU_PDF_SD_FAIL stage=load progress=%u phase=%u steps=%lu\n", static_cast<unsigned>(progress),
+                   static_cast<unsigned>(phase), static_cast<unsigned long>(steps));
+    return false;
+  }
+  (void)exportPdfXhtml(*document);
+  const uint32_t elapsed = millis() - startedAt;
+  esp_rom_printf(
+      "QEMU_PDF_SD_RESULT bytes=%llu elapsed_ms=%lu steps=%lu sections=%d words=%lu prepared_words=%lu "
+      "workspace_peak=%lu card=%llu reader_peak=%lu optional_content_skipped=%u\n",
+      static_cast<unsigned long long>(inputBytes), static_cast<unsigned long>(elapsed),
+      static_cast<unsigned long>(steps), document->getSectionCount(),
+      static_cast<unsigned long>(document->getTotalWordCount()), static_cast<unsigned long>(preparedWords),
+      static_cast<unsigned long>(peakWorkspace), static_cast<unsigned long long>(QemuHalControl::storageCapacity()),
+      static_cast<unsigned long>(QemuHalControl::storageReaderPeak()),
+      document->optionalContentWasSkipped() ? 1U : 0U);
+  emitRuntimeSample();
+  esp_rom_printf("QEMU_PDF_SD_PASS\n");
+  return true;
 }
 
 std::shared_ptr<PdfReflowDocument> loadPdfDocument(const char* path) {
@@ -3549,8 +3745,13 @@ void qemuAcceptanceBegin(MappedInputManager& input, GfxRenderer& renderer) {
   sampleRuntime();
   pinReaderSettings(renderer);
 
+  if (hostPdfAvailable()) {
+    state.phase = runExternalPdf(renderer) ? AcceptancePhase::Finished : AcceptancePhase::Failed;
+    return;
+  }
+
   if (!resumedBoot) {
-    if (!checkStorage() || !checkPdfCore() || !checkPdfCache() || !checkRawPdfFixtures() ||
+    if (!checkRamBudget() || !checkStorage() || !checkPdfCore() || !checkPdfCache() || !checkRawPdfFixtures() ||
         !checkPdfCancellation(renderer, &persistent)) {
       return;
     }

@@ -1,3 +1,16 @@
+## [v1.5.0.9] - 2026-08-11
+
+### Changed
+
+- The PDF warning no longer calls unreadable elements optional.
+- The constrained ESP32-C3 emulator now uses a FAT SD-card image, one-reader enforcement, and the device's 380 KB RAM ceiling.
+
+### Fixed
+
+- Text inside Form XObjects, artifact containers, and PDF layer groups is preserved when it is visible instead of being discarded with page graphics.
+- Large PDF coordinate transforms no longer clip readable text from pages that use wide fixed-point values.
+- Wingdings symbols, headings, paragraph joins, drop caps, tables, and mixed-font lines keep cleaner Unicode text and reading order with the reader's configured font.
+
 ## [v1.5.0.8] - 2026-08-11
 
 ### Fixed

@@ -133,7 +133,7 @@ class PdfPreparationPaintGate {
 
 class PdfPreparation {
  public:
-  PdfPreparation() = default;
+  PdfPreparation();
   ~PdfPreparation();
 
   PdfPreparation(const PdfPreparation&) = delete;
@@ -176,6 +176,7 @@ class PdfPreparation {
   struct SectionRepairRuntime;
   struct PreparedContentRuntime;
   struct PreparedContentOverlay;
+  struct XObjectWorkspace;
 
   struct PreparedSectionRecord {
     PdfMetadataSection section{};
@@ -252,9 +253,13 @@ class PdfPreparation {
     ResourceOwner,
     XObjectDictionary,
     ImageObject,
+    FormResources,
+    FormFontDictionary,
+    FormXObjectDictionary,
     ColorSpace,
     IndexedBaseColorSpace,
     IndexedPalette,
+    DecodeParameters,
     AuxiliaryImageObject,
     FontDictionary,
     FontObject,
@@ -792,6 +797,7 @@ class PdfPreparation {
   PdfStatus allocateImagePalette(uint8_t** palette);
   PdfStatus collectImageCandidates(uint16_t dictionaryIndex, uint8_t ownerScopeIndex);
   PdfStatus collectFontCandidates(uint16_t dictionaryIndex, uint8_t scopeIndex);
+  PdfStatus collectFormResources(uint16_t dictionaryIndex);
   PdfStatus beginNextImageObject();
   PdfStatus beginNextFontObject();
   uint8_t* preparedFontName(uint8_t index);
@@ -939,6 +945,7 @@ class PdfPreparation {
   std::unique_ptr<uint8_t[]> pageText_;
   std::unique_ptr<uint8_t[]> runRecords_;
   std::unique_ptr<uint8_t[]> operandScratch_;
+  std::unique_ptr<XObjectWorkspace> xObjectWorkspace_;
 
   PdfCacheHandle sourceHandle_{};
   PdfCacheFileMetadata sourceMetadata_{};
@@ -1071,11 +1078,15 @@ class PdfPreparation {
   uint8_t imageCandidateCount_ = 0;
   uint8_t xObjectCandidateCount_ = 0;
   uint8_t formScopeCount_ = 0;
+  uint8_t contentResourceScopeCount_ = 0;
+  uint8_t contentFontCount_ = 0;
   uint8_t imageDescriptorCandidateIndex_ = UINT8_MAX;
   uint8_t currentPageImageStart_ = 0;
   uint8_t currentPageImageEnd_ = 0;
   uint8_t sectionEmitImageIndex_ = 0;
   uint8_t imageResolveIndex_ = 0;
+  PdfObjectReference pendingFormXObjectDictionaryReference_{};
+  PdfObjectReference pendingImageDecodeParametersReference_{};
   uint8_t imagePaletteCount_ = 0;
   uint8_t rasterDecodeIndex_ = 0;
   int8_t currentPageImageCandidate_ = -1;

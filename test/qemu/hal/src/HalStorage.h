@@ -1,8 +1,9 @@
 #pragma once
 
-#include <FS.h>
 #include <Print.h>
 #include <common/FsApiConstants.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 #include <cstdint>
 #include <memory>
@@ -34,6 +35,8 @@ class HalStorage {
   HalStorage();
   bool begin();
   bool ready() const;
+  uint64_t totalBytes() const;
+  uint64_t usedBytes();
   std::vector<String> listFiles(const char* path = "/", int maxFiles = 200);
   String readFile(const char* path);
   bool readFileToStream(const char* path, Print& out, size_t chunkSize = 256);
@@ -42,8 +45,8 @@ class HalStorage {
   bool ensureDirectoryExists(const char* path);
   void installDateTimeCallback(const uint8_t* utcOffsetQuarterHoursBiased);
 
-  HalFile open(const char* path, const oflag_t oflag = O_RDONLY);
-  bool mkdir(const char* path, const bool pFlag = true);
+  HalFile open(const char* path, oflag_t oflag = O_RDONLY);
+  bool mkdir(const char* path, bool pFlag = true);
   bool exists(const char* path);
   bool remove(const char* path);
   bool rename(const char* oldPath, const char* newPath);
@@ -57,8 +60,6 @@ class HalStorage {
   bool openFileForWrite(const char* moduleName, const String& path, HalFile& file);
   bool removeDir(const char* path);
   HalStorageCapacityInfo capacityInfo();
-  uint64_t totalBytes();
-  uint64_t usedBytes();
 
   static HalStorage& getInstance() { return instance; }
 
@@ -67,6 +68,7 @@ class HalStorage {
  private:
   static HalStorage instance;
   bool initialized = false;
+  SemaphoreHandle_t storageMutex = nullptr;
 };
 
 #define Storage HalStorage::getInstance()
@@ -74,11 +76,8 @@ class HalStorage {
 class HalFile : public Print {
   friend class HalStorage;
   class Impl;
+  std::unique_ptr<Impl> impl;
   explicit HalFile(std::unique_ptr<Impl> impl);
-  explicit HalFile(fs::File file, bool writable = false);
-  mutable fs::File file;
-  bool countedOpen = false;
-  bool writable = false;
 
  public:
   HalFile();
@@ -110,9 +109,6 @@ class HalFile : public Print {
   void rewindDirectory();
   bool close();
   HalFile openNextFile();
-  // Reuses `entry` across a directory scan. Do not close `entry` between
-  // calls; this method closes the previous child before opening the next one.
-  // The caller must close `entry` once after Entry, End, or Error.
   HalDirectoryNextStatus openNextFile(HalFile& entry);
   bool isOpen() const;
   bool modificationTime(uint64_t* packedFatDateTime);

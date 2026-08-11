@@ -85,8 +85,9 @@ static_assert(sizeof(PdfPreparedContentStreams) <= PdfLimits::PageRunBytes,
               "prepared content stream state must fit the fixed page-run phase overlay");
 
 struct PdfPreparedFontResource {
-  const uint8_t* name = nullptr;
+  uint32_t nameHash = 0;
   PdfFontMap* font = nullptr;
+  uint16_t nameTag = 0;
   uint8_t nameLength = 0;
 };
 
@@ -115,8 +116,8 @@ struct PdfPreparedContentResourceWorkspace {
 
 class PdfPreparedContentResources {
  public:
-  static constexpr uint8_t MaxFonts = 32;
-  static constexpr uint8_t MaxXObjects = 16;
+  static constexpr uint8_t MaxFonts = 40;
+  static constexpr uint8_t MaxXObjects = 96;
   static constexpr uint8_t MaxNameBytes = 32;
 
   explicit PdfPreparedContentResources(PdfPreparedContentResourceWorkspace workspace)

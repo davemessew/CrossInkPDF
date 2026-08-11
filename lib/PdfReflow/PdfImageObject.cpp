@@ -524,8 +524,9 @@ PdfStatus decodeParametersAt(const PdfObjectArena& arena, const uint16_t decodeP
 }
 
 PdfStatus parseDecodeParameters(const PdfObjectArena& arena, const uint16_t dictionaryIndex,
-                                const uint16_t filterValueIndex, const uint16_t filterCount,
-                                PdfImageObjectDescriptor* const descriptor) {
+                                 const uint16_t filterValueIndex, const uint16_t filterCount,
+                                 PdfObjectReference* const decodeParametersReference,
+                                 PdfImageObjectDescriptor* const descriptor) {
   uint16_t decodeParametersIndex = PDF_INVALID_INDEX;
   findValue(arena, dictionaryIndex, "DecodeParms", "DP", &decodeParametersIndex);
   if (filterCount == 0) {
@@ -533,6 +534,18 @@ PdfStatus parseDecodeParameters(const PdfObjectArena& arena, const uint16_t dict
                                                       : PdfStatus::failure(PdfError::Malformed, decodeParametersIndex);
   }
   if (decodeParametersIndex == PDF_INVALID_INDEX) {
+    return PdfStatus::success();
+  }
+  if (decodeParametersIndex >= arena.valueCount) {
+    return PdfStatus::failure(PdfError::Malformed, decodeParametersIndex);
+  }
+  const PdfValue& decodeParameters = arena.values[decodeParametersIndex];
+  if (decodeParameters.kind == PdfValueKind::Reference) {
+    if (decodeParametersReference == nullptr) {
+      return omit(descriptor, PdfError::UnsupportedEncoding, decodeParametersIndex);
+    }
+    *decodeParametersReference = referenceOf(decodeParameters);
+    addUnresolved(descriptor, PdfImageUnresolved::DecodeParameters);
     return PdfStatus::success();
   }
 
@@ -724,6 +737,91 @@ PdfStatus pdfApplyResolvedImageColorSpace(PdfImageObjectDescriptor* const descri
   return PdfStatus::success();
 }
 
+PdfStatus pdfApplyResolvedImageDecodeParameters(const PdfObjectArena& arena, const uint16_t valueIndex,
+                                                 PdfImageObjectDescriptor* const descriptor) {
+  if (descriptor == nullptr || valueIndex >= arena.valueCount ||
+      !pdfImageHasUnresolved(descriptor->unresolved, PdfImageUnresolved::DecodeParameters)) {
+    return PdfStatus::failure(PdfError::InvalidArgument, valueIndex);
+  }
+
+  const uint16_t filterCount = descriptor->stream.terminalCodec == PdfImageTerminalCodec::DctJpeg
+                                   ? 1U
+                                   : descriptor->stream.decoderFilterCount;
+  if (filterCount == 0U) {
+    return PdfStatus::failure(PdfError::Malformed, valueIndex);
+  }
+
+  for (uint16_t ordinal = 0; ordinal < filterCount; ++ordinal) {
+    uint16_t parameterIndex = valueIndex;
+    const PdfValue& root = arena.values[valueIndex];
+    if (root.kind == PdfValueKind::Dictionary) {
+      if (filterCount != 1U) {
+        return PdfStatus::failure(PdfError::Malformed, valueIndex);
+      }
+    } else if (root.kind == PdfValueKind::Array) {
+      if (root.count != filterCount || !pdfArrayAt(arena, valueIndex, ordinal, &parameterIndex) ||
+          parameterIndex >= arena.valueCount) {
+        return PdfStatus::failure(PdfError::Malformed, valueIndex);
+      }
+    } else {
+      return PdfStatus::failure(PdfError::Malformed, valueIndex);
+    }
+
+    const PdfValueKind parameterKind = arena.values[parameterIndex].kind;
+    if (parameterKind == PdfValueKind::Null) {
+      continue;
+    }
+    if (parameterKind != PdfValueKind::Dictionary) {
+      return PdfStatus::failure(PdfError::Malformed, parameterIndex);
+    }
+
+    const bool dct = descriptor->stream.terminalCodec == PdfImageTerminalCodec::DctJpeg;
+    const bool flate = !dct && descriptor->stream.decoderFilters[ordinal] == PdfStreamFilter::Flate;
+    if (dct) {
+      return omit(descriptor, PdfError::UnsupportedEncoding, parameterIndex);
+    }
+    if (!flate) {
+      continue;
+    }
+
+    int64_t predictor = 1;
+    if (!readInteger(arena, parameterIndex, "Predictor", 1, &predictor) || predictor < 1 || predictor > 255) {
+      return PdfStatus::failure(PdfError::Malformed, parameterIndex);
+    }
+    if (predictor != 1 && predictor != 2 && (predictor < 10 || predictor > 15)) {
+      return omit(descriptor, PdfError::UnsupportedEncoding, static_cast<uint64_t>(predictor));
+    }
+    descriptor->parameters.predictor = static_cast<uint8_t>(predictor);
+    if (predictor == 1) {
+      continue;
+    }
+
+    int64_t colors = 1;
+    int64_t bits = 8;
+    int64_t columns = 1;
+    if (!readInteger(arena, parameterIndex, "Colors", 1, &colors) ||
+        !readInteger(arena, parameterIndex, "BitsPerComponent", 8, &bits) ||
+        !readInteger(arena, parameterIndex, "Columns", 1, &columns) || colors <= 0 || bits <= 0 || columns <= 0 ||
+        colors > UINT8_MAX || bits > UINT8_MAX || columns > UINT32_MAX) {
+      return PdfStatus::failure(PdfError::Malformed, parameterIndex);
+    }
+    descriptor->predictorColors = static_cast<uint8_t>(colors);
+    descriptor->predictorBitsPerComponent = static_cast<uint8_t>(bits);
+    descriptor->predictorColumns = static_cast<uint32_t>(columns);
+    if (!colorSpaceUnresolved(*descriptor) &&
+        (colors != sampleComponents(descriptor->parameters.colorSpace) ||
+         bits != descriptor->parameters.bitsPerComponent || columns != descriptor->parameters.width)) {
+      return omit(descriptor, PdfError::UnsupportedEncoding, parameterIndex);
+    }
+  }
+
+  descriptor->unresolved = static_cast<PdfImageUnresolved>(
+      static_cast<uint8_t>(descriptor->unresolved) & ~static_cast<uint8_t>(PdfImageUnresolved::DecodeParameters));
+  descriptor->disposition = descriptor->unresolved == PdfImageUnresolved::None ? PdfImageDisposition::Ready
+                                                                                : PdfImageDisposition::NeedsResolution;
+  return PdfStatus::success();
+}
+
 PdfStatus pdfApplyResolvedImageAuxiliary(PdfImageObjectDescriptor* const base,
                                          const PdfImageObjectDescriptor& auxiliary, const PdfImageAuxiliaryKind kind) {
   if (base == nullptr ||
@@ -854,7 +952,8 @@ PdfStatus pdfParseImageObject(const PdfObjectArena& arena, const PdfImageObjectP
   if (!status.ok()) {
     return status;
   }
-  status = parseDecodeParameters(arena, input.dictionaryIndex, filterValueIndex, filterCount, descriptor);
+  status = parseDecodeParameters(arena, input.dictionaryIndex, filterValueIndex, filterCount,
+                                 input.decodeParametersReference, descriptor);
   if (!status.ok()) {
     return status;
   }

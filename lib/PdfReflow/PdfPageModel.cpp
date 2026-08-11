@@ -49,9 +49,12 @@ PdfStatus PdfPageModel::beginOverflowTextRun(const PdfTextRun& run, uint16_t* co
     return PdfStatus::failure(PdfError::InvalidArgument, runCount_);
   }
   PdfTextRun& previous = workspace_.runs[runCount_ - 1U];
-  if (((previous.flags ^ run.flags) & (PdfTextHidden | PdfTextLight | PdfTextBold)) != 0 ||
+  if (((previous.flags ^ run.flags) & PdfTextHidden) != 0 ||
       static_cast<uint64_t>(previous.textOffset) + previous.textLength != textLength_) {
     return PdfStatus::failure(PdfError::LimitExceeded, runCount_);
+  }
+  if (((previous.flags ^ run.flags) & (PdfTextLight | PdfTextBold)) != 0U) {
+    previous.flags &= static_cast<uint16_t>(~(PdfTextLight | PdfTextBold));
   }
   previous.flags |= static_cast<uint16_t>(run.flags & PdfTextActualText);
   const bool tightContinuation = (run.flags & PdfTextArrayTightContinuation) != 0;
@@ -239,8 +242,7 @@ PdfStatus PdfPageModel::finishTextRun() {
                                        workspace_.text[current.textOffset + 1U] == 0x80U &&
                                         (workspace_.text[current.textOffset + 2U] == 0x90U ||
                                          workspace_.text[current.textOffset + 2U] == 0x91U);
-    if ((previous.fontId == current.fontId || overlappingInlineFragment) &&
-        (previous.flags & mergeRelevantFlags) == (current.flags & mergeRelevantFlags) &&
+    if ((previous.flags & mergeRelevantFlags) == (current.flags & mergeRelevantFlags) &&
         (weightDifference == 0U || overlappingInlineFragment) &&
         (!wideAbsolutePosition || isolatedSoftHyphen || isolatedUnicodeHyphen) &&
         (absoluteBaselineDifference <= 65536 || overlappingInlineFragment) &&
@@ -248,7 +250,12 @@ PdfStatus PdfPageModel::finishTextRun() {
         previousTextEnd == current.textOffset && current.textLength <= UINT32_MAX - previous.textLength &&
         currentEndX - previous.baselineX >= INT32_MIN && currentEndX - previous.baselineX <= INT32_MAX &&
         currentEndY - previous.baseline >= INT32_MIN && currentEndY - previous.baseline <= INT32_MAX) {
-      const int64_t wordGap = std::max<int64_t>(32768, lineHeight / 3);
+      // Invisible OCR layers commonly use tightly positioned word fragments
+      // whose visual gaps are smaller than normal typeset spaces. They still
+      // need word separation when the PDF omitted literal space glyphs.
+      const bool hiddenTextLayer = (previous.flags & PdfTextHidden) != 0U &&
+                                   (current.flags & PdfTextHidden) != 0U;
+      const int64_t wordGap = std::max<int64_t>(32768, lineHeight / (hiddenTextLayer ? 6 : 3));
       const uint8_t currentFirst = workspace_.text[current.textOffset];
       const bool currentJoinsPunctuation = currentFirst == '-' || currentFirst == ',' || currentFirst == '.' ||
                                            currentFirst == ';' || currentFirst == ':' || currentFirst == '!' ||

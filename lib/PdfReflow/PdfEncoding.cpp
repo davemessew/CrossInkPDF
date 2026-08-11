@@ -294,6 +294,14 @@ bool baseEncodingScalar(const PdfBaseEncoding base, const uint8_t code, uint32_t
       return true;
     }
   }
+  if (base == PdfBaseEncoding::Wingdings && code == 'o') {
+    *scalar = 0x2610;
+    return true;
+  }
+  if (base == PdfBaseEncoding::Wingdings3 && code == 0xD3U) {
+    *scalar = 0x2191;
+    return true;
+  }
   if (base == PdfBaseEncoding::Standard && lookupEncodingPair(STANDARD_SPECIAL, code, scalar)) {
     return true;
   }
@@ -361,6 +369,9 @@ bool baseEncodingScalar(const PdfBaseEncoding base, const uint8_t code, uint32_t
       return lookupEncodingPair(STANDARD_SPECIAL, code, scalar);
     case PdfBaseEncoding::AdvPSMP10:
       return lookupEncodingPair(STANDARD_SPECIAL, code, scalar);
+    case PdfBaseEncoding::Wingdings:
+    case PdfBaseEncoding::Wingdings3:
+      return false;
   }
   return false;
 }

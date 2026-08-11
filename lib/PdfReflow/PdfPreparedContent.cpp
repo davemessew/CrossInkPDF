@@ -314,6 +314,20 @@ PdfStatus PdfPreparedContentResources::reset() {
   return PdfStatus::success();
 }
 
+namespace {
+uint32_t preparedFontNameHash(const uint8_t* const name, const size_t length) {
+  uint32_t hash = 2166136261U;
+  for (size_t index = 0; index < length; ++index) {
+    hash = (hash ^ name[index]) * 16777619U;
+  }
+  return hash;
+}
+
+uint16_t preparedFontNameTag(const uint8_t* const name, const size_t length) {
+  return static_cast<uint16_t>(name[0]) << 8U | name[length - 1U];
+}
+}  // namespace
+
 PdfStatus PdfPreparedContentResources::addFont(const uint8_t* const name, const size_t length, PdfFontMap* const font) {
   if (!ready_ || name == nullptr || length == 0 || font == nullptr) {
     return PdfStatus::failure(PdfError::InvalidArgument);
@@ -328,9 +342,11 @@ PdfStatus PdfPreparedContentResources::addFont(const uint8_t* const name, const 
   }
   uint32_t materializedGlyphCount = 0;
   bool fontAlreadyRegistered = false;
+  const uint32_t nameHash = preparedFontNameHash(name, length);
+  const uint16_t nameTag = preparedFontNameTag(name, length);
   for (uint8_t index = 0; index < fontCount_; ++index) {
     const PdfPreparedFontResource& existing = fonts_[index];
-    if (existing.nameLength == length && std::memcmp(existing.name, name, length) == 0) {
+    if (existing.nameLength == length && existing.nameHash == nameHash && existing.nameTag == nameTag) {
       return PdfStatus::failure(PdfError::Malformed, index);
     }
     fontAlreadyRegistered = fontAlreadyRegistered || existing.font == font;
@@ -352,7 +368,8 @@ PdfStatus PdfPreparedContentResources::addFont(const uint8_t* const name, const 
     return PdfStatus::failure(PdfError::LimitExceeded, materializedGlyphCount);
   }
   PdfPreparedFontResource& resource = fonts_[fontCount_++];
-  resource.name = name;
+  resource.nameHash = nameHash;
+  resource.nameTag = nameTag;
   resource.nameLength = static_cast<uint8_t>(length);
   resource.font = font;
   return PdfStatus::success();
@@ -392,9 +409,11 @@ PdfStatus PdfPreparedContentResources::resolveFont(void* const context, const ui
   if (!resources.ready_) {
     return PdfStatus::failure(PdfError::InvalidArgument);
   }
+  const uint32_t nameHash = preparedFontNameHash(name, length);
+  const uint16_t nameTag = preparedFontNameTag(name, length);
   for (uint8_t index = 0; index < resources.fontCount_; ++index) {
     const PdfPreparedFontResource& resource = resources.fonts_[index];
-    if (resource.nameLength == length && std::memcmp(resource.name, name, length) == 0) {
+    if (resource.nameLength == length && resource.nameHash == nameHash && resource.nameTag == nameTag) {
       *font = resource.font;
       return PdfStatus::success();
     }

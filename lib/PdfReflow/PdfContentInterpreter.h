@@ -1,5 +1,6 @@
 #pragma once
 
+#include <climits>
 #include <cstddef>
 #include <cstdint>
 
@@ -23,6 +24,22 @@ struct PdfContentOperand {
   uint16_t itemCount = 0;
   PdfContentOperandKind kind = PdfContentOperandKind::Number;
   uint8_t reserved = 0;
+
+  void setNumber(const int64_t raw) {
+    number = raw < INT32_MIN ? INT32_MIN : (raw > INT32_MAX ? INT32_MAX : static_cast<int32_t>(raw));
+    const uint64_t bits = static_cast<uint64_t>(raw);
+    textOffset = static_cast<uint16_t>(bits);
+    textLength = static_cast<uint16_t>(bits >> 16U);
+    firstItem = static_cast<uint16_t>(bits >> 32U);
+    itemCount = static_cast<uint16_t>(bits >> 48U);
+  }
+
+  int64_t wideNumber() const {
+    const uint64_t bits = static_cast<uint64_t>(textOffset) | (static_cast<uint64_t>(textLength) << 16U) |
+                          (static_cast<uint64_t>(firstItem) << 32U) | (static_cast<uint64_t>(itemCount) << 48U);
+    return bits <= static_cast<uint64_t>(INT64_MAX) ? static_cast<int64_t>(bits)
+                                                    : -1 - static_cast<int64_t>(~bits);
+  }
 };
 
 struct PdfContentArrayItem {
@@ -94,6 +111,7 @@ class PdfContentInterpreter {
 
   uint32_t operatorCount() const { return operatorCount_; }
   uint8_t maximumFormDepth() const { return maximumFormDepth_; }
+  bool textCapacityReached() const { return textCapacityReached_; }
 
  private:
   struct GraphicsState {

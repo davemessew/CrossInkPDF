@@ -1,10 +1,13 @@
 #include "PdfPreparation.h"
 
 #include <algorithm>
-#include <cstdio>
 #include <cstring>
 #include <new>
 #include <type_traits>
+
+#ifdef CROSSINK_QEMU
+#include <esp_rom_sys.h>
+#endif
 
 #include "Memory.h"
 #include "PdfCacheFormat.h"
@@ -72,6 +75,10 @@ constexpr uint32_t kMaximumResolvedLinkRecords =
     PdfLimits::MaxPages * static_cast<uint32_t>(UINT16_MAX);
 constexpr size_t kPreparationImageNameBytes = 32;
 constexpr uint8_t kPreparationPageImageLimit = 8;
+// Resource dictionaries often list fonts that no painted text uses. Keep the
+// lightweight bindings until observation has reduced them to the 32 Unicode
+// maps that fit the fixed glyph workspace.
+constexpr uint8_t kPreparationFontBindingLimit = 40;
 constexpr uint8_t kPreparationImageRepetitionLimit = 16;
 constexpr uint8_t kPreparationPaletteSlots = 2;
 constexpr size_t kPreparationPaletteBytes = PDF_IMAGE_BUILD_PALETTE_BYTES;
@@ -97,19 +104,34 @@ constexpr uint8_t kReadingOrderHistogramBins = 64;
 constexpr int16_t kUnknownTextOrigin = INT16_MIN;
 constexpr int16_t kMappedLinkOrigin = INT16_MIN + 1;
 constexpr int16_t kFullWidthTableOrigin = INT16_MIN + 2;
-constexpr uint16_t kExtractedTextOffsetMask = 0x1fffU;
-constexpr uint16_t kExtractedExplicitWhitespace = 0x2000U;
-constexpr uint16_t kExtractedHeading = 0x8000U;
-constexpr uint16_t kExtractedDropCap = 0x4000U;
-constexpr uint16_t kExtractedTextLengthMask = 0x3fffU;
-constexpr uint16_t kExtractedJoinsPrevious = 0x4000U;
-constexpr uint16_t kExtractedNewBlock = 0x8000U;
+constexpr uint16_t kExtractedExplicitWhitespace = 1U << 0U;
+constexpr uint16_t kExtractedHeading = 1U << 1U;
+constexpr uint16_t kExtractedDropCap = 1U << 2U;
+constexpr uint16_t kExtractedJoinsPrevious = 1U << 3U;
+constexpr uint16_t kExtractedNewBlock = 1U << 4U;
 constexpr uint16_t kExtractedLineXMask = 0x3fffU;
 constexpr uint16_t kExtractedLightText = 0x4000U;
 constexpr uint16_t kExtractedTableCell = 0x8000U;
-static_assert(PdfLimits::PageTextBytes <= kExtractedTextOffsetMask + 1U);
-static_assert(PdfLimits::PageTextBytes <= kExtractedTextLengthMask);
+static_assert(PdfLimits::PageTextBytes <= UINT16_MAX);
+#ifdef CROSSINK_QEMU
+uint32_t qemuTracePdfOmission(const uint32_t line) {
+  static uint32_t seenLines[64]{};
+  static uint8_t seenCount = 0;
+  for (uint8_t index = 0; index < seenCount; ++index) {
+    if (seenLines[index] == line) {
+      return PDF_CACHE_WARNING_OPTIONAL_CONTENT_OMITTED;
+    }
+  }
+  if (seenCount < static_cast<uint8_t>(sizeof(seenLines) / sizeof(seenLines[0]))) {
+    seenLines[seenCount++] = line;
+    esp_rom_printf("QEMU_PDF_OMISSION line=%lu\n", static_cast<unsigned long>(line));
+  }
+  return PDF_CACHE_WARNING_OPTIONAL_CONTENT_OMITTED;
+}
+#define kWarningOptionalImageOmitted qemuTracePdfOmission(__LINE__)
+#else
 constexpr uint32_t kWarningOptionalImageOmitted = PDF_CACHE_WARNING_OPTIONAL_CONTENT_OMITTED;
+#endif
 constexpr size_t kRasterDecoderWorkspaceOffset = 4096;
 constexpr uint32_t kPreparedContentStoreClosed = 0;
 constexpr uint32_t kPreparedContentStoreWriter = 1;
@@ -259,6 +281,24 @@ bool extractedTextStartsNumberedHeading(const uint8_t* const text, const size_t 
   return true;
 }
 
+bool extractedTextIsChapterHeading(const uint8_t* const text, size_t length) {
+  if (text == nullptr) {
+    return false;
+  }
+  while (length != 0U && (text[length - 1U] == ' ' || text[length - 1U] == '\t')) {
+    --length;
+  }
+  if (length <= 8U || std::memcmp(text, "CHAPTER ", 8U) != 0) {
+    return false;
+  }
+  for (size_t character = 8U; character < length; ++character) {
+    if (text[character] < '0' || text[character] > '9') {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool extractedTextEndsOpenSentence(const uint8_t* const text, size_t length) {
   if (text == nullptr) {
     return false;
@@ -326,6 +366,8 @@ PdfBaseEncoding preparedFontBaseEncoding(const PdfObjectArena& arena, const uint
       constexpr char kAdvP4[] = "AdvP4C4E74";
       constexpr char kAdvP4Diacritics[] = "AdvP4C4E59";
       constexpr char kAdvPsMath[] = "AdvPSMP10";
+      constexpr char kWingdings[] = "Wingdings-Regular";
+      constexpr char kWingdings3[] = "Wingdings3";
       if (baseFont.textLength >= sizeof(kTeXMath) - 1U &&
           std::memcmp(name + baseFont.textLength - (sizeof(kTeXMath) - 1U), kTeXMath,
                       sizeof(kTeXMath) - 1U) == 0) {
@@ -345,6 +387,16 @@ PdfBaseEncoding preparedFontBaseEncoding(const PdfObjectArena& arena, const uint
                  std::memcmp(name + baseFont.textLength - (sizeof(kAdvPsMath) - 1U), kAdvPsMath,
                              sizeof(kAdvPsMath) - 1U) == 0) {
         result = PdfBaseEncoding::AdvPSMP10;
+        customBaseEncoding = true;
+      } else if (baseFont.textLength >= sizeof(kWingdings) - 1U &&
+                 std::memcmp(name + baseFont.textLength - (sizeof(kWingdings) - 1U), kWingdings,
+                             sizeof(kWingdings) - 1U) == 0) {
+        result = PdfBaseEncoding::Wingdings;
+        customBaseEncoding = true;
+      } else if (baseFont.textLength >= sizeof(kWingdings3) - 1U &&
+                 std::memcmp(name + baseFont.textLength - (sizeof(kWingdings3) - 1U), kWingdings3,
+                             sizeof(kWingdings3) - 1U) == 0) {
+        result = PdfBaseEncoding::Wingdings3;
         customBaseEncoding = true;
       }
     }
@@ -370,6 +422,26 @@ PdfBaseEncoding preparedFontBaseEncoding(const PdfObjectArena& arena, const uint
     (void)preparedFontBaseEncodingFromName(arena, baseIndex, &result);
   }
   return result;
+}
+
+void normalizePreparedSymbolUnicode(const PdfBaseEncoding baseEncoding, PdfUtf8Value* const value) {
+  if (value == nullptr) {
+    return;
+  }
+  uint32_t scalar = 0;
+  if (baseEncoding == PdfBaseEncoding::Wingdings && value->length == 4U && value->bytes[0] == 'o' &&
+      value->bytes[1] == 0xEFU && value->bytes[2] == 0x81U && value->bytes[3] == 0xAFU) {
+    scalar = 0x2610U;
+  } else if (baseEncoding == PdfBaseEncoding::Wingdings3 && value->length == 3U && value->bytes[0] == 0xEFU &&
+             value->bytes[1] == 0x83U && value->bytes[2] == 0x93U) {
+    scalar = 0x2191U;
+  } else {
+    return;
+  }
+  size_t length = 0;
+  if (pdfAppendUtf8Scalar(scalar, value->bytes, sizeof(value->bytes), &length)) {
+    value->length = static_cast<uint8_t>(length);
+  }
 }
 
 enum class PreparedFontStage : uint8_t {
@@ -585,7 +657,10 @@ struct PreparedXObjectCandidate {
 
 struct PreparedXObjectWorkspace {
   PdfPreparation* owner = nullptr;
-  PreparedXObjectCandidate candidates[PdfPreparedContentResources::MaxXObjects]{};
+  // Kept inside the phase union to preserve its fixed layout. Active page
+  // candidates live in XObjectWorkspace so pages with many Forms do not lose
+  // text after the first sixteen resource names.
+  PreparedXObjectCandidate legacyCandidates[16]{};
 };
 
 struct NavigationDiscoveryScratch {
@@ -1739,6 +1814,37 @@ void stableSortPreparationXrefRun(PdfXrefEntry* const entries, PdfXrefEntry* con
 
 }  // namespace
 
+struct PdfPreparation::XObjectWorkspace {
+  static constexpr size_t ScopeCount = PdfPreparedContentResources::MaxXObjects + 1U;
+  static constexpr size_t RecordBytes =
+      PdfPreparedContentResources::MaxXObjects * sizeof(PdfPreparedXObjectResource);
+  static constexpr size_t ScopeOffset = alignOverlay(RecordBytes, alignof(PdfPreparedContentResources));
+  static constexpr size_t ScopeBytes = ScopeCount * sizeof(PdfPreparedContentResources);
+  static constexpr size_t FontCountOffset = ScopeOffset + ScopeBytes;
+  static constexpr size_t XObjectCountOffset = FontCountOffset + ScopeCount;
+  static constexpr size_t ParentOffset = XObjectCountOffset + ScopeCount;
+  static constexpr size_t FontOffsetOffset = ParentOffset + ScopeCount;
+  static constexpr size_t XObjectOffsetOffset = FontOffsetOffset + ScopeCount;
+  static constexpr size_t ResourceBytes = XObjectOffsetOffset + ScopeCount;
+
+  PdfPreparation* owner = nullptr;
+  PreparedXObjectCandidate candidates[PdfPreparedContentResources::MaxXObjects]{};
+  alignas(PdfPreparedContentResources) uint8_t resourceStorage[ResourceBytes]{};
+
+  PdfPreparedXObjectResource* records() {
+    return reinterpret_cast<PdfPreparedXObjectResource*>(resourceStorage);
+  }
+
+  PdfPreparedContentResources* scopes() {
+    return reinterpret_cast<PdfPreparedContentResources*>(resourceStorage + ScopeOffset);
+  }
+  uint8_t* scopeFontCounts() { return resourceStorage + FontCountOffset; }
+  uint8_t* scopeXObjectCounts() { return resourceStorage + XObjectCountOffset; }
+  uint8_t* scopeParents() { return resourceStorage + ParentOffset; }
+  uint8_t* scopeFontOffsets() { return resourceStorage + FontOffsetOffset; }
+  uint8_t* scopeXObjectOffsets() { return resourceStorage + XObjectOffsetOffset; }
+};
+
 struct PdfPreparation::RasterBatchWorkspace {
   PdfMaskSpoolCloseRuntime maskClose{};
   PdfMaskSpoolReadRuntime maskRead{};
@@ -1767,6 +1873,7 @@ struct PdfPreparation::ExtractedBlockRecord {
   int16_t x = kUnknownTextOrigin;
   int16_t y = kUnknownTextOrigin;
   uint16_t lineX = UINT16_MAX;
+  uint16_t flags = 0;
 };
 
 struct PdfPreparation::ReadingOrderWorkspace {
@@ -1846,8 +1953,10 @@ struct PdfPreparation::NavigationWorkspace {
   PdfImageObjectDescriptor baseDescriptorScratch{};
   uint16_t linkCount = 0;
 
-  auto& xObjectCandidates() { return phaseScratch.xObjects.candidates; }
-  const auto& xObjectCandidates() const { return phaseScratch.xObjects.candidates; }
+  auto& xObjectCandidates() { return phaseScratch.xObjects.owner->xObjectWorkspace_->candidates; }
+  const auto& xObjectCandidates() const {
+    return phaseScratch.xObjects.owner->xObjectWorkspace_->candidates;
+  }
 };
 
 struct ObservedJournalSpillRuntime {
@@ -1861,7 +1970,7 @@ struct PdfPreparation::PreparedContentRuntime {
   PdfPageInfo page{};
   PdfByteRange ranges[PdfLimits::MaxContentStreamsPerPage]{};
   PdfEncodedContentStream streams[PdfLimits::MaxContentStreamsPerPage]{};
-  PreparedFontDescriptor fonts[PdfPreparedContentResources::MaxFonts]{};
+  PreparedFontDescriptor fonts[kPreparationFontBindingLimit]{};
   PdfObjectReference fontDictionaryReference{};
   alignas(PdfPreparedContentStreams) uint8_t preparedStorage[sizeof(PdfPreparedContentStreams)]{};
   uint16_t materializedGlyphCount = 0;
@@ -1892,7 +2001,7 @@ struct PdfPreparation::PreparedContentRuntime {
 };
 
 constexpr size_t kPreparedFontNamePoolBytes =
-    PdfPreparedContentResources::MaxFonts * PdfPreparedContentResources::MaxNameBytes;
+    kPreparationFontBindingLimit * PdfPreparedContentResources::MaxNameBytes;
 
 struct PreparedFontRuntime {
   PdfByteRange decoded[PdfPreparedContentResources::MaxFonts]{};
@@ -2076,6 +2185,7 @@ PdfStatus rejectObservedCMapRecord(void*, const uint32_t ordinal, const void*, c
 }
 
 struct PdfPreparation::PreparedContentOverlay {
+  static constexpr size_t InlineXObjectRecordCapacity = 16U;
   static constexpr size_t DictionaryNavigation = 0;
   static constexpr size_t DictionaryInterpreter =
       alignOverlay(DictionaryNavigation + sizeof(NavigationWorkspace), alignof(PdfContentInterpreter));
@@ -2091,8 +2201,10 @@ struct PdfPreparation::PreparedContentOverlay {
       alignOverlay(DictionaryImages + 8U * sizeof(PdfImagePlacement), alignof(PdfPageModel));
   static constexpr size_t DictionaryResourceScopes =
       alignOverlay(DictionaryPage + sizeof(PdfPageModel), alignof(PdfPreparedContentResources));
-  static constexpr size_t DictionaryEnd =
-      DictionaryResourceScopes + (PdfLimits::MaxFormDepth + 1U) * sizeof(PdfPreparedContentResources);
+  // Per-Form resource scopes live in the checked XObjectWorkspace. Keeping
+  // them here would reserve RAM for both the old 16-Form table and the active
+  // table while also crowding out Unicode font maps.
+  static constexpr size_t DictionaryEnd = DictionaryResourceScopes;
 
   static constexpr size_t DecoderRanges = 0;
   static constexpr size_t DecoderSources =
@@ -2105,7 +2217,7 @@ struct PdfPreparation::PreparedContentOverlay {
       alignOverlay(DecoderFonts + PdfPreparedContentResources::MaxFonts * sizeof(PdfPreparedFontResource),
                    alignof(PdfPreparedXObjectResource));
   static constexpr size_t DecoderResources =
-      alignOverlay(DecoderXObjects + PdfPreparedContentResources::MaxXObjects * sizeof(PdfPreparedXObjectResource),
+      alignOverlay(DecoderXObjects + InlineXObjectRecordCapacity * sizeof(PdfPreparedXObjectResource),
                    alignof(PdfPreparedContentResources));
   static constexpr size_t DecoderStore =
       alignOverlay(DecoderResources + sizeof(PdfPreparedContentResources), alignof(PreparedContentStoreOverlay));
@@ -2139,10 +2251,8 @@ struct PdfPreparation::PreparedContentOverlay {
   static constexpr size_t NativeDecoderOutputBytes =
       std::max(PdfLimits::DecoderOutputBytes, DecoderEnd);
 #if UINTPTR_MAX == UINT32_MAX
-  static_assert(PdfPreparedContentResources::MaxFonts *
-                        (sizeof(PdfPreparedFontResource) +
-                         PdfPreparedContentResources::MaxNameBytes) +
-                    PdfPreparedContentResources::MaxXObjects *
+  static_assert(PdfPreparedContentResources::MaxFonts * sizeof(PdfPreparedFontResource) +
+                    InlineXObjectRecordCapacity *
                         sizeof(PdfPreparedXObjectResource) <=
                 PdfLimits::DecoderOutputBytes);
 #endif
@@ -2164,8 +2274,7 @@ struct PdfPreparation::PreparedContentOverlay {
       FontNavigationPageWindowHeaderBytes +
       FontNavigationPageWindowCapacity * sizeof(PdfPageInfo);
   static constexpr size_t FontNavigationSnapshotMaxBytes =
-      sizeof(PreparedXObjectWorkspace::candidates) + FontNavigationBoundaryBytes +
-      FontNavigationPageWindowMaxBytes +
+      FontNavigationBoundaryBytes + FontNavigationPageWindowMaxBytes +
       sizeof(NavigationWorkspace::pageLabels) + sizeof(NavigationWorkspace::links) +
       sizeof(NavigationWorkspace::imageCacheEntries) + sizeof(NavigationWorkspace::imageCandidates) +
       sizeof(NavigationWorkspace::imageCache) + sizeof(NavigationWorkspace::linkCount);
@@ -2199,7 +2308,7 @@ struct PdfPreparation::PreparedContentOverlay {
 };
 
 uint8_t* PdfPreparation::preparedFontName(const uint8_t index) {
-  if (!runRecords_ || index >= PdfPreparedContentResources::MaxFonts) {
+  if (!runRecords_ || index >= kPreparationFontBindingLimit) {
     return nullptr;
   }
   return runRecords_.get() + PreparedContentOverlay::NativePageRunBytes -
@@ -2238,6 +2347,8 @@ bool PdfPreparationPaintGate::shouldPaint(const uint8_t progressPercent, const u
   ++intermediatePaintCount_;
   return true;
 }
+
+PdfPreparation::PdfPreparation() = default;
 
 PdfPreparation::~PdfPreparation() {
   abortXrefSpools();
@@ -2396,11 +2507,15 @@ PdfStatus PdfPreparation::begin(const PdfPreparationConfig& config) {
   imageCandidateCount_ = 0;
   xObjectCandidateCount_ = 0;
   formScopeCount_ = 0;
+  contentResourceScopeCount_ = 0;
+  contentFontCount_ = 0;
   imageDescriptorCandidateIndex_ = UINT8_MAX;
   currentPageImageStart_ = 0;
   currentPageImageEnd_ = 0;
   sectionEmitImageIndex_ = 0;
   imageResolveIndex_ = 0;
+  pendingFormXObjectDictionaryReference_ = {};
+  pendingImageDecodeParametersReference_ = {};
   imagePaletteCount_ = 0;
   rasterDecodeIndex_ = 0;
   currentPageImageCandidate_ = -1;
@@ -3616,9 +3731,10 @@ PdfStatus PdfPreparation::readPreparedFormContent(void* const context, const uin
     return PdfStatus::failure(PdfError::InvalidOffset, offset);
   }
   const auto* const candidateBytes = reinterpret_cast<const uint8_t*>(&candidate);
-  const size_t candidateOffset = offsetof(PreparedXObjectWorkspace, candidates) +
+  const size_t candidateOffset = offsetof(PdfPreparation::XObjectWorkspace, candidates) +
                                  static_cast<size_t>(candidate.workspaceIndex) * sizeof(PreparedXObjectCandidate);
-  const auto* const workspace = reinterpret_cast<const PreparedXObjectWorkspace*>(candidateBytes - candidateOffset);
+  const auto* const workspace =
+      reinterpret_cast<const PdfPreparation::XObjectWorkspace*>(candidateBytes - candidateOffset);
   if (workspace->owner == nullptr || &workspace->candidates[candidate.workspaceIndex] != &candidate) {
     return PdfStatus::failure(PdfError::InvalidArgument, offset);
   }
@@ -4041,7 +4157,11 @@ PdfStatus PdfPreparation::observePreparedFontRecord(void* const context, const u
       runtime->currentFont >= PdfPreparedContentResources::MaxFonts) {
     return PdfStatus::failure(PdfError::InvalidArgument, ordinal);
   }
-  auto* const workspace = reinterpret_cast<ObservedGlyphWorkspace*>(self.dictionary_.get());
+  if (!self.xObjectWorkspace_) {
+    return PdfStatus::failure(PdfError::InsufficientMemory, ordinal);
+  }
+  auto* const workspace =
+      reinterpret_cast<ObservedGlyphWorkspace*>(self.xObjectWorkspace_->resourceStorage);
   const auto& candidate = *static_cast<const PdfCMapRecord*>(record);
   auto* const records = observedMatchedRecords(workspace);
   uint16_t tupleIndex = workspace->fontHead[runtime->currentFont];
@@ -4601,6 +4721,9 @@ void PdfPreparation::releaseWorkspaces() {
   }
   navigation_ = nullptr;
   placement_ = nullptr;
+  xObjectWorkspace_.reset();
+  contentResourceScopeCount_ = 0;
+  contentFontCount_ = 0;
   abortActiveImageRuntime();
   if (maskSpool_ != nullptr) {
     maskSpool_->abort();
@@ -4736,10 +4859,11 @@ PdfStatus PdfPreparation::initializeParserStorage() {
   static_assert(std::is_trivially_copyable_v<NavigationWorkspace>,
                 "navigation workspace must remain safe for bounded bytewise suspend/restore");
   static_assert(sizeof(NavigationWorkspace) <= PdfLimits::UzlibDictionaryBytes);
-  // Exactly 256 ten-byte records fit the decoder-output tail reserved for
-  // extracted blocks; lineX prevents fragments from one text line being
-  // mistaken for separate columns without growing the fixed workspace.
-  static_assert(sizeof(ExtractedBlockRecord) <= 10);
+  // Image-palette scratch is phase-dead before text extraction. The complete
+  // decoder-output workspace therefore holds 256 semantic records.
+  static_assert(sizeof(ExtractedBlockRecord) == 12);
+  static_assert(PdfLimits::PageRunCount * sizeof(ExtractedBlockRecord) <=
+                PdfLimits::DecoderOutputBytes);
   static_assert(PreparedContentOverlay::DictionaryEnd <= PreparedContentOverlay::NativeDictionaryBytes);
   static_assert(PreparedContentOverlay::DecoderEnd <= PreparedContentOverlay::NativeDecoderOutputBytes);
   static_assert(PreparedContentOverlay::OperandEnd <= PdfLimits::OperandOrderHistogramBytes);
@@ -4767,15 +4891,15 @@ PdfStatus PdfPreparation::initializeParserStorage() {
   static_assert(sizeof(PreparedContentStoreOverlay) == 24);
   static_assert(sizeof(PdfContentOperand) == 16);
   static_assert(sizeof(PdfContentArrayItem) == 12);
-  static_assert(PreparedContentOverlay::FontNavigationSnapshotMaxBytes == 9670);
-  static_assert(PreparedContentOverlay::ContentRuntimeEnd == 5744);
-  static_assert(PreparedContentOverlay::ContentRunTailCapacity == 5520);
-  static_assert(PreparedContentOverlay::ContentPageTailCapacity == 2102);
-  static_assert(PreparedContentOverlay::ContentWriteBufferMinCapacity == 6090);
-  static_assert(PreparedContentOverlay::FontRuntimeEnd == 10064);
-  static_assert(PreparedContentOverlay::FontRunTailCapacity == 1200);
+  static_assert(PreparedContentOverlay::FontNavigationSnapshotMaxBytes == 8006);
+  static_assert(PreparedContentOverlay::ContentRuntimeEnd == 6000);
+  static_assert(PreparedContentOverlay::ContentRunTailCapacity == 5008);
+  static_assert(PreparedContentOverlay::ContentPageTailCapacity == 950);
+  static_assert(PreparedContentOverlay::ContentWriteBufferMinCapacity == 19530);
+  static_assert(PreparedContentOverlay::FontRuntimeEnd == 10640);
+  static_assert(PreparedContentOverlay::FontRunTailCapacity == 368);
   static_assert(PreparedContentOverlay::FontOperandCapacity == 2048);
-  static_assert(PreparedContentOverlay::FontPageTailCapacity == 6422);
+  static_assert(PreparedContentOverlay::FontPageTailCapacity == 5590);
 
   constexpr size_t dictionaryNavigationOffset = PreparedContentOverlay::DictionaryNavigation;
   constexpr size_t dictionaryInterpreterOffset = PreparedContentOverlay::DictionaryInterpreter;
@@ -4788,11 +4912,11 @@ PdfStatus PdfPreparation::initializeParserStorage() {
   static_assert(dictionaryNavigationOffset == 0);
   static_assert(dictionaryInterpreterOffset == 15192);
   static_assert(dictionaryFontsOffset == 20832);
-  static_assert(dictionaryGlyphsOffset == 23776);
-  static_assert(dictionaryImagesOffset == 30944);
-  static_assert(dictionaryPageOffset == 31264);
-  static_assert(dictionaryResourceScopesOffset == 31308);
-  static_assert(dictionaryEnd == 32260);
+  static_assert(dictionaryGlyphsOffset == 24512);
+  static_assert(dictionaryImagesOffset == 31680);
+  static_assert(dictionaryPageOffset == 32000);
+  static_assert(dictionaryResourceScopesOffset == 32044);
+  static_assert(dictionaryEnd == 32044);
   static_assert(dictionaryEnd <= PdfLimits::UzlibDictionaryBytes);
 
   constexpr size_t decoderRangesOffset = PreparedContentOverlay::DecoderRanges;
@@ -4805,10 +4929,10 @@ PdfStatus PdfPreparation::initializeParserStorage() {
   static_assert(decoderRangesOffset == 0);
   static_assert(decoderSourcesOffset == 640);
   static_assert(decoderFontsOffset == 1024);
-  static_assert(decoderXObjectsOffset == 1408);
-  static_assert(decoderResourcesOffset == 3584);
-  static_assert(decoderStoreOffset == 3640);
-  static_assert(decoderEnd == 3664);
+  static_assert(decoderXObjectsOffset == 1504);
+  static_assert(decoderResourcesOffset == 3680);
+  static_assert(decoderStoreOffset == 3736);
+  static_assert(decoderEnd == 3760);
   static_assert(decoderEnd <= PdfLimits::DecoderOutputBytes);
 
   constexpr size_t operandOperandsOffset = PreparedContentOverlay::OperandOperands;
@@ -4827,6 +4951,13 @@ PdfStatus PdfPreparation::initializeParserStorage() {
   if (!dictionary_ || !pageText_ || !runRecords_ || !decoderOutput_) {
     return PdfStatus::failure(PdfError::InsufficientMemory);
   }
+  if (!xObjectWorkspace_) {
+    xObjectWorkspace_ = makeUniqueNoThrow<XObjectWorkspace>();
+    if (!xObjectWorkspace_) {
+      return PdfStatus::failure(PdfError::InsufficientMemory, sizeof(XObjectWorkspace));
+    }
+  }
+  xObjectWorkspace_->owner = this;
   navigation_ = new (dictionary_.get()) NavigationWorkspace{};
   PdfStatus status = configureDefaultParserArena();
   if (!status) {
@@ -11490,7 +11621,8 @@ PdfStatus PdfPreparation::readXmpMetadata() {
 }
 
 PdfStatus PdfPreparation::beginCurrentPageImages() {
-  if (!resolver_.has_value() || navigation_ == nullptr || currentPageIndex_ >= pageCount_ || !runRecords_) {
+  if (!resolver_.has_value() || navigation_ == nullptr || currentPageIndex_ >= pageCount_ || !runRecords_ ||
+      !xObjectWorkspace_) {
     return PdfStatus::failure(PdfError::InvalidArgument, currentPageIndex_);
   }
   imageResolveTask_ = ImageResolveTask::None;
@@ -11506,12 +11638,14 @@ PdfStatus PdfPreparation::beginCurrentPageImages() {
   contentAppendActive_ = false;
   new (&navigation_->phaseScratch.xObjects) PreparedXObjectWorkspace{};
   navigation_->phaseScratch.xObjects.owner = this;
+  xObjectWorkspace_->owner = this;
   for (auto& candidate : navigation_->imageCandidates) {
     resetInPlace(candidate);
   }
   currentPageImageStart_ = 0;
   currentPageImageEnd_ = 0;
   imageResolveIndex_ = 0;
+  pendingFormXObjectDictionaryReference_ = {};
   imagePaletteCount_ = 0;
   currentPageImageCandidate_ = -1;
   lastContentNameLength_ = 0;
@@ -11603,11 +11737,16 @@ PdfStatus PdfPreparation::collectImageCandidates(const uint16_t dictionaryIndex,
     if (value.kind == PdfValueKind::Reference && entry.keyLength != 0 &&
         entry.keyLength < kPreparationImageNameBytes) {
       if (xObjectCandidateCount_ >= PdfPreparedContentResources::MaxXObjects) {
-        warningFlags_ |= kWarningOptionalImageOmitted;
-        entryIndex = entry.next;
-        continue;
+#ifdef CROSSINK_QEMU
+        esp_rom_printf("QEMU_PDF_XOBJECT_CAP page=%lu owner_scope=%u object=%lu name=%.*s\n",
+                       static_cast<unsigned long>(currentPageIndex_), static_cast<unsigned>(ownerScopeIndex),
+                       static_cast<unsigned long>(value.objectNumber), static_cast<int>(entry.keyLength),
+                       reinterpret_cast<const char*>(arena_.text + entry.keyOffset));
+#endif
+        return PdfStatus::failure(PdfError::InsufficientMemory, xObjectCandidateCount_);
       }
       PreparedXObjectCandidate& candidate = navigation_->xObjectCandidates()[xObjectCandidateCount_++];
+      candidate = {};
       candidate.workspaceIndex = static_cast<uint8_t>(xObjectCandidateCount_ - 1U);
       candidate.reference = {value.objectNumber, value.generation};
       candidate.nameLength = static_cast<uint8_t>(entry.keyLength);
@@ -11699,10 +11838,14 @@ PdfStatus PdfPreparation::collectFontCandidates(const uint16_t dictionaryIndex, 
         entryIndex = entry.next;
         continue;
       }
-      if (runtime->fontCount >= PdfPreparedContentResources::MaxFonts) {
-        warningFlags_ |= kWarningOptionalImageOmitted;
-        entryIndex = entry.next;
-        continue;
+      if (runtime->fontCount >= kPreparationFontBindingLimit) {
+#ifdef CROSSINK_QEMU
+        esp_rom_printf("QEMU_PDF_FONT_CAP page=%lu scope=%u object=%lu name=%.*s\n",
+                       static_cast<unsigned long>(currentPageIndex_), static_cast<unsigned>(scopeIndex),
+                       static_cast<unsigned long>(value.objectNumber), static_cast<int>(entry.keyLength),
+                       reinterpret_cast<const char*>(arena_.text + entry.keyOffset));
+#endif
+        return PdfStatus::failure(PdfError::InsufficientMemory, runtime->fontCount);
       }
       const uint8_t descriptorIndex = runtime->fontCount++;
       PreparedFontDescriptor& descriptor = runtime->fonts[descriptorIndex];
@@ -11719,6 +11862,83 @@ PdfStatus PdfPreparation::collectFontCandidates(const uint16_t dictionaryIndex, 
   }
   runtime->fontResolveIndex = 0;
   return PdfStatus::success();
+}
+
+PdfStatus PdfPreparation::collectFormResources(const uint16_t dictionaryIndex) {
+  if (!resolver_.has_value() || navigation_ == nullptr || imageResolveIndex_ >= xObjectCandidateCount_ ||
+      dictionaryIndex >= arena_.valueCount || arena_.values[dictionaryIndex].kind != PdfValueKind::Dictionary) {
+#ifdef CROSSINK_QEMU
+    esp_rom_printf("QEMU_PDF_FORM_RESOURCE_FAIL part=resources index=%u count=%u dictionary=%u values=%u kind=%u\n",
+                   static_cast<unsigned>(imageResolveIndex_), static_cast<unsigned>(xObjectCandidateCount_),
+                   static_cast<unsigned>(dictionaryIndex), static_cast<unsigned>(arena_.valueCount),
+                   dictionaryIndex < arena_.valueCount ? static_cast<unsigned>(arena_.values[dictionaryIndex].kind)
+                                                       : 255U);
+#endif
+    return PdfStatus::failure(PdfError::Malformed, dictionaryIndex);
+  }
+  PreparedXObjectCandidate& form = navigation_->xObjectCandidates()[imageResolveIndex_];
+  if (form.kind != PreparedXObjectKind::Form || form.scopeIndex == 0) {
+#ifdef CROSSINK_QEMU
+    esp_rom_printf("QEMU_PDF_FORM_RESOURCE_INVALID index=%u count=%u kind=%u scope=%u dictionary=%u\n",
+                   static_cast<unsigned>(imageResolveIndex_), static_cast<unsigned>(xObjectCandidateCount_),
+                   static_cast<unsigned>(form.kind), static_cast<unsigned>(form.scopeIndex),
+                   static_cast<unsigned>(dictionaryIndex));
+#endif
+    return PdfStatus::failure(PdfError::Malformed, imageResolveIndex_);
+  }
+
+  pendingFormXObjectDictionaryReference_ = {};
+  uint16_t xObjectIndex = PDF_INVALID_INDEX;
+  if (pdfDictionaryFind(arena_, dictionaryIndex, "XObject", &xObjectIndex)) {
+    if (xObjectIndex >= arena_.valueCount) {
+      return PdfStatus::failure(PdfError::Malformed, xObjectIndex);
+    }
+    const PdfValue& xObjects = arena_.values[xObjectIndex];
+    if (xObjects.kind == PdfValueKind::Dictionary) {
+      const PdfStatus status = collectImageCandidates(xObjectIndex, form.scopeIndex);
+      if (!status) {
+#ifdef CROSSINK_QEMU
+        esp_rom_printf("QEMU_PDF_FORM_RESOURCE_FAIL part=xobjects error=%u offset=%llu\n",
+                       static_cast<unsigned>(status.error), static_cast<unsigned long long>(status.offset));
+#endif
+        return status;
+      }
+    } else if (xObjects.kind == PdfValueKind::Reference) {
+      pendingFormXObjectDictionaryReference_ = {xObjects.objectNumber, xObjects.generation};
+    } else {
+      return PdfStatus::failure(PdfError::Malformed, xObjectIndex);
+    }
+  }
+
+  uint16_t fontIndex = PDF_INVALID_INDEX;
+  if (pdfDictionaryFind(arena_, dictionaryIndex, "Font", &fontIndex)) {
+    if (fontIndex >= arena_.valueCount) {
+      return PdfStatus::failure(PdfError::Malformed, fontIndex);
+    }
+    const PdfValue& fonts = arena_.values[fontIndex];
+    if (fonts.kind == PdfValueKind::Dictionary) {
+      const PdfStatus status = collectFontCandidates(fontIndex, form.scopeIndex);
+      if (!status) {
+#ifdef CROSSINK_QEMU
+        esp_rom_printf("QEMU_PDF_FORM_RESOURCE_FAIL part=fonts error=%u offset=%llu\n",
+                       static_cast<unsigned>(status.error), static_cast<unsigned long long>(status.offset));
+#endif
+        return status;
+      }
+    } else if (fonts.kind == PdfValueKind::Reference) {
+      imageResolveTask_ = ImageResolveTask::FormFontDictionary;
+      return resolver_->begin({fonts.objectNumber, fonts.generation});
+    } else {
+      return PdfStatus::failure(PdfError::Malformed, fontIndex);
+    }
+  }
+
+  if (pendingFormXObjectDictionaryReference_.objectNumber != 0) {
+    imageResolveTask_ = ImageResolveTask::FormXObjectDictionary;
+    return resolver_->begin(pendingFormXObjectDictionaryReference_);
+  }
+  ++imageResolveIndex_;
+  return beginNextImageObject();
 }
 
 PdfStatus PdfPreparation::beginNextFontObject() {
@@ -11931,9 +12151,25 @@ PdfStatus PdfPreparation::beginNextImageObject() {
       }
     }
     if (owner == nullptr) {
+#ifdef CROSSINK_QEMU
+      esp_rom_printf("QEMU_PDF_FORM_OWNER_MISSING index=%u count=%u scope=%u candidate_kind=%u\n",
+                     static_cast<unsigned>(imageResolveIndex_), static_cast<unsigned>(xObjectCandidateCount_),
+                     static_cast<unsigned>(ancestorScope), static_cast<unsigned>(candidate.kind));
+      for (uint8_t index = 0; index < imageResolveIndex_; ++index) {
+        const PreparedXObjectCandidate& prior = navigation_->xObjectCandidates()[index];
+        esp_rom_printf("QEMU_PDF_FORM_PRIOR index=%u kind=%u owner=%u scope=%u\n", static_cast<unsigned>(index),
+                       static_cast<unsigned>(prior.kind), static_cast<unsigned>(prior.ownerScopeIndex),
+                       static_cast<unsigned>(prior.scopeIndex));
+      }
+#endif
       return PdfStatus::failure(PdfError::Malformed, ancestorScope);
     }
     if (owner->reference == candidate.reference) {
+#ifdef CROSSINK_QEMU
+      esp_rom_printf("QEMU_PDF_FORM_CYCLE index=%u owner_scope=%u object=%lu\n",
+                     static_cast<unsigned>(imageResolveIndex_), static_cast<unsigned>(ancestorScope),
+                     static_cast<unsigned long>(candidate.reference.objectNumber));
+#endif
       return PdfStatus::failure(PdfError::Malformed, candidate.reference.objectNumber);
     }
     ancestorScope = owner->ownerScopeIndex;
@@ -11990,6 +12226,45 @@ PdfStatus PdfPreparation::finishImageResolution() {
     case ImageResolveTask::XObjectDictionary: {
       PdfStatus status = collectImageCandidates(resolved.rootIndex, 0);
       return status ? beginNextImageObject() : status;
+    }
+    case ImageResolveTask::FormResources:
+      return collectFormResources(resolved.rootIndex);
+    case ImageResolveTask::FormFontDictionary: {
+      if (imageResolveIndex_ >= xObjectCandidateCount_) {
+        return PdfStatus::failure(PdfError::Malformed, imageResolveIndex_);
+      }
+      const uint8_t scopeIndex = navigation_->xObjectCandidates()[imageResolveIndex_].scopeIndex;
+      PdfStatus status = collectFontCandidates(resolved.rootIndex, scopeIndex);
+      if (!status) {
+#ifdef CROSSINK_QEMU
+        esp_rom_printf("QEMU_PDF_FORM_RESOURCE_FAIL part=resolved_fonts error=%u offset=%llu\n",
+                       static_cast<unsigned>(status.error), static_cast<unsigned long long>(status.offset));
+#endif
+        return status;
+      }
+      if (pendingFormXObjectDictionaryReference_.objectNumber != 0) {
+        imageResolveTask_ = ImageResolveTask::FormXObjectDictionary;
+        return resolver_->begin(pendingFormXObjectDictionaryReference_);
+      }
+      ++imageResolveIndex_;
+      return beginNextImageObject();
+    }
+    case ImageResolveTask::FormXObjectDictionary: {
+      if (imageResolveIndex_ >= xObjectCandidateCount_) {
+        return PdfStatus::failure(PdfError::Malformed, imageResolveIndex_);
+      }
+      const uint8_t scopeIndex = navigation_->xObjectCandidates()[imageResolveIndex_].scopeIndex;
+      PdfStatus status = collectImageCandidates(resolved.rootIndex, scopeIndex);
+      if (!status) {
+#ifdef CROSSINK_QEMU
+        esp_rom_printf("QEMU_PDF_FORM_RESOURCE_FAIL part=resolved_xobjects error=%u offset=%llu\n",
+                       static_cast<unsigned>(status.error), static_cast<unsigned long long>(status.offset));
+#endif
+        return status;
+      }
+      pendingFormXObjectDictionaryReference_ = {};
+      ++imageResolveIndex_;
+      return beginNextImageObject();
     }
     case ImageResolveTask::FontDictionary: {
       PdfStatus status = collectFontCandidates(resolved.rootIndex, 0);
@@ -12108,47 +12383,23 @@ PdfStatus PdfPreparation::finishImageResolution() {
         }
         xObject.matrix = formMatrix;
         xObject.kind = PreparedXObjectKind::Form;
-        if (formScopeCount_ >= PdfLimits::MaxFormDepth) {
+        if (formScopeCount_ >= PdfPreparedContentResources::MaxXObjects) {
           return PdfStatus::failure(PdfError::LimitExceeded, formScopeCount_);
         }
         xObject.scopeIndex = static_cast<uint8_t>(++formScopeCount_);
 
         uint16_t resourcesIndex = PDF_INVALID_INDEX;
         if (pdfDictionaryFind(arena_, resolved.rootIndex, "Resources", &resourcesIndex)) {
-          if (resourcesIndex >= arena_.valueCount ||
-              arena_.values[resourcesIndex].kind != PdfValueKind::Dictionary) {
-            warningFlags_ |= kWarningOptionalImageOmitted;
-            xObject.kind = PreparedXObjectKind::Omitted;
-            ++imageResolveIndex_;
-            return beginNextImageObject();
+          if (resourcesIndex >= arena_.valueCount) {
+            return PdfStatus::failure(PdfError::Malformed, resourcesIndex);
           }
-          uint16_t fontIndex = PDF_INVALID_INDEX;
-          if (pdfDictionaryFind(arena_, resourcesIndex, "Font", &fontIndex)) {
-            if (fontIndex >= arena_.valueCount || arena_.values[fontIndex].kind != PdfValueKind::Dictionary) {
-              warningFlags_ |= kWarningOptionalImageOmitted;
-              xObject.kind = PreparedXObjectKind::Omitted;
-              ++imageResolveIndex_;
-              return beginNextImageObject();
-            }
-            status = collectFontCandidates(fontIndex, xObject.scopeIndex);
-            if (!status) {
-              return status;
-            }
+          const PdfValue& resources = arena_.values[resourcesIndex];
+          if (resources.kind == PdfValueKind::Reference) {
+            pendingFormXObjectDictionaryReference_ = {};
+            imageResolveTask_ = ImageResolveTask::FormResources;
+            return resolver_->begin({resources.objectNumber, resources.generation});
           }
-          uint16_t xObjectIndex = PDF_INVALID_INDEX;
-          if (pdfDictionaryFind(arena_, resourcesIndex, "XObject", &xObjectIndex)) {
-            if (xObjectIndex >= arena_.valueCount ||
-                arena_.values[xObjectIndex].kind != PdfValueKind::Dictionary) {
-              warningFlags_ |= kWarningOptionalImageOmitted;
-              xObject.kind = PreparedXObjectKind::Omitted;
-              ++imageResolveIndex_;
-              return beginNextImageObject();
-            }
-            status = collectImageCandidates(xObjectIndex, xObject.scopeIndex);
-            if (!status) {
-              return status;
-            }
-          }
+          return collectFormResources(resourcesIndex);
         }
         ++imageResolveIndex_;
         return beginNextImageObject();
@@ -12191,11 +12442,13 @@ PdfStatus PdfPreparation::finishImageResolution() {
       }
       PdfImageObjectDescriptor& descriptor = navigation_->imageDescriptorScratch;
       descriptor = {};
+      pendingImageDecodeParametersReference_ = {};
       const PdfImageObjectParseInput input{
           resolved.rootIndex,
           {resolved.streamOffset, resolved.streamLength, sourceMetadata_.size},
           nullptr,
           0,
+          &pendingImageDecodeParametersReference_,
       };
       PdfStatus status = pdfParseImageObject(arena_, input, &descriptor);
       if (!status && status.error == PdfError::InsufficientMemory && status.offset <= kPreparationPaletteBytes) {
@@ -12235,6 +12488,12 @@ PdfStatus PdfPreparation::finishImageResolution() {
       navigation_->xObjectCandidates()[imageResolveIndex_].kind = PreparedXObjectKind::Omitted;
       ++imageResolveIndex_;
       return beginNextImageObject();
+    }
+    case ImageResolveTask::DecodeParameters: {
+      const PdfStatus status =
+          pdfApplyResolvedImageDecodeParameters(arena_, resolved.rootIndex, &navigation_->imageDescriptorScratch);
+      pendingImageDecodeParametersReference_ = {};
+      return status ? continueImageDescriptorResolution() : status;
     }
     case ImageResolveTask::AuxiliaryImageObject:
       return finishAuxiliaryImageResolution();
@@ -12289,6 +12548,10 @@ PdfStatus PdfPreparation::continueImageDescriptorResolution() {
       }
       imageResolveTask_ = ImageResolveTask::IndexedPalette;
       return resolver_->begin(descriptor.paletteReference);
+    }
+    if (pdfImageHasUnresolved(descriptor.unresolved, PdfImageUnresolved::DecodeParameters)) {
+      imageResolveTask_ = ImageResolveTask::DecodeParameters;
+      return resolver_->begin(pendingImageDecodeParametersReference_);
     }
   }
 
@@ -14154,33 +14417,35 @@ uint8_t* PdfPreparation::preparedNavigationSpillBytes(const size_t offset, size_
   static_assert(runtimeEnd < PreparedContentOverlay::NativePageRunBytes);
   constexpr size_t nativeRunTailBytes =
       PreparedContentOverlay::NativePageRunBytes - kPreparedFontNamePoolBytes - runtimeEnd;
+  constexpr size_t pageSpillBytes = std::min(PdfLimits::PageTextBytes, sizeof(NavigationWorkspace));
   constexpr size_t runTailBytes =
-      std::min(nativeRunTailBytes, sizeof(NavigationWorkspace) - PdfLimits::PageTextBytes);
+      std::min(nativeRunTailBytes, sizeof(NavigationWorkspace) - pageSpillBytes);
   // Placement is not constructed while navigation is suspended for content
   // decode, so the complete operand workspace is phase-dead snapshot storage.
   constexpr size_t operandSpillOffset = 0;
-  constexpr size_t operandSpillBytes = sizeof(NavigationWorkspace) - PdfLimits::PageTextBytes - runTailBytes;
+  constexpr size_t operandSpillBytes = sizeof(NavigationWorkspace) - pageSpillBytes - runTailBytes;
   constexpr size_t spillCapacity =
-      PdfLimits::PageTextBytes + runTailBytes + PdfLimits::OperandOrderHistogramBytes;
+      pageSpillBytes + runTailBytes + PdfLimits::OperandOrderHistogramBytes;
   static_assert(operandSpillOffset + operandSpillBytes <= PdfLimits::OperandOrderHistogramBytes);
 #if UINTPTR_MAX == UINT32_MAX
-  static_assert(PdfLimits::PageTextBytes == 8192);
-  static_assert(sizeof(PreparedContentRuntime) == 5744);
-  static_assert(runtimeEnd == 5744);
-  static_assert(nativeRunTailBytes == 5520);
+  static_assert(PdfLimits::PageTextBytes == 20480);
+  static_assert(sizeof(PreparedContentRuntime) == 6000);
+  static_assert(runtimeEnd == 6000);
+  static_assert(nativeRunTailBytes == 5008);
   static_assert(sizeof(PlacementWorkspace) == 508);
   static_assert(operandSpillOffset == 0);
-  static_assert(runTailBytes == 5520);
-  static_assert(operandSpillBytes == 1480);
-  static_assert(operandSpillOffset + operandSpillBytes == 1480);
+  static_assert(pageSpillBytes == sizeof(NavigationWorkspace));
+  static_assert(runTailBytes == 0);
+  static_assert(operandSpillBytes == 0);
+  static_assert(operandSpillOffset + operandSpillBytes == 0);
 #endif
   static_assert(spillCapacity >= sizeof(NavigationWorkspace),
                 "phase-dead workspaces must retain navigation during Flate decode");
-  if (offset < PdfLimits::PageTextBytes) {
-    *contiguousBytes = PdfLimits::PageTextBytes - offset;
+  if (offset < pageSpillBytes) {
+    *contiguousBytes = pageSpillBytes - offset;
     return pageText_.get() + offset;
   }
-  size_t remainingOffset = offset - PdfLimits::PageTextBytes;
+  size_t remainingOffset = offset - pageSpillBytes;
   if (remainingOffset < runTailBytes) {
     *contiguousBytes = runTailBytes - remainingOffset;
     return runRecords_.get() + runtimeEnd + remainingOffset;
@@ -14291,7 +14556,6 @@ PdfStatus PdfPreparation::prepareFontNavigationSnapshot() {
   fontNavigationImageCandidateCount_ = imageCandidateCount_;
 
   const size_t bytes =
-      static_cast<size_t>(fontNavigationXObjectCount_) * sizeof(PreparedXObjectCandidate) +
       PreparedContentOverlay::FontNavigationBoundaryBytes + fontNavigationPageWindowBytes_ +
       static_cast<size_t>(fontNavigationPageLabelCount_) * sizeof(PdfPageLabelRange) +
       static_cast<size_t>(fontNavigationLinkCount_) * sizeof(PreparedLink) +
@@ -14349,11 +14613,6 @@ uint8_t* PdfPreparation::fontNavigationSnapshotFieldBytes(NavigationWorkspace* c
     offset -= bytes;
     return nullptr;
   };
-  if (uint8_t* const selected =
-          select(workspace->phaseScratch.xObjects.candidates,
-                 static_cast<size_t>(fontNavigationXObjectCount_) * sizeof(PreparedXObjectCandidate))) {
-    return selected;
-  }
   if (uint8_t* const selected = select(workspace->outlineEntries,
                                        PreparedContentOverlay::FontNavigationBoundaryBytes)) {
     return selected;
@@ -14720,6 +14979,7 @@ PdfStepResult PdfPreparation::restoreContentNavigation(PdfWorkBudget& budget) {
     const auto* const runtime = reinterpret_cast<const PreparedContentRuntime*>(runRecords_.get());
     navigation_->pageScratch = runtime->page;
     navigation_->phaseScratch.xObjects.owner = this;
+    xObjectWorkspace_->owner = this;
     inlineNavigationSpoolOffset_ = 0;
     inlineNavigationSpillStage_ = InlineNavigationSpillStage::None;
     compactFontNavigation_ = false;
@@ -14867,7 +15127,7 @@ PdfStepResult PdfPreparation::stepFormReachability(PdfWorkBudget& budget) {
   if (!runRecords_ || !navigation_ || !contentLexer_.has_value()) {
     return PdfStepResult::failure(PdfStatus::failure(PdfError::InvalidArgument, formReachabilityIndex_));
   }
-  const auto omitFormsAndContinue = [this]() {
+  const auto omitFormsAndContinue = [this](const uint8_t, const PdfStatus) {
     for (uint8_t index = 0; index < xObjectCandidateCount_; ++index) {
       if (navigation_->xObjectCandidates()[index].kind == PreparedXObjectKind::Form) {
         navigation_->xObjectCandidates()[index].kind = PreparedXObjectKind::Omitted;
@@ -14889,7 +15149,7 @@ PdfStepResult PdfPreparation::stepFormReachability(PdfWorkBudget& budget) {
     if (result.failed()) {
       if (result.status.error == PdfError::UnexpectedEof || result.status.error == PdfError::Malformed ||
           result.status.error == PdfError::Unsupported || result.status.error == PdfError::LimitExceeded) {
-        return omitFormsAndContinue();
+        return omitFormsAndContinue(1U, result.status);
       }
       return result;
     }
@@ -14901,7 +15161,7 @@ PdfStepResult PdfPreparation::stepFormReachability(PdfWorkBudget& budget) {
         ++formReachabilityIndex_;
         PdfStatus status = setPreparedContentRange(formReachabilityIndex_);
         if (!status) {
-          return omitFormsAndContinue();
+          return omitFormsAndContinue(2U, status);
         }
         contentLexer_.emplace(pdfByteRangeSource(contentRange_), sourceWindow_.get(), PdfLimits::SourceBufferBytes);
         lastContentNameLength_ = 0;
@@ -14931,7 +15191,6 @@ PdfStepResult PdfPreparation::stepFormReachability(PdfWorkBudget& budget) {
     if (token.kind != PdfTokenKind::Keyword || !tokenEquals(token, "Do") || lastContentNameLength_ == 0) {
       continue;
     }
-
     uint8_t currentScope = 0;
     if (formReachabilityIndex_ >= navigation_->pageScratch.contentCount) {
       currentScope = UINT8_MAX;
@@ -14944,7 +15203,7 @@ PdfStepResult PdfPreparation::stepFormReachability(PdfWorkBudget& budget) {
         }
       }
       if (currentScope == UINT8_MAX) {
-        return omitFormsAndContinue();
+        return omitFormsAndContinue(3U, PdfStatus::failure(PdfError::Malformed, formReachabilityIndex_));
       }
     }
 
@@ -14971,7 +15230,7 @@ PdfStepResult PdfPreparation::stepFormReachability(PdfWorkBudget& budget) {
         }
       }
       if (parentScope == UINT8_MAX) {
-        return omitFormsAndContinue();
+        return omitFormsAndContinue(4U, PdfStatus::failure(PdfError::Malformed, lookupScope));
       }
       lookupScope = parentScope;
     }
@@ -14981,7 +15240,7 @@ PdfStepResult PdfPreparation::stepFormReachability(PdfWorkBudget& budget) {
     uint8_t ancestorScope = currentScope;
     for (uint8_t depth = 0; depth < PdfLimits::MaxFormDepth && ancestorScope != 0; ++depth) {
       if (ancestorScope == invoked->scopeIndex) {
-        return omitFormsAndContinue();
+      return omitFormsAndContinue(5U, PdfStatus::failure(PdfError::Malformed, invoked->scopeIndex));
       }
       uint8_t parentScope = UINT8_MAX;
       for (uint8_t index = 0; index < xObjectCandidateCount_; ++index) {
@@ -14992,7 +15251,7 @@ PdfStepResult PdfPreparation::stepFormReachability(PdfWorkBudget& budget) {
         }
       }
       if (parentScope == UINT8_MAX) {
-        return omitFormsAndContinue();
+        return omitFormsAndContinue(6U, PdfStatus::failure(PdfError::Malformed, ancestorScope));
       }
       ancestorScope = parentScope;
     }
@@ -15527,7 +15786,11 @@ PdfStepResult PdfPreparation::decodePreparedFonts(PdfWorkBudget& budget) {
     }
     runtime->spillBase = runtime->fileEnd;
     runtime->spillCapacity = 0;
-    auto* const glyphWorkspace = new (dictionary_.get()) ObservedGlyphWorkspace{};
+    if (!xObjectWorkspace_) {
+      return PdfStepResult::failure(PdfStatus::failure(PdfError::InsufficientMemory));
+    }
+    auto* const glyphWorkspace =
+        new (xObjectWorkspace_->resourceStorage) ObservedGlyphWorkspace{};
     auto* const collection = new (glyphWorkspace->phase) ObservedGlyphCollection{};
     std::fill_n(collection->hash, kObservedGlyphHashCapacity, kObservedGlyphInvalid);
     std::fill_n(glyphWorkspace->fontHead, PdfPreparedContentResources::MaxFonts, kObservedGlyphInvalid);
@@ -15542,9 +15805,10 @@ PdfStepResult PdfPreparation::decodePreparedFonts(PdfWorkBudget& budget) {
 }
 
 PdfStepResult PdfPreparation::parsePreparedFonts(PdfWorkBudget& budget) {
-  static_assert(sizeof(ObservedGlyphWorkspace) <= sizeof(NavigationWorkspace),
-                "observed glyph workspace must fit phase-dead navigation RAM");
+  static_assert(sizeof(ObservedGlyphWorkspace) <= XObjectWorkspace::ResourceBytes,
+                "observed glyph workspace must fit phase-dead XObject RAM");
   if (!runRecords_ || !dictionary_ || !pageText_ || !sourceWindow_ ||
+      !xObjectWorkspace_ ||
       inlineNavigationSpillStage_ != InlineNavigationSpillStage::FontReading ||
       !inlineNavigationSpoolHandle_.valid()) {
     return PdfStepResult::failure(PdfStatus::failure(PdfError::InvalidArgument));
@@ -15554,7 +15818,8 @@ PdfStepResult PdfPreparation::parsePreparedFonts(PdfWorkBudget& budget) {
   constexpr size_t dictionaryGlyphsOffset = PreparedContentOverlay::DictionaryGlyphs;
   auto* const content = reinterpret_cast<PreparedContentRuntime*>(runRecords_.get());
   auto* const runtime = reinterpret_cast<PreparedFontRuntime*>(runRecords_.get() + fontRuntimeOffset);
-  auto* const glyphWorkspace = reinterpret_cast<ObservedGlyphWorkspace*>(dictionary_.get());
+  auto* const glyphWorkspace =
+      reinterpret_cast<ObservedGlyphWorkspace*>(xObjectWorkspace_->resourceStorage);
 
   const auto destroyTemporaryFont = [runtime]() {
     if (runtime->sourceFontConstructed) {
@@ -16314,6 +16579,11 @@ PdfStepResult PdfPreparation::parsePreparedFonts(PdfWorkBudget& budget) {
             glyph.sourceCode = lookup.sourceCode;
             glyph.sourceLength = lookup.sourceLength;
             glyph.unicode = lookup.unicode;
+            const PdfBaseEncoding baseEncoding =
+                runtime->descriptorIndex < content->fontCount
+                    ? content->fonts[runtime->descriptorIndex].baseEncoding
+                    : PdfBaseEncoding::Standard;
+            normalizePreparedSymbolUnicode(baseEncoding, &glyph.unicode);
             glyph.width = pdfEstimateGlyphWidth(glyph.unicode);
             status = finalFont->addMaterializedGlyph(glyph);
           }
@@ -16714,7 +16984,7 @@ PdfStepResult PdfPreparation::reopenPreparedContent(PdfWorkBudget& budget) {
 
 PdfStatus PdfPreparation::beginContentInterpretation() {
   if (!dictionary_ || !decoderOutput_ || !pageText_ || !runRecords_ || !operandScratch_ || !sourceWindow_ ||
-      navigation_ == nullptr || placement_ == nullptr ||
+      navigation_ == nullptr || placement_ == nullptr || !xObjectWorkspace_ ||
       currentContentIndex_ + 1U != navigation_->pageScratch.contentCount) {
     return PdfStatus::failure(PdfError::InvalidArgument, currentContentIndex_);
   }
@@ -16725,7 +16995,6 @@ PdfStatus PdfPreparation::beginContentInterpretation() {
   constexpr size_t dictionaryGlyphsOffset = PreparedContentOverlay::DictionaryGlyphs;
   constexpr size_t dictionaryImagesOffset = PreparedContentOverlay::DictionaryImages;
   constexpr size_t dictionaryPageOffset = PreparedContentOverlay::DictionaryPage;
-  constexpr size_t dictionaryResourceScopesOffset = PreparedContentOverlay::DictionaryResourceScopes;
   constexpr size_t operandOperandsOffset = PreparedContentOverlay::OperandOperands;
   constexpr size_t operandArrayItemsOffset = PreparedContentOverlay::OperandArrayItems;
   constexpr size_t operandScratchTextOffset = PreparedContentOverlay::OperandScratchText;
@@ -16809,6 +17078,7 @@ PdfStatus PdfPreparation::beginContentInterpretation() {
               glyph.width = pdfEstimateGlyphWidth(glyph.unicode);
             }
             if (status) {
+              normalizePreparedSymbolUnicode(baseEncoding, &glyph.unicode);
               status = finalFonts[fontIndex].addMaterializedGlyph(glyph);
             }
             if (status) {
@@ -16829,12 +17099,18 @@ PdfStatus PdfPreparation::beginContentInterpretation() {
     return status;
   }
 
-  constexpr uint8_t resourceScopeCount = PdfLimits::MaxFormDepth + 1U;
-  uint8_t scopeFontCounts[resourceScopeCount]{};
-  uint8_t scopeXObjectCounts[resourceScopeCount]{};
-  uint8_t scopeParents[resourceScopeCount]{};
-  uint8_t scopeFontOffsets[resourceScopeCount]{};
-  uint8_t scopeXObjectOffsets[resourceScopeCount]{};
+  const uint8_t resourceScopeCount = static_cast<uint8_t>(formScopeCount_ + 1U);
+  if (resourceScopeCount > PdfPreparedContentResources::MaxXObjects + 1U) {
+    destroyFinalFonts();
+    return PdfStatus::failure(PdfError::InsufficientMemory, resourceScopeCount);
+  }
+  uint8_t* const scopeFontCounts = xObjectWorkspace_->scopeFontCounts();
+  uint8_t* const scopeXObjectCounts = xObjectWorkspace_->scopeXObjectCounts();
+  uint8_t* const scopeParents = xObjectWorkspace_->scopeParents();
+  uint8_t* const scopeFontOffsets = xObjectWorkspace_->scopeFontOffsets();
+  uint8_t* const scopeXObjectOffsets = xObjectWorkspace_->scopeXObjectOffsets();
+  std::fill_n(scopeFontCounts, resourceScopeCount, 0);
+  std::fill_n(scopeXObjectCounts, resourceScopeCount, 0);
   std::fill_n(scopeParents, resourceScopeCount, 0);
   scopeParents[0] = UINT8_MAX;
   const uint8_t* const observedNames = pageText_.get() + kObservedFontNamesOffset;
@@ -16899,40 +17175,15 @@ PdfStatus PdfPreparation::beginContentInterpretation() {
     return PdfStatus::failure(PdfError::LimitExceeded, std::max(fontOffset, xobjectOffset));
   }
 
-  const size_t dictionaryRangesOffset =
-      alignOverlay(PreparedContentOverlay::DictionaryEnd, alignof(PdfByteRange));
-  const size_t dictionarySourcesOffset =
-      alignOverlay(dictionaryRangesOffset + static_cast<size_t>(sourceCount) * sizeof(PdfByteRange),
-                   alignof(PdfByteSource));
-  const size_t dictionarySourcesEnd =
-      dictionarySourcesOffset + static_cast<size_t>(sourceCount) * sizeof(PdfByteSource);
   const size_t dictionaryFontRecordsOffset =
-      alignOverlay(dictionarySourcesEnd, alignof(PdfPreparedFontResource));
+      alignOverlay(PreparedContentOverlay::DictionaryEnd, alignof(PdfPreparedFontResource));
   const size_t fontRecordBytes =
       static_cast<size_t>(fontOffset) * sizeof(PdfPreparedFontResource);
   const size_t dictionaryFontRecordsEnd =
       dictionaryFontRecordsOffset + fontRecordBytes;
-  const size_t dictionaryXObjectRecordsOffset =
-      alignOverlay(dictionaryFontRecordsEnd, alignof(PdfPreparedXObjectResource));
-  const size_t xobjectRecordBytes =
-      static_cast<size_t>(xobjectOffset) * sizeof(PdfPreparedXObjectResource);
   const bool fontsInDictionary =
       dictionaryFontRecordsEnd <= PreparedContentOverlay::NativeDictionaryBytes;
-  const bool xObjectsInDictionary = fontsInDictionary &&
-      dictionaryXObjectRecordsOffset + xobjectRecordBytes <=
-          PreparedContentOverlay::NativeDictionaryBytes;
   size_t decoderResourceOffset = PreparedContentOverlay::NativeDecoderOutputBytes;
-  size_t decoderXObjectRecordsOffset = decoderResourceOffset;
-  if (!xObjectsInDictionary) {
-    if (xobjectRecordBytes > decoderResourceOffset) {
-      destroyFinalFonts();
-      return PdfStatus::failure(PdfError::InsufficientMemory, xobjectRecordBytes);
-    }
-    decoderXObjectRecordsOffset =
-        (decoderResourceOffset - xobjectRecordBytes) &
-        ~(alignof(PdfPreparedXObjectResource) - 1U);
-    decoderResourceOffset = decoderXObjectRecordsOffset;
-  }
   size_t decoderFontRecordsOffset = decoderResourceOffset;
   if (!fontsInDictionary) {
     if (fontRecordBytes > decoderResourceOffset) {
@@ -16944,42 +17195,42 @@ PdfStatus PdfPreparation::beginContentInterpretation() {
         ~(alignof(PdfPreparedFontResource) - 1U);
     decoderResourceOffset = decoderFontRecordsOffset;
   }
-  const size_t fontNameBytes =
-      static_cast<size_t>(runtime->observedFontCount) *
-      PdfPreparedContentResources::MaxNameBytes;
-  if (dictionarySourcesEnd > PreparedContentOverlay::NativeDictionaryBytes ||
-      fontOffset != runtime->observedFontCount || fontNameBytes > decoderResourceOffset) {
+  const size_t sourceRecordBytes = static_cast<size_t>(sourceCount) * sizeof(PdfByteSource);
+  if (sourceRecordBytes > decoderResourceOffset) {
     destroyFinalFonts();
-    return PdfStatus::failure(PdfError::InsufficientMemory, fontNameBytes);
+    return PdfStatus::failure(PdfError::InsufficientMemory, sourceRecordBytes);
   }
-  const size_t decoderFontNamesOffset = decoderResourceOffset - fontNameBytes;
+  const size_t decoderSourcesOffset =
+      (decoderResourceOffset - sourceRecordBytes) & ~(alignof(PdfByteSource) - 1U);
+  decoderResourceOffset = decoderSourcesOffset;
+  const size_t rangeRecordBytes = static_cast<size_t>(sourceCount) * sizeof(PdfByteRange);
+  if (rangeRecordBytes > decoderResourceOffset) {
+    destroyFinalFonts();
+    return PdfStatus::failure(PdfError::InsufficientMemory, rangeRecordBytes);
+  }
+  const size_t decoderRangesOffset =
+      (decoderResourceOffset - rangeRecordBytes) & ~(alignof(PdfByteRange) - 1U);
+  decoderResourceOffset = decoderRangesOffset;
+  if (fontOffset != runtime->observedFontCount) {
+    destroyFinalFonts();
+    return PdfStatus::failure(PdfError::InsufficientMemory, fontOffset);
+  }
   const size_t interpreterSourceBufferBytes =
-      PdfLimits::SourceBufferBytes +
-      std::min(decoderFontNamesOffset, PdfLimits::DecoderOutputBytes);
+      PdfLimits::SourceBufferBytes + std::min(decoderResourceOffset, PdfLimits::DecoderOutputBytes);
 
   auto* const ranges =
-      reinterpret_cast<PdfByteRange*>(dictionary_.get() + dictionaryRangesOffset);
+      reinterpret_cast<PdfByteRange*>(decoderOutput_.get() + decoderRangesOffset);
   auto* const sources =
-      reinterpret_cast<PdfByteSource*>(dictionary_.get() + dictionarySourcesOffset);
+      reinterpret_cast<PdfByteSource*>(decoderOutput_.get() + decoderSourcesOffset);
   auto* const fontRecords = reinterpret_cast<PdfPreparedFontResource*>(
       fontsInDictionary ? dictionary_.get() + dictionaryFontRecordsOffset
                         : decoderOutput_.get() + decoderFontRecordsOffset);
-  auto* const xobjectRecords = reinterpret_cast<PdfPreparedXObjectResource*>(
-      xObjectsInDictionary ? dictionary_.get() + dictionaryXObjectRecordsOffset
-                           : decoderOutput_.get() + decoderXObjectRecordsOffset);
-  uint8_t* const stableFontNames = decoderOutput_.get() + decoderFontNamesOffset;
+  auto* const xobjectRecords = xObjectWorkspace_->records();
   for (uint8_t index = 0; index < sourceCount; ++index) {
     ranges[index] = runtime->ranges[index];
     sources[index] = pdfByteRangeSource(ranges[index]);
   }
-  for (uint8_t index = 0; index < runtime->observedFontCount; ++index) {
-    std::memcpy(stableFontNames +
-                    static_cast<size_t>(index) * PdfPreparedContentResources::MaxNameBytes,
-                preparedFontName(index), PdfPreparedContentResources::MaxNameBytes);
-  }
-
-  auto* const resourceScopes = reinterpret_cast<PdfPreparedContentResources*>(
-      dictionary_.get() + dictionaryResourceScopesOffset);
+  auto* const resourceScopes = xObjectWorkspace_->scopes();
   uint8_t constructedScopeCount = 0;
   const auto destroyResourceScopes = [resourceScopes, &constructedScopeCount]() {
     while (constructedScopeCount != 0) {
@@ -17008,8 +17259,7 @@ PdfStatus PdfPreparation::beginContentInterpretation() {
   }
   for (uint8_t index = 0; status && index < runtime->observedFontCount; ++index) {
     status = resourceScopes[observedScopes[index]].addFont(
-        stableFontNames +
-            static_cast<size_t>(index) * PdfPreparedContentResources::MaxNameBytes,
+        observedNames + static_cast<size_t>(index) * PdfPreparedContentResources::MaxNameBytes,
         observedNameLengths[index], &finalFonts[index]);
   }
   for (uint8_t index = 0; status && index < xObjectCandidateCount_; ++index) {
@@ -17089,6 +17339,8 @@ PdfStatus PdfPreparation::beginContentInterpretation() {
     destroyFinalFonts();
     return status;
   }
+  contentResourceScopeCount_ = constructedScopeCount;
+  contentFontCount_ = constructedFontCount;
   currentContentIndex_ = kContentInterpreterActive;
   transcriptLength_ = 0;
   extractedBlockCount_ = 0;
@@ -17108,29 +17360,26 @@ PdfStepResult PdfPreparation::stepContentInterpretation(PdfWorkBudget& budget) {
 }
 
 void PdfPreparation::destroyContentInterpretation() {
-  if (!dictionary_ || !decoderOutput_ || currentContentIndex_ != kContentInterpreterActive) {
+  if (!dictionary_ || !decoderOutput_ || !xObjectWorkspace_ ||
+      currentContentIndex_ != kContentInterpreterActive) {
     return;
   }
   constexpr size_t dictionaryInterpreterOffset = PreparedContentOverlay::DictionaryInterpreter;
   constexpr size_t dictionaryFontsOffset = PreparedContentOverlay::DictionaryFonts;
   constexpr size_t dictionaryPageOffset = PreparedContentOverlay::DictionaryPage;
-  constexpr size_t dictionaryResourceScopesOffset = PreparedContentOverlay::DictionaryResourceScopes;
   reinterpret_cast<PdfContentInterpreter*>(dictionary_.get() + dictionaryInterpreterOffset)
       ->~PdfContentInterpreter();
   reinterpret_cast<PdfPageModel*>(dictionary_.get() + dictionaryPageOffset)->~PdfPageModel();
-  auto* const resourceScopes = reinterpret_cast<PdfPreparedContentResources*>(
-      dictionary_.get() + dictionaryResourceScopesOffset);
-  uint8_t fontCount = 0;
-  for (uint8_t scope = 0; scope <= PdfLimits::MaxFormDepth; ++scope) {
-    fontCount = static_cast<uint8_t>(fontCount + resourceScopes[scope].fontCount());
-  }
-  for (uint8_t scope = PdfLimits::MaxFormDepth + 1U; scope != 0; --scope) {
+  auto* const resourceScopes = xObjectWorkspace_->scopes();
+  for (uint8_t scope = contentResourceScopeCount_; scope != 0; --scope) {
     resourceScopes[scope - 1U].~PdfPreparedContentResources();
   }
   auto* const fonts = reinterpret_cast<PdfFontMap*>(dictionary_.get() + dictionaryFontsOffset);
-  for (uint8_t index = 0; index < fontCount; ++index) {
+  for (uint8_t index = 0; index < contentFontCount_; ++index) {
     fonts[index].~PdfFontMap();
   }
+  contentResourceScopeCount_ = 0;
+  contentFontCount_ = 0;
   currentContentIndex_ = kContentRuntimeInvalid;
 }
 
@@ -17139,16 +17388,23 @@ PdfStatus PdfPreparation::finishContentInterpretation() {
       currentContentIndex_ != kContentInterpreterActive) {
     return PdfStatus::failure(PdfError::InvalidArgument, currentPageIndex_);
   }
+  constexpr size_t dictionaryInterpreterOffset = PreparedContentOverlay::DictionaryInterpreter;
   constexpr size_t dictionaryPageOffset = PreparedContentOverlay::DictionaryPage;
+  auto* const interpreter =
+      reinterpret_cast<PdfContentInterpreter*>(dictionary_.get() + dictionaryInterpreterOffset);
   auto* const model = reinterpret_cast<PdfPageModel*>(dictionary_.get() + dictionaryPageOffset);
   const uint16_t runCount = model->runCount();
   const PdfTextRun* const runs = model->runs();
   const size_t textLength = model->textLength();
+  if (interpreter->textCapacityReached()) {
+    destroyContentInterpretation();
+    return PdfStatus::failure(PdfError::InsufficientMemory, textLength);
+  }
   if (runCount == 0 || textLength == 0 || textLength > PdfLimits::PageTextBytes) {
     destroyContentInterpretation();
     return PdfStatus::failure(PdfError::NoReadableText, currentPageIndex_);
   }
-  if (runCount > kPreparationBlockWorkspaceBytes / sizeof(ExtractedBlockRecord)) {
+  if (runCount > PdfLimits::DecoderOutputBytes / sizeof(ExtractedBlockRecord)) {
     destroyContentInterpretation();
     return PdfStatus::failure(PdfError::LimitExceeded, runCount);
   }
@@ -17345,9 +17601,10 @@ PdfStatus PdfPreparation::finishContentInterpretation() {
       continue;
     }
     ExtractedBlockRecord& block = converted[convertedCount++];
-    uint16_t encodedTextOffset = static_cast<uint16_t>(compactTextLength);
+    const uint16_t encodedTextOffset = static_cast<uint16_t>(compactTextLength);
+    uint16_t blockFlags = 0;
     if (sourceControlsSpacing) {
-      encodedTextOffset |= kExtractedExplicitWhitespace;
+      blockFlags |= kExtractedExplicitWhitespace;
     }
     const uint8_t terminalCharacter = visibleTextLength == 0U ? 0U : runText[visibleTextLength - 1U];
     const bool sentenceTerminal = terminalCharacter == '.' || terminalCharacter == '!' ||
@@ -17372,11 +17629,19 @@ PdfStatus PdfPreparation::finishContentInterpretation() {
     const bool commonShortHeading = headingTextEquals("ABSTRACT") || headingTextEquals("CONTENTS") ||
                                     headingTextEquals("METHODS") || headingTextEquals("OVERVIEW") ||
                                     headingTextEquals("RESULTS") || headingTextEquals("SUMMARY");
+    const bool chapterLabelHeading = extractedTextIsChapterHeading(runText, visibleTextLength);
+    bool alphabetNavigation = visibleTextLength == 26U;
+    for (size_t character = 0; alphabetNavigation && character < visibleTextLength; ++character) {
+      alphabetNavigation = runText[character] == static_cast<uint8_t>('A' + character);
+    }
     const bool allCapsHeading = visibleTextLength >= 6U && visibleTextLength <= 80U &&
                                  (letterCount >= 10U || commonShortHeading) &&
                                  (!hasHyphen || letterCount >= 10U) && !hasEquationOperator &&
                                  lowercaseCount == 0 && letterCount * 2U >= visibleTextLength &&
                                  height >= bodyTextHeight;
+    const bool distinctAllCapsHeading =
+        allCapsHeading && (commonShortHeading || chapterLabelHeading || height > bodyTextHeight ||
+                           (run.flags & PdfTextBold) != 0U);
     const bool tallHeadingTypography =
         (run.flags & PdfTextBold) != 0U || lowercaseCount == 0U || visibleTextLength <= 48U ||
         height * 3U >= bodyTextHeight * 5U;
@@ -17411,20 +17676,22 @@ PdfStatus PdfPreparation::finishContentInterpretation() {
     const bool sectionTitleBand = sectionBoundaryPage && tallHeading && height * 4U >= bodyTextHeight * 7U;
     const bool prominentTopHeading =
         (tallHeading || boldHeading) && height * 3U >= bodyTextHeight * 4U;
-    const bool boldAllCapsTopHeading = allCapsHeading && (run.flags & PdfTextBold) != 0U &&
+    const bool boldAllCapsTopHeading = distinctAllCapsHeading && (run.flags & PdfTextBold) != 0U &&
                                        baselineY >= currentPageHeight_ * 7U / 8U;
-    bool heading = index != dropCapRunIndex && !dropCapOpeningLine && interiorLine && horizontalLine &&
+    bool heading = !alphabetNavigation && index != dropCapRunIndex && !dropCapOpeningLine && interiorLine &&
+                   horizontalLine &&
                    (contentHeadingBand || centeredTitle || sectionTitleBand || prominentTopHeading ||
-                    boldAllCapsTopHeading || numberedHeading || (sectionBoundaryPage && allCapsHeading)) &&
-                   (allCapsHeading || numberedHeading || tallHeading || boldHeading || centeredTitle ||
-                    centeredShortHeading);
+                    boldAllCapsTopHeading || numberedHeading || chapterLabelHeading ||
+                    (sectionBoundaryPage && distinctAllCapsHeading)) &&
+                   (distinctAllCapsHeading || numberedHeading || chapterLabelHeading || tallHeading ||
+                    boldHeading || centeredTitle || centeredShortHeading);
     const bool previousHeading = convertedCount > 1U &&
-                                 (converted[convertedCount - 2U].textOffset & kExtractedHeading) != 0U;
+                                 (converted[convertedCount - 2U].flags & kExtractedHeading) != 0U;
     bool previousNumberedHeading = false;
     if (previousHeading) {
       const ExtractedBlockRecord& previousBlock = converted[convertedCount - 2U];
-      const uint16_t previousOffset = previousBlock.textOffset & kExtractedTextOffsetMask;
-      const uint16_t previousLength = previousBlock.textLength & kExtractedTextLengthMask;
+      const uint16_t previousOffset = previousBlock.textOffset;
+      const uint16_t previousLength = previousBlock.textLength;
       uint16_t prefixLength = 0;
       bool sawDot = false;
       while (prefixLength < previousLength) {
@@ -17490,8 +17757,8 @@ PdfStatus PdfPreparation::finishContentInterpretation() {
         explicitWhitespaceGap <= static_cast<int64_t>(bodyTextHeight) * 65536 &&
         visibleTextLength != 0U) {
       const ExtractedBlockRecord& previousBlock = converted[convertedCount - 2U];
-      const uint16_t previousOffset = previousBlock.textOffset & kExtractedTextOffsetMask;
-      const uint16_t previousLength = previousBlock.textLength & kExtractedTextLengthMask;
+      const uint16_t previousOffset = previousBlock.textOffset;
+      const uint16_t previousLength = previousBlock.textLength;
       uint16_t previousWordLength = 0;
       bool previousLowercase = true;
       bool previousUppercase = true;
@@ -17580,8 +17847,8 @@ PdfStatus PdfPreparation::finishContentInterpretation() {
         explicitWhitespaceGap >= static_cast<int64_t>(bodyTextHeight) * 2LL * 65536 &&
         explicitWhitespaceGap <= static_cast<int64_t>(bodyTextHeight) * 4LL * 65536) {
       const ExtractedBlockRecord& previousBlock = converted[convertedCount - 2U];
-      const uint16_t previousOffset = previousBlock.textOffset & kExtractedTextOffsetMask;
-      const uint16_t previousLength = previousBlock.textLength & kExtractedTextLengthMask;
+      const uint16_t previousOffset = previousBlock.textOffset;
+      const uint16_t previousLength = previousBlock.textLength;
       uint16_t previousCapitalTail = 0;
       while (previousCapitalTail < previousLength) {
         const uint8_t value = pageText_[previousOffset + previousLength - previousCapitalTail - 1U];
@@ -17596,14 +17863,15 @@ PdfStatus PdfPreparation::finishContentInterpretation() {
                            previousCapitalTail <= 8U);
     }
     if (heading) {
-      encodedTextOffset |= kExtractedHeading;
+      blockFlags |= kExtractedHeading;
     }
     if (index == dropCapRunIndex || (index == dropCapTargetIndex && dropCapTargetJoinsNext)) {
-      encodedTextOffset |= kExtractedDropCap;
+      blockFlags |= kExtractedDropCap;
     }
     block.textOffset = encodedTextOffset;
-    block.textLength = static_cast<uint16_t>(run.textLength |
-                                             (joinsPreviousWord ? kExtractedJoinsPrevious : 0U));
+    block.textLength = static_cast<uint16_t>(run.textLength);
+    block.flags = static_cast<uint16_t>(blockFlags |
+                                        (joinsPreviousWord ? kExtractedJoinsPrevious : 0U));
     const int64_t x = static_cast<int64_t>(run.baselineX) / 65536;
     const int64_t y = static_cast<int64_t>(index == dropCapRunIndex && dropCapTargetIndex != UINT16_MAX
                                                ? runs[dropCapTargetIndex].baseline
@@ -17648,34 +17916,34 @@ PdfStatus PdfPreparation::finishContentInterpretation() {
         std::abs(static_cast<int32_t>(previous.y) - current.y) > 2 ||
         previous.lineX == UINT16_MAX || current.lineX == UINT16_MAX ||
         (previous.lineX & kExtractedLineXMask) != (current.lineX & kExtractedLineXMask) ||
-        ((previous.textOffset ^ current.textOffset) & kExtractedHeading) == 0U) {
+        ((previous.flags ^ current.flags) & kExtractedHeading) == 0U) {
       continue;
     }
     // A PDF may split one visual heading line into multiple text-show
     // operators. Classify the complete line consistently before reordering.
-    previous.textOffset |= kExtractedHeading;
-    current.textOffset |= kExtractedHeading;
+    previous.flags |= kExtractedHeading;
+    current.flags |= kExtractedHeading;
   }
   for (uint16_t first = 0; first < convertedCount; ++first) {
-    if ((converted[first].textOffset & kExtractedHeading) == 0U) {
+    if ((converted[first].flags & kExtractedHeading) == 0U) {
       continue;
     }
-    const uint16_t firstOffset = converted[first].textOffset & kExtractedTextOffsetMask;
-    const uint16_t firstLength = converted[first].textLength & kExtractedTextLengthMask;
+    const uint16_t firstOffset = converted[first].textOffset;
+    const uint16_t firstLength = converted[first].textLength;
     bool repeated = false;
     for (uint16_t second = static_cast<uint16_t>(first + 1U); second < convertedCount; ++second) {
-      if ((converted[second].textOffset & kExtractedHeading) == 0U ||
-          (converted[second].textLength & kExtractedTextLengthMask) != firstLength) {
+      if ((converted[second].flags & kExtractedHeading) == 0U ||
+          converted[second].textLength != firstLength) {
         continue;
       }
-      const uint16_t secondOffset = converted[second].textOffset & kExtractedTextOffsetMask;
+      const uint16_t secondOffset = converted[second].textOffset;
       if (std::memcmp(pageText_.get() + firstOffset, pageText_.get() + secondOffset, firstLength) == 0) {
-        converted[second].textOffset &= static_cast<uint16_t>(~kExtractedHeading);
+        converted[second].flags &= static_cast<uint16_t>(~kExtractedHeading);
         repeated = true;
       }
     }
     if (repeated) {
-      converted[first].textOffset &= static_cast<uint16_t>(~kExtractedHeading);
+      converted[first].flags &= static_cast<uint16_t>(~kExtractedHeading);
     }
   }
   transcriptLength_ = compactTextLength;
@@ -17834,8 +18102,8 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
     return difference >= -tolerance && difference <= tolerance;
   };
   const auto isolatedDiscretionaryHyphen = [&](const ExtractedBlockRecord& block) {
-    const uint16_t textOffset = block.textOffset & kExtractedTextOffsetMask;
-    const uint16_t textLength = block.textLength & kExtractedTextLengthMask;
+    const uint16_t textOffset = block.textOffset;
+    const uint16_t textLength = block.textLength;
     if (static_cast<uint32_t>(textOffset) + textLength > transcriptLength_) {
       return false;
     }
@@ -17950,8 +18218,8 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
           ExtractedBlockRecord& sourceBlock = blocks[sourceIndex];
           uint16_t encodedLineX = sourceBlock.lineX;
           bool suffixNearDiscretionaryHyphen = false;
-          const uint16_t sourceTextOffset = sourceBlock.textOffset & kExtractedTextOffsetMask;
-          const uint16_t sourceTextLength = sourceBlock.textLength & kExtractedTextLengthMask;
+          const uint16_t sourceTextOffset = sourceBlock.textOffset;
+          const uint16_t sourceTextLength = sourceBlock.textLength;
           if (sourceBlock.x >= 0 && sourceBlock.y != kUnknownTextOrigin && sourceTextLength != 0U &&
               sourceTextLength <= 12U &&
               static_cast<uint32_t>(sourceTextOffset) + sourceTextLength <= transcriptLength_ &&
@@ -17973,8 +18241,8 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
             uint16_t bestAnchor = UINT16_MAX;
             for (uint16_t candidate = 0; candidate < blockCount; ++candidate) {
               const ExtractedBlockRecord& anchor = blocks[candidate];
-              const uint16_t anchorOffset = anchor.textOffset & kExtractedTextOffsetMask;
-              const uint16_t anchorLength = anchor.textLength & kExtractedTextLengthMask;
+              const uint16_t anchorOffset = anchor.textOffset;
+              const uint16_t anchorLength = anchor.textLength;
               if (candidate == sourceIndex || anchor.x < 0 || anchor.x >= sourceBlock.x ||
                   !sameCoordinate(anchor.y, sourceBlock.y, 2) || anchor.lineX == UINT16_MAX ||
                   anchorLength == 0U ||
@@ -18006,12 +18274,12 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
           int16_t orderingX = encodedLineX == UINT16_MAX
                                   ? kUnknownTextOrigin
                                   : static_cast<int16_t>(encodedLineX & kExtractedLineXMask);
-          if (sourceIndex != 0U && (sourceBlock.textLength & kExtractedJoinsPrevious) != 0U &&
+          if (sourceIndex != 0U && (sourceBlock.flags & kExtractedJoinsPrevious) != 0U &&
               sameCoordinate(sourceBlock.y, blocks[sourceIndex - 1U].y, 2)) {
             orderingX = order->records[sourceIndex - 1U].x;
           }
-          if (sourceIndex != 0 && (blocks[sourceIndex].textOffset & kExtractedHeading) != 0 &&
-              (blocks[sourceIndex - 1U].textOffset & kExtractedHeading) != 0 &&
+          if (sourceIndex != 0 && (blocks[sourceIndex].flags & kExtractedHeading) != 0 &&
+              (blocks[sourceIndex - 1U].flags & kExtractedHeading) != 0 &&
               sameCoordinate(blocks[sourceIndex].y, blocks[sourceIndex - 1U].y, 2)) {
             orderingX = order->records[sourceIndex - 1U].x;
           }
@@ -18049,17 +18317,15 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
           const ExtractedBlockRecord& second = blocks[index + 1U];
           const ExtractedBlockRecord& third = blocks[index + 2U];
           const ExtractedBlockRecord& fourth = blocks[index + 3U];
-          const bool shortCells = (first.textLength & kExtractedTextLengthMask) <= 8U &&
-                                  (second.textLength & kExtractedTextLengthMask) <= 8U &&
-                                  (third.textLength & kExtractedTextLengthMask) <= 8U &&
-                                  (fourth.textLength & kExtractedTextLengthMask) <= 8U;
+          const bool shortCells = first.textLength <= 8U && second.textLength <= 8U &&
+                                  third.textLength <= 8U && fourth.textLength <= 8U;
           const bool pairedRows = sameCoordinate(first.y, second.y, 2) && sameCoordinate(third.y, fourth.y, 2) &&
                                   !sameCoordinate(first.y, third.y, 2);
           const bool alignedColumns = first.x < second.x && third.x < fourth.x &&
                                       sameCoordinate(first.x, third.x, 4) &&
                                       sameCoordinate(second.x, fourth.x, 4);
           const uint16_t semanticFlags =
-              static_cast<uint16_t>(first.textOffset | second.textOffset | third.textOffset | fourth.textOffset);
+              static_cast<uint16_t>(first.flags | second.flags | third.flags | fourth.flags);
           const int32_t minimumCellGap = std::max<int32_t>(8, pageWidth / 20U);
           uint16_t firstRowEnd = static_cast<uint16_t>(index + 1U);
           while (firstRowEnd < blockCount) {
@@ -18095,7 +18361,7 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
           }
           bool pairedColumnTable = false;
           if (first.x >= 0 && first.y >= 0 &&
-              (first.textOffset & (kExtractedHeading | kExtractedDropCap)) == 0U) {
+              (first.flags & (kExtractedHeading | kExtractedDropCap)) == 0U) {
             const int32_t columnGap = std::max<int32_t>(24, pageWidth / 5U);
             const int16_t columnTolerance = static_cast<int16_t>(
                 std::min<uint16_t>(INT16_MAX, std::max<uint16_t>(8U, pageWidth / 30U)));
@@ -18107,8 +18373,7 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
                   first.lineX != UINT16_MAX && blocks[probe].lineX != UINT16_MAX &&
                   (first.lineX & kExtractedLineXMask) !=
                       (blocks[probe].lineX & kExtractedLineXMask) &&
-                  (first.textLength & kExtractedTextLengthMask) <= 64U &&
-                  (blocks[probe].textLength & kExtractedTextLengthMask) <= 64U &&
+                  first.textLength <= 64U && blocks[probe].textLength <= 64U &&
                   sameCoordinate(blocks[probe].y, first.y, 2)) {
                 secondColumn = probe;
                 break;
@@ -18176,8 +18441,8 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
                     }
                   }
                   const ExtractedBlockRecord& firstData = blocks[firstDataCell];
-                  const uint16_t firstDataLength = firstData.textLength & kExtractedTextLengthMask;
-                  const uint16_t firstDataOffset = firstData.textOffset & kExtractedTextOffsetMask;
+                  const uint16_t firstDataLength = firstData.textLength;
+                  const uint16_t firstDataOffset = firstData.textOffset;
                   const int32_t firstRowGap = static_cast<int32_t>(first.y) - firstData.y;
                   const bool compactNumberedRow = firstDataLength != 0U && firstDataLength <= 4U &&
                                                   firstDataOffset < transcriptLength_ &&
@@ -18198,7 +18463,7 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
             for (uint16_t probe = static_cast<uint16_t>(index + 4U); probe < blockCount; ++probe) {
               const ExtractedBlockRecord& previous = blocks[probe - 1U];
               const ExtractedBlockRecord& current = blocks[probe];
-              if (pairedColumnTable && (current.textOffset & kExtractedHeading) != 0U) {
+              if (pairedColumnTable && (current.flags & kExtractedHeading) != 0U) {
                 tableEnd = probe;
                 break;
               }
@@ -18272,7 +18537,7 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
               break;
             }
           }
-          if ((blocks[placement.sourceIndex].textOffset & (kExtractedHeading | kExtractedDropCap)) != 0) {
+          if ((blocks[placement.sourceIndex].flags & (kExtractedHeading | kExtractedDropCap)) != 0) {
             break;
           }
           if (placementIndex != 0 && sameCoordinate(placement.y, order->records[placementIndex - 1U].y, 2)) {
@@ -18402,7 +18667,7 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
           bool hasPrevious = false;
           for (uint16_t sourceIndex = 0; sourceIndex < blockCount; ++sourceIndex) {
             const CompactTextPlacement& placement = order->records[sourceIndex];
-            if ((blocks[sourceIndex].textOffset & (kExtractedHeading | kExtractedDropCap)) != 0 ||
+            if ((blocks[sourceIndex].flags & (kExtractedHeading | kExtractedDropCap)) != 0 ||
                 placement.y == kUnknownTextOrigin ||
                 static_cast<int32_t>(placement.y) <= static_cast<int32_t>(currentPageHeight_ / 8U) ||
                 static_cast<int32_t>(placement.y) >= static_cast<int32_t>(currentPageHeight_ * 7U / 8U)) {
@@ -18583,7 +18848,7 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
           const bool tableRecord = block.lineX != UINT16_MAX &&
                                    (block.lineX & kExtractedTableCell) != 0U;
           if (block.x >= 0 && !tableRecord &&
-              (block.textOffset & (kExtractedHeading | kExtractedDropCap)) == 0) {
+              (block.flags & (kExtractedHeading | kExtractedDropCap)) == 0) {
             const uint8_t column = columnFor(order->records[index]);
             order->clusterItems[column] = std::min<uint16_t>(order->clusterItems[column],
                                                              static_cast<uint16_t>(block.x));
@@ -18599,21 +18864,21 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
         if (order->applyIndex < blockCount) {
           const uint16_t index = order->applyIndex++;
           ExtractedBlockRecord& current = blocks[index];
-          const bool sourceJoinsPrevious = (current.textLength & kExtractedJoinsPrevious) != 0U;
-          current.textLength &= kExtractedTextLengthMask;
-          const bool currentHeading = (current.textOffset & kExtractedHeading) != 0U;
+          const bool sourceJoinsPrevious = (current.flags & kExtractedJoinsPrevious) != 0U;
+          current.flags &= static_cast<uint16_t>(~kExtractedJoinsPrevious);
+          const bool currentHeading = (current.flags & kExtractedHeading) != 0U;
           const bool forceNewBlock = current.lineX != UINT16_MAX && currentHeading &&
                                      (current.lineX & kExtractedLightText) != 0U;
           bool mergeHeadingCluster = false;
           bool consecutiveNumberedHeadings = false;
           if (index != 0U && !order->lexicalFallback && currentHeading) {
             const ExtractedBlockRecord& previous = blocks[index - 1U];
-            const bool previousHeading = (previous.textOffset & kExtractedHeading) != 0U;
+            const bool previousHeading = (previous.flags & kExtractedHeading) != 0U;
             const bool coordinatesValid = current.x >= 0 && current.y >= 0 && previous.x >= 0 && previous.y >= 0;
-            const uint16_t previousLength = previous.textLength & kExtractedTextLengthMask;
-            const uint16_t previousOffset = previous.textOffset & kExtractedTextOffsetMask;
-            const uint16_t currentLength = current.textLength & kExtractedTextLengthMask;
-            const uint16_t currentOffset = current.textOffset & kExtractedTextOffsetMask;
+            const uint16_t previousLength = previous.textLength;
+            const uint16_t previousOffset = previous.textOffset;
+            const uint16_t currentLength = current.textLength;
+            const uint16_t currentOffset = current.textOffset;
             consecutiveNumberedHeadings =
                 previousHeading && static_cast<uint32_t>(previousOffset) + previousLength <= transcriptLength_ &&
                 static_cast<uint32_t>(currentOffset) + currentLength <= transcriptLength_ &&
@@ -18700,17 +18965,17 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
               const int32_t firstCellReach =
                   static_cast<int32_t>(firstCell.x) +
                   std::min<int32_t>(pageWidth / 2U,
-                                    (blocks[start].textLength & kExtractedTextLengthMask) * 4U) +
+                                    blocks[start].textLength * 4U) +
                   cellGapAllowance;
               const int32_t secondCellReach =
                   static_cast<int32_t>(secondCell.x) +
                   std::min<int32_t>(pageWidth / 2U,
-                                    (blocks[start + 1U].textLength & kExtractedTextLengthMask) * 4U) +
+                                    blocks[start + 1U].textLength * 4U) +
                   cellGapAllowance;
               const int32_t thirdCellReach =
                   static_cast<int32_t>(thirdCell.x) +
                   std::min<int32_t>(pageWidth / 2U,
-                                    (blocks[start + 2U].textLength & kExtractedTextLengthMask) * 4U) +
+                                    blocks[start + 2U].textLength * 4U) +
                   cellGapAllowance;
               const bool rowCoordinatesValid = firstCell.x >= 0 && firstCell.y >= 0 && secondCell.x >= 0 &&
                                                secondCell.y >= 0 && thirdCell.x >= 0 && thirdCell.y >= 0 &&
@@ -18718,8 +18983,8 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
               const bool separatedCellOrigins = secondCell.x > firstCellReach && thirdCell.x > secondCellReach &&
                                                 fourthCell.x > thirdCellReach;
               const uint16_t semanticFlags = static_cast<uint16_t>(
-                  blocks[start].textOffset | blocks[start + 1U].textOffset | blocks[start + 2U].textOffset |
-                  blocks[start + 3U].textOffset);
+                  blocks[start].flags | blocks[start + 1U].flags | blocks[start + 2U].flags |
+                  blocks[start + 3U].flags);
               if (rowCoordinatesValid && separatedCellOrigins &&
                   (semanticFlags & (kExtractedHeading | kExtractedDropCap)) == 0 &&
                   sameCoordinate(firstCell.y, secondCell.y, 2) && sameCoordinate(firstCell.y, thirdCell.y, 2) &&
@@ -18732,8 +18997,8 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
           }
           if (!newBlock) {
             const ExtractedBlockRecord& previous = blocks[index - 1U];
-            bool currentHeading = (current.textOffset & kExtractedHeading) != 0;
-            const bool previousHeading = (previous.textOffset & kExtractedHeading) != 0;
+            bool currentHeading = (current.flags & kExtractedHeading) != 0;
+            const bool previousHeading = (previous.flags & kExtractedHeading) != 0;
             const bool previousForceNewBlock = previous.lineX != UINT16_MAX &&
                                                previousHeading &&
                                                (previous.lineX & kExtractedLightText) != 0U;
@@ -18746,7 +19011,7 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
                   candidateBlock.x < 0 || lineBlock.x < candidateBlock.x) {
                 break;
               }
-              const uint16_t candidateLength = candidateBlock.textLength & kExtractedTextLengthMask;
+              const uint16_t candidateLength = candidateBlock.textLength;
               const int32_t candidateReach = static_cast<int32_t>(candidateBlock.x) +
                                              std::min<int32_t>(pageWidth / 2U, candidateLength * 4U) +
                                              std::max<int32_t>(4, pageWidth / 50U);
@@ -18762,7 +19027,7 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
                                                                                std::abs(static_cast<int32_t>(previous.y) - current.y)))
                                      : UINT16_MAX;
             sameLine = coordinatesValid && gap <= 2U;
-            const uint16_t previousTextLength = previous.textLength & kExtractedTextLengthMask;
+            const uint16_t previousTextLength = previous.textLength;
             const int32_t inlineReach = static_cast<int32_t>(previous.x) +
                                         std::min<int32_t>(pageWidth / 2U, previousTextLength * 4U) +
                                         std::max<int32_t>(4, pageWidth / 50U);
@@ -18775,9 +19040,9 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
             bool crossColumnContinuation = false;
             if (coordinatesValid && !tableRecord && !previousTableRecord && currentColumn > previousColumn &&
                 static_cast<int32_t>(current.y) - previous.y >= static_cast<int32_t>(order->runItems) * 3) {
-              const uint16_t previousOffset = previous.textOffset & kExtractedTextOffsetMask;
-              const uint16_t currentOffset = current.textOffset & kExtractedTextOffsetMask;
-              const uint16_t currentTextLength = current.textLength & kExtractedTextLengthMask;
+              const uint16_t previousOffset = previous.textOffset;
+              const uint16_t currentOffset = current.textOffset;
+              const uint16_t currentTextLength = current.textLength;
               if (previousTextLength != 0U && currentTextLength != 0U &&
                   static_cast<uint32_t>(previousOffset) + previousTextLength <= transcriptLength_ &&
                   static_cast<uint32_t>(currentOffset) + currentTextLength <= transcriptLength_) {
@@ -18795,9 +19060,13 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
                         (currentHeading && previousForceNewBlock));
             if (previousHeading && !currentHeading && coordinatesValid && !tableRecord && !previousTableRecord &&
                 currentColumn == previousColumn && gap <= static_cast<uint32_t>(order->runItems) * 3U) {
-              const uint16_t previousOffset = previous.textOffset & kExtractedTextOffsetMask;
-              const uint16_t currentOffset = current.textOffset & kExtractedTextOffsetMask;
-              const uint16_t currentLength = current.textLength & kExtractedTextLengthMask;
+              const uint16_t previousOffset = previous.textOffset;
+              const uint16_t currentOffset = current.textOffset;
+              const uint16_t currentLength = current.textLength;
+              const bool previousChapterHeading =
+                  previousTextLength != 0U &&
+                  static_cast<uint32_t>(previousOffset) + previousTextLength <= transcriptLength_ &&
+                  extractedTextIsChapterHeading(pageText_.get() + previousOffset, previousTextLength);
               bool sentenceLikeHeading = previousTextLength >= 48U &&
                                          static_cast<uint32_t>(previousOffset) + previousTextLength <= transcriptLength_;
               bool headingHasComma = false;
@@ -18813,15 +19082,16 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
                   sectionBoundaryPage && previousTextLength >= 48U && currentLength <= 32U &&
                   previous.y > static_cast<int16_t>(currentPageHeight_ / 2U) &&
                   gap <= static_cast<uint32_t>(order->runItems) * 3U;
-              if (multilineSectionTitle && previousTextLength != 0U && currentLength != 0U &&
+              if (!previousChapterHeading && multilineSectionTitle && previousTextLength != 0U &&
+                  currentLength != 0U &&
                   static_cast<uint32_t>(previousOffset) + previousTextLength <= transcriptLength_ &&
                   static_cast<uint32_t>(currentOffset) + currentLength <= transcriptLength_ &&
                   extractedTextEndsOpenSentence(pageText_.get() + previousOffset, previousTextLength) &&
                   extractedTextStartsLowercase(pageText_.get() + currentOffset, currentLength)) {
-                current.textOffset |= kExtractedHeading;
+                current.flags |= kExtractedHeading;
                 currentHeading = true;
                 newBlock = false;
-              } else if (gap <= static_cast<uint32_t>(order->runItems) * 2U &&
+              } else if (!previousChapterHeading && gap <= static_cast<uint32_t>(order->runItems) * 2U &&
                          previousTextLength != 0U && currentLength != 0U &&
                   static_cast<uint32_t>(previousOffset) + previousTextLength <= transcriptLength_ &&
                   static_cast<uint32_t>(currentOffset) + currentLength <= transcriptLength_ &&
@@ -18830,11 +19100,11 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
                    sentenceLikeHeading)) {
                 uint16_t headingStart = static_cast<uint16_t>(index - 1U);
                 while (headingStart != 0U &&
-                       (blocks[headingStart].textLength & kExtractedNewBlock) == 0U) {
+                       (blocks[headingStart].flags & kExtractedNewBlock) == 0U) {
                   --headingStart;
                 }
                 for (uint16_t headingIndex = headingStart; headingIndex < index; ++headingIndex) {
-                  blocks[headingIndex].textOffset &= static_cast<uint16_t>(~kExtractedHeading);
+                  blocks[headingIndex].flags &= static_cast<uint16_t>(~kExtractedHeading);
                 }
                 newBlock = false;
               }
@@ -18867,9 +19137,9 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
                   leftEdge != UINT16_MAX && previousIndented && current.x >= 0 &&
                   static_cast<uint16_t>(current.x) <= leftEdge + indentThreshold &&
                   horizontalShift > centeredShift;
-              const uint16_t previousOffset = previous.textOffset & kExtractedTextOffsetMask;
-              const uint16_t currentOffset = current.textOffset & kExtractedTextOffsetMask;
-              const uint16_t currentTextLength = current.textLength & kExtractedTextLengthMask;
+              const uint16_t previousOffset = previous.textOffset;
+              const uint16_t currentOffset = current.textOffset;
+              const uint16_t currentTextLength = current.textLength;
               const bool sentenceContinuation =
                   gap <= static_cast<uint32_t>(order->runItems) * 2U && previousTextLength != 0U &&
                   currentTextLength != 0U &&
@@ -18885,12 +19155,12 @@ PdfStepResult PdfPreparation::stepReadingOrder(PdfWorkBudget& budget) {
             }
           }
           if (newBlock) {
-            current.textLength |= kExtractedNewBlock;
+            current.flags |= kExtractedNewBlock;
             ++currentPageSemanticBlockCount_;
           } else if (sameLine &&
                      (sourceJoinsPrevious ||
-                      (!wideFourCellRow && (current.textOffset & kExtractedExplicitWhitespace) != 0))) {
-            current.textLength |= kExtractedJoinsPrevious;
+                      (!wideFourCellRow && (current.flags & kExtractedExplicitWhitespace) != 0))) {
+            current.flags |= kExtractedJoinsPrevious;
           }
           break;
         }
@@ -20752,12 +21022,12 @@ PdfStepResult PdfPreparation::emitSection(PdfWorkBudget& budget) {
       bool continuesPrevious = false;
       if (semanticWriter_.blockOpen()) {
         const ExtractedBlockRecord& first = blocks[0];
-        const uint16_t firstOffset = first.textOffset & kExtractedTextOffsetMask;
-        const uint16_t firstLength = first.textLength & kExtractedTextLengthMask;
-        const bool firstHeading = (first.textOffset & kExtractedHeading) != 0U;
+        const uint16_t firstOffset = first.textOffset;
+        const uint16_t firstLength = first.textLength;
+        const bool firstHeading = (first.flags & kExtractedHeading) != 0U;
         const bool firstTableCell = first.lineX != UINT16_MAX &&
                                     (first.lineX & kExtractedTableCell) != 0U;
-        continuesPrevious = (first.textLength & kExtractedNewBlock) != 0U && !firstHeading && !firstTableCell &&
+        continuesPrevious = (first.flags & kExtractedNewBlock) != 0U && !firstHeading && !firstTableCell &&
                             static_cast<uint32_t>(firstOffset) + firstLength <= transcriptLength_ &&
                             extractedTextStartsLowercase(pageText_.get() + firstOffset, firstLength);
         if (continuesPrevious) {
@@ -20794,11 +21064,11 @@ PdfStepResult PdfPreparation::emitSection(PdfWorkBudget& budget) {
       continue;
     }
     const ExtractedBlockRecord& record = blocks[currentBlockIndex_];
-    const uint16_t textOffset = record.textOffset & kExtractedTextOffsetMask;
-    const uint16_t textLength = record.textLength & kExtractedTextLengthMask;
+    const uint16_t textOffset = record.textOffset;
+    const uint16_t textLength = record.textLength;
     const uint8_t* const text = pageText_.get() + textOffset;
-    bool heading = (record.textOffset & kExtractedHeading) != 0;
-    const bool startsBlock = (record.textLength & kExtractedNewBlock) != 0;
+    bool heading = (record.flags & kExtractedHeading) != 0;
+    const bool startsBlock = (record.flags & kExtractedNewBlock) != 0;
     const bool continuesPrevious = startsBlock && currentBlockIndex_ == 0U && semanticWriter_.blockOpen();
     const bool tableCell = record.lineX != UINT16_MAX &&
                            (record.lineX & kExtractedTableCell) != 0U;
@@ -20855,17 +21125,27 @@ PdfStepResult PdfPreparation::emitSection(PdfWorkBudget& budget) {
       if (status && heading && !tableCell) {
         uint16_t blockTextLength = 0;
         for (uint16_t index = currentBlockIndex_; index < sectionEmitEndBlock_; ++index) {
-          if (index != currentBlockIndex_ && (blocks[index].textLength & kExtractedNewBlock) != 0) {
+          if (index != currentBlockIndex_ && (blocks[index].flags & kExtractedNewBlock) != 0) {
             break;
           }
-          const uint16_t fragmentLength = blocks[index].textLength & kExtractedTextLengthMask;
+          const uint16_t fragmentLength = blocks[index].textLength;
           blockTextLength = static_cast<uint16_t>(
               std::min<uint32_t>(121U, static_cast<uint32_t>(blockTextLength) + fragmentLength));
         }
         heading = blockTextLength <= 120U;
       }
       if (status && !tableCell) {
-        const uint8_t headingLevel = heading && nextAnchorOrdinal_ == currentSectionFirstAnchor_ ? 1U : 2U;
+        bool earlierHeadingOnSectionFirstPage = false;
+        if (heading && currentPageIndex_ == currentSectionFirstSourcePage_) {
+          for (uint16_t index = 0; index < currentBlockIndex_; ++index) {
+            earlierHeadingOnSectionFirstPage =
+                earlierHeadingOnSectionFirstPage || (blocks[index].flags & kExtractedHeading) != 0U;
+          }
+        }
+        const uint8_t headingLevel =
+            heading && currentPageIndex_ == currentSectionFirstSourcePage_ && !earlierHeadingOnSectionFirstPage
+                ? 1U
+                : 2U;
         status = semanticWriter_.beginBlock(
             {heading ? PdfSemanticBlockKind::Heading : PdfSemanticBlockKind::Paragraph,
              nextAnchorOrdinal_, static_cast<uint8_t>(heading ? headingLevel : 0U)});
@@ -20874,8 +21154,8 @@ PdfStepResult PdfPreparation::emitSection(PdfWorkBudget& budget) {
       status = PdfStatus::failure(PdfError::InvalidArgument, currentBlockIndex_);
     } else if (!continuesPrevious) {
       const ExtractedBlockRecord& previous = blocks[currentBlockIndex_ - 1U];
-      const uint16_t previousOffset = previous.textOffset & kExtractedTextOffsetMask;
-      const uint16_t previousLength = previous.textLength & kExtractedTextLengthMask;
+      const uint16_t previousOffset = previous.textOffset;
+      const uint16_t previousLength = previous.textLength;
       const uint8_t previousEnd = previousLength == 0 ? 0 : pageText_[previousOffset + previousLength - 1U];
       const bool previousSoftHyphen = previousLength >= 2U &&
                                       pageText_[previousOffset + previousLength - 2U] == 0xc2U &&
@@ -20907,16 +21187,16 @@ PdfStepResult PdfPreparation::emitSection(PdfWorkBudget& budget) {
         }
         ++currentWordLength;
       }
-      const bool standaloneDropCapI = (previous.textOffset & kExtractedDropCap) != 0 && previousEnd == 'I' &&
+      const bool standaloneDropCapI = (previous.flags & kExtractedDropCap) != 0 && previousEnd == 'I' &&
                                       !currentApostrophe && currentWordLength > 1U;
-      const bool dropCapJoins = (previous.textOffset & kExtractedDropCap) != 0 && !standaloneDropCapI;
+      const bool dropCapJoins = (previous.flags & kExtractedDropCap) != 0 && !standaloneDropCapI;
       const bool previousJoins = previousEnd == '-' || previousEnd == '/' || previousEnd == '(' ||
                                    previousEnd == '[' || previousEnd == '{' || previousSoftHyphen ||
                                    previousUnicodeDash || previousOpeningPunctuation || dropCapJoins;
       const bool whitespacePresent = previousEnd == ' ' || previousEnd == '\t' || previousEnd == '\r' ||
                                      previousEnd == '\n' || currentStart == ' ' || currentStart == '\t' ||
                                      currentStart == '\r' || currentStart == '\n';
-      const bool joinsPrevious = (record.textLength & kExtractedJoinsPrevious) != 0 && !standaloneDropCapI;
+      const bool joinsPrevious = (record.flags & kExtractedJoinsPrevious) != 0 && !standaloneDropCapI;
       if (!whitespacePresent && !currentPunctuation && !previousJoins &&
           !joinsPrevious) {
         constexpr uint8_t separator = ' ';
@@ -20937,13 +21217,13 @@ PdfStepResult PdfPreparation::emitSection(PdfWorkBudget& budget) {
                                        (text[2] == 0x90U || text[2] == 0x91U);
     if (!startsBlock && (isolatedSoftHyphen || isolatedUnicodeHyphen) && currentBlockIndex_ != 0U &&
         currentBlockIndex_ + 1U < sectionEmitEndBlock_ &&
-        (blocks[currentBlockIndex_ + 1U].textLength & kExtractedNewBlock) == 0U) {
+        (blocks[currentBlockIndex_ + 1U].flags & kExtractedNewBlock) == 0U) {
       const ExtractedBlockRecord& previous = blocks[currentBlockIndex_ - 1U];
       const ExtractedBlockRecord& next = blocks[currentBlockIndex_ + 1U];
-      const uint16_t previousOffset = previous.textOffset & kExtractedTextOffsetMask;
-      const uint16_t previousLength = previous.textLength & kExtractedTextLengthMask;
-      const uint16_t nextOffset = next.textOffset & kExtractedTextOffsetMask;
-      const uint16_t nextLength = next.textLength & kExtractedTextLengthMask;
+      const uint16_t previousOffset = previous.textOffset;
+      const uint16_t previousLength = previous.textLength;
+      const uint16_t nextOffset = next.textOffset;
+      const uint16_t nextLength = next.textLength;
       if (previousLength != 0U && nextLength != 0U &&
           static_cast<uint32_t>(previousOffset) + previousLength <= transcriptLength_ &&
           static_cast<uint32_t>(nextOffset) + nextLength <= transcriptLength_) {
@@ -21045,21 +21325,21 @@ PdfStepResult PdfPreparation::emitSection(PdfWorkBudget& budget) {
   if (sectionEmitStage_ == SectionEmitStage::EndBlock) {
     ++currentBlockIndex_;
     const bool closesBlock = currentBlockIndex_ >= sectionEmitEndBlock_ ||
-                             (blocks[currentBlockIndex_].textLength & kExtractedNewBlock) != 0;
+                             (blocks[currentBlockIndex_].flags & kExtractedNewBlock) != 0;
     if (closesBlock) {
       bool keepParagraphOpen = false;
       if (currentBlockIndex_ >= sectionEmitEndBlock_ && currentPageIndex_ + 1U < pageCount_ &&
           !isSectionBoundary(currentPageIndex_ + 1U) && semanticWriter_.currentBlockKind() == PdfSemanticBlockKind::Paragraph) {
         const ExtractedBlockRecord& last = blocks[currentBlockIndex_ - 1U];
-        const uint16_t lastOffset = last.textOffset & kExtractedTextOffsetMask;
-        const uint16_t lastLength = last.textLength & kExtractedTextLengthMask;
+        const uint16_t lastOffset = last.textOffset;
+        const uint16_t lastLength = last.textLength;
         uint16_t blockStart = static_cast<uint16_t>(currentBlockIndex_ - 1U);
         uint16_t blockTextLength = lastLength;
-        while (blockStart != 0U && (blocks[blockStart].textLength & kExtractedNewBlock) == 0U) {
+        while (blockStart != 0U && (blocks[blockStart].flags & kExtractedNewBlock) == 0U) {
           --blockStart;
           blockTextLength = static_cast<uint16_t>(
               std::min<uint32_t>(UINT16_MAX, static_cast<uint32_t>(blockTextLength) +
-                                                 (blocks[blockStart].textLength & kExtractedTextLengthMask)));
+                                                 blocks[blockStart].textLength));
         }
         keepParagraphOpen = blockTextLength >= 80U &&
                             static_cast<uint32_t>(lastOffset) + lastLength <= transcriptLength_ &&
@@ -23609,6 +23889,12 @@ PdfStepResult PdfPreparation::step() {
         return cancel();
       }
       if (result.failed()) {
+#ifdef CROSSINK_QEMU
+        esp_rom_printf("QEMU_PDF_RESOURCE_RESOLVER_FAIL task=%u index=%u error=%u offset=%llu\n",
+                       static_cast<unsigned>(imageResolveTask_), static_cast<unsigned>(imageResolveIndex_),
+                       static_cast<unsigned>(result.status.error),
+                       static_cast<unsigned long long>(result.status.offset));
+#endif
         resolver_->setSkipUnusedPageResources(false);
         if ((imageResolveTask_ == ImageResolveTask::FontObject ||
              imageResolveTask_ == ImageResolveTask::ToUnicodeObject) &&
@@ -23634,6 +23920,11 @@ PdfStepResult PdfPreparation::step() {
       resolver_->setSkipUnusedPageResources(false);
       operation = finishImageResolution();
       if (!operation) {
+#ifdef CROSSINK_QEMU
+        esp_rom_printf("QEMU_PDF_RESOURCE_FINISH_FAIL task=%u index=%u error=%u offset=%llu\n",
+                       static_cast<unsigned>(imageResolveTask_), static_cast<unsigned>(imageResolveIndex_),
+                       static_cast<unsigned>(operation.error), static_cast<unsigned long long>(operation.offset));
+#endif
         if (imageResolveTask_ == ImageResolveTask::None && operation.error == PdfError::InvalidArgument) {
           setPhase(PdfPreparationPhase::ResolveContent, 68);
           return pause();

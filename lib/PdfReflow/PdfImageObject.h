@@ -44,6 +44,7 @@ enum class PdfImageUnresolved : uint8_t {
   IndexedPalette = 1U << 2U,
   ExplicitMask = 1U << 3U,
   SoftMask = 1U << 4U,
+  DecodeParameters = 1U << 5U,
 };
 
 constexpr PdfImageUnresolved operator|(const PdfImageUnresolved left, const PdfImageUnresolved right) {
@@ -76,6 +77,7 @@ struct PdfImageObjectParseInput {
   // buffer. The parser never allocates; Indexed RGB needs at most 768 bytes.
   uint8_t* palette = nullptr;
   size_t paletteCapacity = 0;
+  PdfObjectReference* decodeParametersReference = nullptr;
 };
 
 struct PdfImageObjectDescriptor {
@@ -107,6 +109,8 @@ PdfStatus pdfParseImageObject(const PdfObjectArena& arena, const PdfImageObjectP
                               PdfImageObjectDescriptor* descriptor);
 PdfStatus pdfApplyResolvedImageColorSpace(PdfImageObjectDescriptor* descriptor,
                                           PdfImageColorSpace resolvedColorSpace);
+PdfStatus pdfApplyResolvedImageDecodeParameters(const PdfObjectArena& arena, uint16_t valueIndex,
+                                                 PdfImageObjectDescriptor* descriptor);
 PdfStatus pdfApplyResolvedImageAuxiliary(PdfImageObjectDescriptor* base, const PdfImageObjectDescriptor& auxiliary,
                                          PdfImageAuxiliaryKind kind);
 

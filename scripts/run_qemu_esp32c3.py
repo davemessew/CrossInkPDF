@@ -1126,7 +1126,11 @@ def _command(qemu: Path) -> list[str]:
     return [str(qemu)]
 
 
-def _monitor(command: list[str], arguments: argparse.Namespace) -> int:
+def _monitor(
+    command: list[str],
+    arguments: argparse.Namespace,
+    working_directory: Path | None = None,
+) -> int:
     if arguments.timeout <= 0:
         sys.stderr.write("QEMU timeout must be greater than zero\n")
         return 1
@@ -1139,6 +1143,7 @@ def _monitor(command: list[str], arguments: argparse.Namespace) -> int:
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            cwd=working_directory,
         )
     except OSError as error:
         sys.stderr.write(f"cannot start QEMU: {error}\n")
@@ -1322,6 +1327,8 @@ def _qemu_machine_command(
         "driver=nvram.esp32c3.efuse,property=drive,value=efuse",
         "-nic",
         "none",
+        "-semihosting-config",
+        "enable=on,target=native",
         "-nographic",
         "-serial",
         "mon:stdio",
@@ -1360,12 +1367,32 @@ def _run(arguments: argparse.Namespace) -> int:
             efuse_copy = temporary / "qemu_efuse.bin"
             shutil.copy2(flash_source, flash_copy)
             shutil.copy2(efuse_source, efuse_copy)
-            return _monitor(
+
+            sd_image = temporary / "qemu_sd.img"
+            with sd_image.open("wb") as image:
+                image.seek(256 * 1024 * 1024 - 1)
+                image.write(b"\0")
+            (temporary / "qemu_sd_format.ok").touch()
+            if arguments.pdf is not None:
+                if not arguments.pdf.is_file():
+                    raise RuntimeError(f"PDF does not exist: {arguments.pdf}")
+                shutil.copy2(arguments.pdf, temporary / "qemu_input.pdf")
+            if arguments.xhtml_out is not None:
+                (temporary / "qemu_output.xhtml").touch()
+            result = _monitor(
                 _qemu_machine_command(
                     executable, flash_copy, efuse_copy
                 ),
                 arguments,
+                temporary,
             )
+            if arguments.xhtml_out is not None:
+                exported = temporary / "qemu_output.xhtml"
+                if not exported.is_file():
+                    raise RuntimeError("QEMU did not create the requested XHTML output")
+                arguments.xhtml_out.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(exported, arguments.xhtml_out)
+            return result
     except (OSError, RuntimeError) as error:
         sys.stderr.write(f"QEMU runner setup failed: {error}\n")
         return 1
@@ -1376,6 +1403,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--qemu", type=Path)
     parser.add_argument("--install", type=Path)
     parser.add_argument("--manifest", type=Path)
+    parser.add_argument("--pdf", type=Path)
+    parser.add_argument("--xhtml-out", type=Path)
     parser.add_argument("--expect", required=True)
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("--log", type=Path, required=True)
