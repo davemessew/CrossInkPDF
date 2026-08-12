@@ -1288,6 +1288,7 @@ int PdfReflowDocument::resolveHrefToSectionIndex(const std::string& href) const 
     return 0;
   }
   static constexpr char prefix[] = "sections/";
+  static constexpr char pagePrefix[] = "pages/";
   static constexpr char suffix[] = ".xhtml";
   if (path.size() == sizeof(prefix) - 1 + 6 + sizeof(suffix) - 1 && path.compare(0, sizeof(prefix) - 1, prefix) == 0 &&
       path.compare(path.size() - (sizeof(suffix) - 1), sizeof(suffix) - 1, suffix) == 0) {
@@ -1295,6 +1296,25 @@ int PdfReflowDocument::resolveHrefToSectionIndex(const std::string& href) const 
     if (parseDecimal(path.data() + sizeof(prefix) - 1, 6, &sectionIndex) && sectionIndex < metadata_.sectionCount) {
       return static_cast<int>(sectionIndex);
     }
+  }
+  if (sections_ && path.size() == sizeof(pagePrefix) - 1 + 6 + sizeof(suffix) - 1 &&
+      path.compare(0, sizeof(pagePrefix) - 1, pagePrefix) == 0 &&
+      path.compare(path.size() - (sizeof(suffix) - 1), sizeof(suffix) - 1, suffix) == 0) {
+    uint32_t sourcePage = 0;
+    if (!parseDecimal(path.data() + sizeof(pagePrefix) - 1, 6, &sourcePage)) {
+      return -1;
+    }
+    uint16_t first = 0;
+    uint16_t end = metadata_.sectionCount;
+    while (first + 1U < end) {
+      const uint16_t middle = static_cast<uint16_t>(first + (end - first) / 2U);
+      if (sections_[middle].firstSourcePage <= sourcePage) {
+        first = middle;
+      } else {
+        end = middle;
+      }
+    }
+    return sourcePage < sections_[0].firstSourcePage ? 0 : static_cast<int>(first);
   }
   return -1;
 }

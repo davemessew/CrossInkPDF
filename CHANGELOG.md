@@ -1,3 +1,15 @@
+## [v1.5.0.15] - 2026-08-12
+
+### Changed
+
+- PDF preparation now divides generated chapters by their text and layout workload instead of after a fixed number of source pages. Sparse chapters stay together while dense chapters are divided before they exceed the reader's safe memory budget.
+- EPUB files and EPUB chapter boundaries are unchanged.
+
+### Fixed
+
+- Internal PDF links remain correct when a later page starts a workload-based section.
+- The constrained reader check now keeps its reserved memory occupied while every generated PDF section is laid out.
+
 ## [v1.5.0.14] - 2026-08-12
 
 ### Fixed

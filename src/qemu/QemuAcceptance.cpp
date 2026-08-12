@@ -1491,8 +1491,6 @@ bool runExternalPdf(MappedInputManager& input, GfxRenderer& renderer) {
     esp_rom_printf("QEMU_PDF_SD_FAIL stage=reader_layout\n");
     return false;
   }
-  readerPressure.reset();
-
   for (int sectionIndex = 0; sectionIndex < document->getSectionCount(); ++sectionIndex) {
     Section section(document, sectionIndex, renderer, "_qemu_external");
     ReaderRenderSpec spec = SETTINGS.readerRenderSpec(layout.width, layout.height, EpubRenderMode::Light);
@@ -1513,6 +1511,7 @@ bool runExternalPdf(MappedInputManager& input, GfxRenderer& renderer) {
       return false;
     }
   }
+  readerPressure.reset();
   const uint32_t elapsed = millis() - startedAt;
   esp_rom_printf(
       "QEMU_PDF_SD_RESULT bytes=%llu elapsed_ms=%lu steps=%lu sections=%d words=%lu prepared_words=%lu "

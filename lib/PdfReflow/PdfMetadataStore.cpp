@@ -156,7 +156,7 @@ void encodeSection(const PdfMetadataSection& section, uint8_t output[kSectionByt
   putU32(output + 12, section.wordCount);
   putU32(output + 16, section.firstAnchorOrdinal);
   putU16(output + 20, static_cast<uint16_t>(section.tocIndex));
-  putU16(output + 22, section.reserved);
+  putU16(output + 22, section.firstSourcePage);
 }
 
 PdfMetadataSection decodeSection(const uint8_t input[kSectionBytes]) {
@@ -167,7 +167,7 @@ PdfMetadataSection decodeSection(const uint8_t input[kSectionBytes]) {
   section.wordCount = getU32(input + 12);
   section.firstAnchorOrdinal = getU32(input + 16);
   section.tocIndex = static_cast<int16_t>(getU16(input + 20));
-  section.reserved = getU16(input + 22);
+  section.firstSourcePage = getU16(input + 22);
   return section;
 }
 
@@ -175,7 +175,7 @@ PdfStatus validateSection(const PdfMetadata& metadata, const PdfMetadataSection&
                           const uint32_t priorBytes, const uint32_t priorWords) {
   if (section.byteSize == 0 || section.byteSize > std::numeric_limits<uint32_t>::max() - priorBytes ||
       section.cumulativeSize != priorBytes + section.byteSize || section.firstWordOrdinal != priorWords ||
-      section.wordCount > std::numeric_limits<uint32_t>::max() - priorWords || section.reserved != 0 ||
+      section.wordCount > std::numeric_limits<uint32_t>::max() - priorWords ||
       section.tocIndex < -1 || section.tocIndex >= static_cast<int16_t>(metadata.outlineCount)) {
     return PdfStatus::failure(PdfError::Malformed, index);
   }

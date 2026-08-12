@@ -14,7 +14,7 @@ inline constexpr size_t LanguageBytes = 24;
 inline constexpr uint16_t MaxSections = 256;
 inline constexpr uint16_t MaxOutlineEntries = 256;
 inline constexpr size_t IoChunkBytes = 64;
-inline constexpr uint16_t CodecVersion = 1;
+inline constexpr uint16_t CodecVersion = 2;
 
 }  // namespace PdfMetadataLimits
 
@@ -45,7 +45,7 @@ struct PdfMetadataSection {
   uint32_t wordCount = 0;
   uint32_t firstAnchorOrdinal = 0;
   int16_t tocIndex = -1;
-  uint16_t reserved = 0;
+  uint16_t firstSourcePage = 0;
 };
 
 static_assert(sizeof(PdfMetadataSection) == 24);

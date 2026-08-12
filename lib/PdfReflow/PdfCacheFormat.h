@@ -4,7 +4,7 @@
 #include <cstdint>
 
 constexpr uint16_t PDF_CACHE_CODEC_VERSION = 1;
-constexpr uint16_t PDF_CACHE_FORMAT_VERSION = 2;
+constexpr uint16_t PDF_CACHE_FORMAT_VERSION = 3;
 constexpr uint16_t PDF_CACHE_CAPABILITY_VERSION = 3;
 constexpr uint64_t PDF_CACHE_FNV64_OFFSET = 14695981039346656037ULL;
 constexpr uint64_t PDF_CACHE_FNV64_PRIME = 1099511628211ULL;

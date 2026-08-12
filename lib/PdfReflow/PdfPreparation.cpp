@@ -1023,7 +1023,7 @@ constexpr size_t kManifestRecordHeaderBytes = 16;
 constexpr size_t kCheckpointBytes = 96;
 constexpr size_t kPageResumeRecordBytes = 512;
 constexpr size_t kPageResumeRecordCrcOffset = kPageResumeRecordBytes - sizeof(uint32_t);
-constexpr uint16_t kPageResumeRecordVersion = 2;
+constexpr uint16_t kPageResumeRecordVersion = 3;
 constexpr size_t kDiscoveryHeaderBytes = 336;
 constexpr size_t kDiscoveryXrefRecordBytes = 24;
 constexpr size_t kDiscoveryPageRecordBytes = 256;
@@ -1050,11 +1050,12 @@ static_assert(kResumeContentOverflowBatchRecords * sizeof(PdfPageContentOverflow
 static_assert(kResumeContentOverflowBatchRecords * kDiscoveryContentOverflowRecordBytes <=
               PdfLimits::PageTextBytes);
 constexpr size_t kDiscoveryTrailerBytes = 72;
-// Reader layout keeps one generated section in memory at a time.  Keep PDF
-// sections short even when the source has no usable outline; the EPUB reader
-// then never has to lay out an entire long PDF chapter as one allocation-heavy
-// unit.  These are storage boundaries only and do not add synthetic TOC items.
-constexpr uint16_t kMaximumPdfPagesPerSection = 8;
+// Reader layout keeps one generated PDF section in memory at a time. Estimate
+// its working set from generated XHTML plus the incoming page's text and block
+// structure, then roll the storage section only between pages. A dense page is
+// always kept whole. These storage boundaries do not add synthetic TOC items.
+constexpr uint32_t kPdfReaderSectionWorkBudgetBytes = 24U * 1024U;
+constexpr uint32_t kPdfReaderBlockWorkBytes = 64U;
 constexpr size_t kDiscoveryHeaderCrcOffset = kDiscoveryHeaderBytes - sizeof(uint32_t);
 constexpr size_t kDiscoveryXrefRecordCrcOffset = kDiscoveryXrefRecordBytes - sizeof(uint32_t);
 constexpr size_t kDiscoveryPageRecordCrcOffset = kDiscoveryPageRecordBytes - sizeof(uint32_t);
@@ -6967,6 +6968,7 @@ PdfStatus PdfPreparation::encodePageResumeRecord(uint8_t* const output, const si
   const PdfMetadataSection& section = navigation_->preparedPageScratch.section;
   if (!pdfValidateCacheRelativePath(sectionRecord_.path, sectionRecord_.pathLength) ||
       section.byteSize != sectionRecord_.size || section.cumulativeSize != cumulativeSectionBytes_ ||
+      section.firstSourcePage != currentSectionFirstSourcePage_ ||
       currentPageFirstAnchor_ == UINT32_MAX || currentPageFirstSection_ == UINT16_MAX ||
       navigation_->pageScratch.pageReference.objectNumber == 0) {
     return PdfStatus::failure(PdfError::Malformed, currentPageIndex_);
@@ -7007,7 +7009,7 @@ PdfStatus PdfPreparation::encodePageResumeRecord(uint8_t* const output, const si
   writeLe32Bmp(output + 224, section.wordCount);
   writeLe32Bmp(output + 228, section.firstAnchorOrdinal);
   writeLe16Bmp(output + 232, static_cast<uint16_t>(section.tocIndex));
-  writeLe16Bmp(output + 234, section.reserved);
+  writeLe16Bmp(output + 234, section.firstSourcePage);
   writeLe32Bmp(output + 236, expandedRequiredBytes_);
   writeLe32Bmp(output + kPageResumeRecordCrcOffset, pdfCacheCrc32(output, kPageResumeRecordCrcOffset));
   return PdfStatus::success();
@@ -7114,9 +7116,10 @@ PdfStatus PdfPreparation::decodePageResumeRecord(const uint8_t* const input, con
   section.wordCount = readLe32Prep(input + 224);
   section.firstAnchorOrdinal = readLe32Prep(input + 228);
   section.tocIndex = static_cast<int16_t>(readLe16Prep(input + 232));
-  section.reserved = readLe16Prep(input + 234);
+  section.firstSourcePage = readLe16Prep(input + 234);
   if (previousSectionBytes > UINT64_MAX - sectionSize || previousSectionBytes + sectionSize != recordSectionBytes ||
-      section.byteSize != sectionSize || section.cumulativeSize != recordSectionBytes || section.reserved != 0 ||
+      section.byteSize != sectionSize || section.cumulativeSize != recordSectionBytes ||
+      section.firstSourcePage != navigation_->preparedPageScratch.firstSourcePage ||
       section.firstWordOrdinal != expectedFirstWord || section.firstAnchorOrdinal != expectedFirstAnchor ||
       section.wordCount > UINT32_MAX - section.firstWordOrdinal ||
       section.firstWordOrdinal + section.wordCount != recordWords || recordNextAnchor <= pageFirstAnchor) {
@@ -10853,33 +10856,6 @@ PdfStepResult PdfPreparation::stepStartNextNavigationObject(PdfWorkBudget& budge
           const PdfStatus status = switchPageTraversalAccess(false);
           if (!status) {
             return PdfStepResult::failure(status);
-          }
-        }
-        {
-          uint16_t* const boundaries = sectionBoundaryPages();
-          uint16_t sectionSlots = 1;
-          for (uint16_t index = 0; index < sectionBoundaryCount_; ++index) {
-            sectionSlots += boundaries[index] != 0 ? 1U : 0U;
-          }
-          for (uint32_t page = kMaximumPdfPagesPerSection;
-               page < pageCount_ && sectionSlots < PdfMetadataLimits::MaxSections;
-               page += kMaximumPdfPagesPerSection) {
-            const uint16_t boundary = static_cast<uint16_t>(page);
-            uint16_t insert = 0;
-            while (insert < sectionBoundaryCount_ && boundaries[insert] < boundary) {
-              ++insert;
-            }
-            if (insert < sectionBoundaryCount_ && boundaries[insert] == boundary) {
-              continue;
-            }
-            if (sectionBoundaryCount_ >= PdfOutlineLimits::MaxEntries) {
-              break;
-            }
-            std::move_backward(boundaries + insert, boundaries + sectionBoundaryCount_,
-                               boundaries + sectionBoundaryCount_ + 1U);
-            boundaries[insert] = boundary;
-            ++sectionBoundaryCount_;
-            ++sectionSlots;
           }
         }
         currentAnnotationPage_ = 0;
@@ -21005,7 +20981,8 @@ PdfStatus PdfPreparation::restoreCurrentSectionScratch() {
   }
   navigation_->preparedPageScratch = {
       {static_cast<uint32_t>(sectionRecord_.size), static_cast<uint32_t>(cumulativeSectionBytes_),
-       currentSectionFirstWord_, totalWords_ - currentSectionFirstWord_, currentSectionFirstAnchor_, -1, 0},
+       currentSectionFirstWord_, totalWords_ - currentSectionFirstWord_, currentSectionFirstAnchor_, -1,
+       static_cast<uint16_t>(currentSectionFirstSourcePage_)},
       sectionRecord_,
       currentSectionFirstSourcePage_,
       currentPageIndex_,
@@ -21020,8 +20997,22 @@ PdfStepResult PdfPreparation::stepOpenSection(PdfWorkBudget& budget) {
   if (budget.stopRequested() || !budget.consumeOperation()) {
     return PdfStepResult::paused();
   }
-  bool newSection =
-      sectionCount_ == 0 || (currentPageIndex_ != 0 && (pendingSectionBoundary_ || isSectionBoundary(currentPageIndex_)));
+  bool newSection = false;
+  if (sectionOpenPrepared_) {
+    newSection = navigation_->preparedPageScratch.firstSourcePage ==
+                 navigation_->preparedPageScratch.lastSourcePageExclusive;
+  } else {
+    const uint64_t currentSectionBytes =
+        sectionCount_ == 0 ? 0U : navigation_->preparedPageScratch.file.size;
+    const uint64_t incomingPageWork = static_cast<uint64_t>(transcriptLength_) +
+                                      static_cast<uint64_t>(extractedBlockCount_) * kPdfReaderBlockWorkBytes;
+    const bool readerWorkBoundary =
+        currentBlockIndex_ == 0 && sectionCount_ != 0 && currentPageIndex_ > currentSectionFirstSourcePage_ &&
+        currentSectionBytes + incomingPageWork > kPdfReaderSectionWorkBudgetBytes;
+    newSection = sectionCount_ == 0 ||
+                 (currentPageIndex_ != 0 &&
+                  (pendingSectionBoundary_ || isSectionBoundary(currentPageIndex_) || readerWorkBoundary));
+  }
   if (newSection && sectionCount_ >= PdfMetadataLimits::MaxSections) {
     newSection = false;
     pendingSectionBoundary_ = false;
@@ -21359,8 +21350,8 @@ PdfStatus PdfPreparation::formatInternalLink(const uint16_t sourcePageIndex, con
   *hrefLength = 0;
   if (resolvedLinksSpilled_) {
     const uint16_t targetPage = static_cast<uint16_t>(x);
-    const int written = std::snprintf(href, capacity, "sections/%06u.xhtml#p%08lx", sectionForPage(targetPage),
-                                      static_cast<unsigned long>(targetPage));
+    const int written = std::snprintf(href, capacity, "pages/%06u.xhtml#p%08lx", targetPage,
+                                       static_cast<unsigned long>(targetPage));
     if (written <= 0 || static_cast<size_t>(written) >= capacity) {
       return PdfStatus::failure(PdfError::LimitExceeded, targetPage);
     }
@@ -21374,8 +21365,8 @@ PdfStatus PdfPreparation::formatInternalLink(const uint16_t sourcePageIndex, con
         static_cast<uint16_t>(y) > link.yMax) {
       continue;
     }
-    const int written = std::snprintf(href, capacity, "sections/%06u.xhtml#p%08lx", sectionForPage(link.targetPage),
-                                      static_cast<unsigned long>(link.targetPage));
+    const int written = std::snprintf(href, capacity, "pages/%06u.xhtml#p%08lx", link.targetPage,
+                                       static_cast<unsigned long>(link.targetPage));
     if (written <= 0 || static_cast<size_t>(written) >= capacity) {
       return PdfStatus::failure(PdfError::LimitExceeded, link.targetPage);
     }
@@ -21846,7 +21837,7 @@ PdfStepResult PdfPreparation::stepCloseSection(PdfWorkBudget& budget) {
           totalWords_ - currentSectionFirstWord_,
           currentSectionFirstAnchor_,
           -1,
-          0,
+          static_cast<uint16_t>(currentSectionFirstSourcePage_),
       };
       navigation_->preparedPageScratch.file = sectionRecord_;
       navigation_->preparedPageScratch.lastSourcePageExclusive = currentPageIndex_ + 1U;

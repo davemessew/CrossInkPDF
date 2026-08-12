@@ -198,12 +198,12 @@ An interrupted or uncertain write does not make an invalid slot authoritative.
 Each reader validates magic, version, size, reserved fields, source binding,
 and CRC before applying sequence ordering.
 
-### `manifest.a` / `manifest.b`: PRMF codec 1, format 2, capability 3
+### `manifest.a` / `manifest.b`: PRMF codec 1, format 3, capability 3
 
 The manifest codec uses:
 
 - codec version `1`
-- cache format version `2`
+- cache format version `3`
 - cache capability version `3`
 - at most `4,096` required files
 - at most `512 KiB` per manifest slot
@@ -213,7 +213,7 @@ The fixed 84-byte header is:
 
 - `[0-3]` magic `PRMF`
 - `[4-5]` codec version (`1`)
-- `[6-7]` cache format version (`2`)
+- `[6-7]` cache format version (`3`)
 - `[8-9]` cache capability version (`3`)
 - `[10-11]` reserved zero
 - `[12-15]` monotonic slot sequence (`uint32_t`)
@@ -379,10 +379,11 @@ modification-time-known flag, generation, counts, and record sizes. It also
 stores an aggregate CRC-32 and FNV-1a ledger over all xref, page, and overflow
 records. Xrefs must decode in strictly increasing object-number order.
 
-After the discovery trailer, committed prepared pages append `PRJR` version 2, 512 bytes each.
+After the discovery trailer, committed prepared pages append `PRJR` version 3, 512 bytes each.
 A record binds its sequence, source identity, generation, completed page and
 section counts, semantic word and anchor cursors, output byte totals, page
-geometry, section path, section size and CRC-32, and ends with its own CRC-32.
+geometry, section path, section size, first source page and CRC-32, and ends
+with its own CRC-32.
 
 Recovery reads only the checkpoint's `journalBytes` prefix; bytes appended
 after that committed boundary are ignored. It validates both discovery passes,
@@ -394,7 +395,7 @@ reader falls back to a clean on-device preparation in a new generation. After
 a replacement generation is committed, later cleanup removes the rejected
 generation while preserving generations referenced by valid manifests.
 
-### `metadata.bin`: XPMD codec 1
+### `metadata.bin`: XPMD codec 2
 
 `metadata.bin` binds book metadata to the semantic section and word ledger. It
 uses a 24-byte header, raw UTF-8 metadata fields, 24-byte section records, and a
@@ -406,7 +407,7 @@ respectively.
 The header is:
 
 - `[0-3]` magic `XPMD`
-- `[4-5]` codec version (`1`)
+- `[4-5]` codec version (`2`)
 - `[6-7]` header size (`24`)
 - `[8-9]` section count
 - `[10-11]` outline count
@@ -414,7 +415,7 @@ The header is:
 - `[16-17]` title byte length
 - `[18-19]` author byte length
 - `[20-21]` language byte length
-- `[22-23]` reserved zero
+- `[22-23]` first zero-based PDF source page in the section
 
 The title, author, and language bytes immediately follow the header. Each
 section record is:
