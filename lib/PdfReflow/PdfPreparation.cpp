@@ -1050,6 +1050,11 @@ static_assert(kResumeContentOverflowBatchRecords * sizeof(PdfPageContentOverflow
 static_assert(kResumeContentOverflowBatchRecords * kDiscoveryContentOverflowRecordBytes <=
               PdfLimits::PageTextBytes);
 constexpr size_t kDiscoveryTrailerBytes = 72;
+// Reader layout keeps one generated section in memory at a time.  Keep PDF
+// sections short even when the source has no usable outline; the EPUB reader
+// then never has to lay out an entire long PDF chapter as one allocation-heavy
+// unit.  These are storage boundaries only and do not add synthetic TOC items.
+constexpr uint16_t kMaximumPdfPagesPerSection = 8;
 constexpr size_t kDiscoveryHeaderCrcOffset = kDiscoveryHeaderBytes - sizeof(uint32_t);
 constexpr size_t kDiscoveryXrefRecordCrcOffset = kDiscoveryXrefRecordBytes - sizeof(uint32_t);
 constexpr size_t kDiscoveryPageRecordCrcOffset = kDiscoveryPageRecordBytes - sizeof(uint32_t);
@@ -10848,6 +10853,33 @@ PdfStepResult PdfPreparation::stepStartNextNavigationObject(PdfWorkBudget& budge
           const PdfStatus status = switchPageTraversalAccess(false);
           if (!status) {
             return PdfStepResult::failure(status);
+          }
+        }
+        {
+          uint16_t* const boundaries = sectionBoundaryPages();
+          uint16_t sectionSlots = 1;
+          for (uint16_t index = 0; index < sectionBoundaryCount_; ++index) {
+            sectionSlots += boundaries[index] != 0 ? 1U : 0U;
+          }
+          for (uint32_t page = kMaximumPdfPagesPerSection;
+               page < pageCount_ && sectionSlots < PdfMetadataLimits::MaxSections;
+               page += kMaximumPdfPagesPerSection) {
+            const uint16_t boundary = static_cast<uint16_t>(page);
+            uint16_t insert = 0;
+            while (insert < sectionBoundaryCount_ && boundaries[insert] < boundary) {
+              ++insert;
+            }
+            if (insert < sectionBoundaryCount_ && boundaries[insert] == boundary) {
+              continue;
+            }
+            if (sectionBoundaryCount_ >= PdfOutlineLimits::MaxEntries) {
+              break;
+            }
+            std::move_backward(boundaries + insert, boundaries + sectionBoundaryCount_,
+                               boundaries + sectionBoundaryCount_ + 1U);
+            boundaries[insert] = boundary;
+            ++sectionBoundaryCount_;
+            ++sectionSlots;
           }
         }
         currentAnnotationPage_ = 0;

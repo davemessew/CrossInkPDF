@@ -1,3 +1,10 @@
+## [v1.5.0.14] - 2026-08-12
+
+### Fixed
+
+- Long generated PDF chapters are divided at PDF page boundaries so they fit the reader's memory without losing text or changing the table of contents.
+- Existing PDF caches are rebuilt once so the safer chapter layout is used immediately after updating.
+
 ## [v1.5.0.13] - 2026-08-12
 
 ### Fixed

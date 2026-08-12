@@ -198,12 +198,12 @@ An interrupted or uncertain write does not make an invalid slot authoritative.
 Each reader validates magic, version, size, reserved fields, source binding,
 and CRC before applying sequence ordering.
 
-### `manifest.a` / `manifest.b`: PRMF codec 1, format 1, capability 3
+### `manifest.a` / `manifest.b`: PRMF codec 1, format 2, capability 3
 
 The manifest codec uses:
 
 - codec version `1`
-- cache format version `1`
+- cache format version `2`
 - cache capability version `3`
 - at most `4,096` required files
 - at most `512 KiB` per manifest slot
@@ -213,7 +213,7 @@ The fixed 84-byte header is:
 
 - `[0-3]` magic `PRMF`
 - `[4-5]` codec version (`1`)
-- `[6-7]` cache format version (`1`)
+- `[6-7]` cache format version (`2`)
 - `[8-9]` cache capability version (`3`)
 - `[10-11]` reserved zero
 - `[12-15]` monotonic slot sequence (`uint32_t`)
