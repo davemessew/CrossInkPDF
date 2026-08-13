@@ -14,6 +14,71 @@ struct GlyphNamePair {
   uint32_t scalar;
 };
 
+constexpr uint32_t kPackedGlyphSequence = UINT32_C(0x80000000);
+
+bool packGlyphNameSequence(const uint8_t* const name, const size_t length, uint32_t* const packed) {
+  if (name == nullptr || packed == nullptr) {
+    return false;
+  }
+  size_t glyphLength = 0;
+  while (glyphLength < length && name[glyphLength] != '.') {
+    ++glyphLength;
+  }
+  if (glyphLength != 3U && glyphLength != 5U) {
+    return false;
+  }
+  const uint8_t count = static_cast<uint8_t>((glyphLength + 1U) / 2U);
+  uint32_t value = kPackedGlyphSequence | static_cast<uint32_t>(count) << 24U;
+  for (uint8_t index = 0; index < count; ++index) {
+    const uint8_t component = name[static_cast<size_t>(index) * 2U];
+    if (((component < 'A' || component > 'Z') && (component < 'a' || component > 'z')) ||
+        (index + 1U < count && name[static_cast<size_t>(index) * 2U + 1U] != '_')) {
+      return false;
+    }
+    value |= static_cast<uint32_t>(component) << (16U - static_cast<uint32_t>(index) * 8U);
+  }
+  *packed = value;
+  return true;
+}
+
+bool decodeLigatureScalar(const uint32_t scalar, PdfUtf8Value* const value) {
+  const char* text = nullptr;
+  uint8_t length = 0;
+  switch (scalar) {
+    case 0xFB00:
+      text = "ff";
+      length = 2;
+      break;
+    case 0xFB01:
+      text = "fi";
+      length = 2;
+      break;
+    case 0xFB02:
+      text = "fl";
+      length = 2;
+      break;
+    case 0xFB03:
+      text = "ffi";
+      length = 3;
+      break;
+    case 0xFB04:
+      text = "ffl";
+      length = 3;
+      break;
+    case 0xFB05:
+    case 0xFB06:
+      text = "st";
+      length = 2;
+      break;
+    default:
+      return false;
+  }
+  *value = {};
+  std::memcpy(value->bytes, text, length);
+  value->length = length;
+  return true;
+}
+
 static constexpr uint32_t WIN_ANSI_80_TO_9F[] = {
     // Several long-lived PDF producers place the embedded font's bullet at
     // 0x81 while declaring WinAnsi. Readers commonly preserve that glyph even
@@ -421,6 +486,12 @@ bool pdfGlyphNameToUnicode(const uint8_t* const name, const size_t length, uint3
   return false;
 }
 
+bool pdfGlyphNameToTextMapping(const uint8_t* const name, const size_t length,
+                               uint32_t* const mapping) {
+  return pdfGlyphNameToUnicode(name, length, mapping) ||
+         packGlyphNameSequence(name, length, mapping);
+}
+
 bool pdfConservativeLatinFallback(const uint8_t code, uint32_t* const scalar) {
   if (scalar == nullptr || code < 0x20 || code > 0x7E) {
     return false;
@@ -501,15 +572,19 @@ PdfStatus PdfSimpleEncoding::setSourceAccess(const bool required) {
   return PdfStatus::success();
 }
 
-PdfStatus PdfSimpleEncoding::begin(const PdfBaseEncoding base) {
+PdfStatus PdfSimpleEncoding::begin(const PdfBaseEncoding base,
+                                   const uint16_t existingDifferenceCount) {
   if (workspace_.differences == nullptr || workspace_.differenceCapacity == 0) {
     return PdfStatus::failure(PdfError::InvalidArgument);
+  }
+  if (existingDifferenceCount > workspace_.differenceCapacity) {
+    return PdfStatus::failure(PdfError::InvalidArgument, existingDifferenceCount);
   }
   if (workspace_.spill.valid() && workspace_.spill.recordSize != sizeof(PdfEncodingDifference)) {
     return PdfStatus::failure(PdfError::InvalidArgument, workspace_.spill.recordSize);
   }
   base_ = base;
-  differenceCount_ = 0;
+  differenceCount_ = existingDifferenceCount;
   spillCount_ = 0;
   return setSourceAccess(true);
 }
@@ -560,7 +635,7 @@ PdfStatus PdfSimpleEncoding::applyDifferences(const PdfObjectArena& arena, const
       return PdfStatus::failure(PdfError::Malformed, ordinal);
     }
     uint32_t scalar = 0;
-    if (!pdfGlyphNameToUnicode(arena.text + value.textOffset, value.textLength, &scalar)) {
+    if (!pdfGlyphNameToTextMapping(arena.text + value.textOffset, value.textLength, &scalar)) {
       return PdfStatus::failure(PdfError::UnsupportedEncoding, ordinal);
     }
     const PdfStatus addStatus = addDifference(static_cast<uint8_t>(code), scalar);
@@ -610,6 +685,20 @@ PdfStatus PdfSimpleEncoding::decode(const uint8_t code, PdfUtf8Value* const valu
     return PdfStatus::failure(PdfError::UnsupportedEncoding, code);
   }
   *value = {};
+  if ((scalar & kPackedGlyphSequence) != 0U) {
+    const uint8_t length = static_cast<uint8_t>((scalar >> 24U) & 0x7FU);
+    if (length < 2U || length > 3U) {
+      return PdfStatus::failure(PdfError::Malformed, scalar);
+    }
+    for (uint8_t index = 0; index < length; ++index) {
+      value->bytes[index] = static_cast<uint8_t>(scalar >> (16U - static_cast<uint32_t>(index) * 8U));
+    }
+    value->length = length;
+    return PdfStatus::success();
+  }
+  if (decodeLigatureScalar(scalar, value)) {
+    return PdfStatus::success();
+  }
   size_t length = 0;
   const PdfStatus status = pdfAppendUtf8Scalar(scalar, value->bytes, sizeof(value->bytes), &length);
   if (status.ok()) {

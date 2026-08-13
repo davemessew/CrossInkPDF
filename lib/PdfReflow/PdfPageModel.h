@@ -44,7 +44,10 @@ enum PdfTextRunFlag : uint16_t {
   PdfTextBold = 1U << 5,
   PdfTextArrayExplicitGap = 1U << 6,
   PdfTextArrayTightContinuation = 1U << 7,
+  PdfTextSemanticBoundary = 1U << 8,
 };
+
+constexpr uint8_t PdfTextSemanticSeparator = 0x1eU;
 
 struct PdfPageModelWorkspace {
   using SpillTextFn = PdfStatus (*)(void* context, size_t logicalOffset, const uint8_t* text, size_t length);
@@ -68,6 +71,7 @@ class PdfPageModel {
   PdfStatus appendText(const uint8_t* text, size_t length);
   PdfStatus beginOverflowTextRun(const PdfTextRun& run, uint16_t* runIndex);
   PdfStatus appendOverflowText(const uint8_t* text, size_t length);
+  PdfStatus appendDetachedSpace();
   PdfStatus expandTextRunBounds(uint16_t runIndex, int32_t x, int32_t y);
   PdfStatus setTextRunBaselineEnd(uint16_t runIndex, int32_t x, int32_t y);
   PdfStatus finishTextRun();
@@ -96,7 +100,7 @@ class PdfPageModel {
   uint16_t runCount_ = 0;
   uint16_t imageCount_ = 0;
   PdfPageWarning warnings_ = PdfPageWarning::None;
-  enum class OverflowSeparator : uint8_t { None, Inferred, Explicit };
+  enum class OverflowSeparator : uint8_t { None, Inferred, Explicit, Semantic };
   OverflowSeparator overflowSeparator_ = OverflowSeparator::None;
   uint16_t duplicateOverlayOffset_ = UINT16_MAX;
   uint8_t textTail_[3]{};

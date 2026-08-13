@@ -112,10 +112,23 @@ PdfStatus PdfPageModel::beginOverflowTextRun(const PdfTextRun& run, uint16_t* co
     previous.flags &= static_cast<uint16_t>(~(PdfTextLight | PdfTextBold));
   }
   previous.flags |= static_cast<uint16_t>(run.flags & PdfTextActualText);
+  const bool semanticBoundary = (run.flags & PdfTextSemanticBoundary) != 0U;
   const bool tightContinuation = (run.flags & PdfTextArrayTightContinuation) != 0;
   const bool explicitGap = (run.flags & PdfTextArrayExplicitGap) != 0;
-  overflowSeparator_ = explicitGap ? OverflowSeparator::Explicit
-                                   : (tightContinuation ? OverflowSeparator::None : OverflowSeparator::Inferred);
+  const int64_t previousEndX = static_cast<int64_t>(previous.baselineX) + previous.baselineDx;
+  const int64_t previousEndY = static_cast<int64_t>(previous.baseline) + previous.baselineDy;
+  const int64_t baselineDifference = static_cast<int64_t>(run.baseline) - previousEndY;
+  const int64_t absoluteBaselineDifference =
+      baselineDifference < 0 ? -baselineDifference : baselineDifference;
+  const int64_t runHeight = std::max<int64_t>(1, static_cast<int64_t>(run.yMax) - run.yMin);
+  const int64_t baselineGap = static_cast<int64_t>(run.baselineX) - previousEndX;
+  const int64_t wordGap = std::max<int64_t>(32768, runHeight / 3);
+  const bool positionedContinuation =
+      absoluteBaselineDifference <= std::max<int64_t>(65536, runHeight / 2) && baselineGap <= wordGap;
+  overflowSeparator_ = semanticBoundary ? OverflowSeparator::Semantic
+                       : explicitGap     ? OverflowSeparator::Explicit
+                       : (tightContinuation || positionedContinuation) ? OverflowSeparator::None
+                                                                       : OverflowSeparator::Inferred;
   previous.xMin = std::min(previous.xMin, run.xMin);
   previous.xMax = std::max(previous.xMax, run.xMax);
   previous.yMin = std::min(previous.yMin, run.yMin);
@@ -131,6 +144,17 @@ PdfStatus PdfPageModel::appendOverflowText(const uint8_t* const text, const size
   PdfTextRun& previous = workspace_.runs[runCount_ - 1U];
   if (static_cast<uint64_t>(previous.textOffset) + previous.textLength != textLength_) {
     return PdfStatus::failure(PdfError::LimitExceeded, textLength_);
+  }
+  if (overflowSeparator_ == OverflowSeparator::Semantic) {
+    if (textLength_ == std::numeric_limits<size_t>::max() || previous.textLength == UINT32_MAX) {
+      return PdfStatus::failure(PdfError::LimitExceeded, textLength_);
+    }
+    const PdfStatus boundaryStatus = appendStoredText(&PdfTextSemanticSeparator, 1U);
+    if (!boundaryStatus) {
+      return boundaryStatus;
+    }
+    ++previous.textLength;
+    overflowSeparator_ = OverflowSeparator::None;
   }
 
   const bool currentSoftHyphen = length == 2U && text[0] == 0xC2U && text[1] == 0xADU;
@@ -171,6 +195,32 @@ PdfStatus PdfPageModel::appendOverflowText(const uint8_t* const text, const size
   }
   previous.textLength += static_cast<uint32_t>(length);
   return PdfStatus::success();
+}
+
+PdfStatus PdfPageModel::appendDetachedSpace() {
+  if (runPending_) {
+    return PdfStatus::failure(PdfError::InvalidArgument, runCount_);
+  }
+  // Leading whitespace has no semantic meaning in reflowed text.
+  if (runCount_ == 0U) {
+    return PdfStatus::success();
+  }
+  PdfTextRun& previous = workspace_.runs[runCount_ - 1U];
+  if (static_cast<uint64_t>(previous.textOffset) + previous.textLength != textLength_) {
+    return PdfStatus::failure(PdfError::InvalidOffset, textLength_);
+  }
+  if (textTailLength_ != 0U && textTail_[textTailLength_ - 1U] == ' ') {
+    return PdfStatus::success();
+  }
+  if (previous.textLength == UINT32_MAX) {
+    return PdfStatus::failure(PdfError::LimitExceeded, textLength_);
+  }
+  constexpr uint8_t space = ' ';
+  const PdfStatus status = appendStoredText(&space, 1U);
+  if (status) {
+    ++previous.textLength;
+  }
+  return status;
 }
 
 PdfStatus PdfPageModel::expandTextRunBounds(const uint16_t runIndex, const int32_t x, const int32_t y) {
@@ -218,7 +268,7 @@ PdfStatus PdfPageModel::finishTextRun() {
     PdfTextRun& previous = workspace_.runs[runCount_ - 1U];
     const PdfTextRun& current = workspace_.runs[runCount_];
     constexpr uint16_t duplicateRelevantFlags =
-        PdfTextHidden | PdfTextActualText | PdfTextLight | PdfTextBold;
+        PdfTextHidden | PdfTextActualText | PdfTextLight | PdfTextBold | PdfTextSemanticBoundary;
     constexpr int64_t duplicateCoordinateTolerance = 512;
     const auto duplicateCoordinate = [](const int32_t left, const int32_t right) {
       constexpr int64_t tolerance = duplicateCoordinateTolerance;
@@ -312,6 +362,7 @@ PdfStatus PdfPageModel::finishTextRun() {
                                         (workspace_.text[current.textOffset + 2U] == 0x90U ||
                                          workspace_.text[current.textOffset + 2U] == 0x91U);
     if ((previous.flags & mergeRelevantFlags) == (current.flags & mergeRelevantFlags) &&
+        (current.flags & PdfTextSemanticBoundary) == 0U &&
         (weightDifference == 0U || overlappingInlineFragment) &&
         (!wideAbsolutePosition || isolatedSoftHyphen || isolatedUnicodeHyphen) &&
         (absoluteBaselineDifference <= 65536 || overlappingInlineFragment) &&

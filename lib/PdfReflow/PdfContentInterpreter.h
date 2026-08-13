@@ -189,6 +189,7 @@ class PdfContentInterpreter {
   PdfStatus showString(const uint8_t* source, size_t length);
   PdfStatus showArray(const PdfContentOperand& array);
   PdfStatus flushTextArrayChunk();
+  PdfStatus flushPendingArrayWhitespace();
   PdfStatus emitActualText(MarkedContentFrame& frame);
   PdfStatus emitDecodedText(const uint8_t* source, size_t length, bool actualText);
   PdfStatus finishSemanticTextRun();
@@ -198,8 +199,9 @@ class PdfContentInterpreter {
   PdfStatus pushTextOperand(PdfContentOperandKind kind, const uint8_t* text, size_t length);
   const uint8_t* tokenText(const PdfToken& token) const;
   PdfStatus pushNumberOperand(const PdfToken& token);
-  PdfStatus pushMarkedContent(const PdfContentOperand* actualText, bool suppress);
+  PdfStatus pushMarkedContent(const PdfContentOperand* actualText, bool suppress, bool startsBlock);
   bool markedContentSuppressed() const;
+  void clearPendingBlockBoundary();
   PdfStatus translateText(PdfFixed16 x, PdfFixed16 y, bool lineMatrix);
   PdfStatus adjustText(PdfFixed16 amount);
   PdfStatus currentTextPoint(PdfFixed16 textX, PdfFixed16 textY, PdfFixed16* x, PdfFixed16* y) const;
@@ -261,6 +263,7 @@ class PdfContentInterpreter {
   bool arrayOpen_ = false;
   bool arrayHasString_ = false;
   bool arrayStreamed_ = false;
+  bool arrayWhitespacePending_ = false;
   // INT32_MAX means that no preceding string exists in the current TJ array.
   // Otherwise this is the accumulated fixed-16 TJ adjustment before the next string.
   int32_t arrayPendingAdjustment_ = 0x7fffffff;

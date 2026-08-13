@@ -263,6 +263,7 @@ class PdfPreparation {
     AuxiliaryImageObject,
     FontDictionary,
     FontObject,
+    FontEncodingObject,
     ToUnicodeObject,
   };
 
@@ -576,6 +577,7 @@ class PdfPreparation {
   enum class SectionEmitStage : uint8_t {
     Idle,
     BeginBlock,
+    Text,
     Images,
     EndBlock,
     Finish,
@@ -708,9 +710,11 @@ class PdfPreparation {
   PdfStatus formatPageSpoolPath(bool prepared, char* output, size_t capacity) const;
   PdfStatus formatAnnotationOverflowSpoolPath(char* output, size_t capacity) const;
   PdfStatus formatContentOverflowSpoolPath(char* output, size_t capacity) const;
+  PdfStatus formatFontEncodingSpoolPath(char* output, size_t capacity) const;
   PdfStatus formatResolvedLinkSpoolPath(char* output, size_t capacity) const;
   PdfStatus formatTraversalSpoolPath(char* output, size_t capacity) const;
   void abortPageSpools();
+  void abortPreparedFontEncodingSpool();
   PdfStatus readCacheSetupBytes(PdfWorkBudget& budget, uint64_t offset, uint8_t* destination, size_t length);
   void rejectResumeState();
   PdfStatus decodeEmitSectionsResumeMetadataPrefix(size_t length);
@@ -800,6 +804,8 @@ class PdfPreparation {
   PdfStatus collectFormResources(uint16_t dictionaryIndex);
   PdfStatus beginNextImageObject();
   PdfStatus beginNextFontObject();
+  PdfStatus appendPreparedFontEncodingDifferences(uint16_t dictionaryIndex,
+                                                  PreparedContentRuntime* runtime);
   uint8_t* preparedFontName(uint8_t index);
   const uint8_t* preparedFontName(uint8_t index) const;
   const FontResolutionCacheEntry* findFontResolution(PdfObjectReference reference);
@@ -979,6 +985,7 @@ class PdfPreparation {
   PdfFixedRecordSpool pageSpool_{};
   PdfFixedRecordSpool annotationOverflowSpool_{};
   PdfFixedRecordSpool contentOverflowSpool_{};
+  PdfFixedRecordSpool fontEncodingSpool_{};
   PdfFixedRecordSpool resolvedLinkSpool_{};
   PdfFixedRecordSpool preparedPageSpool_{};
   PdfMutableRecordSpool traversalSpool_{};
@@ -1042,6 +1049,8 @@ class PdfPreparation {
   uint16_t currentPageSemanticBlockCount_ = 0;
   uint16_t currentBlockIndex_ = 0;
   uint16_t sectionEmitEndBlock_ = 0;
+  uint16_t sectionEmitTextOffset_ = 0;
+  bool sectionEmitTextHasVisible_ = false;
   uint16_t sectionCount_ = 0;
   uint16_t explicitOutlineCount_ = 0;
   uint16_t outlinePendingCount_ = 0;

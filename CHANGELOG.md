@@ -1,3 +1,17 @@
+## [v1.5.0.16] - 2026-08-13
+
+### Changed
+
+- PDF text uses cleaner Unicode mappings, word joins, paragraph boundaries, headings, drop caps, tables, and reading order while continuing to use the reader's configured font and size.
+- Generated PDF sections are divided by their actual text and element workload so complex documents remain readable without a fixed pages-per-section limit.
+
+### Fixed
+
+- Fixed workload-based PDF section splitting using a cleared scratch value instead of the completed section size, which could still leave oversized chapters and cause an out-of-memory error in the reader.
+- Fixed open paragraphs and word-progress metadata when a generated section is divided between PDF pages.
+- Fixed excessive or missing spaces around PDF text-array adjustments and around text fragments merged after the fixed run workspace fills.
+- Added more `/Encoding /Differences` glyph-name mappings so ligatures and uncommon characters no longer appear as replacement symbols in supported PDFs.
+
 ## [v1.5.0.15] - 2026-08-12
 
 ### Changed

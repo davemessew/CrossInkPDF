@@ -1445,18 +1445,11 @@ bool runExternalPdf(MappedInputManager& input, GfxRenderer& renderer) {
     return false;
   }
 
-  const std::shared_ptr<PdfReflowDocument> document = loadPdfDocument(SD_PDF_PATH);
-  if (!document) {
-    esp_rom_printf("QEMU_PDF_SD_FAIL stage=load progress=%u phase=%u steps=%lu\n", static_cast<unsigned>(progress),
-                   static_cast<unsigned>(phase), static_cast<unsigned long>(steps));
-    return false;
-  }
   ReaderLayout layout;
   if (!computeReaderLayout(renderer, &layout)) {
     esp_rom_printf("QEMU_PDF_SD_FAIL stage=layout_geometry\n");
     return false;
   }
-  (void)exportPdfXhtml(*document);
 
   PdfStatus readerStatus{};
   auto readerDocument = loadPdfHalReflowDocumentNoThrow(SD_PDF_PATH, REFLOW_CACHE_DIRECTORY, &readerStatus);
@@ -1489,6 +1482,20 @@ bool runExternalPdf(MappedInputManager& input, GfxRenderer& renderer) {
   reader.reset();
   if (readerAlert) {
     esp_rom_printf("QEMU_PDF_SD_FAIL stage=reader_layout\n");
+    return false;
+  }
+  readerPressure.reset();
+
+  const std::shared_ptr<PdfReflowDocument> document = loadPdfDocument(SD_PDF_PATH);
+  if (!document) {
+    esp_rom_printf("QEMU_PDF_SD_FAIL stage=load progress=%u phase=%u steps=%lu\n", static_cast<unsigned>(progress),
+                   static_cast<unsigned>(phase), static_cast<unsigned long>(steps));
+    return false;
+  }
+  (void)exportPdfXhtml(*document);
+  readerPressure = makeUniqueNoThrow<uint8_t[]>(READER_HEAP_PRESSURE_BYTES);
+  if (!readerPressure) {
+    esp_rom_printf("QEMU_PDF_SD_FAIL stage=layout_pressure\n");
     return false;
   }
   for (int sectionIndex = 0; sectionIndex < document->getSectionCount(); ++sectionIndex) {

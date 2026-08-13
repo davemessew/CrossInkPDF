@@ -40,7 +40,7 @@ class PdfSimpleEncoding {
  public:
   explicit PdfSimpleEncoding(PdfEncodingWorkspace workspace) : workspace_(workspace) {}
 
-  PdfStatus begin(PdfBaseEncoding base);
+  PdfStatus begin(PdfBaseEncoding base, uint16_t existingDifferenceCount = 0);
   PdfStatus applyDifferences(const PdfObjectArena& arena, uint16_t differencesArrayIndex);
   PdfStatus decode(uint8_t code, PdfUtf8Value* value);
 
@@ -60,6 +60,9 @@ class PdfSimpleEncoding {
 };
 
 bool pdfGlyphNameToUnicode(const uint8_t* name, size_t length, uint32_t* scalar);
+// Returns either one Unicode scalar or the compact internal representation of
+// a short underscore-separated glyph sequence such as `f_i` or `T_h`.
+bool pdfGlyphNameToTextMapping(const uint8_t* name, size_t length, uint32_t* mapping);
 bool pdfConservativeLatinFallback(uint8_t code, uint32_t* scalar);
 bool pdfWinAnsiFallback(uint8_t code, uint32_t* scalar);
 PdfStatus pdfDecodePdfTextString(const uint8_t* source, size_t sourceLength, const PdfByteSink& sink);
