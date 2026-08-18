@@ -21,6 +21,7 @@ struct Clipping {
   uint16_t wordCount = 0;
   uint16_t paragraphIndex = UINT16_MAX;
   uint32_t timestamp = 0;
+  uint32_t layoutSignature = 0;
   uint32_t textOffset = 0;
   uint16_t textLength = 0;
   char chapterTitle[CLIPPING_CHAPTER_TITLE_MAX] = {};
@@ -56,12 +57,13 @@ class ClippingStore {
 
   AddResult addClipping(uint16_t spineIndex, uint16_t startPage, uint16_t endPage, uint16_t pageCount,
                         uint16_t startWordIndex, uint16_t endWordIndex, uint16_t wordCount, const char* chapterTitle,
-                        uint16_t paragraphIndex, const std::string& text);
+                        uint16_t paragraphIndex, const std::string& text, uint32_t layoutSignature);
   AddResult addPdfClipping(uint16_t spineIndex, uint16_t startPage, uint16_t endPage, uint16_t pageCount,
                            uint16_t startWordIndex, uint16_t endWordIndex, uint16_t wordCount, const char* chapterTitle,
                            uint16_t itemId, const std::string& text);
   bool removePdfClipping(uint16_t itemId);
   bool clearPdfClippings();
+  bool stampMissingLayoutSignature(uint32_t layoutSignature);
   bool removeClippingAt(size_t index);
   bool saveToFile();
   void clearAll();
@@ -114,5 +116,14 @@ class ClippingStore {
                                        const std::string& title, const std::string& author,
                                        const std::string& bookType);
 };
+
+inline bool clippingStoredRangeMatchesLayout(const Clipping& clipping, const uint16_t currentPageCount,
+                                             const uint32_t currentLayoutSignature) {
+  if (clipping.pageCount != currentPageCount) return false;
+  // Versions 1-2 predate layout signatures. Preserve their fast path until a
+  // reader relayout stamps the layout they were displayed with.
+  return clipping.layoutSignature == 0 || currentLayoutSignature == 0 ||
+         clipping.layoutSignature == currentLayoutSignature;
+}
 
 #define CLIPPINGS ClippingStore::getInstance()

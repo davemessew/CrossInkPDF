@@ -51,7 +51,7 @@ inline freeink::ui::BitmapRef listIconFor(const UIIcon icon, const int size = 24
       case UIIcon::Wifi:
         return freeink::ui::bitmapFromIcon(icon_wifi_32);
       case UIIcon::Library:
-        return freeink::ui::bitmapFromIcon(icon_library_32);
+        return freeink::ui::bitmapFromIcon(icon_lyra_library_32);
       case UIIcon::Hotspot:
         return freeink::ui::bitmapFromIcon(icon_radio_tower_32);
       default:
@@ -72,7 +72,7 @@ inline freeink::ui::BitmapRef listIconFor(const UIIcon icon, const int size = 24
     case UIIcon::Wifi:
       return freeink::ui::bitmapFromIcon(icon_wifi_24);
     case UIIcon::Library:
-      return freeink::ui::bitmapFromIcon(icon_library_24);
+      return freeink::ui::bitmapFromIcon(icon_lyra_library_24);
     case UIIcon::Hotspot:
       return freeink::ui::bitmapFromIcon(icon_radio_tower_24);
     default:
@@ -85,8 +85,8 @@ inline freeink::ui::BitmapRef listIconFor(const UIIcon icon, const int size = 24
 inline void drawLucideIcon(const GfxRenderer& renderer, const freeink::Icon& icon, const int x, const int y,
                            const bool foregroundBlack = true) {
   freeink::ui::GfxRendererTarget target(renderer);
-  target.bitmap(freeink::ui::Rect{static_cast<int16_t>(x), static_cast<int16_t>(y),
-                                  static_cast<int16_t>(icon.w), static_cast<int16_t>(icon.h)},
+  target.bitmap(freeink::ui::Rect{static_cast<int16_t>(x), static_cast<int16_t>(y), static_cast<int16_t>(icon.w),
+                                  static_cast<int16_t>(icon.h)},
                 freeink::ui::bitmapFromIcon(icon), freeink::ui::BitmapMode::Center,
                 freeink::ui::Paint::solid(foregroundBlack ? freeink::ui::Color::Black : freeink::ui::Color::White));
 }

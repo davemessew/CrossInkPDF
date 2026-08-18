@@ -23,19 +23,19 @@
 
 namespace {
 constexpr uint32_t SECTION_CACHE_MAGIC = 0x535843FF;  // bytes: 0xFF, "CXS"
-// v56: <br> after text no longer reapplies container spacing, while empty
-// <br> blocks retain the scene-break gap. Cached page positions must rebuild.
-constexpr uint8_t SECTION_FILE_VERSION = 56;
+// v60: reserve page-edge space for ruby overhang and prefer longer equal-cost
+// CJK lines, invalidating cached pagination from the prior layout contract.
+constexpr uint8_t SECTION_FILE_VERSION = 60;
 // Suspended incremental build: valid pages plus LUTs and a parse-watermark trailer.
 // Change this with layout or payload changes so stale partial pages cannot resume
 // under a different layout contract.
-constexpr uint8_t SECTION_FILE_PARTIAL_VERSION = 0xFC;
+constexpr uint8_t SECTION_FILE_PARTIAL_VERSION = 0xF9;
 constexpr uint16_t INITIAL_SECTION_PAGE_LUT_ENTRIES = 1024;
 constexpr uint32_t HEADER_SIZE = sizeof(SECTION_CACHE_MAGIC) + sizeof(uint8_t) + sizeof(int) + sizeof(float) +
                                  sizeof(bool) + sizeof(bool) + sizeof(uint8_t) + sizeof(uint16_t) + sizeof(uint16_t) +
                                  sizeof(uint16_t) + sizeof(bool) + sizeof(bool) + sizeof(uint8_t) + sizeof(bool) +
                                  sizeof(bool) + sizeof(uint8_t) + sizeof(uint8_t) + sizeof(uint32_t) +
-                                 sizeof(uint32_t) + sizeof(uint32_t) + sizeof(uint32_t);
+                                 sizeof(uint32_t) + sizeof(uint32_t) + sizeof(uint32_t) + sizeof(uint32_t);
 constexpr size_t SECTION_HTML_STREAM_CHUNK_SIZE = 8192;
 constexpr size_t LOW_MEMORY_SECTION_HTML_STREAM_CHUNK_SIZE = 1024;
 
@@ -43,6 +43,7 @@ struct PageLutEntry {
   uint32_t fileOffset;
   uint16_t paragraphIndex;
   uint16_t listItemIndex;
+  uint32_t visibleTextOffset;
 };
 
 template <typename Entry>
@@ -452,7 +453,7 @@ struct Section::PdfPageBuildContext {
 };
 
 void Section::completePdfPage(void* const context, std::unique_ptr<Page> page, const uint16_t paragraphIndex,
-                              const uint16_t listItemIndex) {
+                              const uint16_t listItemIndex, const uint32_t) {
   auto& build = *static_cast<PdfPageBuildContext*>(context);
   if (build.pageCompletionFailed) {
     return;
@@ -494,7 +495,9 @@ Section::Section(const std::shared_ptr<ReflowDocument>& document, const int sect
       sectionIndex(sectionIndex),
       renderer(renderer),
       filePath(document->getCachePath() + "/sections/" + std::to_string(sectionIndex) +
-               (cacheSuffix ? cacheSuffix : "") + ".bin") {}
+               (cacheSuffix ? cacheSuffix : "") + ".bin") {
+  recoverSectionCacheBackup(filePath);
+}
 
 Section::~Section() { suspendBuild(); }
 
@@ -579,7 +582,8 @@ bool Section::writeSectionFileHeader(const ReaderRenderSpec& spec) {
                                    sizeof(spec.hyphenationEnabled) + sizeof(spec.embeddedStyle) +
                                    sizeof(spec.imageRendering) + sizeof(spec.bionicReadingEnabled) +
                                    sizeof(spec.guideReadingEnabled) + sizeof(uint8_t) + sizeof(uint32_t) +
-                                   sizeof(uint32_t) + sizeof(uint8_t) + sizeof(uint32_t) + sizeof(uint32_t),
+                                   sizeof(uint32_t) + sizeof(uint8_t) + sizeof(uint32_t) + sizeof(uint32_t) +
+                                   sizeof(uint32_t),
                 "Header size mismatch");
   return serialization::tryWritePod(file, SECTION_CACHE_MAGIC) &&
          serialization::tryWritePod(file, SECTION_FILE_VERSION) && serialization::tryWritePod(file, spec.fontId) &&
@@ -604,7 +608,8 @@ bool Section::writeSectionFileHeader(const ReaderRenderSpec& spec) {
          serialization::tryWritePod(
              file,
              static_cast<uint32_t>(0)) &&  // Placeholder for paragraph LUT offset (patched later)
-         serialization::tryWritePod(file, static_cast<uint32_t>(0));  // Placeholder for li LUT offset (patched later)
+         serialization::tryWritePod(file, static_cast<uint32_t>(0)) &&  // li LUT offset
+         serialization::tryWritePod(file, static_cast<uint32_t>(0));    // visible text LUT offset
 }
 
 bool Section::loadSectionFile(const ReaderRenderSpec& spec) {
@@ -698,18 +703,18 @@ bool Section::loadSectionFile(const ReaderRenderSpec& spec) {
 
   if (filePartial) {
     // A partial's pageCount is the watermark of a suspended build. Read the watermark
-    // trailer (appended after the li LUT) so estimatedTotalPages can extrapolate.
-    uint32_t liLutOffset = 0;
-    if (!file.seek(HEADER_SIZE - sizeof(uint32_t)) || !serialization::tryReadPod(file, liLutOffset)) {
+    // trailer (appended after the page-start visible-text LUT) so estimatedTotalPages can extrapolate.
+    uint32_t visibleTextLutOffset = 0;
+    if (!file.seek(HEADER_SIZE - sizeof(uint32_t)) || !serialization::tryReadPod(file, visibleTextLutOffset)) {
       file.close();
       LOG_ERR("SCT", "Deserialization failed: missing partial trailer offset");
       clearCache();
       pageCount = 0;
       return false;
     }
-    const uint32_t trailerOffset = liLutOffset + static_cast<uint32_t>(pageCount) * sizeof(uint16_t);
+    const uint32_t trailerOffset = visibleTextLutOffset + static_cast<uint32_t>(pageCount) * sizeof(uint32_t);
     const bool trailerValid =
-        pageCount > 0 && liLutOffset >= HEADER_SIZE && trailerOffset + 2 * sizeof(uint32_t) <= file.size();
+        pageCount > 0 && visibleTextLutOffset >= HEADER_SIZE && trailerOffset + 2 * sizeof(uint32_t) <= file.size();
     if (!trailerValid) {
       file.close();
       LOG_ERR("SCT", "Deserialization failed: malformed partial section");
@@ -810,6 +815,16 @@ bool Section::createSectionFile(const ReaderRenderSpec& spec, const std::functio
   } clearActiveBuildTmpPath{activeBuildTmpSectionPath_};
   pageCount = 0;
   if (layoutAbortedForLowMemory) *layoutAbortedForLowMemory = false;
+  if (buildOptions.cancellationObserved) *buildOptions.cancellationObserved = false;
+  const auto cancelBuild = [&buildOptions]() {
+    if (!buildOptions.isCancellationRequested()) {
+      return false;
+    }
+    if (buildOptions.cancellationObserved) {
+      *buildOptions.cancellationObserved = true;
+    }
+    return true;
+  };
   const bool effectiveBionicReadingEnabled = bionicReadingEnabled;
   const bool effectiveGuideReadingEnabled = guideReadingEnabled;
   LOG_DBG("SCT",
@@ -841,6 +856,10 @@ bool Section::createSectionFile(const ReaderRenderSpec& spec, const std::functio
       Storage.remove(tmpHtmlPath.c_str());
     }
   };
+  if (cancelBuild()) {
+    LOG_DBG("SCT", "Section build cancelled before HTML inflate: spine=%d", sectionIndex);
+    return false;
+  }
   if (usesBorrowedSection) {
     LOG_DBG("SCT", "Parsing borrowed local HTML %s", borrowedSection.localPath.c_str());
   } else if (reusedHtml) {
@@ -898,6 +917,12 @@ bool Section::createSectionFile(const ReaderRenderSpec& spec, const std::functio
   }
   const std::string& parsePath =
       usesBorrowedSection ? borrowedSection.localPath : (htmlCached ? htmlPath : tmpHtmlPath);
+
+  if (cancelBuild()) {
+    LOG_DBG("SCT", "Section build cancelled after HTML inflate: spine=%d", spineIndex);
+    cleanupTempHtml();
+    return false;
+  }
 
   if (Storage.exists(tmpSectionPath.c_str())) {
     Storage.remove(tmpSectionPath.c_str());
@@ -978,7 +1003,7 @@ bool Section::createSectionFile(const ReaderRenderSpec& spec, const std::functio
   }
 
   std::unique_ptr<PdfPageBuildContext> pdfBuild;
-  std::function<void(std::unique_ptr<Page>, uint16_t, uint16_t)> completePage;
+  std::function<void(std::unique_ptr<Page>, uint16_t, uint16_t, uint32_t)> completePage;
   ChapterHtmlPaginationHooks paginationHooks;
   if (semanticPositionEnabled) {
     const ReflowSectionInfo sectionInfo = document->getSectionInfo(sectionIndex);
@@ -1004,7 +1029,8 @@ bool Section::createSectionFile(const ReaderRenderSpec& spec, const std::functio
     paginationHooks = {pdfBuild.get(), &pdfPaginationVtable};
   } else {
     completePage = [this, &lut, &lutCapacity, &lutCount, &pageCompletionFailed, layoutAbortedForLowMemory](
-                       std::unique_ptr<Page> page, const uint16_t paragraphIndex, const uint16_t listItemIndex) {
+                       std::unique_ptr<Page> page, const uint16_t paragraphIndex, const uint16_t listItemIndex,
+                       const uint32_t visibleTextOffset) {
       if (pageCompletionFailed) {
         return;
       }
@@ -1026,7 +1052,7 @@ bool Section::createSectionFile(const ReaderRenderSpec& spec, const std::functio
         pageCompletionFailed = true;
         return;
       }
-      lut[lutCount++] = {fileOffset, paragraphIndex, listItemIndex};
+      lut[lutCount++] = {fileOffset, paragraphIndex, listItemIndex, visibleTextOffset};
     };
   }
 
@@ -1038,8 +1064,36 @@ bool Section::createSectionFile(const ReaderRenderSpec& spec, const std::functio
                                 buildOptions.isPreview() ? std::string(buildOptions.previewAnchor) : std::string{},
                                 buildOptions.previewMaxPages, paginationHooks, usesPhysicalBorrowedContentPath);
   Hyphenator::setPreferredLanguage(document->getLanguage());
+  bool cancelled = false;
+  bool success = false;
   LOG_DBG("SCT", "Parser start: spine=%d free=%u maxAlloc=%u", sectionIndex, ESP.getFreeHeap(), ESP.getMaxAllocHeap());
-  const bool success = visitor.parseAndBuildPages();
+  if (cancelBuild()) {
+    cancelled = true;
+  } else {
+    success = visitor.beginParse();
+  }
+  while (success && !cancelled) {
+    if (cancelBuild()) {
+      visitor.abortParse();
+      cancelled = true;
+      break;
+    }
+    const auto status = visitor.parseStep();
+    if (status == ChapterHtmlSlimParser::ParseStatus::Error) {
+      visitor.abortParse();
+      success = false;
+      break;
+    }
+    if (status == ChapterHtmlSlimParser::ParseStatus::Done) {
+      if (cancelBuild()) {
+        visitor.abortParse();
+        cancelled = true;
+      } else {
+        success = visitor.finishParse();
+      }
+      break;
+    }
+  }
   LOG_DBG("SCT", "Parser done: spine=%d success=%u pages=%u free=%u maxAlloc=%u", sectionIndex, success, pageCount,
           ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 
@@ -1069,8 +1123,12 @@ bool Section::createSectionFile(const ReaderRenderSpec& spec, const std::functio
     pageCompletionFailed = true;
   }
 
-  if (!success || pageCompletionFailed) {
-    LOG_ERR("SCT", "Failed to parse XML and build pages");
+  if (!success || pageCompletionFailed || cancelled) {
+    if (cancelled) {
+      LOG_DBG("SCT", "Section build cancelled during parse: spine=%d", sectionIndex);
+    } else {
+      LOG_ERR("SCT", "Failed to parse XML and build pages");
+    }
     // Explicitly close() file before calling Storage.remove()
     file.close();
     Storage.remove(tmpSectionPath.c_str());
@@ -1158,14 +1216,24 @@ bool Section::createSectionFile(const ReaderRenderSpec& spec, const std::functio
     }
   }
 
+  const uint32_t visibleTextLutOffset = static_cast<uint32_t>(file.position());
+  for (uint16_t i = 0; i < replayCount; i++) {
+    const uint32_t visibleTextOffset = pdfBuild ? 0 : lut[i].visibleTextOffset;
+    if (!serialization::tryWritePod(file, visibleTextOffset)) {
+      file.close();
+      Storage.remove(tmpSectionPath.c_str());
+      return false;
+    }
+  }
   const uint32_t sectionPrefixLength = file.position();
 
-  // Patch header with final pageCount, lutOffset, anchorMapOffset, paragraphLutOffset, and liLutOffset.
-  if (!file.seek(HEADER_SIZE - sizeof(uint32_t) * 4 - sizeof(pageCount)) ||
+  // Patch header with final pageCount and all cache lookup-table offsets.
+  if (!file.seek(HEADER_SIZE - sizeof(uint32_t) * 5 - sizeof(pageCount)) ||
       !serialization::tryWritePod(file, pageCount) || !serialization::tryWritePod(file, lutOffset) ||
       !serialization::tryWritePod(file, anchorMapOffset) || !serialization::tryWritePod(file, paragraphLutOffset) ||
-      !serialization::tryWritePod(file, liLutFileOffset) ||
-      (pdfBuild && !pdfBuild->appendSectionBindingTrailer(file, sectionPrefixLength)) || !file.sync()) {
+      !serialization::tryWritePod(file, liLutFileOffset) || !serialization::tryWritePod(file, visibleTextLutOffset) ||
+      (pdfBuild && !pdfBuild->appendSectionBindingTrailer(file, sectionPrefixLength)) ||
+      !file.sync()) {
     LOG_ERR("SCT", "Failed to finalize section cache");
     file.close();
     Storage.remove(tmpSectionPath.c_str());
@@ -1324,6 +1392,7 @@ bool Section::startBuild(const ReaderRenderSpec& spec, const SectionBuildOptions
   auto ctx = makeUniqueNoThrow<BuildContext>();
   if (!ctx) {
     LOG_ERR("SCT", "Failed to allocate section build context");
+    lastLayoutAbortedForLowMemory_ = true;
     file.close();
     Storage.remove(tmpSectionPath.c_str());
     cleanupTempHtml();
@@ -1385,7 +1454,8 @@ bool Section::startBuild(const ReaderRenderSpec& spec, const SectionBuildOptions
       *document, sectionIndex, ctxPtr->parsePath, renderer, fontId, lineCompression, extraParagraphSpacing, forceParagraphIndents,
       paragraphAlignment, viewportWidth, viewportHeight, hyphenationEnabled, bionicReadingEnabled, guideReadingEnabled,
       wordSpacing,
-      [this, ctxPtr](std::unique_ptr<Page> page, const uint16_t paragraphIndex, const uint16_t listItemIndex) {
+      [this, ctxPtr](std::unique_ptr<Page> page, const uint16_t paragraphIndex, const uint16_t listItemIndex,
+                     const uint32_t visibleTextOffset) {
         if (ctxPtr->pageCompletionFailed) {
           return;
         }
@@ -1401,13 +1471,14 @@ bool Section::startBuild(const ReaderRenderSpec& spec, const SectionBuildOptions
           ctxPtr->pageCompletionFailed = true;
           return;
         }
-        ctxPtr->lut[ctxPtr->lutCount++] = {fileOffset, paragraphIndex, listItemIndex};
+        ctxPtr->lut[ctxPtr->lutCount++] = {fileOffset, paragraphIndex, listItemIndex, visibleTextOffset};
       },
       embeddedStyle, ctxPtr->contentBase, ctxPtr->imageBasePath, imageRendering, std::move(tocAnchors), popupFn,
       ctxPtr->cssParser, renderMode, buildOptions.isPreview() ? std::string(buildOptions.previewAnchor) : std::string{},
       buildOptions.previewMaxPages);
   if (!ctx->parser) {
     LOG_ERR("SCT", "Failed to allocate section parser");
+    lastLayoutAbortedForLowMemory_ = true;
     if (ctx->cssParser) ctx->cssParser->clear();
     file.close();
     Storage.remove(tmpSectionPath.c_str());
@@ -1419,7 +1490,12 @@ bool Section::startBuild(const ReaderRenderSpec& spec, const SectionBuildOptions
   build_ = std::move(ctx);
   if (!build_->parser->beginParse()) {
     LOG_ERR("SCT", "Failed to begin incremental section parse");
-    abandonBuild();
+    lastLayoutAbortedForLowMemory_ = build_->parser->wasLowMemoryAbortTriggered();
+    if (lastLayoutAbortedForLowMemory_ && partial_) {
+      suspendBuild();
+    } else {
+      abandonBuild();
+    }
     return false;
   }
   build_->totalBytes = build_->parser->parseTotalBytes();
@@ -1594,19 +1670,26 @@ bool Section::commitBuildFile(const uint8_t version, const uint32_t bytesConsume
     }
   }
 
+  const uint32_t visibleTextLutOffset = static_cast<uint32_t>(file.position());
+  for (uint16_t i = 0; i < build_->lutCount; i++) {
+    if (!serialization::tryWritePod(file, build_->lut[i].visibleTextOffset)) {
+      return failCommit();
+    }
+  }
+
   if (asPartial) {
-    // Watermark trailer, located on load as liLutOffset + pageCount * sizeof(uint16_t).
+    // Watermark trailer follows the page-start visible-text LUT.
     if (!serialization::tryWritePod(file, bytesConsumed) || !serialization::tryWritePod(file, totalBytes)) {
       return failCommit();
     }
   }
 
   // Patch header with the built page count and section offsets...
-  if (!file.seek(HEADER_SIZE - sizeof(uint32_t) * 4 - sizeof(builtPageCount_)) ||
+  if (!file.seek(HEADER_SIZE - sizeof(uint32_t) * 5 - sizeof(builtPageCount_)) ||
       !serialization::tryWritePod(file, builtPageCount_) || !serialization::tryWritePod(file, lutOffset) ||
       !serialization::tryWritePod(file, anchorMapOffset) || !serialization::tryWritePod(file, paragraphLutOffset) ||
-      !serialization::tryWritePod(file, liLutFileOffset) || !file.seek(sizeof(SECTION_CACHE_MAGIC)) ||
-      !serialization::tryWritePod(file, version) || !file.sync()) {
+      !serialization::tryWritePod(file, liLutFileOffset) || !serialization::tryWritePod(file, visibleTextLutOffset) ||
+      !file.seek(sizeof(SECTION_CACHE_MAGIC)) || !serialization::tryWritePod(file, version) || !file.sync()) {
     LOG_ERR("SCT", "Failed to commit section cache");
     return failCommit();
   }
@@ -1763,7 +1846,7 @@ std::unique_ptr<Page> Section::loadPageAt(const int page) const {
     return nullptr;
   }
 
-  if (!f.seek(HEADER_SIZE - sizeof(uint32_t) * 4)) {
+  if (!f.seek(HEADER_SIZE - sizeof(uint32_t) * 5)) {
     return nullptr;
   }
   uint32_t lutOffset;
@@ -1873,7 +1956,7 @@ std::optional<uint16_t> Section::getCachedPageCount() const {
     return std::nullopt;
   }
 
-  if (!f.seek(HEADER_SIZE - sizeof(uint32_t) * 4 - sizeof(uint16_t))) {
+  if (!f.seek(HEADER_SIZE - sizeof(uint32_t) * 5 - sizeof(uint16_t))) {
     return std::nullopt;
   }
   uint16_t count;
@@ -1890,7 +1973,7 @@ std::optional<uint16_t> Section::getPageForAnchor(const std::string& anchor) con
   }
 
   const uint32_t fileSize = f.size();
-  if (!f.seek(HEADER_SIZE - sizeof(uint32_t) * 3)) {
+  if (!f.seek(HEADER_SIZE - sizeof(uint32_t) * 4)) {
     return std::nullopt;
   }
   uint32_t anchorMapOffset;
@@ -1933,7 +2016,7 @@ std::optional<uint16_t> Section::getPageForParagraphIndex(const uint16_t pIndex)
   }
 
   const uint32_t fileSize = f.size();
-  if (!f.seek(HEADER_SIZE - sizeof(uint32_t) * 2)) {
+  if (!f.seek(HEADER_SIZE - sizeof(uint32_t) * 3)) {
     return std::nullopt;
   }
   uint32_t paragraphLutOffset;
@@ -1997,7 +2080,7 @@ std::optional<uint16_t> Section::getParagraphIndexForPage(const uint16_t page) c
   }
 
   const uint32_t fileSize = f.size();
-  if (!f.seek(HEADER_SIZE - sizeof(uint32_t) * 2)) {
+  if (!f.seek(HEADER_SIZE - sizeof(uint32_t) * 3)) {
     return std::nullopt;
   }
   uint32_t paragraphLutOffset;
@@ -2045,7 +2128,7 @@ std::optional<uint16_t> Section::getListItemIndexForPage(const uint16_t page) co
   }
 
   const uint32_t fileSize = f.size();
-  if (!f.seek(HEADER_SIZE - sizeof(uint32_t))) {
+  if (!f.seek(HEADER_SIZE - sizeof(uint32_t) * 2)) {
     return std::nullopt;
   }
   uint32_t liLutOffset;
@@ -2056,7 +2139,7 @@ std::optional<uint16_t> Section::getListItemIndexForPage(const uint16_t page) co
     return std::nullopt;
   }
 
-  if (!f.seek(HEADER_SIZE - sizeof(uint32_t) * 2)) {
+  if (!f.seek(HEADER_SIZE - sizeof(uint32_t) * 3)) {
     return std::nullopt;
   }
   uint32_t paragraphLutOffset;
@@ -2100,7 +2183,7 @@ std::optional<uint16_t> Section::getPageForListItemIndex(const uint16_t liIndex)
   }
 
   const uint32_t fileSize = f.size();
-  if (!f.seek(HEADER_SIZE - sizeof(uint32_t))) {
+  if (!f.seek(HEADER_SIZE - sizeof(uint32_t) * 2)) {
     return std::nullopt;
   }
   uint32_t liLutOffset;
@@ -2112,7 +2195,7 @@ std::optional<uint16_t> Section::getPageForListItemIndex(const uint16_t liIndex)
   }
 
   // The li LUT shares count with the paragraph LUT; read count from paragraphLutOffset
-  if (!f.seek(HEADER_SIZE - sizeof(uint32_t) * 2)) {
+  if (!f.seek(HEADER_SIZE - sizeof(uint32_t) * 3)) {
     return std::nullopt;
   }
   uint32_t paragraphLutOffset;
@@ -2155,4 +2238,78 @@ std::optional<uint16_t> Section::getPageForListItemIndex(const uint16_t liIndex)
   }
 
   return resultPage;
+}
+
+std::optional<uint32_t> Section::getVisibleTextOffsetForPage(const uint16_t page) const {
+  if (build_ && page < build_->lutCount) {
+    return build_->lut[page].visibleTextOffset;
+  }
+
+  FsFile f;
+  if (!Storage.openFileForRead("SCT", filePath, f)) return std::nullopt;
+  const uint32_t fileSize = f.size();
+  if (!f.seek(HEADER_SIZE - sizeof(uint32_t) * 5 - sizeof(uint16_t))) return std::nullopt;
+  uint16_t count = 0;
+  if (!serialization::tryReadPod(f, count) || page >= count) return std::nullopt;
+  if (!f.seek(HEADER_SIZE - sizeof(uint32_t))) return std::nullopt;
+  uint32_t lutOffset = 0;
+  if (!serialization::tryReadPod(f, lutOffset) || lutOffset < HEADER_SIZE ||
+      lutOffset + (static_cast<uint32_t>(page) + 1U) * sizeof(uint32_t) > fileSize ||
+      !f.seek(lutOffset + static_cast<uint32_t>(page) * sizeof(uint32_t))) {
+    return std::nullopt;
+  }
+  uint32_t offset = 0;
+  return serialization::tryReadPod(f, offset) ? std::optional<uint32_t>(offset) : std::nullopt;
+}
+
+std::optional<uint16_t> Section::getPageForVisibleTextOffset(const uint32_t offset,
+                                                             const bool preferFirstAtOffset) const {
+  if (build_ && build_->lutCount > 0) {
+    uint16_t result = 0;
+    for (uint16_t i = 0; i < build_->lutCount; i++) {
+      const uint32_t start = build_->lut[i].visibleTextOffset;
+      if (start > offset) break;
+      result = i;
+      if (preferFirstAtOffset && start == offset) break;
+    }
+    const uint32_t last = build_->lut[build_->lutCount - 1].visibleTextOffset;
+    if (offset <= last) return result;
+    // An extension build starts from page zero while its previously committed
+    // partial remains readable.  Its shorter live prefix must not hide a page
+    // that the committed cache already knows how to resolve.
+  }
+
+  FsFile f;
+  if (!Storage.openFileForRead("SCT", filePath, f)) return std::nullopt;
+  const uint32_t fileSize = f.size();
+  uint32_t magic = 0;
+  uint8_t version = 0;
+  if (!serialization::tryReadPod(f, magic) || magic != SECTION_CACHE_MAGIC || !serialization::tryReadPod(f, version) ||
+      (version != SECTION_FILE_VERSION && version != SECTION_FILE_PARTIAL_VERSION) ||
+      !f.seek(HEADER_SIZE - sizeof(uint32_t) * 5 - sizeof(uint16_t))) {
+    return std::nullopt;
+  }
+  uint16_t count = 0;
+  if (!serialization::tryReadPod(f, count) || count == 0 || !f.seek(HEADER_SIZE - sizeof(uint32_t))) {
+    return std::nullopt;
+  }
+  uint32_t lutOffset = 0;
+  if (!serialization::tryReadPod(f, lutOffset) || lutOffset < HEADER_SIZE ||
+      lutOffset + static_cast<uint32_t>(count) * sizeof(uint32_t) > fileSize) {
+    return std::nullopt;
+  }
+  uint16_t result = 0;
+  uint32_t last = 0;
+  for (uint16_t i = 0; i < count; i++) {
+    uint32_t start = 0;
+    if (!f.seek(lutOffset + static_cast<uint32_t>(i) * sizeof(uint32_t)) || !serialization::tryReadPod(f, start)) {
+      return std::nullopt;
+    }
+    last = start;
+    if (start > offset) break;
+    result = i;
+    if (preferFirstAtOffset && start == offset) break;
+  }
+  if (version == SECTION_FILE_PARTIAL_VERSION && offset > last) return std::nullopt;
+  return result;
 }

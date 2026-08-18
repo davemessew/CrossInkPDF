@@ -21,12 +21,18 @@
 namespace fui = freeink::ui;
 
 LookedUpWordsActivity::LookedUpWordsActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
-                                             std::string bookCachePath)
+                                             std::string bookCachePath, const char* dictionaryFontFamilyName,
+                                             const uint8_t dictionaryFontPointSize)
     : Activity("LookedUpWords", renderer, mappedInput),
       cachePath(std::move(bookCachePath)),
       controller(renderer, mappedInput, *this, cachePath),
       uiTarget(makeUiTarget(renderer)),
-      app(uiTarget, uiTarget.deviceContext()) {}
+      app(uiTarget, uiTarget.deviceContext()) {
+  this->dictionaryFontPointSize = dictionaryFontPointSize;
+  if (dictionaryFontFamilyName) {
+    std::strncpy(this->dictionaryFontFamilyName, dictionaryFontFamilyName, sizeof(this->dictionaryFontFamilyName) - 1);
+  }
+}
 
 const char* LookedUpWordsActivity::glyphFor(LookupHistory::Status s) {
   switch (s) {
@@ -140,19 +146,26 @@ void LookedUpWordsActivity::loop() {
   if (controller.isActive()) {
     switch (controller.handleInput()) {
       case DictionaryLookupController::LookupEvent::FoundDefinition: {
-        startActivityForResult(std::make_unique<DictionaryDefinitionActivity>(
-                                   renderer, mappedInput, controller.getFoundWord(), controller.getFoundLocation(),
-                                   true, cachePath, controller.getRecordHistory(), controller.getLookupWord(),
-                                   DictionaryLookupController::toHistStatus(controller.getFoundStatus())),
-                               [this](const ActivityResult& result) {
-                                 reloadEntries();
-                                 if (!result.isCancelled) {
-                                   setResult(ActivityResult{});
-                                   finish();
-                                 } else {
-                                   requestUpdate();
-                                 }
-                               });
+        auto definition = makeUniqueNoThrow<DictionaryDefinitionActivity>(
+            renderer, mappedInput, controller.getFoundWord(), controller.getFoundLocation(), true, cachePath,
+            controller.getRecordHistory(), controller.getLookupWord(),
+            DictionaryLookupController::toHistStatus(controller.getFoundStatus()), nullptr, nullptr,
+            dictionaryFontFamilyName, dictionaryFontPointSize);
+        if (!definition) {
+          LOG_ERR("LOOKUP", "OOM allocating DictionaryDefinitionActivity (%u bytes)",
+                  static_cast<unsigned>(sizeof(DictionaryDefinitionActivity)));
+          requestUpdate();
+          break;
+        }
+        startActivityForResult(std::move(definition), [this](const ActivityResult& result) {
+          reloadEntries();
+          if (!result.isCancelled) {
+            setResult(ActivityResult{});
+            finish();
+          } else {
+            requestUpdate();
+          }
+        });
         break;
       }
       case DictionaryLookupController::LookupEvent::NotFoundDismissedBack:
@@ -286,8 +299,8 @@ void LookedUpWordsActivity::render(RenderLock&&) {
   if (entries.empty()) {
     const int midY = contentTop + (pageHeight - contentTop - metrics.buttonHintsHeight) / 2;
     renderer.drawCenteredText(UI_10_FONT_ID, midY, tr(STR_LOOKUP_HISTORY_EMPTY));
-    const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
-    GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+    const auto buttonLabels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
+    GUI.drawButtonHints(renderer, buttonLabels.btn1, buttonLabels.btn2, buttonLabels.btn3, buttonLabels.btn4);
     renderer.displayBuffer(HalDisplay::FAST_REFRESH);
     return;
   }
@@ -296,8 +309,8 @@ void LookedUpWordsActivity::render(RenderLock&&) {
   app.render();
   uiReady = true;
 
-  const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_SELECT), tr(STR_DIR_UP), tr(STR_DIR_DOWN));
-  GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+  const auto buttonLabels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_SELECT), tr(STR_DIR_UP), tr(STR_DIR_DOWN));
+  GUI.drawButtonHints(renderer, buttonLabels.btn1, buttonLabels.btn2, buttonLabels.btn3, buttonLabels.btn4);
 
   renderer.displayBuffer(HalDisplay::FAST_REFRESH);
 }

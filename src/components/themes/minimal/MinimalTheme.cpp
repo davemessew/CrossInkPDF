@@ -332,7 +332,7 @@ void drawMissingBookCover(const GfxRenderer& renderer, const Rect& coverRect, co
   renderer.drawLine(placeholderRect.x, dividerY, placeholderRect.x + placeholderRect.width - 1, dividerY, true);
 
   constexpr int iconSize = 32;
-  drawLucideIcon(renderer, icon_image_32, placeholderRect.x + (placeholderRect.width - iconSize) / 2,
+  drawLucideIcon(renderer, icon_book_open_32, placeholderRect.x + (placeholderRect.width - iconSize) / 2,
                  placeholderRect.y + (placeholderRect.height / 3 - iconSize) / 2);
 
   constexpr int textPadding = 16;
@@ -664,6 +664,8 @@ void MinimalTheme::drawButtonHints(GfxRenderer& renderer, const char* btn1, cons
       renderer.drawRoundedRect(x, pageHeight - buttonY, buttonWidth, buttonHeight, 1, kButtonCornerRadius, true, true,
                                false, false, true);
     } else {
+      // Clear the previous full-sized hint before drawing the inactive marker.
+      renderer.fillRect(x, pageHeight - buttonY, buttonWidth, buttonHeight, false);
       const int smallButtonY = pageHeight - smallButtonHeight;
       renderer.fillRoundedRect(x, smallButtonY, buttonWidth, smallButtonHeight, kButtonCornerRadius, Color::White);
       renderer.drawRoundedRect(x, smallButtonY, buttonWidth, smallButtonHeight, 1, kButtonCornerRadius, true, true,

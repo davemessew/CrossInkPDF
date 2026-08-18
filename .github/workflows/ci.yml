@@ -85,36 +85,67 @@ jobs:
         run: ctest --test-dir build/host-tests --output-on-failure
 
   build:
-    # Never run untrusted fork PR code on the self-hosted runner.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, linux, crossink-build]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: [default, sticky]
     steps:
       - uses: actions/checkout@v6
         with:
           submodules: recursive
 
-      - name: Verify PlatformIO Core
-        run: pio --version
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
 
-      - name: Build CrossInk production variants
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "latest"
+          enable-cache: true
+
+      - name: Cache PlatformIO packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: ${{ runner.os }}-platformio-${{ matrix.environment }}-${{ hashFiles('platformio.ini', 'platformio.local.example.ini') }}
+          restore-keys: |
+            ${{ runner.os }}-platformio-${{ matrix.environment }}-
+            ${{ runner.os }}-platformio-
+
+      - name: Install PlatformIO Core
+        run: uv pip install --system -U https://github.com/pioarduino/platformio-core/archive/refs/tags/v6.1.19.zip
+
+      - name: Build firmware
         run: |
           set -euo pipefail
-          pio run -e default | tee pio-default.log
-          pio run -e tiny | tee pio-tiny.log
-          pio run -e xlarge | tee pio-xlarge.log
+          if [ "${{ matrix.environment }}" = "default" ]; then
+            pio run -e default | tee pio-default.log
+            pio run -e tiny | tee pio-tiny.log
+            pio run -e xlarge | tee pio-xlarge.log
+          else
+            pio run -e "${{ matrix.environment }}" | tee "pio-${{ matrix.environment }}.log"
+          fi
 
       - name: Extract firmware stats
         run: |
           set -euo pipefail
           {
-            echo "## Firmware build stats"
-            for environment in default tiny xlarge; do
+            echo "## ${{ matrix.environment }} firmware build stats"
+            if [ "${{ matrix.environment }}" = "default" ]; then
+              environments="default tiny xlarge"
+            else
+              environments="${{ matrix.environment }}"
+            fi
+            for environment in ${environments}; do
               echo "### ${environment}"
               grep -E "RAM:\s|Flash:\s" "pio-${environment}.log" | while read -r line; do echo "- ${line}"; done
             done
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload firmware artifacts
+        if: matrix.environment == 'default'
         uses: actions/upload-artifact@v7
         with:
           name: firmware-production

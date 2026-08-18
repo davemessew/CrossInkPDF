@@ -11,9 +11,26 @@
 
 void WordSelectNavigator::load(std::vector<WordInfo> w, std::vector<Row> r, std::string pool,
                                bool consumeInitialConfirm) {
-  words = std::move(w);
-  rows = std::move(r);
-  textPool = std::move(pool);
+  ownedWords = std::move(w);
+  ownedRows = std::move(r);
+  ownedTextPool = std::move(pool);
+  words.reset(ownedWords.data(), ownedWords.size());
+  rows.reset(ownedRows.data(), ownedRows.size());
+  textPool = ownedTextPool.data();
+  currentRow = static_cast<int>(rows.size()) / 2;
+  currentWordInRow =
+      (!rows.empty() && rows[currentRow].wordCount > 0) ? static_cast<int>(rows[currentRow].wordCount) / 2 : 0;
+  confirmReleaseConsumed = consumeInitialConfirm;
+}
+
+void WordSelectNavigator::loadView(WordInfo* w, const size_t wordCount, Row* r, const size_t rowCount, const char* pool,
+                                   const bool consumeInitialConfirm) {
+  std::vector<WordInfo>().swap(ownedWords);
+  std::vector<Row>().swap(ownedRows);
+  std::string().swap(ownedTextPool);
+  words.reset(w, wordCount);
+  rows.reset(r, rowCount);
+  textPool = pool;
   currentRow = static_cast<int>(rows.size()) / 2;
   currentWordInRow =
       (!rows.empty() && rows[currentRow].wordCount > 0) ? static_cast<int>(rows[currentRow].wordCount) / 2 : 0;
@@ -70,9 +87,12 @@ uint16_t WordSelectNavigator::poolAppend(std::string& pool, const char* s, size_
 }
 
 void WordSelectNavigator::reset() {
-  words.clear();
-  rows.clear();
-  textPool.clear();
+  ownedWords.clear();
+  ownedRows.clear();
+  ownedTextPool.clear();
+  words.reset();
+  rows.reset();
+  textPool = nullptr;
   currentRow = 0;
   currentWordInRow = 0;
   inMultiSelectMode = false;
@@ -124,7 +144,7 @@ std::string WordSelectNavigator::buildPhrase(int fromIdx, int toIdx) const {
     if (i == skipIdx) continue;
     const auto* w = getWordAt(i);
     if (!w) continue;
-    if (!phrase.empty()) phrase += ' ';
+    if (!phrase.empty() && !w->joinWithoutSpaceBefore) phrase += ' ';
     // getLookup() returns the merged, hyphen-stripped text for a hyphenated
     // pair (e.g. "externity" for "exter-" + "nity"), matching the single-word
     // lookup path. For ordinary words it equals the display text.
@@ -411,7 +431,9 @@ std::string WordSelectNavigator::finishTouchMultiSelect() {
 bool WordSelectNavigator::HighlightSnapshot::capture(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
                                                      const GfxRenderer& renderer) {
   bytes_ = 0;
-  const size_t bytes = renderer.readFramebufferRegion(x, y, w, h, buf_, sizeof(buf_));
+  if (!storage_) return false;
+  const size_t bytes =
+      renderer.readFramebufferRegion(x, y, w, h, storage_->bytes, HighlightSnapshotStorage::MAX_SNAPSHOT_BYTES);
   if (bytes == 0) return false;
   x_ = x;
   y_ = y;
@@ -422,8 +444,15 @@ bool WordSelectNavigator::HighlightSnapshot::capture(uint16_t x, uint16_t y, uin
 }
 
 void WordSelectNavigator::HighlightSnapshot::restore(GfxRenderer& renderer) const {
-  if (!valid()) return;
-  renderer.writeFramebufferRegion(x_, y_, w_, h_, buf_);
+  if (!valid() || !storage_) return;
+  renderer.writeFramebufferRegion(x_, y_, w_, h_, storage_->bytes);
+}
+
+void WordSelectNavigator::releaseWorkingSet() {
+  reset();
+  std::vector<WordInfo>().swap(ownedWords);
+  std::vector<Row>().swap(ownedRows);
+  std::string().swap(ownedTextPool);
 }
 
 void WordSelectNavigator::renderHighlight(const GfxRenderer& renderer, int lineHeight) const {

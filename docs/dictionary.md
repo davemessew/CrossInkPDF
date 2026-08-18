@@ -1,6 +1,12 @@
+---
+title: Dictionary
+nav_order: 5
+---
+
 # Dictionary
 
-For the best experience, prepare your dictionary using CrossInk's [dictionary preparation tool](https://inky.crossink.dev/#dictionary-tools), which creates `.oft` and `.oft.cspt` accelerator files. An unprepared dictionary with uncompressed `.dict` and `.idx` files also works: on its first lookup, CrossInk creates a smaller on-device `.qidx` quick index automatically.
+> [!TIP]
+> For the best experience, prepare your dictionary using CrossInk's web companion tool [Inky](https://inky.crossink.dev/#dictionary-tools), which creates `.oft` and `.oft.cspt` accelerator files. An unprepared dictionary with uncompressed `.dict` and `.idx` files also works: on its first lookup, CrossInk creates a smaller on-device `.qidx` quick index automatically.
 
 ## Supported Format
 
@@ -19,13 +25,14 @@ Minimum requirement: one `.dict` and one `.idx` file in the same folder. Their f
 
 ## Setting Up a Dictionary
 
+Example folder structure: `SDCARD/.dictionaries/Cambridge/*.dict`. Make sure the dictionary folder is **NOT** nested like `/Cambridge/Cambridge/*.dict`
+
 1. Copy your dictionary folder(s) to one of these directories on the SD card:
    - `/.dictionaries/` (checked first)
    - `/dictionaries/`
-2. If only one dictionary is found and no dictionary has been selected before, it is selected automatically.
-3. To choose between multiple dictionaries, open **Settings -> Dictionary** on the device and select one from the list.
-
-To deselect the current dictionary, select **None** from the list.
+2. If no dictionary has been selected before, the first dictionary in the alphabetical device list is selected automatically.
+3. To choose between multiple dictionaries, open **Settings -> Reader -> Dictionary** on the device and select one from the list.
+4. Per book dictionaries can be set from within the in-reader menu `Book Options -> Settings Gear tab -> Book Dictionary`
 
 ### Preparing Compressed or Large Dictionaries
 
@@ -35,7 +42,7 @@ An uncompressed dictionary with only `.dict` and `.idx` files is usable without 
 
 `.qidx` is a disposable device cache: it is rebuilt when it is missing, invalid, or belongs to a differently sized `.idx` file, and it can be deleted safely. If the lookup is cancelled or the SD card cannot create the cache, the lookup still works by scanning the full `.idx`; CrossInk will try to create the quick index again on a later lookup.
 
-Desktop preparation remains recommended for large dictionaries. `*.idx.oft.cspt` is the preferred direct-lookup accelerator, with `*.idx.oft` as its fallback; either one prevents CrossInk from creating `.qidx`. The desktop files also speed up synonym resolution, suggestions, and ordinal lookups, whereas `.qidx` accelerates the main `.idx` word search only.
+Desktop preparation remains recommended for large dictionaries. `*.idx.oft.cspt` is the preferred direct-lookup accelerator, with `*.idx.oft` as its fallback; either one prevents CrossInk from creating `.qidx`. The desktop files also speed up synonym resolution and ordinal lookups. The smaller `.qidx` accelerates direct lookup and bounds spelling-suggestion searches, but it does not accelerate synonyms or ordinal lookups.
 
 ---
 
@@ -43,11 +50,26 @@ Desktop preparation remains recommended for large dictionaries. `*.idx.oft.cspt`
 
 The **Look Up Word** option in the reader menu is only visible when a dictionary is active.
 
+### Buttons
+
 1. Open the reader menu and choose **Look Up Word**.
 2. The page becomes a word-select overlay - one word is highlighted, initially near the centre of the page.
 3. Use **Up/Down** to move between rows, **Left/Right** to move between words on the same row.
 4. Press **Confirm** to look up the highlighted word.
 5. Press **Back** to exit word-select without looking anything up.
+
+### Touchscreen
+
+In an EPUB reader with **Touch Reader Controls** enabled, touch and hold a
+word for about one second. CrossInk opens word selection on that word; lift
+your finger to look it up. To look up a phrase, keep holding after the
+selection opens, drag to the last word, then lift your finger. This is a
+direct shortcut from the reading page, so you do not need to open the reader
+menu first.
+
+When word selection is already open, including selection opened from a
+definition, touch a word to start a selection and drag before releasing to
+look up a phrase. Releasing without dragging looks up the single touched word.
 
 ### Quick Lookup
 
@@ -108,6 +130,12 @@ In word-select mode, you can select a sequence of words to look up as a phrase.
 
 Multi-word select works in both the reader word-select and the definition word-select (chained lookup).
 
+On a touchscreen, use a press-and-drag selection instead of the button
+sequence: touch the first word, drag to the last word, and lift your finger to
+look up the selected phrase. The first long hold on the reading page is only
+needed to enter lookup; once word selection is open, touching a word starts
+the range immediately.
+
 **Limitation:** Multi-word selection cannot span a page boundary. If a phrase crosses from one page to the next, only the words on the current page are available for selection. As a workaround, reduce the reader font size so more words fit on a single page, perform the lookup, then restore the original font size.
 
 ---
@@ -122,6 +150,8 @@ Each book can have its own dictionary, independent of the global setting.
 4. To remove the override, open **Book Dictionary** and select **Use Global**. The picker shows the current global dictionary name in parentheses next to Use Global.
 
 The global dictionary is automatically restored whenever the book is closed. Changing a book's dictionary does not affect the global setting or other books.
+
+Using **Switch Dictionary** during a word lookup is temporary. It applies only to that lookup flow; when lookup closes, the reader returns to the book's dictionary override, or the global dictionary when the book has no override.
 
 ---
 
@@ -144,11 +174,15 @@ The history screen shows the 50 most recent entries. The on-disk history is appe
 
 ## IPA Phonetic Characters
 
-Dictionary definitions use the same font as the active reader. If you use an SD-card font with the needed glyphs, pronunciation symbols and other non-Latin dictionary text are passed through unchanged.
+Dictionary definitions use the active reader font and size by default. If at least one dictionary is installed, you can set the default dictionary font and size in **Settings > Reader > Font Options**. Books inherit those defaults unless you choose a different font or size in **Book Options > Font Options**. Choose **Use Global** in Book Options to return a book to the global defaults. When the reader uses an SD-card font, you can choose a different dictionary size while keeping that same family; built-in reader fonts continue to use their active size. A saved size with no matching file uses the closest available size from the dictionary family.
+
+Only one SD-card font family is loaded at a time: CrossInk temporarily swaps to the dictionary font while a definition is open, then restores the reader font when you close it. If a book's selected dictionary font is missing, the definition temporarily uses the global dictionary font. If that is also unavailable, it falls back to the reader font. The per-book selection is kept so it resumes automatically if you reinstall the family.
 
 Built-in fonts keep the glyphs they contain and approximate only unsupported pronunciation symbols. If you see a filled diamond, choose an SD-card font that includes that character.
 
 You can download CrossInk's SD card catalog of fonts with IPA glyphs built-in from [Inky](https://inky.crossink.dev/#downloads).
+
+See the [dictionary font builder](dictionary-development.md#generating-dictionary-fonts) if you want to build your own dictionary fonts via the CLI.
 
 ---
 

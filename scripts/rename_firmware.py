@@ -84,12 +84,12 @@ def _get_rc_artifact_name(project_dir, env):
     device_type = _get_firmware_device_type(env)
     branch = (
         _get_project_option(env, 'custom_rc_branch')
-        or os.environ.get('CROSSPOINT_RC_BRANCH')
+        or os.environ.get('CROSSINK_RC_BRANCH')
         or _get_git_branch(project_dir)
     )
     short_hash = (
         _get_project_option(env, 'custom_rc_hash')
-        or os.environ.get('CROSSPOINT_RC_HASH')
+        or os.environ.get('CROSSINK_RC_HASH')
         or _get_git_value(
         project_dir,
         'rev-parse',

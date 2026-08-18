@@ -5,6 +5,7 @@
 #include <string>
 
 #include "activities/Activity.h"
+#include "activities/ScreenTransitionRefresh.h"
 #include "network/CrossPointWebServer.h"
 
 enum class CalibreConnectState { WIFI_SELECTION, SERVER_STARTING, SERVER_RUNNING, ERROR };
@@ -15,6 +16,7 @@ enum class CalibreConnectState { WIFI_SELECTION, SERVER_STARTING, SERVER_RUNNING
  */
 class CalibreConnectActivity final : public Activity {
   CalibreConnectState state = CalibreConnectState::WIFI_SELECTION;
+  ScreenTransitionRefresh screenTransitionRefresh;
 
   std::unique_ptr<CrossPointWebServer> webServer;
   std::string connectedIP;

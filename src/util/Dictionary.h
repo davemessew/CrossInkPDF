@@ -73,11 +73,19 @@ class Dictionary {
  public:
   static constexpr unsigned long LONG_PRESS_MS = 600;
 
-  // Returns the active dictionary folder base path by reading dictionary.bin from the SD card.
-  // If cachePath is non-null and non-empty, reads <cachePath>/dictionary.bin (per-book override).
-  // Otherwise reads /.crosspoint/dictionary.bin (global setting).
+  // Returns the active dictionary folder base path. A temporary lookup override
+  // takes priority; otherwise resolves the per-book/global dictionary.bin files.
   // Returns empty string if no dictionary is configured or the file cannot be read.
   static std::string readDictPath(const char* cachePath = nullptr);
+
+  // Returns the persisted per-book/global dictionary path without applying a
+  // temporary lookup override.
+  static std::string readConfiguredDictPath(const char* cachePath = nullptr);
+
+  // Temporarily overrides dictionary resolution for the active lookup flow.
+  // This is memory-only; callers must clear it when the lookup activity exits.
+  static void setLookupDictPathOverride(const char* folderPath);
+  static void clearLookupDictPathOverride();
 
   // Writes folderPath to /.crosspoint/dictionary.bin (global setting).
   // Pass empty string to clear the global dictionary.
@@ -111,6 +119,11 @@ class Dictionary {
   static DictLocation locate(const std::string& word, const DictLookupCallbacks& cbs = {},
                              const char* cachePath = nullptr);
 
+  // Search the exact word and then its stem variants while reusing one open
+  // index/accelerator session. matchedStem is set only when a variant matched.
+  static DictLocation locateWithStemVariants(const std::string& word, bool* matchedStem,
+                                             const DictLookupCallbacks& cbs = {}, const char* cachePath = nullptr);
+
   // Look up word in .idx (via .idx.oft if present). Returns definition or empty string.
   static std::string lookup(const std::string& word, const DictLookupCallbacks& cbs = {},
                             const char* cachePath = nullptr);
@@ -142,6 +155,22 @@ class Dictionary {
   // putting a 256-byte array on the stack in every caller (and 512B peak when nested).
   static char wordBuf[256];
 
+  enum class LookupAccelerator : uint8_t { None, Cspt, Oft, QuickIndex };
+
+  struct LookupSession {
+    std::string folderPath;
+    HalFile idx;
+    HalFile accelerator;
+    uint32_t idxFileSize = 0;
+    uint32_t qidxSampleCount = 0;
+    uint8_t suffixBytes = 8;
+    LookupAccelerator acceleratorKind = LookupAccelerator::None;
+  };
+
+  static bool openLookupSession(LookupSession& session, const char* cachePath);
+  static void closeLookupSession(LookupSession& session);
+  static DictLocation locateInSession(LookupSession& session, const std::string& word, const DictLookupCallbacks& cbs);
+
   // Read a null-terminated word from an open file into buf (max bufSize-1 chars).
   // Returns the number of characters read (excluding null), or -1 on error.
   static int readWordInto(HalFile& file, char* buf, size_t bufSize);
@@ -164,8 +193,9 @@ class Dictionary {
                                uint32_t* endByte, bool startBeforeCaseMatches);
 
   // Binary search a device-generated sampled .qidx sidecar.
-  static bool binarySearchQuickIndex(HalFile& qidx, HalFile& idx, const char* target, uint32_t idxFileSize,
-                                     uint32_t* startByte, uint32_t* endByte);
+  static bool binarySearchQuickIndex(HalFile& qidx, HalFile& idx, uint32_t sampleCount, const char* target,
+                                     uint32_t idxFileSize, uint32_t* startByte, uint32_t* endByte,
+                                     uint32_t* matchedSample = nullptr);
 
   static bool buildQuickIndex(HalFile& idx, uint32_t idxFileSize, uint8_t suffixBytes, const char* qidxPath,
                               const DictLookupCallbacks& cbs);

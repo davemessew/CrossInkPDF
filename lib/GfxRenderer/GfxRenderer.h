@@ -18,6 +18,7 @@ class SdCardFont;
 
 #include <cassert>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <string>
 #include <vector>
@@ -174,7 +175,7 @@ class GfxRenderer {
   // (which holds a const GfxRenderer&) before measuring word widths. Safe to call on non-SD fonts (no-op).
   // styleMask: bitmask of styles to prepare (bit 0=regular, 1=bold, 2=italic, 3=bold-italic).
   void ensureSdCardFontReady(int fontId, const char* utf8Text, uint8_t styleMask = 0x0F) const;
-  void ensureSdCardFontReady(int fontId, const std::vector<std::string>& words, bool includeHyphen,
+  void ensureSdCardFontReady(int fontId, const std::deque<std::string>& words, bool includeHyphen,
                              uint8_t styleMask = 0x0F) const;
   void ensureSdCardFontReady(int fontId, const uint32_t* codepoints, uint32_t cpCount, bool includeSpace,
                              bool includeHyphen, uint8_t styleMask = 0x0F) const;
@@ -213,6 +214,7 @@ class GfxRenderer {
   // EXPERIMENTAL: Windowed update - display only a rectangular region
   // void displayWindow(int x, int y, int width, int height) const;
   void invertScreen() const;
+  void invertRect(int x, int y, int width, int height) const;
   void clearScreen(uint8_t color = 0xFF) const;
   void getOrientedViewableTRBL(int* outTop, int* outRight, int* outBottom, int* outLeft) const;
 
@@ -225,6 +227,7 @@ class GfxRenderer {
   int getWriteRows() const { return _stripActive ? _stripRows : panelHeight; }
 
   // Drawing
+  bool isPixelBlack(int x, int y) const;
   void drawPixel(int x, int y, bool state = true) const;
   void drawLine(int x1, int y1, int x2, int y2, bool state = true) const;
   void drawLine(int x1, int y1, int x2, int y2, int lineWidth, bool state) const;
@@ -275,7 +278,10 @@ class GfxRenderer {
   int getSpaceAdvance(int fontId, uint32_t leftCp, uint32_t rightCp, EpdFontFamily::Style style) const;
   /// Returns the kerning adjustment between two adjacent codepoints.
   int getKerning(int fontId, uint32_t leftCp, uint32_t rightCp, EpdFontFamily::Style style) const;
-  int getTextAdvanceX(int fontId, const char* text, EpdFontFamily::Style style) const;
+  /// Returns the rendered advance of \p text. When \p followingCp is supplied,
+  /// includes its kerning with the final glyph in the same fixed-point rounding
+  /// step that drawText() uses, without drawing or consuming that codepoint.
+  int getTextAdvanceX(int fontId, const char* text, EpdFontFamily::Style style, uint32_t followingCp = 0) const;
   int getFontAscenderSize(int fontId) const;
   int getLineHeight(int fontId) const;
   std::string truncatedText(int fontId, const char* text, int maxWidth,

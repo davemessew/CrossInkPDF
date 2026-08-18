@@ -14,19 +14,19 @@
 
 #include "Epub/EpubRenderMode.h"
 #include "Epub/FootnoteEntry.h"
+#include "Epub/Page.h"
 #include "Epub/ParsedText.h"
 #include "Epub/blocks/ImageBlock.h"
 #include "Epub/blocks/TextBlock.h"
 #include "Epub/css/CssParser.h"
 #include "Epub/css/CssStyle.h"
 
-class Page;
 class GfxRenderer;
 class ReflowSectionSource;
 
 struct ChapterHtmlPaginationVtable {
   void (*completePage)(void* context, std::unique_ptr<Page> page, uint16_t paragraphIndex,
-                       uint16_t listItemIndex) = nullptr;
+                       uint16_t listItemIndex, uint32_t visibleTextOffset) = nullptr;
   bool (*finishTextBlock)(void* context, const Page* currentPage) = nullptr;
   bool (*beginTextBlock)(void* context, const char* anchor, size_t anchorLength) = nullptr;
   bool (*trackTextLine)(void* context, const TextBlock* line) = nullptr;
@@ -58,12 +58,11 @@ class ChapterHtmlSlimParser {
 
  private:
   static constexpr uint8_t MAX_SIMPLE_TABLE_COLUMNS = 8;
-  static constexpr uint16_t MAX_SIMPLE_TABLE_CELLS = 64;
   static constexpr uint16_t MAX_SIMPLE_TABLE_CELL_WORDS = 160;
   static constexpr uint8_t TABLE_SEMANTIC_ANCHOR_BYTES = 10;
-  // The extra slot holds the active cell that causes the bounded 64-cell
-  // fragment path to fall back to paragraphs.
-  static constexpr uint16_t TABLE_SEMANTIC_ANCHOR_CAPACITY = MAX_SIMPLE_TABLE_CELLS + 1;
+  // Tables are streamed one row at a time. Retain anchors only for that row;
+  // the extra slot lets an over-wide row fall back without losing its active cell.
+  static constexpr uint16_t TABLE_SEMANTIC_ANCHOR_CAPACITY = MAX_SIMPLE_TABLE_COLUMNS + 1;
   static constexpr uint8_t TABLE_CELL_PADDING = 6;
   static constexpr size_t MAX_INLINE_STYLE_DEPTH = 64;
   static constexpr size_t MAX_BLOCK_STYLE_DEPTH = 16;
@@ -75,7 +74,7 @@ class ChapterHtmlSlimParser {
   const int sectionIndex;
   const std::string& filepath;
   GfxRenderer& renderer;
-  std::function<void(std::unique_ptr<Page>, uint16_t, uint16_t)> completePageFn;
+  std::function<void(std::unique_ptr<Page>, uint16_t, uint16_t, uint32_t)> completePageFn;
   ChapterHtmlPaginationHooks paginationHooks_;
   std::function<void()> popupFn;  // Popup callback
   int depth = 0;
@@ -91,6 +90,8 @@ class ChapterHtmlSlimParser {
   // leave one char at end for null pointer
   char partWordBuffer[MAX_WORD_SIZE + 1] = {};
   int partWordBufferIndex = 0;
+  uint32_t partWordVisibleOffset = 0;
+  uint32_t visibleTextOffset = 0;
   uint16_t currentTextRunBytes = 0;
   bool nextWordContinues = false;  // true when next flushed word attaches to previous (inline element boundary)
   std::unique_ptr<ParsedText> currentTextBlock = nullptr;
@@ -101,6 +102,8 @@ class ChapterHtmlSlimParser {
   std::string rubyTextBuffer;
   std::unique_ptr<Page> currentPage = nullptr;
   int16_t currentPageNextY = 0;
+  uint32_t currentPageVisibleOffset = 0;
+  bool currentPageVisibleOffsetSet = false;
   int fontId;
   float lineCompression;
   bool extraParagraphSpacing;
@@ -136,6 +139,7 @@ class ChapterHtmlSlimParser {
   uint32_t previewStartOrdinal = 0;
   uint32_t previewElementOrdinal = 0;
   bool malformedMarkupTruncated = false;
+  bool syntheticCharacterData = false;
   XML_Parser activeParser = nullptr;
   FsFile parseFile_;
   size_t parseFileOffset_ = 0;
@@ -193,6 +197,7 @@ class ChapterHtmlSlimParser {
   struct BufferedTableCell {
     std::unique_ptr<ParsedText> text;
     std::vector<std::pair<int, FootnoteEntry>> footnotes;
+    uint32_t visibleTextOffset = 0;
     bool isHeader = false;
     uint8_t colSpan = 1;
   };
@@ -207,13 +212,12 @@ class ChapterHtmlSlimParser {
   struct BufferedTable {
     BlockStyle blockStyle;
     std::vector<BufferedTableRow> rows;
-    // Null for EPUB. PDF allocates one zeroed 650-byte parallel anchor buffer
-    // for the table, avoiding both per-cell allocations and common EPUB bytes.
+    // Null for EPUB. PDF allocates one 90-byte row anchor buffer and reuses it
+    // for the whole table, avoiding per-cell allocations and whole-table limits.
     std::unique_ptr<char[]> paginationAnchors;
     uint16_t maxCols = 0;
     uint16_t totalCells = 0;
     bool unsupported = false;
-
     char* paginationAnchorAt(const uint16_t cellIndex) {
       return paginationAnchors && cellIndex < TABLE_SEMANTIC_ANCHOR_CAPACITY
                  ? paginationAnchors.get() + static_cast<size_t>(cellIndex) * TABLE_SEMANTIC_ANCHOR_BYTES
@@ -225,6 +229,18 @@ class ChapterHtmlSlimParser {
                  ? paginationAnchors.get() + static_cast<size_t>(cellIndex) * TABLE_SEMANTIC_ANCHOR_BYTES
                  : nullptr;
     }
+
+    // When the whole-table reservation is unavailable, retain only the current
+    // source row plus the render-ready rows that fit on the active page.
+    bool streaming = false;
+    bool streamingFlattened = false;
+    bool streamingTopSpacingApplied = false;
+    uint8_t streamingColumnCount = 0;
+    uint8_t streamingFragmentColumnCount = 0;
+    uint16_t streamingFragmentHeight = 1;
+    uint32_t streamingFragmentVisibleOffset = 0;
+    std::vector<TableFragmentRow> streamingFragmentRows;
+    std::vector<FootnoteEntry> streamingFragmentFootnotes;
   };
 
   int tableDepth = 0;
@@ -234,6 +250,7 @@ class ChapterHtmlSlimParser {
   bool currentTableCellIsHeader = false;
   uint8_t currentTableCellColSpan = 1;
   bool currentTableCellSemanticDeferred = false;
+  uint32_t currentTableCellVisibleOffset = 0;
   std::unique_ptr<BufferedTable> currentTableBuffer = nullptr;
   std::vector<CssAncestorEntry> ancestorStack_;
 
@@ -285,6 +302,7 @@ class ChapterHtmlSlimParser {
   bool trackPaginationTextLine(const TextBlock& line);
   bool usesSemanticLayout() const;
   bool shouldRetainAnchor(const std::string& anchor) const;
+  void setCurrentPageVisibleOffset(uint32_t offset);
   void completeCurrentPage();
   void makePages();
   int effectiveLineHeight() const;
@@ -307,9 +325,13 @@ class ChapterHtmlSlimParser {
   void finalizeCurrentTableCell();
   void emitBufferedTableAsParagraphs(BufferedTable& table);
   void emitBufferedTableAsFragments(BufferedTable& table);
+  bool streamCurrentTableRow();
+  bool flushStreamingTableFragment(BufferedTable& table);
+  void emitStreamingTableRowsAsParagraphs(BufferedTable& table);
+  void finishStreamingTable(BufferedTable& table);
+  void fallbackStreamingTableToParagraphs(const char* reason);
   void emitCurrentTableBuffer();
   void fallbackCurrentTableBufferToParagraphs(const char* reason);
-  void fallbackCurrentTableBufferIfNeeded(const char* stage);
   void flushMalformedPartialContent();
   bool appendMalformedMarkupWarningPage();
   void prewarmSectionAdvanceTable(FsFile& file) const;
@@ -331,7 +353,8 @@ class ChapterHtmlSlimParser {
       const uint8_t paragraphAlignment, const uint16_t viewportWidth, const uint16_t viewportHeight,
       const bool hyphenationEnabled, const bool bionicReadingEnabled, const bool guideReadingEnabled,
       const uint8_t wordSpacing,
-      std::function<void(std::unique_ptr<Page>, uint16_t, uint16_t)> completePageFn, const bool embeddedStyle,
+      std::function<void(std::unique_ptr<Page>, uint16_t, uint16_t, uint32_t)> completePageFn,
+      const bool embeddedStyle,
       const std::string& contentBase, const std::string& imageBasePath, const uint8_t imageRendering = 0,
       std::vector<std::string> tocAnchors = {}, const std::function<void()>& popupFn = nullptr,
       CssParser* cssParser = nullptr, const EpubRenderMode renderMode = EpubRenderMode::CrossInkDefault,
@@ -374,7 +397,7 @@ class ChapterHtmlSlimParser {
   bool finishParse();
   void abortParse();
   void releaseInputFile();
-  void addLineToPage(std::shared_ptr<TextBlock> line);
+  void addLineToPage(std::shared_ptr<TextBlock> line, uint32_t visibleOffset);
   const std::vector<std::pair<std::string, uint16_t>>& getAnchors() const { return anchorData; }
   bool wasLowMemoryFallbackTriggered() const { return lowMemoryImageFallback; }
   bool wasLowMemoryAbortTriggered() const { return lowMemoryAbort && !paginationHookFailed; }

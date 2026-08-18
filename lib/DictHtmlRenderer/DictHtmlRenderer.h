@@ -65,6 +65,11 @@ class DictHtmlRenderer {
   // on success. Used by the definition view so only one page is ever resident.
   bool renderFromFileStreaming(const char* dictPath, uint32_t offset, uint32_t size, const SpanSink& sink);
 
+  // Recovery path for browser-tolerated HTML that Expat cannot parse (for
+  // example, repeated <li> tags without matching </li> tags). Streams the
+  // visible text while discarding tags and preserving basic block breaks.
+  bool renderPlainTextFromFileStreaming(const char* dictPath, uint32_t offset, uint32_t size, const SpanSink& sink);
+
 #ifdef DICT_HTML_RENDERER_TRACK_UNKNOWN
   bool hasUnknownTags() const { return unknownTagCount > 0; }
 
@@ -150,6 +155,11 @@ class DictHtmlRenderer {
   // the partial entity is written to carry/carryLen for prepending to the next chunk.
   // Set isLast=true for the final chunk (no carryover possible).
   void feedEntityResolved(const char* buf, int len, bool isLast, char* carry, int* carryLen);
+
+  // Plain-text equivalent used by the malformed-HTML recovery path. Tags are
+  // discarded, common/numeric entities are decoded, and text is emitted via
+  // the installed span sink.
+  void feedPlainText(const char* buf, int len, bool isLast, char* carry, int* carryLen);
 
   // Normalize HTML void elements before handing the fragment to Expat. StarDict
   // HTML is often valid HTML but not valid XML (for example <BR> and <IMG ...>

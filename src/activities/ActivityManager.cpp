@@ -209,7 +209,7 @@ bool ActivityManager::handleGlobalHomeGesture() {
   }
 
   const bool homeGesture = currentActivity->usesFullScreenReaderVerticalSwipes() ? mappedInput.wasReaderHomeGesture()
-                                                                                   : mappedInput.wasHomeGesture();
+                                                                                 : mappedInput.wasHomeGesture();
   if (!homeGesture) {
     return false;
   }
@@ -361,10 +361,15 @@ void ActivityManager::goToBrowser() {
 }
 
 bool ActivityManager::goToOpdsServer(const uint32_t serverIndex, const bool networkBootReady) {
+#ifndef SIMULATOR
   if (!networkBootReady) {
     silentRestartToNetwork(NetworkBootTarget::OPDS, serverIndex);
     return true;
   }
+#else
+  // The desktop build has no fragmented WiFi heap to clear; keep the preview in-process.
+  (void)networkBootReady;
+#endif
 
   OPDS_STORE.loadFromFile();
   const auto* storedServer = OPDS_STORE.getServer(serverIndex);
@@ -385,12 +390,13 @@ bool ActivityManager::goToOpdsServer(const uint32_t serverIndex, const bool netw
   return true;
 }
 
-void ActivityManager::goToReader(std::string path, const bool suppressBackRelease, const bool allowFastInitialRefresh) {
+void ActivityManager::goToReader(std::string path, const bool suppressBackRelease, const bool allowFastInitialRefresh,
+                                 const bool cleanImageBaseOnEntry) {
   // OPDS credentials are unrelated to local reading and may contain several
   // heap-backed strings. Home reloads them lazily when it becomes active.
   OPDS_STORE.release();
   replaceActivity(std::make_unique<ReaderActivity>(renderer, mappedInput, std::move(path), suppressBackRelease,
-                                                   allowFastInitialRefresh));
+                                                   allowFastInitialRefresh, cleanImageBaseOnEntry));
 }
 
 void ActivityManager::goToSleep(bool fromTimeout) {
@@ -407,7 +413,7 @@ void ActivityManager::goToFullScreenMessage(std::string message, EpdFontFamily::
   replaceActivity(std::make_unique<FullScreenMessageActivity>(renderer, mappedInput, std::move(message), style));
 }
 
-void ActivityManager::goHome(HomeMenuItem initialMenuItem) {
+void ActivityManager::goHome(HomeMenuItem initialMenuItem, const bool initialFullRefresh) {
   if (initialMenuItem == HomeMenuItem::NONE && currentActivity) {
     const auto& activityName = currentActivity->name;
     if (activityName == "FileBrowser") {
@@ -424,7 +430,7 @@ void ActivityManager::goHome(HomeMenuItem initialMenuItem) {
       initialMenuItem = HomeMenuItem::SETTINGS_MENU;
     }
   }
-  replaceActivity(std::make_unique<HomeActivity>(renderer, mappedInput, initialMenuItem));
+  replaceActivity(std::make_unique<HomeActivity>(renderer, mappedInput, initialMenuItem, initialFullRefresh));
 }
 void ActivityManager::goToCrashReport() { replaceActivity(std::make_unique<CrashActivity>(renderer, mappedInput)); }
 
@@ -521,8 +527,23 @@ std::string ActivityManager::getCurrentBookPath() const {
 
 ScreenshotInfo ActivityManager::getScreenshotInfo() const {
   if (currentActivity) {
-    return currentActivity->getScreenshotInfo();
+    const ScreenshotInfo info = currentActivity->getScreenshotInfo();
+    if (info.readerType != ScreenshotInfo::ReaderType::None) {
+      return info;
+    }
   }
+
+  // Reader overlays such as the dictionary are pushed above the book activity.
+  // Keep their visible framebuffer, but inherit the book's screenshot filename.
+  for (auto it = stackActivities.rbegin(); it != stackActivities.rend(); ++it) {
+    if (*it) {
+      const ScreenshotInfo info = (*it)->getScreenshotInfo();
+      if (info.readerType != ScreenshotInfo::ReaderType::None) {
+        return info;
+      }
+    }
+  }
+
   return {};
 }
 

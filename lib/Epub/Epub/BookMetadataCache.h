@@ -72,6 +72,7 @@ class BookMetadataCache {
   Arena spineHrefIndexArena;
   ArenaVector<SpineHrefIndexEntry> spineHrefIndex;
   bool useSpineHrefIndex = false;
+  bool lowMemoryFailure = false;
 
   static constexpr uint16_t LARGE_SPINE_THRESHOLD = 300;
 
@@ -123,6 +124,7 @@ class BookMetadataCache {
 
   // Reading phase (read mode)
   bool load();
+  bool failedForLowMemory() const { return lowMemoryFailure; }
   SpineEntry getSpineEntry(int index);
   size_t getSpineCumulativeSize(int index);
   TocEntry getTocEntry(int index);

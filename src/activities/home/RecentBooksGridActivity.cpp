@@ -38,6 +38,7 @@ constexpr int kSelectionPadding = 4;
 constexpr int kSelectionOutlineGap = 2;
 constexpr int kSelectionOuterInset = kSelectionPadding + kSelectionOutlineGap;
 constexpr unsigned long kLongPressMs = 1000;
+constexpr unsigned long kActionFeedbackMs = 1000;
 constexpr float kCircleRadians = 6.2831853f;
 constexpr float kCircleRadiansPerPercent = kCircleRadians / 100.0f;
 
@@ -135,10 +136,16 @@ int moveVerticalInGrid(const int currentIndex, const int totalItems, const int c
   return std::max(previousPageStart, previousPageCandidate);
 }
 
-void updateRecentBookCoverPath(const RecentBook& book, const std::string& coverBmpPath) {
-  if (!RECENT_BOOKS.updateBook(book.path, book.title, book.author, coverBmpPath)) {
+void updateRecentBookCover(const RecentBook& book) {
+  if (!RECENT_BOOKS.updateBook(book.path, book.title, book.author, book.coverBmpPath, book.coverState)) {
     LOG_ERR("RBGA", "failed to update recent book metadata: %s", book.path.c_str());
   }
+}
+
+void markCoverMissing(RecentBook& book) {
+  book.coverBmpPath.clear();
+  book.coverState = RecentBook::CoverState::Missing;
+  updateRecentBookCover(book);
 }
 
 bool hasThumbnailPlaceholder(const std::string& coverBmpPath) {
@@ -193,7 +200,7 @@ std::string getReusableCoverPath(const RecentBook& book) {
 }
 
 void ensureReusableCoverPath(RecentBook& book) {
-  if (hasThumbnailPlaceholder(book.coverBmpPath)) {
+  if (book.coverState == RecentBook::CoverState::Missing || hasThumbnailPlaceholder(book.coverBmpPath)) {
     return;
   }
 
@@ -203,7 +210,7 @@ void ensureReusableCoverPath(RecentBook& book) {
   }
 
   book.coverBmpPath = reusablePath;
-  updateRecentBookCoverPath(book, reusablePath);
+  updateRecentBookCover(book);
 }
 }  // namespace
 
@@ -252,8 +259,7 @@ void RecentBooksGridActivity::loadPageCovers(int pageStart) {
 #endif
     ensureReusableCoverPath(book);
     if (book.coverBmpPath.empty()) {
-      needsGeneration = true;
-      break;
+      continue;
     }
     const std::string thumbPath = UITheme::getCoverThumbPath(book.coverBmpPath, COVER_WIDTH, COVER_HEIGHT);
     if (needsCoverThumbGeneration(book, thumbPath)) {
@@ -279,12 +285,15 @@ void RecentBooksGridActivity::loadPageCovers(int pageStart) {
       continue;
     }
 #endif
-    const std::string coverPath =
-        book.coverBmpPath.empty() ? "" : UITheme::getCoverThumbPath(book.coverBmpPath, COVER_WIDTH, COVER_HEIGHT);
+    if (book.coverBmpPath.empty()) {
+      processedCount++;
+      continue;
+    }
+    const std::string coverPath = UITheme::getCoverThumbPath(book.coverBmpPath, COVER_WIDTH, COVER_HEIGHT);
     if (needsCoverThumbGeneration(book, coverPath)) {
       if (FsHelpers::hasEpubExtension(book.path)) {
         Epub epub(book.path, "/.crosspoint");
-        if (epub.load(true, true)) {
+        if (epub.load(true, true, Epub::XLocationLoadMode::Skip)) {
           if (!showingLoading) {
             showingLoading = true;
             popupRect = GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
@@ -293,10 +302,9 @@ void RecentBooksGridActivity::loadPageCovers(int pageStart) {
           if (epub.generateThumbBmp(COVER_WIDTH, COVER_HEIGHT, &renderer, SETTINGS.getReaderFontId())) {
             const std::string reusablePath = epub.getThumbBmpPath();
             book.coverBmpPath = reusablePath;
-            updateRecentBookCoverPath(book, reusablePath);
-          } else {
-            updateRecentBookCoverPath(book, "");
-            book.coverBmpPath = "";
+            updateRecentBookCover(book);
+          } else if (!epub.hasCoverImage()) {
+            markCoverMissing(book);
           }
         }
       } else if (FsHelpers::hasXtcExtension(book.path)) {
@@ -310,10 +318,7 @@ void RecentBooksGridActivity::loadPageCovers(int pageStart) {
           if (xtc.generateThumbBmp(COVER_WIDTH, COVER_HEIGHT)) {
             const std::string reusablePath = xtc.getThumbBmpPath();
             book.coverBmpPath = reusablePath;
-            updateRecentBookCoverPath(book, reusablePath);
-          } else {
-            updateRecentBookCoverPath(book, "");
-            book.coverBmpPath = "";
+            updateRecentBookCover(book);
           }
         }
       }
@@ -378,6 +383,12 @@ int RecentBooksGridActivity::bookIndexFromPoint(const int x, const int y) {
 }
 
 void RecentBooksGridActivity::loop() {
+  if (pendingCacheDeletedFeedback && millis() - cacheDeletedFeedbackShowTime >= kActionFeedbackMs) {
+    pendingCacheDeletedFeedback = false;
+    requestUpdate();
+    return;
+  }
+
   if (TouchHeaderBackButton::wasTapped(mappedInput, TouchHeaderBackButton::compactHeaderRect(renderer))) {
     onGoHome();
     return;
@@ -555,6 +566,7 @@ void RecentBooksGridActivity::showBookActionMenu(const int bookIndex, const bool
       std::make_unique<FileBrowserActionActivity>(renderer, mappedInput, book.title, std::move(items),
                                                   ignoreInitialConfirmRelease),
       [this, book](const ActivityResult& result) {
+        longPressFired = false;
         if (result.isCancelled) {
           return;
         }
@@ -578,8 +590,8 @@ void RecentBooksGridActivity::showBookActionMenu(const int bookIndex, const bool
                     if (!BookActions::clearBookCache(book.path)) {
                       LOG_ERR("RBGA", "Failed to clear book cache for: %s", book.path.c_str());
                     } else {
-                      BookActions::drawToast(renderer, tr(STR_BOOK_CACHE_DELETED));
-                      delay(1000);
+                      pendingCacheDeletedFeedback = true;
+                      cacheDeletedFeedbackShowTime = millis();
                     }
                   }
                   reloadAfterBookAction();
@@ -798,6 +810,10 @@ void RecentBooksGridActivity::render(RenderLock&&) {
   // the grid but are not rendered in this compact hint bar.
   const auto labels = mappedInput.mapLabels(tr(STR_HOME), tr(STR_OPEN), tr(STR_DIR_LEFT), tr(STR_DIR_RIGHT));
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+
+  if (pendingCacheDeletedFeedback) {
+    GUI.drawPopup(renderer, tr(STR_BOOK_CACHE_DELETED));
+  }
 
   renderer.displayBuffer();
 

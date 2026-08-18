@@ -1414,7 +1414,10 @@ let operationCancelled = false; // Set by Cancel to stop conversion loops and up
 let uploadGeneration = 0; // Incremented each uploadFile() call; guards stale restoreAfterCancel()
 let currentUploadWs = null; // Active WebSocket reference for external abort
 let currentUploadXhr = null; // Active XHR reference for external abort
-const WS_PORT = 81;
+// On-device HTTP uses port 80 and WebSocket uses 81. The simulator maps the
+// same adjacent-port contract to an unprivileged host pair such as 8080/8081.
+const HTTP_PORT = Number(window.location.port || 80);
+const WS_PORT = HTTP_PORT + 1;
 const WS_CHUNK_SIZE = 4096; // 4KB chunks - smaller for ESP32 stability
 
 // ============================================================================
@@ -1450,6 +1453,7 @@ const UPLOAD_SETTINGS_STORAGE_KEY = "crossink.files.uploadSettings.v1";
 const DEFAULT_UPLOAD_SETTINGS = Object.freeze({
   convertBeforeUpload: false,
   renameFromMetadata: false,
+  splitLongSections: true,
   quality: DEFAULT_JPEG_QUALITY,
   referenceCharacters: X_DEFAULT_REFERENCE_CHARACTERS_PER_PAGE,
   deviceTarget: "auto",
@@ -1463,6 +1467,7 @@ function getCurrentUploadSettings() {
   return {
     convertBeforeUpload: !!document.getElementById("convertBeforeUpload")?.checked,
     renameFromMetadata: !!document.getElementById("renameFromMetadataToggle")?.checked,
+    splitLongSections: !!document.getElementById("splitLongSectionsToggle")?.checked,
     quality: parseInt(document.getElementById("qualitySlider")?.value || JPEG_QUALITY, 10),
     referenceCharacters: parseInt(
       document.getElementById("referenceCharactersInput")?.value || X_DEFAULT_REFERENCE_CHARACTERS_PER_PAGE,
@@ -1481,6 +1486,7 @@ function applyUploadSettings(settings = {}) {
   try {
     document.getElementById("convertBeforeUpload").checked = !!merged.convertBeforeUpload;
     document.getElementById("renameFromMetadataToggle").checked = !!merged.renameFromMetadata;
+    document.getElementById("splitLongSectionsToggle").checked = !!merged.splitLongSections;
     document.getElementById("export-log-checkbox").checked = !!merged.exportLog;
     document.getElementById("rememberUploadSettings").checked = !!settings.rememberSettings;
     document.getElementById("referenceCharactersInput").value = normalizedReferenceCharactersPerPage(
@@ -2009,7 +2015,6 @@ const DEFENSIVE_STYLE =
   '<style type="text/css">img,svg{max-width:100%;height:auto}body{overflow-wrap:break-word}table{max-width:100%;table-layout:fixed}pre,code{white-space:pre-wrap;word-wrap:break-word}*{box-sizing:border-box}</style>';
 const X_LOCATION_MANIFEST_PATH = "META-INF/x-locations.json";
 const X_LOCATION_WORDS_PER_UNIT = 64;
-const SECTION_SPLIT_ENABLED = true;
 const SECTION_SPLIT_WORD_THRESHOLD = 8000;
 const SECTION_SPLIT_BYTE_THRESHOLD = 32768;
 const SECTION_SPLIT_HARD_BYTE_LIMIT = 49152;
@@ -2594,7 +2599,8 @@ function chunkHasReaderContent(nodes) {
     if (node.nodeType === Node.TEXT_NODE) return !hidden && !!(node.textContent || "").trim();
     if (node.nodeType !== Node.ELEMENT_NODE) return false;
     const name = localName(node);
-    const nextHidden = hidden || node.hasAttribute("data-AmznRemoved-M8") || ["script", "style", "svg", "metadata"].includes(name);
+    const nextHidden =
+      hidden || node.hasAttribute("data-AmznRemoved-M8") || ["script", "style", "svg", "metadata"].includes(name);
     if (nextHidden) return false;
     if (name === "img") return true;
     return Array.from(node.childNodes).some((child) => visit(child, nextHidden));
@@ -2658,7 +2664,9 @@ function collapseReaderEmptySpineItems(xhtmlFiles, opfContent, opfPath) {
   const doc = new DOMParser().parseFromString(opfContent, "application/xml");
   const redirects = new Map();
   if (doc.querySelector("parsererror")) return { opfContent, redirects };
-  const manifestById = new Map(Array.from(doc.getElementsByTagNameNS("*", "item")).map((item) => [item.getAttribute("id"), item]));
+  const manifestById = new Map(
+    Array.from(doc.getElementsByTagNameNS("*", "item")).map((item) => [item.getAttribute("id"), item]),
+  );
   const spine = doc.getElementsByTagNameNS("*", "spine")[0];
   if (!spine) return { opfContent, redirects };
   const refs = Array.from(spine.getElementsByTagNameNS("*", "itemref"));
@@ -2700,13 +2708,35 @@ function rewriteCollapsedSpineReferences(content, sourcePath, redirects) {
   return changed ? safeSerialize(doc, content) : content;
 }
 
-function splitLongXhtmlSections(xhtmlFiles, opfContent, opfPath) {
-  if (!SECTION_SPLIT_ENABLED) return { files: xhtmlFiles, splitSections: {}, sourceSpineMap: null };
+function rewriteSplitSectionReferences(content, sourcePath, anchorTargets) {
+  if (anchorTargets.size === 0) return content;
+  const doc = new DOMParser().parseFromString(content, "application/xml");
+  if (doc.querySelector("parsererror")) return content;
+  let changed = false;
+  for (const element of Array.from(doc.getElementsByTagName("*"))) {
+    for (const attribute of ["href", "xlink:href"]) {
+      const value = element.getAttribute(attribute);
+      if (!value || /^[a-z][a-z0-9+.-]*:/i.test(value)) continue;
+      const [href, fragment = ""] = value.split(/#(.*)/s, 2);
+      if (!fragment) continue;
+      const targetPath = href ? resolvePath(sourcePath, decodeHref(href)) : sourcePath;
+      const partPath = anchorTargets.get(targetPath)?.get(decodeHref(fragment));
+      if (!partPath) continue;
+      element.setAttribute(attribute, `${relativeZipPath(sourcePath, partPath)}#${fragment}`);
+      changed = true;
+    }
+  }
+  return changed ? safeSerialize(doc, content) : content;
+}
+
+function splitLongXhtmlSections(xhtmlFiles, opfContent, opfPath, enabled) {
+  if (!enabled) return { files: xhtmlFiles, splitSections: {}, anchorTargets: new Map(), sourceSpineMap: null };
 
   const parser = new DOMParser();
   const serializer = new XMLSerializer();
   const out = {};
   const splitSections = {};
+  const anchorTargets = new Map();
   const originalSpineHrefs = parseOpfSpineHrefs(opfContent, opfPath);
   const spinePaths = new Set(originalSpineHrefs);
   const sourceByHref = {};
@@ -2800,6 +2830,8 @@ function splitLongXhtmlSections(xhtmlFiles, opfContent, opfPath) {
     }
 
     splitSections[path] = [];
+    const sectionAnchors = new Map();
+    anchorTargets.set(path, sectionAnchors);
     const tagOffsets = new Map();
     chunks.forEach((chunk, partIndex) => {
       const partPath = makeSectionSplitPath(path, partIndex);
@@ -2808,6 +2840,10 @@ function splitLongXhtmlSections(xhtmlFiles, opfContent, opfPath) {
       for (const childIndex of splitContainer.childPath) partContainer = partContainer.childNodes[childIndex];
       while (partContainer.firstChild) partContainer.removeChild(partContainer.firstChild);
       for (const node of chunk) partContainer.appendChild(partDoc.importNode(node, true));
+      for (const element of Array.from(partDoc.getElementsByTagName("*"))) {
+        const anchor = element.getAttribute("id") || (localName(element) === "a" ? element.getAttribute("name") : null);
+        if (anchor && !sectionAnchors.has(anchor)) sectionAnchors.set(anchor, partPath);
+      }
       out[partPath] = safeSerialize(partDoc, content);
       splitSections[path].push(partPath);
       const rangesByName = new Map();
@@ -2831,6 +2867,7 @@ function splitLongXhtmlSections(xhtmlFiles, opfContent, opfPath) {
   return {
     files: out,
     splitSections,
+    anchorTargets,
     sourceSpineMap: hasSplits ? { version: 1, spineCount: originalSpineHrefs.length, sourceByHref } : null,
   };
 }
@@ -4230,8 +4267,16 @@ async function convertEpubFile(file, progressCallback) {
     logFix("EPUB sections", `Collapsed ${collapseResult.redirects.size} empty chapter stubs`);
   }
 
-  const sectionSplitResult = splitLongXhtmlSections(processedXhtmlFiles, opfContent, opfPath);
+  const splitLongSections = !!document.getElementById("splitLongSectionsToggle")?.checked;
+  const sectionSplitResult = splitLongXhtmlSections(processedXhtmlFiles, opfContent, opfPath, splitLongSections);
   processedXhtmlFiles = sectionSplitResult.files;
+  for (const [xhtmlPath, content] of Object.entries(processedXhtmlFiles)) {
+    processedXhtmlFiles[xhtmlPath] = rewriteSplitSectionReferences(
+      content,
+      xhtmlPath,
+      sectionSplitResult.anchorTargets,
+    );
+  }
   if (Object.keys(sectionSplitResult.splitSections).length > 0) {
     const splitPartCount = Object.values(sectionSplitResult.splitSections).reduce(
       (sum, parts) => sum + parts.length,
@@ -4252,9 +4297,12 @@ async function convertEpubFile(file, progressCallback) {
     if (fileObj.dir || path === "mimetype") continue;
     const low = path.toLowerCase();
     if (low.endsWith(".ncx") || low.match(/\.(xml|svg)$/)) {
-      extraTextFiles[path] = rewriteCollapsedSpineReferences(
-        scrubEpubTextResource(path, await safeReadText(fileObj)), path, collapseResult.redirects,
+      const content = rewriteCollapsedSpineReferences(
+        scrubEpubTextResource(path, await safeReadText(fileObj)),
+        path,
+        collapseResult.redirects,
       );
+      extraTextFiles[path] = rewriteSplitSectionReferences(content, path, sectionSplitResult.anchorTargets);
     }
   }
 
@@ -4267,6 +4315,7 @@ async function convertEpubFile(file, progressCallback) {
     const opfDir = opfPath.includes("/") ? opfPath.substring(0, opfPath.lastIndexOf("/")) : "";
     t = fixOPF(t, opfContent, opfDir, splitImages);
     t = addSplitSectionsToOpf(t, opfPath, sectionSplitResult.splitSections);
+    t = rewriteSplitSectionReferences(t, opfPath, sectionSplitResult.anchorTargets);
     if (t !== opfContent) logFix("OPF", "manifest updated");
     out.file(opfPath, t, DEFLATE_OPTS);
 

@@ -934,6 +934,6 @@ void NearbyBookTransferActivity::render(RenderLock&&) {
                                               showNavigation ? tr(STR_DIR_DOWN) : "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
   }
-  renderer.displayBuffer();
+  renderer.displayBuffer(screenTransitionRefresh_.modeFor(static_cast<uint8_t>(state_)));
   if (drewReceivingScreen) receivingScreenDrawn_.store(true, std::memory_order_release);
 }

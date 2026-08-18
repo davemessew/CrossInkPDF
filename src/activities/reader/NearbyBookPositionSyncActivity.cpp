@@ -184,7 +184,7 @@ void NearbyBookPositionSyncActivity::render(RenderLock&&) {
 
   if (state_ == State::SHOWING_RESULT) {
     renderComparison();
-    renderer.displayBuffer();
+    renderer.displayBuffer(screenTransitionRefresh_.modeFor(static_cast<uint8_t>(state_)));
     return;
   }
 
@@ -230,7 +230,7 @@ void NearbyBookPositionSyncActivity::render(RenderLock&&) {
       const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_NEARBY_POSITION_SHARE_BUTTON), "", "");
       GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4, true);
     }
-    renderer.displayBuffer();
+    renderer.displayBuffer(screenTransitionRefresh_.modeFor(static_cast<uint8_t>(state_)));
     return;
   }
 
@@ -242,7 +242,7 @@ void NearbyBookPositionSyncActivity::render(RenderLock&&) {
   }
   const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4, true);
-  renderer.displayBuffer();
+  renderer.displayBuffer(screenTransitionRefresh_.modeFor(static_cast<uint8_t>(state_)));
 }
 
 void NearbyBookPositionSyncActivity::enqueueEspNowPacket(const uint8_t*, const uint8_t*, int) {}
@@ -384,8 +384,13 @@ void NearbyBookPositionSyncActivity::renderReady(const std::string& primary, con
   UITheme::drawCenteredText(renderer, screen, UI_10_FONT_ID, y, primary.c_str(), true, EpdFontFamily::BOLD);
   y += renderer.getLineHeight(UI_10_FONT_ID) + metrics.verticalSpacing;
   if (!detailPrimary.empty()) {
-    UITheme::drawCenteredText(renderer, screen, SMALL_FONT_ID, y, detailPrimary.c_str(), true);
-    y += renderer.getLineHeight(SMALL_FONT_ID) + metrics.verticalSpacing;
+    const auto detailLines =
+        renderer.wrappedText(SMALL_FONT_ID, detailPrimary.c_str(), screen.width - metrics.contentSidePadding * 2, 3);
+    for (const auto& line : detailLines) {
+      UITheme::drawCenteredText(renderer, screen, SMALL_FONT_ID, y, line.c_str(), true);
+      y += renderer.getLineHeight(SMALL_FONT_ID);
+    }
+    y += metrics.verticalSpacing;
   }
   if (!detailSecondary.empty()) {
     UITheme::drawCenteredText(renderer, screen, SMALL_FONT_ID, y, detailSecondary.c_str(), true);
@@ -1271,7 +1276,7 @@ void NearbyBookPositionSyncActivity::render(RenderLock&&) {
 
   if (state_ == State::SHOWING_RESULT) {
     renderComparison();
-    renderer.displayBuffer();
+    renderer.displayBuffer(screenTransitionRefresh_.modeFor(static_cast<uint8_t>(state_)));
     return;
   }
 
@@ -1317,7 +1322,7 @@ void NearbyBookPositionSyncActivity::render(RenderLock&&) {
       const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_NEARBY_POSITION_SHARE_BUTTON), "", "");
       GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4, true);
     }
-    renderer.displayBuffer();
+    renderer.displayBuffer(screenTransitionRefresh_.modeFor(static_cast<uint8_t>(state_)));
     return;
   }
 
@@ -1329,7 +1334,7 @@ void NearbyBookPositionSyncActivity::render(RenderLock&&) {
   }
   const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4, true);
-  renderer.displayBuffer();
+  renderer.displayBuffer(screenTransitionRefresh_.modeFor(static_cast<uint8_t>(state_)));
 }
 
 void NearbyBookPositionSyncActivity::renderReady(const std::string& primary, const std::string& detailPrimary,
@@ -1341,8 +1346,13 @@ void NearbyBookPositionSyncActivity::renderReady(const std::string& primary, con
   UITheme::drawCenteredText(renderer, screen, UI_10_FONT_ID, y, primary.c_str(), true, EpdFontFamily::BOLD);
   y += renderer.getLineHeight(UI_10_FONT_ID) + metrics.verticalSpacing;
   if (!detailPrimary.empty()) {
-    UITheme::drawCenteredText(renderer, screen, SMALL_FONT_ID, y, detailPrimary.c_str(), true);
-    y += renderer.getLineHeight(SMALL_FONT_ID) + metrics.verticalSpacing;
+    const auto detailLines =
+        renderer.wrappedText(SMALL_FONT_ID, detailPrimary.c_str(), screen.width - metrics.contentSidePadding * 2, 3);
+    for (const auto& line : detailLines) {
+      UITheme::drawCenteredText(renderer, screen, SMALL_FONT_ID, y, line.c_str(), true);
+      y += renderer.getLineHeight(SMALL_FONT_ID);
+    }
+    y += metrics.verticalSpacing;
   }
   if (!detailSecondary.empty()) {
     UITheme::drawCenteredText(renderer, screen, SMALL_FONT_ID, y, detailSecondary.c_str(), true);

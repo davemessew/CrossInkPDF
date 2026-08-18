@@ -110,9 +110,9 @@ void DictionarySuggestionsActivity::loop() {
     DictUtils::cancelAndFinish(*this);
     return;
   }
-  const bool prevItem = mappedInput.wasReleased(MappedInputManager::Button::Up) ||
+  const bool prevItem = DictUtils::dictionaryPageButtonTriggered(mappedInput, true) ||
                         mappedInput.wasReleased(MappedInputManager::Button::Left);
-  const bool nextItem = mappedInput.wasReleased(MappedInputManager::Button::Down) ||
+  const bool nextItem = DictUtils::dictionaryPageButtonTriggered(mappedInput, false) ||
                         mappedInput.wasReleased(MappedInputManager::Button::Right);
   if (prevItem && selectedIndex > 0) {
     selectedIndex--;

@@ -17,7 +17,7 @@ internet connection, account, or computer.
 
 ## Receive a File
 
-1. On the receiving reader, open **File Transfer > Receive Nearby File**.
+1. On the receiving reader, open **File Transfer > Receive File**.
 2. Select **Start receiving**. The screen stays open while it waits for a
    sender.
 3. To change where received files are saved, select **Change folder** before
@@ -33,7 +33,7 @@ creates a separate copy with a numbered suffix.
 
 ## Send a File
 
-1. On the receiving reader, start **Receive Nearby File** as described above.
+1. On the receiving reader, start **Receive File** as described above.
 2. On the sending reader, find a supported file in **Browse Files** or
    **Recent Books**.
 3. Open the file action menu and select **Send to Nearby Device**.

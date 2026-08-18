@@ -407,7 +407,7 @@ KeyboardEntryActivity::InputFieldTouchTarget KeyboardEntryActivity::inputFieldTo
 
   int availableWidth = pageWidth;
   // Clear the side-button hint gutters, which only render on edge-button boards without touch.
-  if (deviceHasEdgeSideButtons(gpio) && !gpio.hasTouch()) {
+  if (deviceUsesSideButtonHintGutters(gpio)) {
     availableWidth -= 2 * metrics.sideButtonHintsWidth;
   }
   const int effectiveMargin = (pageWidth - availableWidth * metrics.keyboardTextFieldWidthPercent / 100) / 2;
@@ -740,7 +740,7 @@ void KeyboardEntryActivity::render(RenderLock&&) {
   const bool isPassword = (inputType == InputType::Password);
   int availableWidth = pageWidth;
   // Clear the side-button hint gutters, which only render on edge-button boards without touch.
-  if (deviceHasEdgeSideButtons(gpio) && !gpio.hasTouch()) {
+  if (deviceUsesSideButtonHintGutters(gpio)) {
     availableWidth -= 2 * metrics.sideButtonHintsWidth;
   }
   const int effectiveMargin = (pageWidth - availableWidth * metrics.keyboardTextFieldWidthPercent / 100) / 2;

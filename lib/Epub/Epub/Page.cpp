@@ -380,29 +380,35 @@ void Page::renderText(GfxRenderer& renderer, const int fontId, const int xOffset
                              [](const PageElement& element) { return element.getTag() != TAG_PageImage; });
 }
 
-void Page::renderImages(GfxRenderer& renderer, const int fontId, const int xOffset, const int yOffset) const {
-  renderImages(renderer, fontId, xOffset, yOffset, nullptr);
+void Page::renderImages(GfxRenderer& renderer, const int fontId, const int xOffset, const int yOffset,
+                        const bool foregroundBlack) const {
+  renderImages(renderer, fontId, xOffset, yOffset, foregroundBlack, nullptr);
 }
 
 void Page::renderImages(GfxRenderer& renderer, const int fontId, const int xOffset, const int yOffset,
                         PdfPixelCacheRenderWorkspace* const pdfWorkspace) const {
-  renderFilteredPageElements(elements, renderer, fontId, xOffset, yOffset, true,
+  renderImages(renderer, fontId, xOffset, yOffset, true, pdfWorkspace);
+}
+
+void Page::renderImages(GfxRenderer& renderer, const int fontId, const int xOffset, const int yOffset,
+                        const bool foregroundBlack, PdfPixelCacheRenderWorkspace* const pdfWorkspace) const {
+  renderFilteredPageElements(elements, renderer, fontId, xOffset, yOffset, foregroundBlack,
                              pdfWorkspace,
                              [](const PageElement& element) { return element.getTag() == TAG_PageImage; });
 }
 
 void Page::renderWithImagePlaceholders(GfxRenderer& renderer, const int fontId, const int xOffset, const int yOffset,
                                        const bool foregroundBlack) const {
+  renderText(renderer, fontId, xOffset, yOffset, foregroundBlack);
   for (const auto& element : elements) {
-    if (element->getTag() == TAG_PageImage) {
-      auto& pageImage = static_cast<PageImage&>(*element);
-      if (pageImage.getImageBlock().needsDecode()) {
-        pageImage.renderPlaceholder(renderer, xOffset, yOffset, foregroundBlack);
-      } else {
-        pageImage.render(renderer, fontId, xOffset, yOffset, foregroundBlack);
-      }
+    if (element->getTag() != TAG_PageImage) {
+      continue;
+    }
+    auto& pageImage = static_cast<PageImage&>(*element);
+    if (pageImage.getImageBlock().needsDecode()) {
+      pageImage.renderPlaceholder(renderer, xOffset, yOffset, foregroundBlack);
     } else {
-      element->render(renderer, fontId, xOffset, yOffset, foregroundBlack);
+      pageImage.render(renderer, fontId, xOffset, yOffset, foregroundBlack);
     }
   }
 }

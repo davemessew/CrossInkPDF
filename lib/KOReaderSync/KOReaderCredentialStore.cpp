@@ -138,6 +138,8 @@ std::string KOReaderCredentialStore::getBaseUrl() const {
   return url;
 }
 
+bool KOReaderCredentialStore::usesCrossPointSyncServer() const { return getBaseUrl() == DEFAULT_SERVER_URL; }
+
 void KOReaderCredentialStore::setMatchMethod(DocumentMatchMethod method) { matchMethod = method; }
 
 void KOReaderCredentialStore::setSendMetadata(bool enabled) { sendMetadata = enabled; }

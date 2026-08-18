@@ -111,13 +111,12 @@ The default optimization path converts images for e-ink reading, limits them to
 the target device size, saves them as JPEG at 85% quality, and applies basic EPUB
 repairs such as safer SVG handling. Advanced Mode lets you pick the target
 device, JPEG quality, image split or rotation handling, split overlap, and
-whether EPUB sections over 2,000 visible words should be split into smaller
-reader sections.
+whether large EPUB sections should be split into smaller reader sections.
 
 Optimization changes the EPUB file contents before upload. Note: if you use
 hash-based KOReader sync, this will break the syncing because it changes the epub
-and therefore the hash. If optimization fails, the uploader falls back to sending
-the original file.
+and therefore the hash. Use filename based syncing to ensure compatibility.
+If optimization fails, the uploader falls back to sending the original file.
 
 ### Settings
 

@@ -35,6 +35,7 @@ THEMES = {
     "lyra-carousel": 4,
     "lyra_carousel": 4,
     "carousel": 4,
+    "dashboard": 6,
 }
 REFLOW_MARKERS = {
     "uncached": "SIM_REFLOW_UNCACHED_PASS ",

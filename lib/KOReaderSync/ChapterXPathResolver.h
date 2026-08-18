@@ -37,4 +37,9 @@ class ChapterXPathResolver {
    */
   static std::string findXPathForProgress(const std::shared_ptr<ReflowDocument>& document, int spineIndex,
                                           float intraSpineProgress);
+
+  // Resolve a zero-based visible Unicode codepoint offset. This is the stable
+  // page position stored in CrossInk's section cache, independent of layout.
+  static std::string findXPathForVisibleTextOffset(const std::shared_ptr<ReflowDocument>& document, int spineIndex,
+                                                   uint32_t visibleTextOffset);
 };

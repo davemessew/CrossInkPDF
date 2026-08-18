@@ -71,6 +71,9 @@ class HalClock {
   // so the HAL stays free of any app-layer settings dependency.
   bool syncFromNTP();
 
+  // Sync the ESP32 system clock without requiring an external RTC.
+  bool syncSystemTimeFromNTP();
+
  private:
   bool getDate(uint16_t& year, uint8_t& month, uint8_t& day, uint8_t& hour, uint8_t& minute) const;
   bool writeDateTimeToRTC(uint16_t year, uint8_t month, uint8_t day, uint8_t weekday, uint8_t hour, uint8_t minute,

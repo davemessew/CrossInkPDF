@@ -10,7 +10,7 @@ For focused reference material, see [Reader Features](./reader-features.md),
 [Controls](./controls.md), [SD Card Fonts](./sd-card-fonts.md),
 [File Transfer](./webserver.md), and [Troubleshooting](./troubleshooting.md).
 
-- [CrossInk User Guide](#CrossInk-user-guide)
+- [CrossInk User Guide](#crossink-user-guide)
   - [1. Hardware Overview](#1-hardware-overview)
     - [Button Layout](#button-layout)
     - [Taking a Screenshot](#taking-a-screenshot)
@@ -24,10 +24,6 @@ For focused reference material, see [Reader Features](./reader-features.md),
     - [3.4 Recent Books Screen](#34-recent-books-screen)
     - [3.5 File Transfer Screen](#35-file-transfer-screen)
     - [3.5.1 Calibre Wireless Transfers](#351-calibre-wireless-transfers)
-      - [Installing the Plugin in Calibre](#installing-the-plugin-in-calibre)
-      - [Configuring the CrossPoint Plugin in Calibre](#configuring-the-crosspoint-plugin-in-calibre)
-      - [Uploading Books](#uploading-books)
-      - [Removing a Book](#removing-a-book)
     - [3.6 Settings](#36-settings)
       - [3.6.1 Display](#361-display)
       - [3.6.2 Reader](#362-reader)
@@ -36,8 +32,9 @@ For focused reference material, see [Reader Features](./reader-features.md),
       - [3.6.5 OPDS Servers (Multiple Libraries)](#365-opds-servers-multiple-libraries)
       - [3.6.6 Web Settings (Wi-Fi + OPDS)](#366-web-settings-wi-fi--opds)
       - [3.6.7 KOReader Sync Quick Setup](#367-koreader-sync-quick-setup)
-        - [Option A: Free Public Server (`sync.koreader.rocks`)](#option-a-free-public-server-synckoreaderrocks)
-        - [Option B: Self-Hosted Server (Docker Compose)](#option-b-self-hosted-server-docker-compose)
+        - [Option A: CrossPoint Sync Server (`sync.crosspointreader.com`, default)](#option-a-crosspoint-sync-server-synccrosspointreadercom-default)
+        - [Option B: Legacy Public KOReader Server (`sync.koreader.rocks`)](#option-b-legacy-public-koreader-server-synckoreaderrocks)
+        - [Option C: Self-Hosted Server (Docker Compose)](#option-c-self-hosted-server-docker-compose)
     - [3.7 Sleep Screen](#37-sleep-screen)
       - [Cover settings](#cover-settings)
       - [Custom images](#custom-images)
@@ -48,6 +45,7 @@ For focused reference material, see [Reader Features](./reader-features.md),
     - [Chapter Navigation](#chapter-navigation)
     - [Auto Page Turn](#auto-page-turn)
     - [Tilt Page Turn (X3 and Sticky)](#tilt-page-turn-x3-and-sticky)
+    - [Touch Reader Controls](#touch-reader-controls)
     - [Footnote Navigation](#footnote-navigation)
     - [System Navigation](#system-navigation)
     - [Supported Languages](#supported-languages)
@@ -135,7 +133,7 @@ Download links for files already on the device are available in the web interfac
 
 A **Wi-Fi signal strength indicator** (dBm) is displayed on-screen during joined-network web server sessions.
 
-The same screen also has **Receive Nearby File**, which receives a supported
+The same screen also has **Receive File**, which receives a supported
 book or image directly from another nearby CrossInk reader without joining a
 Wi-Fi network. See [Nearby File Transfer](./nearby-file-transfer.md) for the
 complete sender and receiver workflow.
@@ -254,7 +252,13 @@ device model and build.
 
 - **Reader Dark Mode**, **Embedded Style**, **Images**, **Bionic Reading**, and
   **Guide Dots** are directly available from the Reader settings. See
-  [Reader Features](./reader-features.md) for their behavior.
+  [Reader Features](./reader-features.md) for their behavior, including the
+  [Bionic Reading](./reader-features.md#bionic-reading) guide.
+
+- **Touch Reader Controls**: Enable or disable touchscreen page turns and
+  reader gestures on supported devices. **Disable Touchscreen** blocks touch
+  input while a book is open, while leaving touch available in reader menus so
+  you can turn it back on.
 
 - **Images**: Whether to display supported embedded images found in reflowable books; options are "Display" (default), "Placeholder", or "Suppress".
 
@@ -601,6 +605,26 @@ Auto Page Turn automatically advances pages at a set interval, useful for hands-
 
 On the **Xteink X3** and **Sticky**, the gyroscope can be used to turn pages by tilting the device. This feature and its left-right or forward-back direction are available in **Settings -> Controls**.
 
+### Touch Reader Controls
+
+On supported touchscreen devices, **Touch Reader Controls** is enabled by
+default. In an open EPUB, tap the left third of the page to go back; tap the
+rest of the page to go forward. You can also swipe right for the previous page
+or left for the next page. The top and bottom gesture bands are reserved for
+vertical gestures, so taps in those bands do not turn pages.
+
+Swipe down to open the reader menu and swipe up to return Home. On an X4 Pro,
+which has a capacitive Home key, the vertical gestures are reversed: swipe up
+to open the reader menu, and use a short press of the Home key to return Home.
+A long press of that key also opens the reader menu.
+
+Turn **Touch Reader Controls** off in **Reader Options** to disable these
+page-turn and gesture controls. **Disable Touchscreen** prevents touch input
+while a book is open but keeps it available in reader menus. For the different
+touch selection gestures used by [dictionary lookup](./dictionary.md#looking-up-a-word)
+and [clippings](./reader-features.md#clippings-and-highlights), see those
+feature guides.
+
 ### Footnote Navigation
 
 When reading an EPUB that contains footnotes, you can navigate to the footnote text by selecting the footnote reference in the book. From the footnote, you can return to your original reading position.
@@ -678,6 +702,8 @@ storage and cache-clearing behavior.
 
 CrossInk prioritizes reliable reading within the X3/X4 memory and display
 limits:
+
+Dictionary lookup supports word selection, recent per-book history, chained lookups from definitions, and per-book dictionary overrides. See the [Dictionary guide](./dictionary.md) for installation and preparation instructions.
 
 - **PDFs:** A PDF needs selectable text or a usable OCR text layer. CrossInk does not run OCR, decrypt password-protected files, or reproduce fixed pages, forms, vector artwork, and complex magazine layouts. See [PDF Support](./docs/pdf-support.md).
 - **Cover Images:** Large cover images embedded into EPUB require several seconds (~10s for ~2000 pixel tall image) to convert for sleep screen and home screen thumbnail. Consider optimizing the EPUB with e.g. https://github.com/bigbag/epub-to-xtc-converter to speed this up.

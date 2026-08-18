@@ -37,12 +37,14 @@ bool ContentOpfParser::setup() {
   if (!itemIndexArena.init(ITEM_INDEX_ARENA_SLAB_BYTES)) {
     LOG_ERR("COF", "Failed to allocate manifest index arena (%u bytes)",
             static_cast<unsigned>(ITEM_INDEX_ARENA_SLAB_BYTES));
+    lowMemoryFailure = true;
     return false;
   }
 
   parser = XML_ParserCreate(nullptr);
   if (!parser) {
     LOG_DBG("COF", "Couldn't allocate memory for parser");
+    lowMemoryFailure = true;
     return false;
   }
 
@@ -76,6 +78,7 @@ size_t ContentOpfParser::write(const uint8_t* buffer, const size_t size) {
 
     if (!buf) {
       LOG_ERR("COF", "Couldn't allocate memory for buffer");
+      lowMemoryFailure = true;
       destroyXmlParser(parser);
       return 0;
     }
@@ -212,6 +215,7 @@ void XMLCALL ContentOpfParser::startElement(void* userData, const XML_Char* name
       if (!self->itemIndex.push_back(entry)) {
         LOG_ERR("COF", "Manifest index arena OOM at %zu items", self->itemIndex.size());
         self->parseFailed = true;
+        self->lowMemoryFailure = true;
         if (self->parser) {
           XML_StopParser(self->parser, XML_FALSE);
         }
@@ -245,7 +249,7 @@ void XMLCALL ContentOpfParser::startElement(void* userData, const XML_Char* name
     }
 
     // Collect CSS files
-    if (mediaType == MEDIA_TYPE_CSS) {
+    if (self->collectCssFiles && mediaType == MEDIA_TYPE_CSS) {
       self->cssFiles.push_back(href);
     }
 

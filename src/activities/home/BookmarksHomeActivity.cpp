@@ -188,9 +188,6 @@ void BookmarksHomeActivity::buildListScreen(UiApp::ScreenType& screen) {
 void BookmarksHomeActivity::render(RenderLock&&) {
   renderer.clearScreen();
 
-  const auto pageWidth = renderer.getScreenWidth();
-  const auto& metrics = UITheme::getInstance().getMetrics();
-
   const Rect header = TouchHeaderBackButton::headerRect(renderer, mappedInput);
   if (mappedInput.hasTouchHardware()) {
     TouchHeaderBackButton::draw(renderer, uiTarget, header, tr(STR_BOOKMARKS), false);

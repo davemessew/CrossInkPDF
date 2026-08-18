@@ -42,5 +42,6 @@ async function copyDirectoryWithoutMacMetadata(from, to) {
 }
 
 await copyDirectoryWithoutMacMetadata(resolve(repoRoot, 'docs/images'), resolve(siteRoot, 'public/images'));
+await copyIfPresent(resolve(repoRoot, 'web/assets/logo.png'), resolve(siteRoot, 'public/logo.png'));
 await copyIfPresent(resolve(repoRoot, 'docs/catalog'), resolve(siteRoot, 'public/catalog'));
 await copyIfPresent(resolve(repoRoot, 'docs/CNAME'), resolve(siteRoot, 'public/CNAME'));

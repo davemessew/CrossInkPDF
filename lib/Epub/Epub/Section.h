@@ -20,8 +20,14 @@ class CssParser;
 struct SectionBuildOptions {
   const char* previewAnchor = nullptr;
   uint16_t previewMaxPages = 0;
+  // Full-section callers can stop between parser chunks without creating a
+  // readable partial cache. The callback must remain valid for the build.
+  bool (*shouldCancel)(void* context) = nullptr;
+  void* cancelContext = nullptr;
+  bool* cancellationObserved = nullptr;
 
   bool isPreview() const { return previewAnchor && previewAnchor[0] != '\0' && previewMaxPages > 0; }
+  bool isCancellationRequested() const { return shouldCancel && shouldCancel(cancelContext); }
 };
 
 class Section {
@@ -35,6 +41,7 @@ class Section {
     uint32_t fileOffset;
     uint16_t paragraphIndex;
     uint16_t listItemIndex;
+    uint32_t visibleTextOffset;
   };
 
   struct BuildContext {
@@ -79,7 +86,7 @@ class Section {
   std::unique_ptr<Page> loadPageDuringBuild(int page);
   bool usesPdfWordIndex() const;
   static void completePdfPage(void* context, std::unique_ptr<Page> page, uint16_t paragraphIndex,
-                              uint16_t listItemIndex);
+                              uint16_t listItemIndex, uint32_t visibleTextOffset);
   static bool finishPdfTextBlock(void* context, const Page* currentPage);
   static bool beginPdfTextBlock(void* context, const char* anchor, size_t anchorLength);
   static bool trackPdfTextLine(void* context, const TextBlock* line);
@@ -169,4 +176,9 @@ class Section {
                                                      uint32_t globalWordOrdinal);
   std::optional<uint16_t> getPageForSemanticCursor(uint32_t wordCursor);
   const std::string& getCacheFilePath() const { return filePath; }
+
+  // Content coordinate recorded at the start of each rendered page. Available
+  // for finalized sections and the readable prefix of incremental sections.
+  std::optional<uint32_t> getVisibleTextOffsetForPage(uint16_t page) const;
+  std::optional<uint16_t> getPageForVisibleTextOffset(uint32_t offset, bool preferFirstAtOffset = false) const;
 };

@@ -570,9 +570,7 @@ bool MappedInputManager::wasReaderMenuGesture() const {
   return hasHomeKeyHardware() ? direction == SwipeDir::Up : direction == SwipeDir::Down;
 }
 
-bool MappedInputManager::wasReaderHomeGesture() const {
-  return !hasHomeKeyHardware() && wasSwipe() == SwipeDir::Up;
-}
+bool MappedInputManager::wasReaderHomeGesture() const { return !hasHomeKeyHardware() && wasSwipe() == SwipeDir::Up; }
 
 bool MappedInputManager::wasReaderLightPanelGesture() const {
   return hasHomeKeyHardware() && wasSwipe() == SwipeDir::Down;

@@ -34,6 +34,8 @@ class RecentBooksGridActivity final : public Activity {
   ButtonNavigator buttonNavigator;
   int selectorIndex = 0;
   bool longPressFired = false;
+  bool pendingCacheDeletedFeedback = false;
+  unsigned long cacheDeletedFeedbackShowTime = 0UL;
   std::vector<BookState> recentBooks;
 #if defined(CROSSINK_ENABLE_PDF) && CROSSINK_ENABLE_PDF
   RecentBookProgress::PdfProductCache pdfProductCache;

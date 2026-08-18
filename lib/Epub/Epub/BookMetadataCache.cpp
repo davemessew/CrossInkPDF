@@ -12,7 +12,7 @@
 
 namespace {
 constexpr uint32_t BOOK_CACHE_MAGIC = 0x425843FF;  // bytes: 0xFF, "CXB"
-constexpr uint8_t BOOK_CACHE_VERSION = 10;         // v10: ignore ambiguous guide text references
+constexpr uint8_t BOOK_CACHE_VERSION = 9;          // v9: NFC titles and updated guide start-reference handling
 constexpr char bookBinFile[] = "/book.bin";
 constexpr char tmpSpineBinFile[] = "/spine.bin.tmp";
 constexpr char tmpTocBinFile[] = "/toc.bin.tmp";
@@ -68,6 +68,7 @@ BookMetadataCache::TocEntry readTocEntryFrom(F& file) {
 /* ============= WRITING / BUILDING FUNCTIONS ================ */
 
 bool BookMetadataCache::beginWrite() {
+  lowMemoryFailure = false;
   buildMode = true;
   spineCount = 0;
   tocCount = 0;
@@ -110,6 +111,7 @@ bool BookMetadataCache::beginTocPass() {
     spineHrefIndexArena.release();
     if (!spineHrefIndexArena.init(METADATA_ARENA_SLAB_BYTES) || !spineHrefIndex.resize(spineCount)) {
       LOG_ERR("BMC", "Failed to allocate spine href index arena for %u spine items", spineCount);
+      lowMemoryFailure = true;
       spineHrefIndex.resetStorage();
       spineHrefIndexArena.release();
       tocFile.close();
@@ -245,6 +247,7 @@ bool BookMetadataCache::buildBookBin(const std::string& epubPath, const BookMeta
   if (!metadataArena.init(METADATA_ARENA_SLAB_BYTES)) {
     LOG_ERR("BMC", "Failed to allocate metadata scratch arena (%u bytes)",
             static_cast<unsigned>(METADATA_ARENA_SLAB_BYTES));
+    lowMemoryFailure = true;
     closeBuildFiles();
     return false;
   }
@@ -253,6 +256,7 @@ bool BookMetadataCache::buildBookBin(const std::string& epubPath, const BookMeta
   ArenaVector<int16_t> spineToTocIndex(metadataArena);
   if (!spineToTocIndex.resize(spineCount)) {
     LOG_ERR("BMC", "Failed to allocate spine-to-TOC index for %u spine items", spineCount);
+    lowMemoryFailure = true;
     closeBuildFiles();
     return false;
   }
@@ -292,6 +296,7 @@ bool BookMetadataCache::buildBookBin(const std::string& epubPath, const BookMeta
     ArenaVector<ZipFile::SizeTarget> targets(metadataArena);
     if (!targets.resize(spineCount) || !spineSizes.resize(spineCount)) {
       LOG_ERR("BMC", "Failed to allocate batch size lookup scratch for %u spine items", spineCount);
+      lowMemoryFailure = true;
       zip.close();
       closeBuildFiles();
       return false;

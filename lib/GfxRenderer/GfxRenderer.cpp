@@ -165,7 +165,7 @@ void GfxRenderer::ensureSdCardFontReady(int fontId, const char* utf8Text, uint8_
   }
 }
 
-void GfxRenderer::ensureSdCardFontReady(int fontId, const std::vector<std::string>& words, bool includeHyphen,
+void GfxRenderer::ensureSdCardFontReady(int fontId, const std::deque<std::string>& words, bool includeHyphen,
                                         uint8_t styleMask) const {
   auto it = sdCardFonts_.find(fontId);
   if (it != sdCardFonts_.end()) {
@@ -911,6 +911,29 @@ static void renderCharImpl(const GfxRenderer& renderer, GfxRenderer::RenderMode 
 
 // IMPORTANT: This function is in critical rendering path and is called for every pixel. Please keep it as simple and
 // efficient as possible.
+bool GfxRenderer::isPixelBlack(const int x, const int y) const {
+  int phyX = 0;
+  int phyY = 0;
+  rotateCoordinates(orientation, x, y, &phyX, &phyY, panelWidth, panelHeight);
+  if (phyX < 0 || phyX >= panelWidth || phyY < 0 || phyY >= panelHeight) {
+    return false;
+  }
+
+  const uint8_t* target = frameBuffer;
+  uint32_t rowY = static_cast<uint32_t>(phyY);
+  if (_stripActive) {
+    if (phyY < _stripY0 || phyY >= _stripY0 + _stripRows) {
+      return false;
+    }
+    target = _stripBuf;
+    rowY = static_cast<uint32_t>(phyY - _stripY0);
+  }
+
+  const uint32_t byteIndex = rowY * panelWidthBytes + (phyX / 8);
+  const uint8_t bitPosition = 7 - (phyX % 8);
+  return (target[byteIndex] & (1 << bitPosition)) == 0;
+}
+
 void GfxRenderer::drawPixel(const int x, const int y, const bool state) const {
   int phyX = 0;
   int phyY = 0;
@@ -918,9 +941,10 @@ void GfxRenderer::drawPixel(const int x, const int y, const bool state) const {
   // Note: this call should be inlined for better performance
   rotateCoordinates(orientation, x, y, &phyX, &phyY, panelWidth, panelHeight);
 
-  // Bounds checking against runtime panel dimensions
+  // Text glyphs and shapes may cross a clipping edge. This is a per-pixel hot
+  // path, so logging here can turn one off-screen glyph into thousands of slow
+  // serial writes and starve input/power handling for minutes.
   if (phyX < 0 || phyX >= panelWidth || phyY < 0 || phyY >= panelHeight) {
-    LOG_ERR("GFX", "!! Outside range (%d, %d) -> (%d, %d)", x, y, phyX, phyY);
     return;
   }
 
@@ -2263,6 +2287,50 @@ void GfxRenderer::invertScreen() const {
   }
 }
 
+void GfxRenderer::invertRect(const int x, const int y, const int width, const int height) const {
+  if (frameBuffer == nullptr || width <= 0 || height <= 0) return;
+
+  const int lx0 = std::max(0, x);
+  const int ly0 = std::max(0, y);
+  const int lx1 = std::min(getScreenWidth(), x + width);
+  const int ly1 = std::min(getScreenHeight(), y + height);
+  if (lx0 >= lx1 || ly0 >= ly1) return;
+
+  int paX, paY, pbX, pbY;
+  rotateCoordinates(orientation, lx0, ly0, &paX, &paY, panelWidth, panelHeight);
+  rotateCoordinates(orientation, lx1 - 1, ly1 - 1, &pbX, &pbY, panelWidth, panelHeight);
+
+  const int phyX0 = std::min(paX, pbX);
+  const int phyX1 = std::max(paX, pbX);
+  int phyY0 = std::min(paY, pbY);
+  int phyY1 = std::max(paY, pbY);
+
+  uint8_t* target = getWriteTarget();
+  const int originY = getWriteOriginY();
+  phyY0 = std::max(phyY0, originY);
+  phyY1 = std::min(phyY1, originY + getWriteRows() - 1);
+  if (phyY0 > phyY1) return;
+
+  const int byteStart = phyX0 >> 3;
+  const int byteEnd = phyX1 >> 3;
+  const uint8_t headMask = static_cast<uint8_t>(0xFFu >> (phyX0 & 7));
+  const uint8_t tailMask = static_cast<uint8_t>(0xFFu << (7 - (phyX1 & 7)));
+
+  for (int py = phyY0; py <= phyY1; ++py) {
+    uint8_t* row = target + static_cast<int32_t>(py - originY) * panelWidthBytes;
+    if (byteStart == byteEnd) {
+      row[byteStart] ^= headMask & tailMask;
+      continue;
+    }
+
+    row[byteStart] ^= headMask;
+    for (int byte = byteStart + 1; byte < byteEnd; ++byte) {
+      row[byte] ^= 0xFFu;
+    }
+    row[byteEnd] ^= tailMask;
+  }
+}
+
 void GfxRenderer::displayBuffer(const HalDisplay::RefreshMode refreshMode, const bool turnOffScreen) const {
   display.displayBuffer(refreshMode, fadingFix || turnOffScreen);
 }
@@ -2598,7 +2666,8 @@ int GfxRenderer::getKerning(const int fontId, const uint32_t leftCp, const uint3
   return fp4::toPixel(kernFP);                                           // snap 4.4 fixed-point to nearest pixel
 }
 
-int GfxRenderer::getTextAdvanceX(const int fontId, const char* text, EpdFontFamily::Style style) const {
+int GfxRenderer::getTextAdvanceX(const int fontId, const char* text, const EpdFontFamily::Style style,
+                                 const uint32_t followingCp) const {
   // Match the font drawText would use for CJK-bearing strings (see resolveTextFontId).
   const int resolvedFontId = resolveTextFontId(fontId, text, style);
   // Measure the exact codepoint stream drawText renders: bidi-reordered and
@@ -2624,6 +2693,8 @@ int GfxRenderer::getTextAdvanceX(const int fontId, const char* text, EpdFontFami
       return 0;
     }
     const auto& font = fontIt->second;
+    uint32_t lastCp = 0;
+    bool lastScaledSmallCap = false;
     while (uint32_t cp = utf8NextCodepoint(reinterpret_cast<const uint8_t**>(&text))) {
       if (BidiUtils::isTransparentMark(cp)) {
         continue;
@@ -2640,6 +2711,20 @@ int GfxRenderer::getTextAdvanceX(const int fontId, const char* text, EpdFontFami
       } else {
         widthFP += advFP;
       }
+      lastCp = cp;
+      lastScaledSmallCap = scaledSmallCap;
+    }
+    if (followingCp != 0 && lastCp != 0) {
+      uint32_t adjustedFollowingCp = followingCp;
+      const bool followingScaledSmallCap = isSmallCapsLowercase(style, adjustedFollowingCp);
+      if (followingScaledSmallCap) {
+        adjustedFollowingCp = smallCapsUppercaseCodepoint(adjustedFollowingCp);
+      }
+      int32_t kernFP = font.getKerning(lastCp, adjustedFollowingCp, style);
+      if (lastScaledSmallCap || followingScaledSmallCap) {
+        kernFP = smallCapsAdvanceFP(kernFP);
+      }
+      widthFP += kernFP;
     }
     return fp4::toPixel(widthFP);
   }
@@ -2721,7 +2806,21 @@ int GfxRenderer::getTextAdvanceX(const int fontId, const char* text, EpdFontFami
     prevCp = cp;
     prevScaledSmallCap = scaledSmallCap;
   }
-  widthPx += fp4::toPixel(prevAdvanceFP);  // final glyph's advance
+  if (followingCp != 0 && prevCp != 0) {
+    uint32_t adjustedFollowingCp = followingCp;
+    const bool followingScaledSmallCap = isSmallCapsLowercase(style, adjustedFollowingCp);
+    if (followingScaledSmallCap) {
+      adjustedFollowingCp = smallCapsUppercaseCodepoint(adjustedFollowingCp);
+    }
+    adjustedFollowingCp = font.getFallbackCodepoint(adjustedFollowingCp, style);
+    int32_t kernFP = font.getKerning(prevCp, adjustedFollowingCp, style);  // 4.4 fixed-point kern
+    if (prevScaledSmallCap || followingScaledSmallCap) {
+      kernFP = smallCapsAdvanceFP(kernFP);
+    }
+    widthPx += fp4::toPixel(prevAdvanceFP + kernFP);
+  } else {
+    widthPx += fp4::toPixel(prevAdvanceFP);  // final glyph's advance
+  }
   return widthPx;
 }
 

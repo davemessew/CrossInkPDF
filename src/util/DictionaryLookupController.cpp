@@ -21,11 +21,11 @@
 #include "util/Dictionary.h"
 
 DictionaryLookupController::DictionaryLookupController(GfxRenderer& renderer, MappedInputManager& mappedInput,
-                                                       Activity& owner, std::string cachePath)
+                                                       Activity& owner, const std::string& cachePath)
     : renderer(renderer),
       mappedInput(mappedInput),
       owner(owner),
-      cachePath(std::move(cachePath))
+      cachePath(cachePath)
 #if CROSSINK_APP_CAP_TOUCH
       ,
       altFormUiTarget(makeUiTarget(renderer)),
@@ -64,10 +64,11 @@ void DictionaryLookupController::startLookup(const std::string& word, bool recor
   lookupCancelled = false;
   lookupCancelRequested = false;
   lookupReadError = false;
+  lookupMatchedStem = false;
   recordHistory_ = recordHistory;
   state = LookupState::LookingUp;
   // CLEANUP: on Auto-only commit, delete only this line (gate below stays — it's the Auto check)
-  if (shouldShowPopup()) {
+  if (lookupToastEnabled_ && shouldShowPopup()) {
     // Toast overlay: draw popup directly over whatever the user is currently viewing.
     // RenderLock serializes against the render task — without it, a prior requestUpdate()
     // (e.g. from navigation) may still be mid-refresh, and concurrent framebuffer / SPI
@@ -75,6 +76,8 @@ void DictionaryLookupController::startLookup(const std::string& word, bool recor
     RenderLock lock;
     GUI.drawPopup(renderer, tr(STR_DICT_LOOKING_UP));
     renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+  } else if (!lookupToastEnabled_) {
+    owner.requestUpdate();
   }
   if (!DictionaryLookupWorker::instance().start(*this)) {
     showMemoryErrorAndReset();
@@ -107,7 +110,8 @@ DictionaryLookupController::LookupEvent DictionaryLookupController::handleInput(
 
       if (foundLocation.found) {
         foundWord = std::move(foundLocation.headword);
-        foundStatus = nextIsSuggestion ? FoundStatus::Suggestion : FoundStatus::Direct;
+        foundStatus =
+            nextIsSuggestion ? FoundStatus::Suggestion : (lookupMatchedStem ? FoundStatus::Stem : FoundStatus::Direct);
         nextIsSuggestion = false;
         return LookupEvent::FoundDefinition;
       }
@@ -115,23 +119,6 @@ DictionaryLookupController::LookupEvent DictionaryLookupController::handleInput(
       if (lookupReadError) {
         showReadError();
         return LookupEvent::None;
-      }
-
-      // Try stem variants (locate only — no definition loaded into RAM)
-      auto stems = Dictionary::getStemVariants(lookupWord);
-      for (const auto& stem : stems) {
-        auto loc = Dictionary::locate(stem, {}, cachePath.c_str());
-        if (loc.found) {
-          foundWord = std::move(loc.headword);
-          foundLocation = std::move(loc);
-          foundStatus = nextIsSuggestion ? FoundStatus::Suggestion : FoundStatus::Stem;
-          nextIsSuggestion = false;
-          return LookupEvent::FoundDefinition;
-        }
-        if (loc.readError) {
-          showReadError();
-          return LookupEvent::None;
-        }
       }
 
       // Try alt forms
@@ -311,6 +298,18 @@ bool DictionaryLookupController::render() {
   return false;
 }
 
+const char* DictionaryLookupController::getFailureMessage() const {
+  if (state == LookupState::ReadError) return tr(STR_DICT_READ_FAILED);
+  if (state == LookupState::NotFound) return tr(STR_DICT_NOT_FOUND);
+  return "";
+}
+
+bool DictionaryLookupController::dismissFailureForDictionarySwitch() {
+  if (!hasFailureFeedback()) return false;
+  state = LookupState::Idle;
+  return true;
+}
+
 bool DictionaryLookupController::handleMultiSelect(WordSelectNavigator& navigator) {
   std::string msPhrase;
   const auto msAction = navigator.handleMultiSelectInput(mappedInput, msPhrase);
@@ -377,6 +376,7 @@ void DictionaryLookupController::handleLookupFailed() {
       showMemoryErrorAndReset();
       return;
     }
+    fullScreenChildWasShown_ = true;
     owner.startActivityForResult(std::move(sugActivity), [this](const ActivityResult& result) {
       if (result.isCancelled) {
         setNotFound();
@@ -415,16 +415,18 @@ void DictionaryLookupController::runLookup() {
   cbs.ctx = this;
   cbs.onProgress = &DictionaryLookupController::progressCallback;
   cbs.shouldCancel = &DictionaryLookupController::cancelCallback;
-  // A missing/unwritable sidecar is non-fatal: locate() retains its full-index
-  // scan fallback, so an unprepared dictionary always remains usable.
-  Dictionary::prepareQuickIndex(cbs, cachePath.c_str());
+  const std::string dictionaryPath = Dictionary::readDictPath(cachePath.c_str());
+  if (!dictionaryPath.empty() && dictionaryPath != preparedQuickIndexPath &&
+      Dictionary::prepareQuickIndex(cbs, cachePath.c_str())) {
+    preparedQuickIndexPath = dictionaryPath;
+  }
   if (lookupCancelRequested) {
     lookupCancelled = true;
     lookupDone = true;
     logDictionaryLookupTaskEnd();
     return;
   }
-  foundLocation = Dictionary::locate(lookupWord, cbs, cachePath.c_str());
+  foundLocation = Dictionary::locateWithStemVariants(lookupWord, &lookupMatchedStem, cbs, cachePath.c_str());
   lookupReadError = foundLocation.readError;
   lookupCancelled = lookupCancelRequested.load();
   lookupDone = true;

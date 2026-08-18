@@ -89,7 +89,12 @@ void OpdsBookBrowserActivity::onEnter() {
     return;
   }
 
+#ifdef SIMULATOR
+  // Use deterministic catalog data so the UI can be exercised without WiFi or an OPDS server.
+  fetchFeed(currentPath);
+#else
   checkAndConnectWifi();
+#endif
 }
 
 void OpdsBookBrowserActivity::onExit() {
@@ -98,6 +103,7 @@ void OpdsBookBrowserActivity::onExit() {
   entries.reset();
   navigationHistory.clear();
 
+#ifndef SIMULATOR
   if (WiFi.getMode() != WIFI_MODE_NULL) {
     WiFi.disconnect(false);
     delay(30);
@@ -105,6 +111,7 @@ void OpdsBookBrowserActivity::onExit() {
   // OPDS launches from minimal network boot, so restore the full app state
   // even if setup failed before WiFi was started.
   silentRestart();
+#endif
 }
 
 void OpdsBookBrowserActivity::activateSelected() {
@@ -175,7 +182,20 @@ void OpdsBookBrowserActivity::loop() {
     return;
   }
 
-  if (state == BrowserState::DOWNLOADING) return;
+  if (state == BrowserState::DOWNLOADING) {
+#ifdef SIMULATOR
+    if (uiReady) {
+      const fui::InputSnapshot snap = touchSnapshotFrom(mappedInput);
+      if (snap.touchPressed || snap.touchReleased) app.route(snap);
+    }
+    if (cancelDownload || mappedInput.wasReleased(MappedInputManager::Button::Back)) {
+      cancelDownload = false;
+      state = BrowserState::BROWSING;
+      requestUpdate();
+    }
+#endif
+    return;
+  }
 
   if (state == BrowserState::BROWSING) {
     if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
@@ -406,7 +426,7 @@ void OpdsBookBrowserActivity::render(RenderLock&&) {
   uiReady = false;
   app.render();
   uiReady = true;
-  renderer.displayBuffer();
+  renderer.displayBuffer(screenTransitionRefresh.modeFor(static_cast<uint8_t>(state)));
 }
 
 void OpdsBookBrowserActivity::showLoadingBeforeFetch() {
@@ -425,6 +445,31 @@ void OpdsBookBrowserActivity::fetchFeed(const std::string& path) {
     requestUpdate();
     return;
   }
+
+#ifdef SIMULATOR
+  clearEntries();
+  searchTemplate = "simulator://search?query={searchTerms}";
+
+  if (path.empty()) {
+    appendEntry(OpdsEntry{OpdsEntryType::NAVIGATION, "Browse fiction", "", "/fiction", ""});
+    appendEntry(OpdsEntry{OpdsEntryType::BOOK, "The Left Hand of Darkness", "Ursula K. Le Guin",
+                          "/books/the-left-hand-of-darkness.epub", ""});
+    appendEntry(
+        OpdsEntry{OpdsEntryType::BOOK, "A Room of One's Own", "Virginia Woolf", "/books/a-room-of-ones-own.epub", ""});
+    appendEntry(OpdsEntry{OpdsEntryType::BOOK, "Frankenstein", "Mary Shelley", "/books/frankenstein.epub", ""});
+  } else {
+    appendEntry(
+        OpdsEntry{OpdsEntryType::BOOK, "The Dispossessed", "Ursula K. Le Guin", "/books/the-dispossessed.epub", ""});
+    appendEntry(OpdsEntry{OpdsEntryType::BOOK, "Kindred", "Octavia E. Butler", "/books/kindred.epub", ""});
+    appendEntry(OpdsEntry{OpdsEntryType::BOOK, "The Time Machine", "H. G. Wells", "/books/the-time-machine.epub", ""});
+  }
+
+  selectorIndex = 0;
+  topIndex = 0;
+  state = BrowserState::BROWSING;
+  requestUpdate();
+  return;
+#endif
 
   if (server.url.empty()) {
     state = BrowserState::ERROR;
@@ -538,7 +583,15 @@ void OpdsBookBrowserActivity::downloadBook(const OpdsEntry& book) {
   statusMessage = book.title;
   downloadProgress = downloadTotal = 0;
   cancelDownload = false;
+  goHomeAfterCancel = false;
   requestUpdate(true);
+
+#ifdef SIMULATOR
+  downloadProgress = 1;
+  downloadTotal = 2;
+  requestUpdate(true);
+  return;
+#endif
 
   // Build full download URL relative to the current feed, not the root server URL
   const std::string feedUrl = UrlUtils::buildUrl(server.url, currentPath);
@@ -568,6 +621,10 @@ void OpdsBookBrowserActivity::downloadBook(const OpdsEntry& book) {
       return true;
     }
     mappedInput.update();
+    if (mappedInput.wasHomeGesture()) {
+      goHomeAfterCancel = true;
+      cancelRequested = true;
+    }
     if (mappedInput.isPressed(MappedInputManager::Button::Back) ||
         mappedInput.wasPressed(MappedInputManager::Button::Back) ||
         mappedInput.wasReleased(MappedInputManager::Button::Back)) {
@@ -591,6 +648,10 @@ void OpdsBookBrowserActivity::downloadBook(const OpdsEntry& book) {
         // The activity loop is blocked for the whole download; pump input here
         // so the Cancel button or a Back press can abort mid-transfer.
         mappedInput.update();
+        if (mappedInput.wasHomeGesture()) {
+          goHomeAfterCancel = true;
+          cancelRequested = true;
+        }
         if (mappedInput.wasReleased(MappedInputManager::Button::Back)) cancelRequested = true;
         if (uiReady) {
           const fui::InputSnapshot snap = touchSnapshotFrom(mappedInput);
@@ -613,6 +674,10 @@ void OpdsBookBrowserActivity::downloadBook(const OpdsEntry& book) {
     state = BrowserState::BROWSING;
   } else if (result == HttpDownloader::ABORTED) {
     LOG_INF("OPDS", "Download cancelled");
+    if (goHomeAfterCancel) {
+      onGoHome();
+      return;
+    }
     mappedInput.suppressNextBackRelease();
     state = BrowserState::BROWSING;
   } else {

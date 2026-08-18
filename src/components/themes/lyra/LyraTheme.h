@@ -93,8 +93,6 @@ constexpr ThemeMetrics values = {.batteryWidth = 16,
 class LyraTheme : public BaseTheme {
  public:
   // Component drawing methods
-  void fillBatteryIcon(const GfxRenderer& renderer, Rect rect, uint16_t percentage,
-                       bool foregroundBlack = true) const override;
   void drawSubHeader(const GfxRenderer& renderer, Rect rect, const char* label,
                      const char* rightLabel = nullptr) const override;
   void drawTabBar(const GfxRenderer& renderer, Rect rect, const std::vector<TabInfo>& tabs,

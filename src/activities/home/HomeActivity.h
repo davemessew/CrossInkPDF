@@ -33,6 +33,9 @@ class HomeActivity final : public Activity {
   bool recentsLoading = false;
   bool recentsLoaded = false;
   bool firstRenderDone = false;
+  // Silent restarts keep the panel's previous frame. The first Home paint must
+  // use a clean waveform so X4 panels do not diff against a WiFi screen.
+  bool initialFullRefresh = false;
   bool hasReadingStats = false;
   bool hasBookmarks = false;
   bool hasClippings = false;
@@ -121,8 +124,10 @@ class HomeActivity final : public Activity {
 
  public:
   explicit HomeActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
-                        HomeMenuItem initialMenuItemValue = HomeMenuItem::NONE)
-      : Activity("Home", renderer, mappedInput), initialMenuItem(initialMenuItemValue) {}
+                        HomeMenuItem initialMenuItemValue = HomeMenuItem::NONE, bool initialFullRefreshValue = false)
+      : Activity("Home", renderer, mappedInput),
+        initialFullRefresh(initialFullRefreshValue),
+        initialMenuItem(initialMenuItemValue) {}
   void onEnter() override;
   void onExit() override;
   void loop() override;

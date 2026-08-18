@@ -5,7 +5,6 @@
 #include <I18n.h>
 #include <Logging.h>
 #include <WiFi.h>
-#include <esp_sntp.h>
 #include <esp_wifi.h>
 
 #include <algorithm>
@@ -15,6 +14,7 @@
 #include "CrossPointSettings.h"
 #include "Epub/Section.h"
 #include "EpubReaderUtils.h"
+#include "HalClock.h"
 #include "KOReaderCredentialStore.h"
 #include "KOReaderDocumentId.h"
 #include "MappedInputManager.h"
@@ -77,34 +77,14 @@ const char* matchMethodName(const DocumentMatchMethod method) {
 }
 
 void syncTimeWithNTP() {
-  // Stop SNTP if already running (can't reconfigure while running)
-  if (esp_sntp_enabled()) {
-    esp_sntp_stop();
+#ifndef SIMULATOR
+  if (!halClock.syncSystemTimeFromNTP()) {
+    LOG_DBG("KOSync", "NTP sync unavailable, using fallback");
   }
-
-  // Configure SNTP
-  esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
-  esp_sntp_setservername(0, "pool.ntp.org");
-  esp_sntp_init();
-
-  // Wait for time to sync (with timeout)
-  int retry = 0;
-  const int maxRetries = 50;  // 5 seconds max
-  while (sntp_get_sync_status() != SNTP_SYNC_STATUS_COMPLETED && retry < maxRetries) {
-    vTaskDelay(100 / portTICK_PERIOD_MS);
-    retry++;
-  }
-
-  if (retry < maxRetries) {
-  } else {
-    LOG_DBG("KOSync", "NTP sync timeout, using fallback");
-  }
+#endif
 }
 
 void wifiOff() {
-  if (esp_sntp_enabled()) {
-    esp_sntp_stop();
-  }
   WiFi.disconnect(false);
   delay(100);
   WiFi.mode(WIFI_OFF);
@@ -139,7 +119,11 @@ bool KOReaderSyncActivity::ensureLocalProgressLoaded() {
   }
 
   if (currentSpineIndex < 0 || currentSpineIndex >= epub->getSpineItemsCount()) currentSpineIndex = 0;
-  const CrossPointPosition localPos = {currentSpineIndex, currentPage, totalPagesInSpine};
+  CrossPointPosition localPos = {currentSpineIndex, currentPage, totalPagesInSpine};
+  if (progress.hasVisibleTextOffset) {
+    localPos.visibleTextOffset = progress.visibleTextOffset;
+    localPos.hasVisibleTextOffset = true;
+  }
   const PositionCoordinateSpace coordinateSpace = primaryMatchMethod == DocumentMatchMethod::FILENAME
                                                       ? PositionCoordinateSpace::SourceDocument
                                                       : PositionCoordinateSpace::CurrentDocument;
@@ -159,7 +143,9 @@ void KOReaderSyncActivity::saveProgressAndReturn(const CrossPointPosition& posit
     LOG_DBG("KOSync", "Adjusted remote page count before save: page=%d count=%d -> %d", position.pageNumber,
             position.totalPages, pageCount);
   }
-  if (!EpubReaderUtils::saveProgress(*epub, position.spineIndex, position.pageNumber, pageCount)) {
+  const std::optional<uint32_t> visibleTextOffset =
+      position.hasVisibleTextOffset ? std::optional<uint32_t>(position.visibleTextOffset) : std::nullopt;
+  if (!EpubReaderUtils::saveProgress(*epub, position.spineIndex, position.pageNumber, pageCount, visibleTextOffset)) {
     {
       RenderLock lock(*this);
       state = SYNC_FAILED;
@@ -172,7 +158,7 @@ void KOReaderSyncActivity::saveProgressAndReturn(const CrossPointPosition& posit
   returnToReader();
 }
 
-void KOReaderSyncActivity::returnToReader() { activityManager.goToReader(epubPath); }
+void KOReaderSyncActivity::returnToReader() { activityManager.goToReader(epubPath, false, false, true); }
 
 bool KOReaderSyncActivity::consumeInitialConfirmRelease() {
   if (!lockInitialConfirmRelease) {
@@ -336,6 +322,8 @@ void KOReaderSyncActivity::performSync() {
                                                             ? PositionCoordinateSpace::SourceDocument
                                                             : PositionCoordinateSpace::CurrentDocument;
   bool usedRichPosition = false;
+  // The client only accepts rich positions from the official CrossPoint Sync server.
+  // Filename matching still needs source-document mapping because optimized books can diverge.
   if (remoteCoordinateSpace == PositionCoordinateSpace::CurrentDocument && remoteProgress.position.has_value()) {
     const auto richMapped = ProgressMapper::fromRichPosition(epub, *remoteProgress.position, renderer);
     if (richMapped.has_value()) {
@@ -358,12 +346,26 @@ void KOReaderSyncActivity::performSync() {
     return;
   }
 
-  // Refine page using section cache LUTs: li index, anchor, or paragraph index.
-  if (!usedRichPosition &&
-      (remotePosition.hasLiIndex || remotePosition.xpathAnchorId[0] != '\0' || remotePosition.hasParagraphIndex)) {
+  // Refine page using the content-offset LUT first, then structural anchors.
+  // A partial cache deliberately returns no page for an offset outside its
+  // watermark; preserving that offset lets the reader index through to it.
+  if (!usedRichPosition && (remotePosition.hasVisibleTextOffset || remotePosition.hasLiIndex ||
+                            remotePosition.xpathAnchorId[0] != '\0' || remotePosition.hasParagraphIndex)) {
     Section tempSection(epub, remotePosition.spineIndex, renderer);
     bool refined = false;
-    if (remotePosition.hasLiIndex) {
+    if (remotePosition.hasVisibleTextOffset) {
+      const auto contentPage = tempSection.getPageForVisibleTextOffset(remotePosition.visibleTextOffset, true);
+      if (contentPage.has_value()) {
+        LOG_DBG("KOSync", "Visible offset %lu -> page %d (was %d)",
+                static_cast<unsigned long>(remotePosition.visibleTextOffset), *contentPage, remotePosition.pageNumber);
+        remotePosition.pageNumber = *contentPage;
+        refined = true;
+      } else {
+        LOG_DBG("KOSync", "Visible offset %lu is beyond the cached section watermark",
+                static_cast<unsigned long>(remotePosition.visibleTextOffset));
+      }
+    }
+    if (!refined && remotePosition.hasLiIndex) {
       const auto liPage = tempSection.getPageForListItemIndex(remotePosition.liIndex);
       if (liPage.has_value()) {
         LOG_DBG("KOSync", "Li index %u -> page %d (was %d)", remotePosition.liIndex, *liPage,
@@ -477,9 +479,10 @@ void KOReaderSyncActivity::performUpload() {
   progress.percentage = localProgress.percentage;
   progress.device = SETTINGS.getEffectiveDeviceName();
 
-  // Rich CrossPoint position for crosspoint-sync servers (lossless
-  // CrossPoint<->CrossPoint sync); plain kosync servers ignore the extra field.
-  {
+  // Rich CrossPoint position for the default CrossPoint sync server (lossless
+  // CrossPoint<->CrossPoint sync). The HTTP client also enforces this boundary
+  // before serializing the extension.
+  if (KOREADER_STORE.usesCrossPointSyncServer()) {
     KOReaderRichPosition pos;
     const float pct = localProgress.percentage < 0.0f   ? 0.0f
                       : localProgress.percentage > 1.0f ? 1.0f
@@ -616,13 +619,13 @@ void KOReaderSyncActivity::render(RenderLock&&) {
 
     const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4, true);
-    renderer.displayBuffer();
+    renderer.displayBuffer(screenTransitionRefresh.modeFor(static_cast<uint8_t>(state)));
     return;
   }
 
   if (state == SYNCING || state == UPLOADING) {
     UITheme::drawCenteredText(renderer, screen, UI_10_FONT_ID, top, statusMessage.c_str(), true, EpdFontFamily::BOLD);
-    renderer.displayBuffer();
+    renderer.displayBuffer(screenTransitionRefresh.modeFor(static_cast<uint8_t>(state)));
     return;
   }
 
@@ -686,7 +689,7 @@ void KOReaderSyncActivity::render(RenderLock&&) {
     // Bottom button hints
     const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_SELECT), tr(STR_DIR_UP), tr(STR_DIR_DOWN));
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4, true);
-    renderer.displayBuffer();
+    renderer.displayBuffer(screenTransitionRefresh.modeFor(static_cast<uint8_t>(state)));
     return;
   }
 
@@ -696,7 +699,7 @@ void KOReaderSyncActivity::render(RenderLock&&) {
 
     const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_UPLOAD), "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4, true);
-    renderer.displayBuffer();
+    renderer.displayBuffer(screenTransitionRefresh.modeFor(static_cast<uint8_t>(state)));
     return;
   }
 
@@ -707,7 +710,7 @@ void KOReaderSyncActivity::render(RenderLock&&) {
 
     const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_DONE), "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4, true);
-    renderer.displayBuffer();
+    renderer.displayBuffer(screenTransitionRefresh.modeFor(static_cast<uint8_t>(state)));
     return;
   }
 
@@ -724,7 +727,7 @@ void KOReaderSyncActivity::render(RenderLock&&) {
 
     const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4, true);
-    renderer.displayBuffer();
+    renderer.displayBuffer(screenTransitionRefresh.modeFor(static_cast<uint8_t>(state)));
     return;
   }
 }

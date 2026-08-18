@@ -193,9 +193,9 @@ bool readLegacyProgressFile(const std::string& path, ReflowReadingPosition& posi
   FsFile file;
   if (!Storage.openFileForRead("EBP", path, file)) return false;
 
-  uint8_t data[6] = {};
+  uint8_t data[10] = {};
   const size_t fileSize = file.size();
-  if (fileSize != 4 && fileSize != 6) {
+  if (fileSize != 4 && fileSize != 6 && fileSize != 10) {
     LOG_ERR("EBP", "Progress file has unexpected size: %u", static_cast<unsigned>(fileSize));
   }
   if (fileSize > sizeof(data)) {
@@ -215,7 +215,7 @@ bool readLegacyProgressFile(const std::string& path, ReflowReadingPosition& posi
     LOG_ERR("EBP", "Failed to close progress file after read: %s", path.c_str());
     return false;
   }
-  if (fileSize != 4 && fileSize != 6) {
+  if (fileSize != 4 && fileSize != 6 && fileSize != 10) {
     return false;
   }
 
@@ -225,10 +225,15 @@ bool readLegacyProgressFile(const std::string& path, ReflowReadingPosition& posi
   decoded.pageNumber = static_cast<int>(static_cast<uint16_t>(data[2]) |
                                         (static_cast<uint16_t>(data[3]) << 8));
   if (decoded.pageNumber == UINT16_MAX) decoded.pageNumber = 0;
-  if (fileSize == 6) {
+  if (fileSize == 6 || fileSize == 10) {
     decoded.pageCount = static_cast<int>(static_cast<uint16_t>(data[4]) |
                                          (static_cast<uint16_t>(data[5]) << 8));
     decoded.hasPageCount = true;
+  }
+  if (fileSize == 10) {
+    decoded.visibleTextOffset = static_cast<uint32_t>(data[6]) | (static_cast<uint32_t>(data[7]) << 8) |
+                                (static_cast<uint32_t>(data[8]) << 16) | (static_cast<uint32_t>(data[9]) << 24);
+    decoded.hasVisibleTextOffset = true;
   }
   position = decoded;
   return true;
@@ -373,7 +378,8 @@ bool Epub::findContentOpfFile(std::string* contentOpfFile) const {
   return true;
 }
 
-bool Epub::parseContentOpf(BookMetadataCache::BookMetadata& bookMetadata, const bool writeSpineEntries) {
+bool Epub::parseContentOpf(BookMetadataCache::BookMetadata& bookMetadata, const bool writeSpineEntries,
+                           const bool collectCssFiles) {
   std::string contentOpfFilePath;
   if (!findContentOpfFile(&contentOpfFilePath)) {
     LOG_ERR("EBP", "Could not find content.opf in zip");
@@ -389,14 +395,20 @@ bool Epub::parseContentOpf(BookMetadataCache::BookMetadata& bookMetadata, const 
   }
 
   ContentOpfParser opfParser(getCachePath(), getBasePath(), contentOpfSize,
-                             writeSpineEntries ? bookMetadataCache.get() : nullptr);
+                             writeSpineEntries ? bookMetadataCache.get() : nullptr, collectCssFiles);
   if (!opfParser.setup()) {
     LOG_ERR("EBP", "Could not setup content.opf parser");
+    if (opfParser.failedForLowMemory()) {
+      lastLoadFailure = OpenFailure::OutOfMemory;
+    }
     return false;
   }
 
   if (!readItemContentsToStream(contentOpfFilePath, opfParser, 1024)) {
     LOG_ERR("EBP", "Could not read content.opf");
+    if (opfParser.failedForLowMemory()) {
+      lastLoadFailure = OpenFailure::OutOfMemory;
+    }
     return false;
   }
 
@@ -434,8 +446,8 @@ bool Epub::parseContentOpf(BookMetadataCache::BookMetadata& bookMetadata, const 
     tocNavItem = opfParser.tocNavPath;
   }
 
-  if (!opfParser.cssFiles.empty()) {
-    cssFiles = opfParser.cssFiles;
+  if (collectCssFiles && !opfParser.cssFiles.empty()) {
+    cssFiles = std::move(opfParser.cssFiles);
   }
 
   return true;
@@ -527,6 +539,13 @@ void Epub::discoverCssFilesFromZip() {
   }
 }
 
+void Epub::releaseCssFileList() {
+  // Stylesheet paths are one-shot cache-build scratch. Swap with an empty
+  // vector so hundreds of generator-emitted paths do not remain resident
+  // while the chapter itself is laid out.
+  std::vector<std::string>().swap(cssFiles);
+}
+
 Epub::CssParseStatus Epub::parseCssFiles(const bool forceRebuild) const {
   // Maximum CSS file size we'll attempt to parse (uncompressed)
   // Larger files risk memory exhaustion on ESP32
@@ -534,17 +553,23 @@ Epub::CssParseStatus Epub::parseCssFiles(const bool forceRebuild) const {
   // Minimum heap required before attempting CSS parsing
   constexpr size_t MIN_HEAP_FOR_CSS_PARSING = 64 * 1024;  // 64KB
 
-  // See if we have a usable cached version of the CSS rules. File existence alone is not enough:
-  // stale cache formats are removed by loadFromCache(), then rebuilt below.
-  if (cssParser->hasCache() && !forceRebuild) {
-    if (cssParser->loadFromCache()) {
-      const bool partialCache = cssParser->isCachePartial();
-      LOG_DBG("EBP", "CSS cache valid, skipping parseCssFiles");
-      cssParser->clear();
-      return partialCache ? CssParseStatus::Partial : CssParseStatus::Complete;
+  // Cache validation is intentionally disk-only here. Hydrating the rules just
+  // to inspect the header duplicates the section builder's peak allocation.
+  if (!forceRebuild) {
+    switch (cssParser->inspectCache()) {
+      case CssParser::CacheStatus::Complete:
+        LOG_DBG("EBP", "CSS cache valid, skipping parseCssFiles");
+        return CssParseStatus::Complete;
+      case CssParser::CacheStatus::Partial:
+        LOG_DBG("EBP", "Partial CSS cache valid, skipping parseCssFiles");
+        return CssParseStatus::Partial;
+      case CssParser::CacheStatus::Invalid:
+        LOG_DBG("EBP", "CSS cache invalid, rebuilding CSS rules");
+        cssParser->deleteCache();
+        break;
+      case CssParser::CacheStatus::Missing:
+        break;
     }
-    LOG_DBG("EBP", "CSS cache invalid, rebuilding CSS rules");
-    cssParser->clear();
   }
 
   // No cache yet - parse CSS files. If memory runs out partway through, keep
@@ -695,15 +720,18 @@ Epub::CssParseStatus Epub::parseCssFiles(const bool forceRebuild) const {
 }
 
 // load in the meta data for the epub file
-bool Epub::load(const bool buildIfMissing, const bool skipLoadingCss) {
+bool Epub::load(const bool buildIfMissing, const bool skipLoadingCss, const XLocationLoadMode xLocationLoadMode) {
+  lastLoadFailure = OpenFailure::InvalidOrUnreadable;
   // Initialize spine/TOC cache
   bookMetadataCache = makeBookMetadataCacheNoThrow(cachePath);
   if (!bookMetadataCache) {
+    lastLoadFailure = OpenFailure::OutOfMemory;
     return false;
   }
   // Always create CssParser - needed for inline style parsing even without CSS files
   cssParser = makeCssParserNoThrow(cachePath);
   if (!cssParser) {
+    lastLoadFailure = OpenFailure::OutOfMemory;
     bookMetadataCache.reset();
     return false;
   }
@@ -711,30 +739,33 @@ bool Epub::load(const bool buildIfMissing, const bool skipLoadingCss) {
   // Try to load existing cache first
   if (bookMetadataCache->load()) {
     if (!skipLoadingCss) {
-      // Rebuild CSS cache when missing or when cache version changed (loadFromCache removes stale file)
+      // Rebuild CSS cache when missing, invalid, or previously incomplete.
       bool rebuildCssCache = false;
       bool forceCssRebuild = false;
       bool retryingPartialCssCache = false;
-      if (!cssParser->hasCache()) {
-        LOG_DBG("EBP", "CSS rules cache missing, attempting to parse CSS files");
-        rebuildCssCache = true;
-      } else if (!cssParser->loadFromCache()) {
-        LOG_DBG("EBP", "CSS rules cache stale, attempting to parse CSS files");
-        cssParser->deleteCache();
-        rebuildCssCache = true;
-      } else if (cssParser->isCachePartial()) {
-        LOG_DBG("EBP", "CSS rules cache is partial, attempting to rebuild complete CSS cache");
-        cssParser->clear();
-        rebuildCssCache = true;
-        forceCssRebuild = true;
-        retryingPartialCssCache = true;
-      } else {
-        cssParser->clear();
+      switch (cssParser->inspectCache()) {
+        case CssParser::CacheStatus::Missing:
+          LOG_DBG("EBP", "CSS rules cache missing, attempting to parse CSS files");
+          rebuildCssCache = true;
+          break;
+        case CssParser::CacheStatus::Invalid:
+          LOG_DBG("EBP", "CSS rules cache invalid, attempting to parse CSS files");
+          cssParser->deleteCache();
+          rebuildCssCache = true;
+          break;
+        case CssParser::CacheStatus::Partial:
+          LOG_DBG("EBP", "CSS rules cache is partial, attempting to rebuild complete CSS cache");
+          rebuildCssCache = true;
+          forceCssRebuild = true;
+          retryingPartialCssCache = true;
+          break;
+        case CssParser::CacheStatus::Complete:
+          break;
       }
 
       if (rebuildCssCache) {
         BookMetadataCache::BookMetadata cachedMetadata = bookMetadataCache->coreMetadata;
-        if (!parseContentOpf(cachedMetadata, /*writeSpineEntries=*/false)) {
+        if (!parseContentOpf(cachedMetadata, /*writeSpineEntries=*/false, /*collectCssFiles=*/true)) {
           LOG_ERR("EBP", "Could not parse content.opf from cached bookMetadata for CSS files");
           // continue anyway - book will work without CSS and we'll still load any inline style CSS
         } else {
@@ -742,8 +773,10 @@ bool Epub::load(const bool buildIfMissing, const bool skipLoadingCss) {
         }
         bookMetadataCache.reset();
         const CssParseStatus cssStatus = parseCssFiles(forceCssRebuild);
+        releaseCssFileList();
         bookMetadataCache = makeBookMetadataCacheNoThrow(cachePath);
         if (!bookMetadataCache) {
+          lastLoadFailure = OpenFailure::OutOfMemory;
           return false;
         }
         if (!bookMetadataCache->load()) {
@@ -766,7 +799,10 @@ bool Epub::load(const bool buildIfMissing, const bool skipLoadingCss) {
     // resident pins tens of KB for the whole reading session (more on warm resume into
     // an already-cached chapter, where createSectionFile never runs to clear it).
     cssParser->clear();
-    loadXLocations();
+    if (xLocationLoadMode == XLocationLoadMode::Immediate) {
+      loadXLocations();
+    }
+    lastLoadFailure = OpenFailure::None;
     return true;
   }
 
@@ -793,11 +829,13 @@ bool Epub::load(const bool buildIfMissing, const bool skipLoadingCss) {
     LOG_ERR("EBP", "Could not begin writing content.opf pass");
     return false;
   }
-  if (!parseContentOpf(bookMetadata)) {
+  if (!parseContentOpf(bookMetadata, /*writeSpineEntries=*/true, /*collectCssFiles=*/!skipLoadingCss)) {
     LOG_ERR("EBP", "Could not parse content.opf");
     return false;
   }
-  discoverCssFilesFromZip();
+  if (!skipLoadingCss) {
+    discoverCssFilesFromZip();
+  }
   if (!bookMetadataCache->endContentOpfPass()) {
     LOG_ERR("EBP", "Could not end writing content.opf pass");
     return false;
@@ -806,6 +844,9 @@ bool Epub::load(const bool buildIfMissing, const bool skipLoadingCss) {
   // TOC Pass - try EPUB 3 nav first, fall back to NCX
   if (!bookMetadataCache->beginTocPass()) {
     LOG_ERR("EBP", "Could not begin writing toc pass");
+    if (bookMetadataCache->failedForLowMemory()) {
+      lastLoadFailure = OpenFailure::OutOfMemory;
+    }
     return false;
   }
 
@@ -840,6 +881,9 @@ bool Epub::load(const bool buildIfMissing, const bool skipLoadingCss) {
   // Build final book.bin
   if (!bookMetadataCache->buildBookBin(filepath, bookMetadata)) {
     LOG_ERR("EBP", "Could not update mappings and sizes");
+    if (bookMetadataCache->failedForLowMemory()) {
+      lastLoadFailure = OpenFailure::OutOfMemory;
+    }
     return false;
   }
   LOG_DBG("EBP", "Total indexing completed in %lu ms", millis() - indexingStart);
@@ -856,11 +900,13 @@ bool Epub::load(const bool buildIfMissing, const bool skipLoadingCss) {
     } else {
       LOG_ERR("EBP", "CSS cache build failed; leaving any existing section caches in place");
     }
+    releaseCssFileList();
   }
 
   // Reload the cache from disk so it's in the correct state
   bookMetadataCache = makeBookMetadataCacheNoThrow(cachePath);
   if (!bookMetadataCache) {
+    lastLoadFailure = OpenFailure::OutOfMemory;
     return false;
   }
   if (!bookMetadataCache->load()) {
@@ -868,7 +914,10 @@ bool Epub::load(const bool buildIfMissing, const bool skipLoadingCss) {
     return false;
   }
 
-  loadXLocations();
+  if (xLocationLoadMode == XLocationLoadMode::Immediate) {
+    loadXLocations();
+  }
+  lastLoadFailure = OpenFailure::None;
   return true;
 }
 
@@ -980,6 +1029,10 @@ const std::string& Epub::getLanguage() const {
   }
 
   return bookMetadataCache->coreMetadata.language;
+}
+
+bool Epub::hasCoverImage() const {
+  return bookMetadataCache && bookMetadataCache->isLoaded() && !bookMetadataCache->coreMetadata.coverItemHref.empty();
 }
 
 std::string Epub::getCoverBmpPath(bool cropped) const {
@@ -1330,7 +1383,8 @@ bool Epub::getResourceSize(const int sectionIndex, const std::string& href, size
 }
 
 bool Epub::loadXLocations() {
-  locationSpine.clear();
+  locationSpine.reset();
+  locationSpineCount = 0;
   locationChapterGroups.reset();
   locationChapterGroupCount = 0;
   sourceSpineMap.reset();
@@ -1403,7 +1457,11 @@ bool Epub::loadXLocations() {
     return false;
   }
 
-  locationSpine.assign(static_cast<size_t>(spineCount), {});
+  auto parsedSpine = makeUniqueNoThrow<LocationSpineEntry[]>(static_cast<size_t>(spineCount));
+  if (!parsedSpine) {
+    LOG_ERR("EBP", "OOM: X location spine (%zu bytes)", static_cast<size_t>(spineCount) * sizeof(LocationSpineEntry));
+    return false;
+  }
   bool hasValidEntry = false;
   size_t ordinal = 0;
   for (JsonObjectConst spineItem : spine) {
@@ -1422,7 +1480,7 @@ bool Epub::loadXLocations() {
     const int chapterGroup = spineItem["chapterGroup"] | -1;
     const uint16_t parsedChapterGroup =
         chapterGroup >= 0 && chapterGroup <= UINT16_MAX ? static_cast<uint16_t>(chapterGroup) : UINT16_MAX;
-    locationSpine[static_cast<size_t>(index)].chapterGroup = parsedChapterGroup;
+    parsedSpine[static_cast<size_t>(index)].chapterGroup = parsedChapterGroup;
     if (startLocation == 0 && endLocation == 0) {
       continue;
     }
@@ -1431,14 +1489,16 @@ bool Epub::loadXLocations() {
       continue;
     }
 
-    locationSpine[static_cast<size_t>(index)] = {startLocation, endLocation, wordStart, wordCount, parsedChapterGroup};
+    parsedSpine[static_cast<size_t>(index)] = {startLocation, endLocation, wordStart, wordCount, parsedChapterGroup};
     hasValidEntry = true;
   }
 
   if (!hasValidEntry) {
-    locationSpine.clear();
     return false;
   }
+
+  locationSpine = std::move(parsedSpine);
+  locationSpineCount = static_cast<size_t>(spineCount);
 
   totalLocations = parsedTotalLocations;
   totalWords = parsedReferenceUnits;
@@ -1468,7 +1528,8 @@ bool Epub::loadXLocations() {
         parsedGroups[static_cast<size_t>(index)] = {static_cast<uint16_t>(firstSpineIndex),
                                                     static_cast<uint16_t>(lastSpineIndex), true};
       }
-      for (auto& entry : locationSpine) {
+      for (size_t i = 0; i < locationSpineCount; i++) {
+        auto& entry = locationSpine[i];
         if (entry.chapterGroup >= groupCount || !parsedGroups[entry.chapterGroup].valid) {
           entry.chapterGroup = UINT16_MAX;
         }
@@ -1565,14 +1626,14 @@ bool Epub::loadXLocations() {
   xLocationsLoaded = true;
   LOG_INF("EBP", "Loaded X locations: %lu locations, %lu reference pages across %zu spine items",
           static_cast<unsigned long>(totalLocations), static_cast<unsigned long>(totalReferencePages),
-          locationSpine.size());
+          locationSpineCount);
   return true;
 }
 
 bool Epub::resolveChapterGroupRange(const int currentSpineIndex, int& firstSpineIndex, int& lastSpineIndex) const {
   firstSpineIndex = currentSpineIndex;
   lastSpineIndex = currentSpineIndex;
-  if (currentSpineIndex < 0 || currentSpineIndex >= static_cast<int>(locationSpine.size()) || !locationChapterGroups) {
+  if (currentSpineIndex < 0 || currentSpineIndex >= static_cast<int>(locationSpineCount) || !locationChapterGroups) {
     return false;
   }
   const uint16_t groupIndex = locationSpine[static_cast<size_t>(currentSpineIndex)].chapterGroup;
@@ -1759,7 +1820,7 @@ ReflowSectionInfo Epub::getSectionInfo(const int sectionIndex) const {
   if (spine.tocIndex >= 0 && spine.tocIndex < getTocItemsCount()) {
     info.title = getTocItem(spine.tocIndex).title;
   }
-  if (xLocationsLoaded && sectionIndex < static_cast<int>(locationSpine.size())) {
+  if (xLocationsLoaded && sectionIndex < static_cast<int>(locationSpineCount)) {
     const auto& location = locationSpine[static_cast<size_t>(sectionIndex)];
     info.firstWordOrdinal = location.wordStart;
     info.wordCount = location.wordCount;
@@ -1834,7 +1895,7 @@ float Epub::calculateSizeProgress(const int currentSpineIndex, const float curre
 // Calculate progress in book (returns 0.0-1.0)
 float Epub::calculateProgress(const int currentSpineIndex, const float currentSpineRead) const {
   if (!xLocationsLoaded || totalLocations == 0 || currentSpineIndex < 0 ||
-      currentSpineIndex >= static_cast<int>(locationSpine.size())) {
+      currentSpineIndex >= static_cast<int>(locationSpineCount)) {
     return calculateSizeProgress(currentSpineIndex, currentSpineRead);
   }
 
@@ -1850,7 +1911,7 @@ float Epub::calculateProgress(const int currentSpineIndex, const float currentSp
 }
 
 bool Epub::resolveLocationPercentToSpineProgress(const int percent, int& spineIndex, float& spineProgress) const {
-  if (!xLocationsLoaded || totalLocations == 0 || locationSpine.empty()) {
+  if (!xLocationsLoaded || totalLocations == 0 || locationSpineCount == 0) {
     return false;
   }
 
@@ -1862,7 +1923,7 @@ bool Epub::resolveLocationPercentToSpineProgress(const int percent, int& spineIn
   }
 
   if (clampedPercent >= 100) {
-    for (int i = static_cast<int>(locationSpine.size()) - 1; i >= 0; i--) {
+    for (int i = static_cast<int>(locationSpineCount) - 1; i >= 0; i--) {
       const LocationSpineEntry& entry = locationSpine[static_cast<size_t>(i)];
       if (entry.startLocation > 0 && entry.endLocation >= entry.startLocation) {
         spineIndex = i;
@@ -1875,7 +1936,7 @@ bool Epub::resolveLocationPercentToSpineProgress(const int percent, int& spineIn
 
   const float targetCompletedLocations =
       static_cast<float>(totalLocations) * static_cast<float>(clampedPercent) / 100.0f;
-  for (size_t i = 0; i < locationSpine.size(); i++) {
+  for (size_t i = 0; i < locationSpineCount; i++) {
     const LocationSpineEntry& entry = locationSpine[i];
     if (entry.startLocation == 0 || entry.endLocation < entry.startLocation) {
       continue;
@@ -1907,7 +1968,7 @@ bool Epub::resolveReferencePage(const int currentSpineIndex, const float current
   currentPage = 0;
   pageCount = 0;
   if (!xLocationsLoaded || totalWords == 0 || wordsPerReferencePage == 0 || totalReferencePages == 0 ||
-      currentSpineIndex < 0 || currentSpineIndex >= static_cast<int>(locationSpine.size())) {
+      currentSpineIndex < 0 || currentSpineIndex >= static_cast<int>(locationSpineCount)) {
     return false;
   }
 
@@ -1958,18 +2019,23 @@ bool Epub::saveReadingPosition(const ReflowReadingPosition& position) const {
     LOG_ERR("EBP", "Could not open progress temp file for write");
     return false;
   }
-  const uint8_t data[6] = {
+  const uint8_t data[10] = {
       static_cast<uint8_t>(position.sectionIndex & 0xFF),
       static_cast<uint8_t>((position.sectionIndex >> 8) & 0xFF),
       static_cast<uint8_t>(position.pageNumber & 0xFF),
       static_cast<uint8_t>((position.pageNumber >> 8) & 0xFF),
       static_cast<uint8_t>(position.pageCount & 0xFF),
       static_cast<uint8_t>((position.pageCount >> 8) & 0xFF),
+      static_cast<uint8_t>(position.visibleTextOffset & 0xFF),
+      static_cast<uint8_t>((position.visibleTextOffset >> 8) & 0xFF),
+      static_cast<uint8_t>((position.visibleTextOffset >> 16) & 0xFF),
+      static_cast<uint8_t>((position.visibleTextOffset >> 24) & 0xFF),
   };
-  const size_t written = file.write(data, sizeof(data));
-  if (written != sizeof(data)) {
+  const size_t dataSize = position.hasVisibleTextOffset ? sizeof(data) : 6;
+  const size_t written = file.write(data, dataSize);
+  if (written != dataSize) {
     LOG_ERR("EBP", "Short write saving progress: %u/%u bytes", static_cast<unsigned>(written),
-            static_cast<unsigned>(sizeof(data)));
+            static_cast<unsigned>(dataSize));
     file.close();
     Storage.remove(tmpPath.c_str());
     return false;

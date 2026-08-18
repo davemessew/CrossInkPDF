@@ -10,6 +10,7 @@
 #include <string>
 
 #include "activities/Activity.h"
+#include "activities/ScreenTransitionRefresh.h"
 #include "components/UIThemeTokens.h"
 #include "components/UiAppHelpers.h"
 #include "util/ButtonNavigator.h"
@@ -61,6 +62,7 @@ class NearbyBookTransferActivity final : public Activity {
 
   Mode mode_;
   State state_ = State::ChooseReceiveAction;
+  ScreenTransitionRefresh screenTransitionRefresh_;
   std::string sourcePath_;
   bool returnToReader_ = false;
   bool radioUsed_ = false;

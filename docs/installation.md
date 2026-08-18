@@ -5,6 +5,11 @@ nav_order: 2
 
 # Installation
 
+## Supported Devices
+
+- Xteink X3, X4
+- Seeed Studio Sticky
+
 ## Web Installation via USB
 
 #### For new installs and updates.
@@ -18,8 +23,8 @@ nav_order: 2
 
 #### For installing newer versions of CrossInk. Can be used by USB locked devices.
 
-1. Download the firmware for your device type from the [releases page](https://github.com/uxjulia/CrossInk/releases): `firmware-x3-x4-*.bin` for X3 and X4, or `firmware-sticky-*.bin` for Seeed Sticky.
-2. Place the downloaded `firmware-*.bin` file in your SD card. You can place this file anywhere.
+1. Follow the same steps from the Web Installation method above. There will be an option to download the firmware instead of USB flashing.
+2. Place the downloaded `firmware-*.bin` file on your SD card. You can place this file anywhere.
 3. Go to `Settings > System > SD Card Firmware Update` and navigate to the `.bin` file and update.
 
 ## USB Locked Devices

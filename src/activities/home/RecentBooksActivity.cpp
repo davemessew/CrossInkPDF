@@ -31,6 +31,7 @@ namespace {
 constexpr size_t MAX_LIST_RECENT_BOOKS = 10;
 // Hold threshold for the long-press action menu (firmware convention).
 constexpr unsigned long LONG_PRESS_MS = 1000;
+constexpr unsigned long ACTION_FEEDBACK_MS = 1000;
 constexpr fui::ActionId ACTION_ROW = 1;
 }  // namespace
 
@@ -105,6 +106,12 @@ void RecentBooksActivity::onExit() {
 }
 
 void RecentBooksActivity::loop() {
+  if (pendingCacheDeletedFeedback && millis() - cacheDeletedFeedbackShowTime >= ACTION_FEEDBACK_MS) {
+    pendingCacheDeletedFeedback = false;
+    requestUpdate();
+    return;
+  }
+
   if (TouchHeaderBackButton::wasTapped(mappedInput, renderer)) {
     onGoHome();
     return;
@@ -281,6 +288,7 @@ void RecentBooksActivity::showBookActionMenu(const size_t bookIndex, const bool 
       std::make_unique<FileBrowserActionActivity>(renderer, mappedInput, book.title, std::move(items),
                                                   ignoreInitialConfirmRelease),
       [this, book](const ActivityResult& result) {
+        longPressFired = false;
         if (result.isCancelled) {
           return;
         }
@@ -304,8 +312,8 @@ void RecentBooksActivity::showBookActionMenu(const size_t bookIndex, const bool 
                     if (!BookActions::clearBookCache(book.path)) {
                       LOG_ERR("RBA", "Failed to clear book cache for: %s", book.path.c_str());
                     } else {
-                      BookActions::drawToast(renderer, tr(STR_BOOK_CACHE_DELETED));
-                      delay(1000);
+                      pendingCacheDeletedFeedback = true;
+                      cacheDeletedFeedbackShowTime = millis();
                     }
                   }
                   reloadAfterBookAction();
@@ -427,6 +435,9 @@ void RecentBooksActivity::buildListScreen(UiApp::ScreenType& screen) {
   props.selectedIndex = static_cast<int16_t>(selectorIndex);
   props.action = ACTION_ROW;
   props.inputMask = fui::InputTouch;  // physical buttons stay in loop()
+  props.iconSize = 28;
+  props.labelText = screen.theme().bodyText;
+  props.labelText.bold = true;
   const fui::Rect listBounds = screen.body();
   listTop = listBounds.y;
   listBottom = listBounds.bottom();
@@ -460,6 +471,10 @@ void RecentBooksActivity::render(RenderLock&&) {
 
   const auto labels = mappedInput.mapLabels(tr(STR_HOME), tr(STR_OPEN), tr(STR_DIR_UP), tr(STR_DIR_DOWN));
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+
+  if (pendingCacheDeletedFeedback) {
+    GUI.drawPopup(renderer, tr(STR_BOOK_CACHE_DELETED));
+  }
 
   renderer.displayBuffer();
 }

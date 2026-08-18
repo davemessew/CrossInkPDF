@@ -7,6 +7,7 @@
 
 #include "NetworkModeSelectionActivity.h"
 #include "activities/Activity.h"
+#include "activities/ScreenTransitionRefresh.h"
 #include "network/CrossPointWebServer.h"
 
 // Web server activity states
@@ -56,9 +57,12 @@ class CrossPointWebServerActivity final : public Activity {
 
   // Cached signal-strength bracket (0..4) for the WiFi indicator.
   int lastWifiBars = 0;
+  ScreenTransitionRefresh screenTransitionRefresh;
 
   void renderServerRunning() const;
+  void renderHeader() const;
   void renderWifiIndicator(int subHeaderTop) const;
+  bool exitRequested() const;
 
   void onNetworkModeSelected(NetworkMode mode);
   void onWifiSelectionComplete(bool connected);

@@ -63,7 +63,7 @@ bool rectContains(const Rect& rect, const int x, const int y) {
 
 struct ReaderLayoutSettingsSnapshot {
   uint8_t fontFamily;
-  uint8_t fontSize;
+  uint8_t readerFontPointSize;
   uint8_t lineHeightPercent;
   uint8_t wordSpacing;
   uint8_t orientation;
@@ -85,7 +85,7 @@ struct ReaderLayoutSettingsSnapshot {
   char sdFontFamilyName[sizeof(SETTINGS.sdFontFamilyName)] = {};
 
   bool operator==(const ReaderLayoutSettingsSnapshot& other) const {
-    return fontFamily == other.fontFamily && fontSize == other.fontSize &&
+    return fontFamily == other.fontFamily && readerFontPointSize == other.readerFontPointSize &&
            lineHeightPercent == other.lineHeightPercent && wordSpacing == other.wordSpacing &&
            orientation == other.orientation && screenMargin == other.screenMargin &&
            publisherPageNumbers == other.publisherPageNumbers && paragraphAlignment == other.paragraphAlignment &&
@@ -101,24 +101,12 @@ struct ReaderLayoutSettingsSnapshot {
 
 ReaderLayoutSettingsSnapshot captureReaderLayoutSettings() {
   ReaderLayoutSettingsSnapshot snapshot{
-      SETTINGS.fontFamily,
-      SETTINGS.fontSize,
-      SETTINGS.lineHeightPercent,
-      SETTINGS.wordSpacing,
-      SETTINGS.orientation,
-      SETTINGS.screenMargin,
-      SETTINGS.publisherPageNumbers,
-      SETTINGS.paragraphAlignment,
-      SETTINGS.embeddedStyle,
-      SETTINGS.hyphenationEnabled,
-      SETTINGS.textAntiAliasing,
-      SETTINGS.readerDarkMode,
-      SETTINGS.imageRendering,
-      SETTINGS.extraParagraphSpacing,
-      SETTINGS.forceParagraphIndents,
-      SETTINGS.bionicReadingEnabled,
-      SETTINGS.guideReadingEnabled,
-      SETTINGS.epubRenderMode,
+      SETTINGS.fontFamily,           SETTINGS.readerFontPointSize,   SETTINGS.lineHeightPercent,
+      SETTINGS.wordSpacing,          SETTINGS.orientation,           SETTINGS.screenMargin,
+      SETTINGS.publisherPageNumbers, SETTINGS.paragraphAlignment,    SETTINGS.embeddedStyle,
+      SETTINGS.hyphenationEnabled,   SETTINGS.textAntiAliasing,      SETTINGS.readerDarkMode,
+      SETTINGS.imageRendering,       SETTINGS.extraParagraphSpacing, SETTINGS.forceParagraphIndents,
+      SETTINGS.bionicReadingEnabled, SETTINGS.guideReadingEnabled,   SETTINGS.epubRenderMode,
   };
   std::strncpy(snapshot.sdFontFamilyName, SETTINGS.sdFontFamilyName, sizeof(snapshot.sdFontFamilyName) - 1);
   snapshot.sdFontFamilyName[sizeof(snapshot.sdFontFamilyName) - 1] = '\0';
@@ -183,7 +171,10 @@ EpubReaderMenuActivity::EpubReaderMenuActivity(
     void* saveGlobalSettingsContext, ReaderOptionsActivity::GlobalSettingsEditCallback beginGlobalSettingsEditCallback,
     void* beginGlobalSettingsEditContext, const bool stablePageNumbersAvailable,
     ReaderOptionsActivity::GlobalSettingsEditCallback endGlobalSettingsEditCallback, void* endGlobalSettingsEditContext,
-    const ReflowCapabilitySet documentCapabilities)
+    const ReflowCapabilitySet documentCapabilities,
+    const char* dictionaryFontFamilyName, const uint8_t dictionaryFontPointSize, const bool hasDictionaryFontOverride,
+    ReaderOptionsActivity::DictionaryFontChangedCallback dictionaryFontChangedCallback,
+    void* dictionaryFontChangedContext)
     : Activity("EpubReaderMenu", renderer, mappedInput),
       menuItems(buildMenuItems(hasFootnotes, hasDictionary, hasBookmarks, hasClippings, isCurrentPageBookmarked,
                                isBookCompleted, showReadingPaceReset, documentCapabilities)),
@@ -203,8 +194,16 @@ EpubReaderMenuActivity::EpubReaderMenuActivity(
       stablePageNumbersAvailable(stablePageNumbersAvailable),
       endGlobalSettingsEditCallback(endGlobalSettingsEditCallback),
       endGlobalSettingsEditContext(endGlobalSettingsEditContext),
+      dictionaryFontPointSize(dictionaryFontPointSize),
+      hasDictionaryFontOverride(hasDictionaryFontOverride),
+      dictionaryFontChangedCallback(dictionaryFontChangedCallback),
+      dictionaryFontChangedContext(dictionaryFontChangedContext),
       uiTarget(makeUiTarget(renderer)),
-      app(uiTarget, uiTarget.deviceContext()) {}
+      app(uiTarget, uiTarget.deviceContext()) {
+  if (dictionaryFontFamilyName) {
+    std::strncpy(this->dictionaryFontFamilyName, dictionaryFontFamilyName, sizeof(this->dictionaryFontFamilyName) - 1);
+  }
+}
 
 EpubReaderMenuActivity::TabMenuItems EpubReaderMenuActivity::buildMenuItems(
     bool hasFootnotes, bool hasDictionary, bool hasBookmarks, bool hasClippings, bool isCurrentPageBookmarked,
@@ -238,7 +237,6 @@ EpubReaderMenuActivity::TabMenuItems EpubReaderMenuActivity::buildMenuItems(
   mainItems.push_back({MenuAction::READING_STATS, StrId::STR_READING_STATS});
   mainItems.push_back(
       {MenuAction::TOGGLE_COMPLETED, isBookCompleted ? StrId::STR_MARK_UNFINISHED : StrId::STR_MARK_FINISHED});
-
   if (showExternalSync) {
     bookmarkItems.push_back({MenuAction::SYNC, StrId::STR_SYNC_PROGRESS});
   }
@@ -257,6 +255,9 @@ EpubReaderMenuActivity::TabMenuItems EpubReaderMenuActivity::buildMenuItems(
       bookmarkItems.push_back({MenuAction::DELETE_BOOKMARKS, StrId::STR_DELETE_BOOKMARKS});
     }
   }
+  bookmarkItems.push_back({MenuAction::SYNC, StrId::STR_SYNC_PROGRESS});
+  bookmarkItems.push_back({MenuAction::NEARBY_POSITION_SYNC, StrId::STR_NEARBY_POSITION_SYNC});
+  bookmarkItems.push_back({MenuAction::SEND_NEARBY_BOOK, StrId::STR_SEND_NEARBY_BOOK});
   bookmarkItems.push_back({MenuAction::SCREENSHOT, StrId::STR_SCREENSHOT_BUTTON});
   bookmarkItems.push_back({MenuAction::DISPLAY_QR, StrId::STR_DISPLAY_QR});
 
@@ -269,6 +270,31 @@ EpubReaderMenuActivity::TabMenuItems EpubReaderMenuActivity::buildMenuItems(
   return items;
 }
 
+void EpubReaderMenuActivity::dictionaryFontChangedForMenu(void* ctx, const char* familyName, const uint8_t pointSize) {
+  auto* self = static_cast<EpubReaderMenuActivity*>(ctx);
+  if (!self) return;
+
+  if (familyName && familyName[0] != '\0') {
+    self->hasDictionaryFontOverride = true;
+    std::strncpy(self->dictionaryFontFamilyName, familyName, sizeof(self->dictionaryFontFamilyName) - 1);
+    self->dictionaryFontFamilyName[sizeof(self->dictionaryFontFamilyName) - 1] = '\0';
+  } else {
+    self->hasDictionaryFontOverride = false;
+    std::strncpy(self->dictionaryFontFamilyName, SETTINGS.dictionarySdFontFamilyName,
+                 sizeof(self->dictionaryFontFamilyName) - 1);
+    self->dictionaryFontFamilyName[sizeof(self->dictionaryFontFamilyName) - 1] = '\0';
+    self->dictionaryFontPointSize = SETTINGS.dictionaryFontPointSize;
+  }
+  if (self->hasDictionaryFontOverride) {
+    self->dictionaryFontPointSize = pointSize;
+  }
+  if (self->dictionaryFontChangedCallback) {
+    self->dictionaryFontChangedCallback(self->dictionaryFontChangedContext,
+                                        self->hasDictionaryFontOverride ? self->dictionaryFontFamilyName : nullptr,
+                                        self->dictionaryFontPointSize);
+  }
+}
+
 const std::vector<EpubReaderMenuActivity::MenuItem>& EpubReaderMenuActivity::activeMenuItems() const {
   return menuItems[activeTabIndex()];
 }
@@ -278,8 +304,11 @@ void EpubReaderMenuActivity::focusTabRow() {
   topIndex = 0;
 }
 
-void EpubReaderMenuActivity::cycleActiveTab() {
-  const auto nextTabIndex = ButtonNavigator::nextIndex(static_cast<int>(activeTabIndex()), MENU_TAB_COUNT);
+void EpubReaderMenuActivity::cycleActiveTab() { moveActiveTab(true); }
+
+void EpubReaderMenuActivity::moveActiveTab(const bool forward) {
+  const int nextTabIndex = forward ? ButtonNavigator::nextIndex(static_cast<int>(activeTabIndex()), MENU_TAB_COUNT)
+                                   : ButtonNavigator::previousIndex(static_cast<int>(activeTabIndex()), MENU_TAB_COUNT);
   activeTab = static_cast<MenuTab>(nextTabIndex);
   focusTabRow();
   requestUpdate();
@@ -323,20 +352,21 @@ bool EpubReaderMenuActivity::activateSelectedItem() {
 
   if (selectedAction == MenuAction::READER_OPTIONS) {
     const auto before = captureReaderLayoutSettings();
-    startActivityForResult(
-        std::make_unique<ReaderOptionsActivity>(
-            renderer, mappedInput, saveReaderSettingsCallback, saveReaderSettingsContext, saveGlobalSettingsCallback,
-            saveGlobalSettingsContext, beginGlobalSettingsEditCallback, beginGlobalSettingsEditContext,
-            endGlobalSettingsEditCallback, endGlobalSettingsEditContext, stablePageNumbersAvailable),
-        [this, before](const ActivityResult& result) {
-          settingsChanged = settingsChanged || haveReaderLayoutSettingsChanged(before);
-          pendingOrientation = SETTINGS.orientation;  // sync in case orientation changed
-          if (result.isCancelled) {
-            finishCancelled();
-            return;
-          }
-          requestUpdate();
-        });
+    startActivityForResult(std::make_unique<ReaderOptionsActivity>(
+                               renderer, mappedInput, saveReaderSettingsCallback, saveReaderSettingsContext,
+                               saveGlobalSettingsCallback, saveGlobalSettingsContext, beginGlobalSettingsEditCallback,
+                               beginGlobalSettingsEditContext, endGlobalSettingsEditCallback,
+                               endGlobalSettingsEditContext, stablePageNumbersAvailable, dictionaryFontFamilyName,
+                               dictionaryFontPointSize, hasDictionaryFontOverride, dictionaryFontChangedForMenu, this),
+                           [this, before](const ActivityResult& result) {
+                             settingsChanged = settingsChanged || haveReaderLayoutSettingsChanged(before);
+                             pendingOrientation = SETTINGS.orientation;  // sync in case orientation changed
+                             if (result.isCancelled) {
+                               finishCancelled();
+                               return;
+                             }
+                             requestUpdate();
+                           });
     return true;
   }
 
@@ -544,6 +574,8 @@ void EpubReaderMenuActivity::loop() {
   buttonNavigator.onPreviousRelease([this, menuCount, &moveSelection] {
     moveSelection(ButtonNavigator::previousIndex(selectedIndex + 1, menuCount + 1));
   });
+  buttonNavigator.onNextContinuous([this] { moveActiveTab(true); });
+  buttonNavigator.onPreviousContinuous([this] { moveActiveTab(false); });
 
   if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
     activateSelectedItem();

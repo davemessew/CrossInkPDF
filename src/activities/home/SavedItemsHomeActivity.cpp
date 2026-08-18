@@ -221,6 +221,8 @@ void SavedItemsHomeActivity::buildListScreen(UiApp::ScreenType& screen) {
   props.selectedIndex = static_cast<int16_t>(selectedIndex);
   props.action = ACTION_ROW;
   props.inputMask = fui::InputTouch;
+  props.labelText = screen.theme().bodyText;
+  props.labelText.bold = true;
   const fui::Rect bounds = screen.body();
   listTop = bounds.y;
   listBottom = bounds.bottom();

@@ -21,20 +21,25 @@ export type DocEntry = {
 
 const modules = import.meta.glob<DocModule>("../../../docs/**/*.md");
 
-// Slugs that are too technical/internal for the public docs site. These are
-// dropped from both the nav and route generation, so the pages are not built.
+// Slugs that are too technical/internal for the public docs navigation. Keep
+// their routes available because other public documentation links to them.
 const HIDDEN_SLUGS = new Set([
   "hyphenation-trie-format",
   "activity-manager",
   "i18n",
   "translators",
   "webserver-endpoints",
+  "simulator",
+  "dictionary-development",
+  "file-formats",
 ]);
 
+const publicModules = Object.fromEntries(
+  Object.entries(modules).filter(([path]) => !path.includes("/docs/development/")),
+);
+
 const visibleModules = Object.fromEntries(
-  Object.entries(modules).filter(
-    ([path]) => !path.includes("/docs/contributing/") && !HIDDEN_SLUGS.has(slugFromPath(path)),
-  ),
+  Object.entries(publicModules).filter(([path]) => !HIDDEN_SLUGS.has(slugFromPath(path))),
 );
 
 function titleFromSlug(slug: string) {
@@ -57,9 +62,9 @@ function urlFromSlug(slug: string) {
   return `/${slug}.html`;
 }
 
-export async function getDocs(): Promise<DocEntry[]> {
+async function getEntries(sourceModules: typeof modules): Promise<DocEntry[]> {
   const entries = await Promise.all(
-    Object.entries(visibleModules).map(async ([path, load]) => {
+    Object.entries(sourceModules).map(async ([path, load]) => {
       const mod = await load();
       const slug = slugFromPath(path);
       return {
@@ -83,7 +88,15 @@ export async function getDocs(): Promise<DocEntry[]> {
   });
 }
 
+export function getDocs(): Promise<DocEntry[]> {
+  return getEntries(visibleModules);
+}
+
+export function getRoutableDocs(): Promise<DocEntry[]> {
+  return getEntries(publicModules);
+}
+
 export async function getDocBySlug(slug: string) {
-  const docs = await getDocs();
+  const docs = await getRoutableDocs();
   return docs.find((doc) => doc.slug === slug);
 }

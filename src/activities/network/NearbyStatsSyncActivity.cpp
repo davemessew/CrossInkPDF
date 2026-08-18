@@ -45,7 +45,7 @@ void NearbyStatsSyncActivity::render(RenderLock&&) {
                             EpdFontFamily::BOLD);
   const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
-  renderer.displayBuffer();
+  renderer.displayBuffer(screenTransitionRefresh_.modeFor(static_cast<uint8_t>(state_)));
 }
 
 void NearbyStatsSyncActivity::enqueueEspNowPacket(const uint8_t*, const uint8_t*, int) {}
@@ -631,7 +631,7 @@ void NearbyStatsSyncActivity::render(RenderLock&&) {
     renderReady(primary, detailPrimary, detailSecondary);
     const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_NEARBY_STATS_SYNC_BUTTON), "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
-    renderer.displayBuffer();
+    renderer.displayBuffer(screenTransitionRefresh_.modeFor(static_cast<uint8_t>(state_)));
     return;
   }
 
@@ -647,7 +647,7 @@ void NearbyStatsSyncActivity::render(RenderLock&&) {
   }
   const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
-  renderer.displayBuffer();
+  renderer.displayBuffer(screenTransitionRefresh_.modeFor(static_cast<uint8_t>(state_)));
 }
 
 void NearbyStatsSyncActivity::renderReady(const std::string& primary, const std::string& detailPrimary,
@@ -661,8 +661,13 @@ void NearbyStatsSyncActivity::renderReady(const std::string& primary, const std:
   renderer.drawCenteredText(UI_10_FONT_ID, y, primary.c_str(), true, EpdFontFamily::BOLD);
   y += lineHeight + metrics.verticalSpacing;
   if (!detailPrimary.empty()) {
-    renderer.drawCenteredText(SMALL_FONT_ID, y, detailPrimary.c_str(), true);
-    y += renderer.getLineHeight(SMALL_FONT_ID) + metrics.verticalSpacing;
+    const auto detailLines = renderer.wrappedText(SMALL_FONT_ID, detailPrimary.c_str(),
+                                                  renderer.getScreenWidth() - metrics.contentSidePadding * 2, 3);
+    for (const auto& line : detailLines) {
+      renderer.drawCenteredText(SMALL_FONT_ID, y, line.c_str(), true);
+      y += renderer.getLineHeight(SMALL_FONT_ID);
+    }
+    y += metrics.verticalSpacing;
   }
   if (!detailSecondary.empty()) {
     renderer.drawCenteredText(SMALL_FONT_ID, y, detailSecondary.c_str(), true);

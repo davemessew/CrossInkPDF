@@ -3,6 +3,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
+#include <cstring>
 #include <memory>
 #include <string>
 #include <vector>
@@ -13,29 +14,45 @@
 
 class DictionaryWordSelectActivity final : public Activity {
  public:
+  using ReaderBackgroundRenderFn = void (*)(void* context);
+  using ReaderPageReloadFn = std::unique_ptr<Page> (*)(void* context);
+
   // reservedBottomHeight is the post-bezel reserved space the caller (EpubReader)
   // left below the page text — status-bar height OR auto-page-turn indicator
   // height, per the caller's own layout formula. The skip-initial-render fast
   // path clears exactly that strip so the framebuffer matches the menu→lookup
   // path (no status bar, no auto-turn label visible during word-select).
-  explicit DictionaryWordSelectActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
-                                        std::unique_ptr<Page> page, int marginLeft, int marginTop,
-                                        const std::string& cachePath, const std::string& nextPageFirstWord = "",
-                                        bool framebufferContainsPage = false, int reservedBottomHeight = 0,
-                                        int initialTouchX = -1, int initialTouchY = -1,
-                                        bool autoLookupInitialWord = false)
+  explicit DictionaryWordSelectActivity(
+      GfxRenderer& renderer, MappedInputManager& mappedInput, std::unique_ptr<Page> page, int marginLeft, int marginTop,
+      std::string cachePath, std::string nextPageFirstWord = "", bool framebufferContainsPage = false,
+      int reservedBottomHeight = 0, int initialTouchX = -1, int initialTouchY = -1, bool autoLookupInitialWord = false,
+      const char* dictionaryFontFamilyName = nullptr, uint8_t dictionaryFontPointSize = 0,
+      void* readerContext = nullptr, ReaderBackgroundRenderFn readerBackgroundRender = nullptr,
+      ReaderPageReloadFn readerPageReload = nullptr)
       : Activity("DictionaryWordSelect", renderer, mappedInput),
         page(std::move(page)),
         marginLeft(marginLeft),
         marginTop(marginTop),
-        cachePath(cachePath),
-        nextPageFirstWord(nextPageFirstWord),
-        controller(renderer, mappedInput, *this, cachePath),
+        cachePath(std::move(cachePath)),
+        nextPageFirstWord(std::move(nextPageFirstWord)),
+        // DictionaryLookupController borrows this activity-owned path.  Qualify
+        // the member so it cannot instead bind to the constructor parameter,
+        // which is destroyed as soon as construction completes.
+        controller(renderer, mappedInput, *this, this->cachePath),
         framebufferContainsPage_(framebufferContainsPage),
         reservedBottomHeight_(reservedBottomHeight),
         initialTouchX_(initialTouchX),
         initialTouchY_(initialTouchY),
-        autoLookupInitialWord_(autoLookupInitialWord) {}
+        autoLookupInitialWord_(autoLookupInitialWord),
+        dictionaryFontPointSize_(dictionaryFontPointSize),
+        readerContext_(readerContext),
+        readerBackgroundRender_(readerBackgroundRender),
+        readerPageReload_(readerPageReload) {
+    if (dictionaryFontFamilyName) {
+      std::strncpy(dictionaryFontFamilyName_, dictionaryFontFamilyName, sizeof(dictionaryFontFamilyName_) - 1);
+    }
+    navigator.setHighlightSnapshotStorage(&highlightSnapshotStorage_);
+  }
 
   void onEnter() override;
   void onExit() override;
@@ -49,7 +66,40 @@ class DictionaryWordSelectActivity final : public Activity {
   std::string cachePath;
   std::string nextPageFirstWord;
 
+  struct WorkingSet {
+    std::unique_ptr<WordSelectNavigator::WordInfo[]> words;
+    std::unique_ptr<WordSelectNavigator::Row[]> rows;
+    std::unique_ptr<char[]> textPool;
+    std::unique_ptr<char[]> measurementScratch;
+    size_t wordCapacity = 0;
+    size_t wordCount = 0;
+    size_t rowCapacity = 0;
+    size_t rowCount = 0;
+    size_t textCapacity = 0;
+    size_t textUsed = 0;
+    size_t measurementScratchCapacity = 0;
+
+    void clear() {
+      words.reset();
+      rows.reset();
+      textPool.reset();
+      measurementScratch.reset();
+      wordCapacity = 0;
+      wordCount = 0;
+      rowCapacity = 0;
+      rowCount = 0;
+      textCapacity = 0;
+      textUsed = 0;
+      measurementScratchCapacity = 0;
+    }
+  };
+
+  WorkingSet workingSet_;
   WordSelectNavigator navigator;
+  // Shared with the stacked definition activity. It is fixed storage inside
+  // this activity, so it adds no allocator churn and replaces two simultaneous
+  // 4 KB snapshots with one.
+  WordSelectNavigator::HighlightSnapshotStorage highlightSnapshotStorage_;
   DictionaryLookupController controller;
 
   // Differential repaint state. The first render in a session always goes through
@@ -78,7 +128,18 @@ class DictionaryWordSelectActivity final : public Activity {
   int initialTouchX_ = -1;
   int initialTouchY_ = -1;
   bool autoLookupInitialWord_ = false;
+  // This child owns its fixed-size copy so the reader does not keep the
+  // dictionary selection resident while laying out EPUB sections.
+  char dictionaryFontFamilyName_[64] = "";
+  uint8_t dictionaryFontPointSize_ = 0;
   bool touchDragLookup_ = false;
+  void* readerContext_ = nullptr;
+  ReaderBackgroundRenderFn readerBackgroundRender_ = nullptr;
+  ReaderPageReloadFn readerPageReload_ = nullptr;
+  bool workingSetSuspended_ = false;
+  bool workingSetMemoryError_ = false;
+  int suspendedSelectionX_ = -1;
+  int suspendedSelectionY_ = -1;
 
   bool skipLoopDelay() override { return controller.skipLoopDelay(); }
 
@@ -109,9 +170,15 @@ class DictionaryWordSelectActivity final : public Activity {
   void openDictionarySwitch();
   void renderDefinitionBackground();
   static void renderDefinitionBackgroundCallback(void* context);
+  bool buildWorkingSet(bool consumeInitialConfirm);
+  void suspendWorkingSet();
+  bool restoreWorkingSet();
 
-  void extractWords(std::vector<WordSelectNavigator::WordInfo>& words, std::vector<WordSelectNavigator::Row>& rows,
-                    std::string& textPool);
-  void mergeHyphenatedWords(std::vector<WordSelectNavigator::WordInfo>& words,
-                            std::vector<WordSelectNavigator::Row>& rows, std::string& textPool);
+  bool allocateWorkingSet();
+  bool extractWords();
+  bool mergeHyphenatedWords();
+  bool appendText(const char* text, size_t length, uint16_t& offset);
+  bool appendMergedText(const char* first, size_t firstLength, const char* second, size_t secondLength,
+                        uint16_t& offset);
+  bool appendWord(WordSelectNavigator::WordInfo word);
 };

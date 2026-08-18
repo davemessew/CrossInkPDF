@@ -136,7 +136,7 @@ See [Font Build Variants](./docs/font-build-variants.md) for more detail.
 
 ## Installation
 
-The easiest route is the web installer:
+The fastest route is [Inky, CrossInk's web installer](https://inky.crossink.dev/#flash-tools):
 
 1. Download the [`tiny` firmware](https://github.com/davemessew/CrossInkPDF/releases/download/pdf-reflow-v1.5.0.16/firmware-tiny-pdf-reflow-v1.5.0.16.bin) for standard text or the [`xlarge` firmware](https://github.com/davemessew/CrossInkPDF/releases/download/pdf-reflow-v1.5.0.16/firmware-xlarge-pdf-reflow-v1.5.0.16.bin) for large text.
 2. Open the CrossInk web installer.
@@ -174,11 +174,35 @@ More cache and storage details are available in [Data Cache](./docs/data-cache.m
 - [Web server usage](./docs/webserver.md)
 - [Common issues](./docs/troubleshooting.md)
 - [Project scope](./SCOPE.md)
-- [Contributing](./docs/contributing/README.md)
+- [Development docs](./docs/development/README.md)
 
 ## Development
 
-CrossInk uses PlatformIO. Build the normal-font firmware with:
+CrossInk uses PlatformIO for building and flashing firmware.
+
+See [Getting Started](./docs/development/getting-started.md) for prerequisites, clone setup, and validation commands.
+
+### Nix/NixOS
+
+Nix/NixOS users can enter the development shell with either `nix develop` (flakes) or `nix-shell`:
+
+```bash
+nix develop -f nix
+# or
+nix-shell nix
+```
+
+To flash a connected ESP32-C3 device, enable PlatformIO's udev rules in your NixOS configuration:
+
+```nix
+services.udev.packages = with pkgs; [ platformio-core.udev ];
+```
+
+After rebuilding the system configuration, reconnect the device or reload udev rules.
+
+### Build / flash / monitor
+
+Connect your Xteink X4 or X3 via USB-C and run:
 
 ```sh
 pio run -e tiny
@@ -190,10 +214,18 @@ Build the large-font variant with:
 pio run -e xlarge
 ```
 
-See [Getting Started](./docs/contributing/getting-started.md) for setup and [Testing and Debugging](./docs/contributing/testing-debugging.md) for the development tools.
+See [Testing and Debugging](./docs/development/testing-debugging.md) for serial logging, simulator checks, static analysis, and bug-report guidance.
 
 ## Project lineage
 
 This project is based on [CrossInk](https://github.com/uxjulia/CrossInk), which is itself a personal fork of [CrossPoint Reader](https://github.com/crosspoint-reader/crosspoint-reader).
 
+The current firmware base includes the official CrossInk 1.5.0 release.
+
 The aim of this fork is narrow: keep CrossInk's focused, readable e-ink experience and make supported PDFs behave like books instead of miniature printed pages.
+
+## Internals
+
+The ESP32-C3 has about 380 KB of usable RAM, so CrossInk stores reusable book and device data on the SD card instead of rebuilding everything in memory.
+
+See [Data Cache](./docs/data-cache.md) for the `.crosspoint` layout and [File Formats](./docs/file-formats.md) for binary cache details.

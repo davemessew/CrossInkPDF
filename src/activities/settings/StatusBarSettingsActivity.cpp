@@ -429,14 +429,8 @@ void StatusBarSettingsActivity::render(RenderLock&&) {
   const int contentX = isLandscapeCw ? hintGutterWidth : 0;
   const int contentWidth = pageWidth - hintGutterWidth;
 
-  const int contentTop =
-      metrics.topPadding + TouchHeaderBackButton::height(metrics, mappedInput) + metrics.verticalSpacing;
   const int previewLabelLineHeight = renderer.getLineHeight(UI_10_FONT_ID);
   constexpr int previewLabelGap = 18;
-  const int previewStatusBarHeight = UITheme::getStatusBarHeight();
-  const int previewSectionHeight = previewLabelLineHeight + previewLabelGap + previewStatusBarHeight;
-  const int contentHeight =
-      pageHeight - contentTop - metrics.buttonHintsHeight - previewSectionHeight - metrics.verticalSpacing * 2;
 
   const auto labels = mappedInput.mapLabels(
       tr(STR_BACK), selectedItemUsesOptionMenu() ? tr(STR_SELECT) : tr(STR_TOGGLE), tr(STR_DIR_UP), tr(STR_DIR_DOWN));

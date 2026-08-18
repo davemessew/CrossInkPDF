@@ -3,6 +3,8 @@
 #include <string>
 #include <type_traits>
 
+#include "ClippingStore.h"
+#include "Epub/Epub/ReaderRenderSpec.h"
 #include "activities/reader/WordRef.h"
 #include "clippings/ClipTextBuilder.h"
 
@@ -53,4 +55,32 @@ TEST(ClipTextBuilder, JoinsInsertedHyphenAcrossParagraphBoundary) {
   const ClippingResult result = ClipTextBuilder::build(store, order, 0, 1, 2, 0, 2);
 
   EXPECT_EQ(result.text, "hyphenated");
+}
+
+TEST(ClippingLayout, RejectsStoredRangeWhenFontChangesWithoutChangingPageCount) {
+  ReaderRenderSpec original;
+  original.fontId = 12;
+  original.viewportWidth = 760;
+  original.viewportHeight = 430;
+
+  ReaderRenderSpec changed = original;
+  changed.fontId = 16;
+
+  Clipping clipping;
+  clipping.pageCount = 20;
+  clipping.layoutSignature = readerRenderSpecSignature(original);
+
+  EXPECT_TRUE(clippingStoredRangeMatchesLayout(clipping, 20, readerRenderSpecSignature(original)));
+  EXPECT_FALSE(clippingStoredRangeMatchesLayout(clipping, 20, readerRenderSpecSignature(changed)));
+}
+
+TEST(ClippingLayout, PreservesLegacyFastPathUntilRelayout) {
+  Clipping clipping;
+  clipping.pageCount = 20;
+  clipping.layoutSignature = 0;
+
+  ReaderRenderSpec current;
+  current.fontId = 12;
+  EXPECT_TRUE(clippingStoredRangeMatchesLayout(clipping, 20, readerRenderSpecSignature(current)));
+  EXPECT_FALSE(clippingStoredRangeMatchesLayout(clipping, 21, readerRenderSpecSignature(current)));
 }

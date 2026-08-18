@@ -148,7 +148,7 @@ bool DictionaryRegistry::discover() {
     return *s1 == '\0' && *s2 != '\0';
   });
 
-  maybeAutoSelectSingleDictionary();
+  maybeAutoSelectDefaultDictionary();
 
   return !entries_.empty();
 }
@@ -166,14 +166,14 @@ int DictionaryRegistry::indexOf(const std::string& basePath) const {
   return -1;
 }
 
-void DictionaryRegistry::maybeAutoSelectSingleDictionary() const {
-  if (entries_.size() != 1) return;
+void DictionaryRegistry::maybeAutoSelectDefaultDictionary() const {
+  if (entries_.empty()) return;
 
-  const std::string activePath = Dictionary::readDictPath();
+  const std::string activePath = Dictionary::readConfiguredDictPath();
   if (activePath == entries_[0].basePath) return;
   if (activePath.empty() && Dictionary::hasGlobalDictPathFile()) return;
   if (!activePath.empty() && indexOf(activePath) >= 0) return;
 
-  LOG_INF("DREG", "Auto-selecting only discovered dictionary: %s", entries_[0].basePath.c_str());
+  LOG_INF("DREG", "Auto-selecting first discovered dictionary: %s", entries_[0].basePath.c_str());
   Dictionary::saveGlobalDictPath(entries_[0].basePath.c_str());
 }

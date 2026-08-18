@@ -4,13 +4,16 @@
 #include <FontCacheManager.h>
 #include <GfxRenderer.h>
 #include <I18n.h>
+#include <MemoryBudget.h>
 #include <SdCardFont.h>
 #include <Utf8.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
+#include <limits>
 
 #include "../settings/DictionarySelectActivity.h"
 #include "CrossPointSettings.h"
@@ -30,40 +33,108 @@ namespace {
 // highlight rectangle overruns into the inter-word gap.
 constexpr char SOFT_HYPHEN_UTF8[] = "\xC2\xAD";
 constexpr size_t SOFT_HYPHEN_BYTES = 2;
+constexpr size_t WORD_SELECT_ALLOCATION_HEADROOM = 8U * 1024U;
+constexpr size_t ADVANCE_CODEPOINT_CAPACITY = SdCardFont::MAX_PAGE_GLYPHS;
 
-int16_t measureWordAdvanceX(const GfxRenderer& renderer, int fontId, const std::string& word,
-                            EpdFontFamily::Style style) {
-  if (word.find(SOFT_HYPHEN_UTF8) == std::string::npos) {
-    return static_cast<int16_t>(renderer.getTextAdvanceX(fontId, word.c_str(), style));
-  }
-  std::string sanitized = word;
-  size_t pos = 0;
-  while ((pos = sanitized.find(SOFT_HYPHEN_UTF8, pos)) != std::string::npos) {
-    sanitized.erase(pos, SOFT_HYPHEN_BYTES);
-  }
-  return static_cast<int16_t>(renderer.getTextAdvanceX(fontId, sanitized.c_str(), style));
+struct WorkingSetBudget {
+  size_t wordCount = 0;
+  size_t rowCount = 0;
+  size_t textBytes = 0;
+  size_t maxSourceWordBytes = 0;
+};
+
+struct WordPartRef {
+  const char* text = nullptr;
+  size_t length = 0;
+  size_t sourceOffset = 0;
+};
+
+bool isDashSeparator(const char* text, const size_t length, const size_t offset) {
+  return offset + 2 < length && static_cast<uint8_t>(text[offset]) == 0xE2 &&
+         static_cast<uint8_t>(text[offset + 1]) == 0x80 &&
+         (static_cast<uint8_t>(text[offset + 2]) == 0x93 || static_cast<uint8_t>(text[offset + 2]) == 0x94);
 }
 
-int16_t measureWordAdvanceX(const GfxRenderer& renderer, int fontId, const std::string& word,
-                            EpdFontFamily::Style style, uint8_t bionicBoundary, uint16_t bionicSuffixX) {
+bool containsDashSeparator(const char* text, const size_t length) {
+  for (size_t i = 0; i < length; ++i) {
+    if (isDashSeparator(text, length, i)) return true;
+  }
+  return false;
+}
+
+template <typename Sink>
+void forEachWordPart(const char* text, const size_t length, Sink&& sink) {
+  size_t partStart = 0;
+  for (size_t i = 0; i < length;) {
+    if (!isDashSeparator(text, length, i)) {
+      i++;
+      continue;
+    }
+    if (i > partStart) sink(WordPartRef{text + partStart, i - partStart, partStart});
+    i += 3;
+    partStart = i;
+  }
+  if (partStart < length) sink(WordPartRef{text + partStart, length - partStart, partStart});
+}
+
+bool addBudgetBytes(size_t& total, const size_t bytes) {
+  if (bytes > std::numeric_limits<size_t>::max() - total) return false;
+  total += bytes;
+  return true;
+}
+
+const char* withoutSoftHyphens(const char* word, const size_t length, char* scratch, const size_t scratchCapacity) {
+  if (!word || !scratch || scratchCapacity == 0) return word;
+  bool hasSoftHyphen = false;
+  for (size_t i = 0; i + 1 < length; ++i) {
+    if (word[i] == SOFT_HYPHEN_UTF8[0] && word[i + 1] == SOFT_HYPHEN_UTF8[1]) {
+      hasSoftHyphen = true;
+      break;
+    }
+  }
+  if (!hasSoftHyphen) return word;
+
+  size_t out = 0;
+  for (size_t i = 0; i < length && out + 1 < scratchCapacity;) {
+    if (i + 1 < length && word[i] == SOFT_HYPHEN_UTF8[0] && word[i + 1] == SOFT_HYPHEN_UTF8[1]) {
+      i += SOFT_HYPHEN_BYTES;
+      continue;
+    }
+    scratch[out++] = word[i++];
+  }
+  scratch[out] = '\0';
+  return scratch;
+}
+
+int16_t measureWordAdvanceX(const GfxRenderer& renderer, const int fontId, const char* word, const size_t length,
+                            const EpdFontFamily::Style style, char* scratch, const size_t scratchCapacity) {
+  const char* measured = withoutSoftHyphens(word, length, scratch, scratchCapacity);
+  return static_cast<int16_t>(renderer.getTextAdvanceX(fontId, measured, style));
+}
+
+int16_t measureWordAdvanceX(const GfxRenderer& renderer, const int fontId, const char* word, const size_t length,
+                            const EpdFontFamily::Style style, const uint8_t bionicBoundary,
+                            const uint16_t bionicSuffixX, char* scratch, const size_t scratchCapacity) {
   if (bionicBoundary == 0 || bionicSuffixX == 0) {
-    return measureWordAdvanceX(renderer, fontId, word, style);
+    return measureWordAdvanceX(renderer, fontId, word, length, style, scratch, scratchCapacity);
   }
-  const size_t suffixStart = std::min<size_t>(bionicBoundary, word.size());
-  return static_cast<int16_t>(bionicSuffixX + renderer.getTextAdvanceX(fontId, word.c_str() + suffixStart, style));
+  const size_t suffixStart = std::min<size_t>(bionicBoundary, length);
+  return static_cast<int16_t>(bionicSuffixX + renderer.getTextAdvanceX(fontId, word + suffixStart, style));
 }
 
-int16_t measureWordAdvanceX(const GfxRenderer& renderer, int fontId, const std::string& word,
-                            EpdFontFamily::Style style, uint8_t bionicBoundary, uint16_t bionicRunOffset,
-                            bool wordIsRtl) {
+int16_t measureWordAdvanceX(const GfxRenderer& renderer, const int fontId, const char* word, const size_t length,
+                            const EpdFontFamily::Style style, const uint8_t bionicBoundary,
+                            const uint16_t bionicRunOffset, const bool wordIsRtl, char* scratch,
+                            const size_t scratchCapacity) {
   if (!wordIsRtl || bionicBoundary == 0 || bionicRunOffset == 0) {
-    return measureWordAdvanceX(renderer, fontId, word, style, bionicBoundary, bionicRunOffset);
+    return measureWordAdvanceX(renderer, fontId, word, length, style, bionicBoundary, bionicRunOffset, scratch,
+                               scratchCapacity);
   }
 
   const auto boldStyle = static_cast<EpdFontFamily::Style>(style | EpdFontFamily::BOLD);
   char boldBuf[40];
-  const size_t boldLen = std::min<size_t>({static_cast<size_t>(bionicBoundary), word.size(), sizeof(boldBuf) - 1});
-  memcpy(boldBuf, word.c_str(), boldLen);
+  const size_t boldLen = std::min<size_t>({static_cast<size_t>(bionicBoundary), length, sizeof(boldBuf) - 1});
+  memcpy(boldBuf, word, boldLen);
   boldBuf[boldLen] = '\0';
   return static_cast<int16_t>(bionicRunOffset + renderer.getTextAdvanceX(fontId, boldBuf, boldStyle));
 }
@@ -83,20 +154,47 @@ constexpr uint8_t styleToBitMask(EpdFontFamily::Style style) {
 
 void DictionaryWordSelectActivity::onEnter() {
   Activity::onEnter();
+  Dictionary::clearLookupDictPathOverride();
   mappedInput.setReaderTouchscreenOverride(true);
   ignoreInitialBackRelease_ = mappedInput.isPressed(MappedInputManager::Button::Back);
-  std::vector<WordSelectNavigator::WordInfo> words;
-  std::vector<WordSelectNavigator::Row> rows;
-  std::string textPool;
-  textPool.reserve(512);
-  extractWords(words, rows, textPool);
-  mergeHyphenatedWords(words, rows, textPool);
-  // Only consume the initial Confirm release if Confirm is still held at onEnter — i.e.
-  // we were opened mid hold-to-lookup. Other entry paths (e.g. reader menu → Lookup) have
-  // already released Confirm by the time we open, so consuming would swallow the user's
-  // first deliberate tap and force them to press twice.
   const bool consumeInitialConfirm = mappedInput.isPressed(MappedInputManager::Button::Confirm);
-  navigator.load(std::move(words), std::move(rows), std::move(textPool), consumeInitialConfirm);
+  if (!buildWorkingSet(consumeInitialConfirm)) {
+    if (workingSetMemoryError_) {
+      GUI.drawPopup(renderer, tr(STR_MEMORY_ERROR));
+      renderer.displayBuffer();
+      delay(1000);
+    }
+    ActivityResult result;
+    result.isCancelled = true;
+    setResult(std::move(result));
+    finish();
+    return;
+  }
+  autoLookupInitialWord_ = false;
+  requestUpdate();
+}
+
+bool DictionaryWordSelectActivity::buildWorkingSet(const bool consumeInitialConfirm) {
+  workingSetMemoryError_ = false;
+  if (!page) {
+    LOG_ERR("DICT", "Cannot build word selection without a reader page");
+    return false;
+  }
+  navigator.releaseWorkingSet();
+  workingSet_.clear();
+  if (!allocateWorkingSet()) {
+    workingSetMemoryError_ = true;
+    return false;
+  }
+  prebuildAdvanceTable();
+  if (!extractWords() || !mergeHyphenatedWords()) {
+    workingSetMemoryError_ = true;
+    navigator.releaseWorkingSet();
+    workingSet_.clear();
+    return false;
+  }
+  navigator.loadView(workingSet_.words.get(), workingSet_.wordCount, workingSet_.rows.get(), workingSet_.rowCount,
+                     workingSet_.textPool.get(), consumeInitialConfirm);
 #if CROSSINK_APP_CAP_TOUCH
   navigator.setTouchDragCursorVisible(mappedInput.hasTouch());
   bool initialTouchHit = false;
@@ -111,18 +209,51 @@ void DictionaryWordSelectActivity::onEnter() {
       result.isCancelled = true;
       setResult(std::move(result));
       finish();
-      return;
+      return false;
     }
     touchDragLookup_ = navigator.beginTouchMultiSelect();
   }
 #else
   navigator.setTouchDragCursorVisible(false);
 #endif
-  requestUpdate();
+  return true;
+}
+
+void DictionaryWordSelectActivity::suspendWorkingSet() {
+  if (workingSetSuspended_ || !readerPageReload_) return;
+  if (const auto* selected = navigator.getSelected()) {
+    suspendedSelectionX_ = selected->screenX + selected->width / 2;
+    suspendedSelectionY_ = selected->screenY + renderer.getLineHeight(SETTINGS.getReaderFontId()) / 2;
+  }
+  navigator.releaseWorkingSet();
+  workingSet_.clear();
+  page.reset();
+  workingSetSuspended_ = true;
+  MemoryBudget::logHeapShape("dict.parent_suspended");
+}
+
+bool DictionaryWordSelectActivity::restoreWorkingSet() {
+  if (!workingSetSuspended_) return true;
+  page = readerPageReload_(readerContext_);
+  if (!page) {
+    LOG_ERR("DICT", "Failed to reload reader page after dictionary definition");
+    return false;
+  }
+  if (!buildWorkingSet(/*consumeInitialConfirm=*/false)) return false;
+  if (suspendedSelectionX_ >= 0 && suspendedSelectionY_ >= 0) {
+    navigator.selectWordAtPoint(suspendedSelectionX_, suspendedSelectionY_,
+                                renderer.getLineHeight(SETTINGS.getReaderFontId()));
+  }
+  workingSetSuspended_ = false;
+  MemoryBudget::logHeapShape("dict.parent_restored");
+  return true;
 }
 
 void DictionaryWordSelectActivity::onExit() {
   controller.onExit();
+  navigator.releaseWorkingSet();
+  workingSet_.clear();
+  Dictionary::clearLookupDictPathOverride();
   mappedInput.setReaderTouchscreenOverride(false);
   const auto& sdFonts = renderer.getSdCardFonts();
   auto it = sdFonts.find(SETTINGS.getReaderFontId());
@@ -143,28 +274,56 @@ void DictionaryWordSelectActivity::prewarmHighlightGlyphs(int currIdx) {
 }
 
 void DictionaryWordSelectActivity::prebuildAdvanceTable() {
-  // Concatenate every word on the page and OR the style flags. ~2KB transient
-  // string; freed on return. Matches FontCacheManager::PrewarmScope's
-  // scanText_ allocation pattern.
-  std::string pageText;
-  pageText.reserve(2048);
+  if (!renderer.isSdCardFont(SETTINGS.getReaderFontId())) return;
+
+  // A page can contain hundreds of distinct glyphs, so this 2 KB collector is
+  // too large for the render-task stack. Allocate it fallibly and release it
+  // before extraction; a failure only loses the SD-font speed-up.
+  auto codepoints = makeUniqueNoThrow<uint32_t[]>(ADVANCE_CODEPOINT_CAPACITY);
+  if (!codepoints) {
+    const auto heap = MemoryBudget::snapshot();
+    LOG_ERR("DICT", "OOM allocating advance collector (%u bytes, free=%u maxAlloc=%u)",
+            static_cast<unsigned>(ADVANCE_CODEPOINT_CAPACITY * sizeof(uint32_t)), heap.freeHeap, heap.maxAllocHeap);
+    return;
+  }
+  const uint32_t* const codepointData = codepoints.get();
+
+  uint16_t codepointCount = 0;
   uint8_t pageStyleMask = 0;
+  bool truncated = false;
   for (const auto& element : page->elements) {
     if (element->getTag() != TAG_PageLine) continue;
     const auto* line = static_cast<const PageLine*>(element.get());
     const auto& block = line->getBlock();
     if (!block) continue;
     for (uint16_t i = 0; i < block->wordCount(); i++) {
-      pageText.append(block->wordText(i));
-      pageText.push_back(' ');
+      const auto* cursor = reinterpret_cast<const unsigned char*>(block->wordText(i));
+      uint32_t codepoint = 0;
+      while ((codepoint = utf8NextCodepoint(&cursor))) {
+        if (std::find(codepointData, codepointData + codepointCount, codepoint) != codepointData + codepointCount) {
+          continue;
+        }
+        if (codepointCount >= ADVANCE_CODEPOINT_CAPACITY) {
+          truncated = true;
+          break;
+        }
+        codepoints[codepointCount++] = codepoint;
+      }
       pageStyleMask |= styleToBitMask(block->wordStyle(i));
     }
   }
   if (pageStyleMask == 0) pageStyleMask = styleToBitMask(EpdFontFamily::REGULAR);
-  // The advance table persists across clearCache() (SdCardFont.h:201) so
-  // this only pays the SD cost on the first entry; subsequent ones
-  // amortize.
-  renderer.ensureSdCardFontReady(SETTINGS.getReaderFontId(), pageText.c_str(), pageStyleMask);
+  if (truncated) {
+    LOG_ERR("DICT", "SD-font advance collector cap hit (%u); remaining glyphs will load on demand",
+            static_cast<unsigned>(ADVANCE_CODEPOINT_CAPACITY));
+  }
+  if (codepointCount > 0) {
+    // Use the codepoint overload so prewarm itself has no growing std::string.
+    // RTL presentation forms that are absent here still use the normal
+    // fallible on-demand font path during measurement.
+    renderer.ensureSdCardFontReady(SETTINGS.getReaderFontId(), codepointData, codepointCount,
+                                   /*includeSpace=*/true, /*includeHyphen=*/true, pageStyleMask);
+  }
 }
 
 void DictionaryWordSelectActivity::clearFrontButtonHintArea() {
@@ -190,6 +349,10 @@ void DictionaryWordSelectActivity::clearFrontButtonHintArea() {
 }
 
 void DictionaryWordSelectActivity::renderDefinitionBackground() {
+  if (!page) {
+    LOG_ERR("DICT", "Cannot redraw dictionary background without a reader page");
+    return;
+  }
   renderer.clearScreen();
 
   // Dictionary layout can evict the reader font's bitmap glyph cache. Rebuild
@@ -206,16 +369,209 @@ void DictionaryWordSelectActivity::renderDefinitionBackgroundCallback(void* cont
   static_cast<DictionaryWordSelectActivity*>(context)->renderDefinitionBackground();
 }
 
-void DictionaryWordSelectActivity::extractWords(std::vector<WordSelectNavigator::WordInfo>& words,
-                                                std::vector<WordSelectNavigator::Row>& rows, std::string& textPool) {
-  words.clear();
-  words.reserve(64);
-  rows.clear();
-  rows.reserve(16);
+bool DictionaryWordSelectActivity::allocateWorkingSet() {
+  WorkingSetBudget budget;
+  bool valid = true;
+  bool haveRow = false;
+  int16_t currentRowY = 0;
+  WordPartRef previousRowLast{};
 
-  // Populate the SD font's advance table once so every getTextAdvanceX call
-  // below takes the fast in-RAM path.
-  prebuildAdvanceTable();
+  const auto addMergedBudget = [&](const WordPartRef& first, const WordPartRef& second, const bool stripLeadingSecond) {
+    if (first.length == 0 || first.text[first.length - 1] != '-' || first.text[0] == '-') return;
+    const size_t secondSkip = stripLeadingSecond && second.length > 0 && second.text[0] == '-' ? 1 : 0;
+    const size_t mergedLength = first.length - 1 + second.length - secondSkip;
+    if (mergedLength > UINT16_MAX || !addBudgetBytes(budget.textBytes, mergedLength + 1)) valid = false;
+  };
+
+  for (const auto& element : page->elements) {
+    if (element->getTag() != TAG_PageLine) continue;
+    const auto* line = static_cast<const PageLine*>(element.get());
+    const auto& block = line->getBlock();
+    if (!block) continue;
+    const int16_t screenY = static_cast<int16_t>(
+        line->yPos + marginTop + block->getRubyShift(renderer.getFontAscenderSize(SETTINGS.getReaderFontId())));
+    for (uint16_t wordIndex = 0; wordIndex < block->wordCount(); ++wordIndex) {
+      const char* word = block->wordText(wordIndex);
+      const size_t wordLength = block->wordTextLen(wordIndex);
+      budget.maxSourceWordBytes = std::max(budget.maxSourceWordBytes, wordLength + 1);
+      if (wordLength > UINT16_MAX || !utf8ContainsLookupCharacter(word)) continue;
+
+      forEachWordPart(word, wordLength, [&](const WordPartRef& part) {
+        if (!valid || part.length == 0 || part.length > UINT16_MAX || budget.wordCount >= UINT16_MAX) {
+          valid = false;
+          return;
+        }
+        budget.wordCount++;
+        if (!addBudgetBytes(budget.textBytes, part.length + 1)) {
+          valid = false;
+          return;
+        }
+
+        if (!haveRow) {
+          haveRow = true;
+          currentRowY = screenY;
+        } else if (std::abs(static_cast<int>(screenY) - static_cast<int>(currentRowY)) > 2) {
+          budget.rowCount++;
+          addMergedBudget(previousRowLast, part, /*stripLeadingSecond=*/true);
+          currentRowY = screenY;
+        }
+        previousRowLast = part;
+      });
+    }
+  }
+  if (haveRow) budget.rowCount++;
+  if (budget.rowCount > static_cast<size_t>(INT16_MAX)) valid = false;
+  if (haveRow && !nextPageFirstWord.empty()) {
+    const WordPartRef next{nextPageFirstWord.c_str(), nextPageFirstWord.size(), 0};
+    addMergedBudget(previousRowLast, next, /*stripLeadingSecond=*/false);
+  }
+
+  constexpr size_t MAX_TEXT_POOL_BYTES = static_cast<size_t>(UINT16_MAX) + 1U;
+  if (!valid || budget.textBytes > MAX_TEXT_POOL_BYTES ||
+      budget.maxSourceWordBytes > std::numeric_limits<size_t>::max() / 2U) {
+    LOG_ERR("DICT", "Word selection page exceeds bounded working-set limits");
+    return false;
+  }
+
+  const size_t wordBytes = budget.wordCount * sizeof(WordSelectNavigator::WordInfo);
+  const size_t rowBytes = budget.rowCount * sizeof(WordSelectNavigator::Row);
+  const size_t scratchBytes = budget.maxSourceWordBytes * 2U;
+  size_t totalBytes = 0;
+  valid = addBudgetBytes(totalBytes, wordBytes) && addBudgetBytes(totalBytes, rowBytes) &&
+          addBudgetBytes(totalBytes, budget.textBytes) && addBudgetBytes(totalBytes, scratchBytes);
+  if (!valid) {
+    LOG_ERR("DICT", "Word selection working-set size overflow");
+    return false;
+  }
+
+  const size_t largestBlock = std::max({wordBytes, rowBytes, budget.textBytes, scratchBytes});
+  auto heap = MemoryBudget::snapshot();
+  if (heap.maxAllocHeap < largestBlock ||
+      heap.freeHeap <
+          totalBytes + std::min(WORD_SELECT_ALLOCATION_HEADROOM, std::numeric_limits<size_t>::max() - totalBytes)) {
+    const auto before = heap;
+    if (renderer.releaseSdCardFontForLowMemory(SETTINGS.getReaderFontId())) {
+      heap = MemoryBudget::snapshot();
+      LOG_DBG("DICT", "Released reader SD-font caches for %u-byte working set: free=%u->%u maxAlloc=%u->%u",
+              static_cast<unsigned>(totalBytes), before.freeHeap, heap.freeHeap, before.maxAllocHeap,
+              heap.maxAllocHeap);
+    }
+  }
+
+  workingSet_.wordCapacity = budget.wordCount;
+  workingSet_.rowCapacity = budget.rowCount;
+  workingSet_.textCapacity = budget.textBytes;
+  workingSet_.measurementScratchCapacity = scratchBytes;
+
+  if (budget.wordCount > 0) {
+    workingSet_.words = makeUniqueNoThrow<WordSelectNavigator::WordInfo[]>(budget.wordCount);
+    if (!workingSet_.words) {
+      heap = MemoryBudget::snapshot();
+      LOG_ERR("DICT", "OOM allocating word metadata (%u bytes, free=%u maxAlloc=%u)", static_cast<unsigned>(wordBytes),
+              heap.freeHeap, heap.maxAllocHeap);
+      workingSet_.clear();
+      return false;
+    }
+  }
+  if (budget.textBytes > 0) {
+    workingSet_.textPool = makeUniqueNoThrow<char[]>(budget.textBytes);
+    if (!workingSet_.textPool) {
+      heap = MemoryBudget::snapshot();
+      LOG_ERR("DICT", "OOM allocating word text arena (%u bytes, free=%u maxAlloc=%u)",
+              static_cast<unsigned>(budget.textBytes), heap.freeHeap, heap.maxAllocHeap);
+      workingSet_.clear();
+      return false;
+    }
+  }
+  if (budget.rowCount > 0) {
+    workingSet_.rows = makeUniqueNoThrow<WordSelectNavigator::Row[]>(budget.rowCount);
+    if (!workingSet_.rows) {
+      heap = MemoryBudget::snapshot();
+      LOG_ERR("DICT", "OOM allocating row metadata (%u bytes, free=%u maxAlloc=%u)", static_cast<unsigned>(rowBytes),
+              heap.freeHeap, heap.maxAllocHeap);
+      workingSet_.clear();
+      return false;
+    }
+  }
+  if (scratchBytes > 0) {
+    workingSet_.measurementScratch = makeUniqueNoThrow<char[]>(scratchBytes);
+    if (!workingSet_.measurementScratch) {
+      heap = MemoryBudget::snapshot();
+      LOG_ERR("DICT", "OOM allocating word measurement scratch (%u bytes, free=%u maxAlloc=%u)",
+              static_cast<unsigned>(scratchBytes), heap.freeHeap, heap.maxAllocHeap);
+      workingSet_.clear();
+      return false;
+    }
+  }
+  return true;
+}
+
+bool DictionaryWordSelectActivity::appendText(const char* text, const size_t length, uint16_t& offset) {
+  if (!text || length > UINT16_MAX || workingSet_.textUsed > UINT16_MAX ||
+      length + 1 > workingSet_.textCapacity - workingSet_.textUsed) {
+    LOG_ERR("DICT", "Word text arena overflow (used=%u capacity=%u append=%u)",
+            static_cast<unsigned>(workingSet_.textUsed), static_cast<unsigned>(workingSet_.textCapacity),
+            static_cast<unsigned>(length + 1));
+    return false;
+  }
+  offset = static_cast<uint16_t>(workingSet_.textUsed);
+  char* const textPool = workingSet_.textPool.get();
+  memcpy(textPool + workingSet_.textUsed, text, length);
+  workingSet_.textPool[workingSet_.textUsed + length] = '\0';
+  workingSet_.textUsed += length + 1;
+  return true;
+}
+
+bool DictionaryWordSelectActivity::appendMergedText(const char* first, const size_t firstLength, const char* second,
+                                                    const size_t secondLength, uint16_t& offset) {
+  const size_t mergedLength = firstLength + secondLength;
+  if (!first || !second || mergedLength > UINT16_MAX || workingSet_.textUsed > UINT16_MAX ||
+      mergedLength + 1 > workingSet_.textCapacity - workingSet_.textUsed) {
+    LOG_ERR("DICT", "Merged word text exceeds arena (used=%u capacity=%u append=%u)",
+            static_cast<unsigned>(workingSet_.textUsed), static_cast<unsigned>(workingSet_.textCapacity),
+            static_cast<unsigned>(mergedLength + 1));
+    return false;
+  }
+  offset = static_cast<uint16_t>(workingSet_.textUsed);
+  char* const textPool = workingSet_.textPool.get();
+  char* destination = textPool + workingSet_.textUsed;
+  memcpy(destination, first, firstLength);
+  memcpy(destination + firstLength, second, secondLength);
+  destination[mergedLength] = '\0';
+  workingSet_.textUsed += mergedLength + 1;
+  return true;
+}
+
+bool DictionaryWordSelectActivity::appendWord(WordSelectNavigator::WordInfo word) {
+  if (workingSet_.wordCount >= workingSet_.wordCapacity) {
+    LOG_ERR("DICT", "Word metadata capacity exceeded");
+    return false;
+  }
+  if (workingSet_.rowCount == 0 || std::abs(static_cast<int>(word.screenY) -
+                                            static_cast<int>(workingSet_.rows[workingSet_.rowCount - 1].yPos)) > 2) {
+    if (workingSet_.rowCount >= workingSet_.rowCapacity || workingSet_.wordCount > UINT16_MAX) {
+      LOG_ERR("DICT", "Row metadata capacity exceeded");
+      return false;
+    }
+    workingSet_.rows[workingSet_.rowCount] = {word.screenY, static_cast<uint16_t>(workingSet_.wordCount), 0};
+    workingSet_.rowCount++;
+  }
+  auto& row = workingSet_.rows[workingSet_.rowCount - 1];
+  if (row.wordCount == UINT16_MAX) {
+    LOG_ERR("DICT", "Row word count exceeded");
+    return false;
+  }
+  word.row = static_cast<int16_t>(workingSet_.rowCount - 1);
+  workingSet_.words[workingSet_.wordCount++] = word;
+  row.wordCount++;
+  return true;
+}
+
+bool DictionaryWordSelectActivity::extractWords() {
+  const size_t scratchHalf = workingSet_.measurementScratchCapacity / 2U;
+  char* prefixScratch = workingSet_.measurementScratch.get();
+  char* sanitizeScratch = prefixScratch ? prefixScratch + scratchHalf : nullptr;
+  const char* const textPool = workingSet_.textPool.get();
 
   // Fallback used by blocks where we can't derive a per-line gap
   // (single-word blocks, degenerate first-word measurements).
@@ -228,174 +584,187 @@ void DictionaryWordSelectActivity::extractWords(std::vector<WordSelectNavigator:
     const auto& block = line->getBlock();
     if (!block) continue;
 
-    const uint16_t wordCount = block->wordCount();
+    const uint16_t sourceWordCount = block->wordCount();
     const int rubyShift = block->getRubyShift(renderer.getFontAscenderSize(SETTINGS.getReaderFontId()));
-
-    // Per-line gap = xPos[1] - xPos[0] - firstWordWidth. Justified blocks
-    // stretch the gap (ParsedText.cpp:514-553 adds justifyExtra), so a
-    // global space-width can't be reused — we measure per-block.
     int16_t lineGapWidth = naturalSpaceWidth;
-    if (wordCount >= 2 && block->wordTextLen(0) > 0) {
-      const EpdFontFamily::Style firstStyle = block->wordStyle(0);
+    if (sourceWordCount >= 2 && block->wordTextLen(0) > 0) {
+      const char* firstWord = block->wordText(0);
+      const size_t firstLength = block->wordTextLen(0);
+      const auto firstStyle = block->wordStyle(0);
       const uint8_t firstBionicBoundary = block->bionicBoundary(0);
       const uint16_t firstBionicSuffixX = block->bionicRunOffset(0);
-      const std::string firstWordText(block->wordText(0), block->wordTextLen(0));
-      const bool firstWordIsRtl = isRtlWord(firstWordText.c_str(), block->getBlockStyle().isRtl);
-      const int16_t firstWidth = measureWordAdvanceX(renderer, SETTINGS.getReaderFontId(), firstWordText, firstStyle,
-                                                     firstBionicBoundary, firstBionicSuffixX, firstWordIsRtl);
+      const bool firstWordIsRtl = isRtlWord(firstWord, block->getBlockStyle().isRtl);
+      const int16_t firstWidth =
+          measureWordAdvanceX(renderer, SETTINGS.getReaderFontId(), firstWord, firstLength, firstStyle,
+                              firstBionicBoundary, firstBionicSuffixX, firstWordIsRtl, sanitizeScratch, scratchHalf);
       const int16_t derivedGap = static_cast<int16_t>(block->wordXpos(1) - block->wordXpos(0) - firstWidth);
-      // When wordList[1] is a continuation (attached punctuation etc., ParsedText.cpp:537-544)
-      // the layout inserts no inter-word gap, so derivedGap collapses to the kerning offset
-      // (~1-3 px). Real gaps are always >= getSpaceAdvance(...), so a half-space threshold
-      // cleanly separates a real gap from a continuation kerning without needing Block to
-      // expose continuesVec. Without the threshold, an undersized lineGapWidth propagates as
-      // a per-word width overestimate (~4-6 px) — the highlight rectangle bleeds past the
-      // word into the inter-word space.
       if (derivedGap > naturalSpaceWidth / 2) lineGapWidth = derivedGap;
     }
 
-    for (uint16_t wordIndex = 0; wordIndex < wordCount; ++wordIndex) {
-      int16_t screenX = line->xPos + block->wordXpos(wordIndex) + marginLeft;
-      int16_t screenY = line->yPos + marginTop + rubyShift;
-      const std::string wordText(block->wordText(wordIndex), block->wordTextLen(wordIndex));
-      const EpdFontFamily::Style wordStyle = block->wordStyle(wordIndex);
+    int lastSelectableWordIndex = -2;
+    for (uint16_t wordIndex = 0; wordIndex < sourceWordCount; ++wordIndex) {
+      const int16_t screenX = line->xPos + block->wordXpos(wordIndex) + marginLeft;
+      const int16_t screenY = line->yPos + marginTop + rubyShift;
+      const char* wordText = block->wordText(wordIndex);
+      const size_t wordLength = block->wordTextLen(wordIndex);
+      const auto wordStyle = block->wordStyle(wordIndex);
       const uint8_t bionicBoundary = block->bionicBoundary(wordIndex);
       const uint16_t bionicSuffixX = block->bionicRunOffset(wordIndex);
-      const bool wordIsRtl = isRtlWord(wordText.c_str(), block->getBlockStyle().isRtl);
+      const bool wordIsRtl = isRtlWord(wordText, block->getBlockStyle().isRtl);
 
-      // Skip tokens with no alphanumeric characters (bullets, punctuation, etc.)
-      if (!std::any_of(wordText.begin(), wordText.end(), [](unsigned char c) { return std::isalnum(c); })) {
+      if (!utf8ContainsLookupCharacter(wordText)) {
+        lastSelectableWordIndex = -2;
         continue;
       }
 
-      // Split on en-dash (U+2013: E2 80 93) and em-dash (U+2014: E2 80 94)
-      std::vector<size_t> splitStarts;
-      splitStarts.reserve(4);
-      size_t partStart = 0;
-      for (size_t i = 0; i < wordText.size();) {
-        if (i + 2 < wordText.size() && static_cast<uint8_t>(wordText[i]) == 0xE2 &&
-            static_cast<uint8_t>(wordText[i + 1]) == 0x80 &&
-            (static_cast<uint8_t>(wordText[i + 2]) == 0x93 || static_cast<uint8_t>(wordText[i + 2]) == 0x94)) {
-          if (i > partStart) splitStarts.push_back(partStart);
-          i += 3;
-          partStart = i;
-        } else {
-          i++;
-        }
-      }
-      if (partStart < wordText.size()) splitStarts.push_back(partStart);
-
-      if (splitStarts.size() <= 1 && partStart == 0) {
-        // Non-bionic width = (xPos[i+1] - xPos[i]) - lineGapWidth, which is the
-        // layout's xpos diff with the trailing inter-word gap removed.
-        // Bionic words use direct split-run measurement because bold/non-bold
-        // run widths can diverge from the gap heuristic.
-        // Punctuation tokens skipped above kept their xpos entries as boundary
-        // markers, so this works regardless of what the next token is.
-        // Last word per block has no next xpos; fall back to direct
-        // measurement. Clamp to 1 to guard pathological cases (continuation
-        // negative kerning, short words where the entire xpos diff is the
-        // gap).
+      if (!containsDashSeparator(wordText, wordLength)) {
         int16_t wordWidth;
         if (bionicBoundary > 0 && bionicSuffixX > 0) {
-          wordWidth = measureWordAdvanceX(renderer, SETTINGS.getReaderFontId(), wordText, wordStyle, bionicBoundary,
-                                          bionicSuffixX, wordIsRtl);
-        } else if (wordIndex + 1 < wordCount) {
+          wordWidth = measureWordAdvanceX(renderer, SETTINGS.getReaderFontId(), wordText, wordLength, wordStyle,
+                                          bionicBoundary, bionicSuffixX, wordIsRtl, sanitizeScratch, scratchHalf);
+        } else if (wordIndex + 1 < sourceWordCount) {
           const int16_t raw = static_cast<int16_t>(block->wordXpos(wordIndex + 1) - block->wordXpos(wordIndex));
           wordWidth = std::max(static_cast<int16_t>(1), static_cast<int16_t>(raw - lineGapWidth));
         } else {
-          wordWidth = measureWordAdvanceX(renderer, SETTINGS.getReaderFontId(), wordText, wordStyle, bionicBoundary,
-                                          bionicSuffixX);
+          wordWidth = measureWordAdvanceX(renderer, SETTINGS.getReaderFontId(), wordText, wordLength, wordStyle,
+                                          bionicBoundary, bionicSuffixX, sanitizeScratch, scratchHalf);
         }
-        {
-          uint16_t off = WordSelectNavigator::poolAppend(textPool, wordText.c_str(), wordText.size());
-          WordSelectNavigator::WordInfo wi;
-          wi.textOffset = off;
-          wi.textLen = static_cast<uint16_t>(wordText.size());
-          wi.lookupOffset = off;
-          wi.lookupLen = wi.textLen;
-          wi.screenX = screenX;
-          wi.screenY = screenY;
-          wi.width = wordWidth;
-          wi.style = wordStyle;
-          wi.fontId = SETTINGS.getReaderFontId();
-          wi.isRtl = wordIsRtl;
-          wi.bionicBoundary = bionicBoundary;
-          wi.bionicSuffixX = bionicSuffixX;
-          words.push_back(wi);
-        }
-      } else {
-        for (size_t si = 0; si < splitStarts.size(); si++) {
-          size_t start = splitStarts[si];
-          size_t end = (si + 1 < splitStarts.size()) ? splitStarts[si + 1] : wordText.size();
-          size_t textEnd = end;
-          while (textEnd > start && textEnd <= wordText.size()) {
-            if (textEnd >= 3 && static_cast<uint8_t>(wordText[textEnd - 3]) == 0xE2 &&
-                static_cast<uint8_t>(wordText[textEnd - 2]) == 0x80 &&
-                (static_cast<uint8_t>(wordText[textEnd - 1]) == 0x93 ||
-                 static_cast<uint8_t>(wordText[textEnd - 1]) == 0x94)) {
-              textEnd -= 3;
-            } else {
-              break;
-            }
-          }
-          std::string part = wordText.substr(start, textEnd - start);
-          if (part.empty()) continue;
 
-          std::string prefix = wordText.substr(0, start);
-          // Dash-split words are rare (~0-2 per page); per-part measurement
-          // is fine here. Soft-hyphen stripping matches the rest of
-          // extractWords and matches layout's preprocessor.
-          int16_t offsetX =
-              prefix.empty() ? 0 : measureWordAdvanceX(renderer, SETTINGS.getReaderFontId(), prefix, wordStyle);
-          int16_t partWidth = measureWordAdvanceX(renderer, SETTINGS.getReaderFontId(), part, wordStyle);
-          {
-            uint16_t off = WordSelectNavigator::poolAppend(textPool, part.c_str(), part.size());
-            WordSelectNavigator::WordInfo wi;
-            wi.textOffset = off;
-            wi.textLen = static_cast<uint16_t>(part.size());
-            wi.lookupOffset = off;
-            wi.lookupLen = wi.textLen;
-            wi.screenX = static_cast<int16_t>(screenX + offsetX);
-            wi.screenY = screenY;
-            wi.width = partWidth;
-            wi.style = wordStyle;
-            wi.fontId = SETTINGS.getReaderFontId();
-            wi.isRtl = wordIsRtl;
-            words.push_back(wi);
+        bool joinWithoutSpaceBefore = false;
+        if (lastSelectableWordIndex == static_cast<int>(wordIndex) - 1 && workingSet_.wordCount > 0) {
+          const uint16_t previousIndex = wordIndex - 1;
+          const auto previousStyle = block->wordStyle(previousIndex);
+          const int16_t previousMeasuredWidth = static_cast<int16_t>(
+              renderer.getTextAdvanceX(SETTINGS.getReaderFontId(), block->wordText(previousIndex), previousStyle));
+          const int16_t currentMeasuredWidth =
+              measureWordAdvanceX(renderer, SETTINGS.getReaderFontId(), wordText, wordLength, wordStyle, bionicBoundary,
+                                  bionicSuffixX, wordIsRtl, sanitizeScratch, scratchHalf);
+          const int currentLeft = screenX;
+          const int currentRight = screenX + currentMeasuredWidth;
+          auto& previousWord = workingSet_.words[workingSet_.wordCount - 1];
+          const int previousLeft = previousWord.screenX;
+          const int previousRight = previousLeft + previousMeasuredWidth;
+          const int gap = currentLeft >= previousLeft ? currentLeft - previousRight : previousLeft - currentRight;
+          joinWithoutSpaceBefore = gap < naturalSpaceWidth / 2;
+          if (joinWithoutSpaceBefore) {
+            previousWord.width = previousMeasuredWidth;
+            wordWidth = currentMeasuredWidth;
           }
         }
+
+        uint16_t offset = 0;
+        if (!appendText(wordText, wordLength, offset)) return false;
+        WordSelectNavigator::WordInfo word;
+        word.textOffset = offset;
+        word.textLen = static_cast<uint16_t>(wordLength);
+        word.lookupOffset = offset;
+        word.lookupLen = word.textLen;
+        word.screenX = screenX;
+        word.screenY = screenY;
+        word.width = wordWidth;
+        word.style = wordStyle;
+        word.fontId = SETTINGS.getReaderFontId();
+        word.isRtl = wordIsRtl;
+        word.joinWithoutSpaceBefore = joinWithoutSpaceBefore;
+        word.bionicBoundary = bionicBoundary;
+        word.bionicSuffixX = bionicSuffixX;
+        if (!appendWord(word)) return false;
+        lastSelectableWordIndex = wordIndex;
+        continue;
+      }
+
+      bool partSucceeded = true;
+      forEachWordPart(wordText, wordLength, [&](const WordPartRef& part) {
+        if (!partSucceeded || part.length == 0) return;
+        int16_t offsetX = 0;
+        if (part.sourceOffset > 0) {
+          if (!prefixScratch || part.sourceOffset + 1 > scratchHalf) {
+            partSucceeded = false;
+            return;
+          }
+          memcpy(prefixScratch, wordText, part.sourceOffset);
+          prefixScratch[part.sourceOffset] = '\0';
+          offsetX = measureWordAdvanceX(renderer, SETTINGS.getReaderFontId(), prefixScratch, part.sourceOffset,
+                                        wordStyle, sanitizeScratch, scratchHalf);
+        }
+
+        uint16_t offset = 0;
+        if (!appendText(part.text, part.length, offset)) {
+          partSucceeded = false;
+          return;
+        }
+        const char* storedPart = textPool + offset;
+        const int16_t partWidth = measureWordAdvanceX(renderer, SETTINGS.getReaderFontId(), storedPart, part.length,
+                                                      wordStyle, sanitizeScratch, scratchHalf);
+        WordSelectNavigator::WordInfo word;
+        word.textOffset = offset;
+        word.textLen = static_cast<uint16_t>(part.length);
+        word.lookupOffset = offset;
+        word.lookupLen = word.textLen;
+        word.screenX = static_cast<int16_t>(screenX + offsetX);
+        word.screenY = screenY;
+        word.width = partWidth;
+        word.style = wordStyle;
+        word.fontId = SETTINGS.getReaderFontId();
+        word.isRtl = wordIsRtl;
+        if (!appendWord(word)) partSucceeded = false;
+      });
+      if (!partSucceeded) return false;
+      lastSelectableWordIndex = -2;
+    }
+  }
+  return true;
+}
+
+bool DictionaryWordSelectActivity::mergeHyphenatedWords() {
+  const char* const textPool = workingSet_.textPool.get();
+  for (size_t rowIndex = 0; rowIndex + 1 < workingSet_.rowCount; ++rowIndex) {
+    const auto& row = workingSet_.rows[rowIndex];
+    const auto& nextRow = workingSet_.rows[rowIndex + 1];
+    if (row.wordCount == 0 || nextRow.wordCount == 0) continue;
+    const size_t lastWordIndex = row.firstWord + row.wordCount - 1;
+    const size_t nextWordIndex = nextRow.firstWord;
+    auto& last = workingSet_.words[lastWordIndex];
+    auto& next = workingSet_.words[nextWordIndex];
+    const char* lastText = textPool + last.textOffset;
+    if (!utf8EndsWithHyphen(lastText, last.textLen) || lastText[0] == '-') continue;
+
+    const char* nextText = textPool + next.textOffset;
+    const size_t nextSkip = next.textLen > 0 && nextText[0] == '-' ? 1 : 0;
+    uint16_t mergedOffset = 0;
+    if (!appendMergedText(lastText, last.textLen - 1, nextText + nextSkip, next.textLen - nextSkip, mergedOffset)) {
+      return false;
+    }
+    const size_t mergedLength = last.textLen - 1 + next.textLen - nextSkip;
+    last.continuationIndex = static_cast<int>(nextWordIndex);
+    next.continuationOf = static_cast<int>(lastWordIndex);
+    last.lookupOffset = mergedOffset;
+    last.lookupLen = static_cast<uint16_t>(mergedLength);
+    next.lookupOffset = mergedOffset;
+    next.lookupLen = static_cast<uint16_t>(mergedLength);
+  }
+
+  if (!nextPageFirstWord.empty() && workingSet_.rowCount > 0) {
+    const auto& lastRow = workingSet_.rows[workingSet_.rowCount - 1];
+    if (lastRow.wordCount > 0) {
+      auto& last = workingSet_.words[lastRow.firstWord + lastRow.wordCount - 1];
+      const char* lastText = textPool + last.textOffset;
+      if (utf8EndsWithHyphen(lastText, last.textLen) && lastText[0] != '-') {
+        uint16_t mergedOffset = 0;
+        if (!appendMergedText(lastText, last.textLen - 1, nextPageFirstWord.c_str(), nextPageFirstWord.size(),
+                              mergedOffset)) {
+          return false;
+        }
+        last.lookupOffset = mergedOffset;
+        last.lookupLen = static_cast<uint16_t>(last.textLen - 1 + nextPageFirstWord.size());
       }
     }
   }
-
-  WordSelectNavigator::organizeIntoRows(words, rows);
-}
-
-void DictionaryWordSelectActivity::mergeHyphenatedWords(std::vector<WordSelectNavigator::WordInfo>& words,
-                                                        std::vector<WordSelectNavigator::Row>& rows,
-                                                        std::string& textPool) {
-  WordSelectNavigator::mergeHyphenatedPairs(words, rows, textPool);
-
-  // Cross-page hyphenation: update lookup text when the last word on this page
-  // ends with a hyphen and its continuation begins the next page.
-  if (!nextPageFirstWord.empty() && !rows.empty()) {
-    const int lastWordIdx = rows.back().firstWord + rows.back().wordCount - 1;
-    const char* lastWord = textPool.data() + words[lastWordIdx].textOffset;
-    uint16_t lastLen = words[lastWordIdx].textLen;
-    if (lastLen > 0 && utf8EndsWithHyphen(lastWord, lastLen) && lastWord[0] != '-') {
-      std::string firstPart(lastWord, lastLen);
-      utf8RemoveTrailingHyphen(firstPart);
-      std::string merged = firstPart + nextPageFirstWord;
-      uint16_t off = WordSelectNavigator::poolAppend(textPool, merged.c_str(), merged.size());
-      words[lastWordIdx].lookupOffset = off;
-      words[lastWordIdx].lookupLen = static_cast<uint16_t>(merged.size());
-    }
-  }
+  return true;
 }
 
 void DictionaryWordSelectActivity::openDictionarySwitch() {
-  auto picker = makeUniqueNoThrow<DictionarySelectActivity>(renderer, mappedInput, cachePath, true);
+  auto picker = makeUniqueNoThrow<DictionarySelectActivity>(renderer, mappedInput, cachePath, true, true);
   if (!picker) {
     LOG_ERR("DICT", "OOM: DictionarySelectActivity");
     return;
@@ -407,6 +776,13 @@ void DictionaryWordSelectActivity::openDictionarySwitch() {
       requestUpdate();
       return;
     }
+    const auto* selection = std::get_if<FilePathResult>(&result.data);
+    if (!selection) {
+      LOG_ERR("DICT", "Dictionary switch returned no path");
+      requestUpdate();
+      return;
+    }
+    Dictionary::setLookupDictPathOverride(selection->path.c_str());
     controller.startLookup(controller.getLookupWord(), false);
   });
 }
@@ -423,20 +799,51 @@ void DictionaryWordSelectActivity::loop() {
   if (controller.isActive()) {
     switch (controller.handleInput()) {
       case DictionaryLookupController::LookupEvent::FoundDefinition: {
-        startActivityForResult(std::make_unique<DictionaryDefinitionActivity>(
-                                   renderer, mappedInput, controller.getFoundWord(), controller.getFoundLocation(),
-                                   true, cachePath, controller.getRecordHistory(), controller.getLookupWord(),
-                                   DictionaryLookupController::toHistStatus(controller.getFoundStatus()), this,
-                                   &DictionaryWordSelectActivity::renderDefinitionBackgroundCallback),
-                               [this](const ActivityResult& result) {
-                                 if (!result.isCancelled) {
-                                   setResult(ActivityResult{});
-                                   finish();
-                                 } else {
-                                   forceFullRepaintOnNextRender();
-                                   requestUpdate();
-                                 }
-                               });
+        // Rebuild the reader page while its font is still resident. The child
+        // then overlays the modal after swapping to the dictionary font, so we
+        // never need a second framebuffer or two live SD-font families.
+        {
+          RenderLock lock(*this);
+          renderDefinitionBackground();
+        }
+        auto definition = makeUniqueNoThrow<DictionaryDefinitionActivity>(
+            renderer, mappedInput, controller.getFoundWord(), controller.getFoundLocation(), true, cachePath,
+            controller.getRecordHistory(), controller.getLookupWord(),
+            DictionaryLookupController::toHistStatus(controller.getFoundStatus()),
+            readerBackgroundRender_ ? readerContext_ : this,
+            readerBackgroundRender_ ? readerBackgroundRender_
+                                    : &DictionaryWordSelectActivity::renderDefinitionBackgroundCallback,
+            dictionaryFontFamilyName_, dictionaryFontPointSize_, true, &highlightSnapshotStorage_);
+        if (!definition) {
+          LOG_ERR("DICT", "OOM allocating DictionaryDefinitionActivity (%u bytes)",
+                  static_cast<unsigned>(sizeof(DictionaryDefinitionActivity)));
+          forceFullRepaintOnNextRender();
+          requestUpdate();
+          break;
+        }
+        suspendWorkingSet();
+        startActivityForResult(std::move(definition), [this](const ActivityResult& result) {
+          if (!result.isCancelled) {
+            setResult(ActivityResult{});
+            finish();
+          } else {
+            {
+              RenderLock lock(*this);
+              if (!restoreWorkingSet()) {
+                GUI.drawPopup(renderer, tr(STR_MEMORY_ERROR));
+                renderer.displayBuffer();
+                delay(1000);
+                ActivityResult parentResult;
+                parentResult.isCancelled = true;
+                setResult(std::move(parentResult));
+                finish();
+                return;
+              }
+            }
+            forceFullRepaintOnNextRender();
+            requestUpdate();
+          }
+        });
         break;
       }
       case DictionaryLookupController::LookupEvent::NotFoundDismissedBack:

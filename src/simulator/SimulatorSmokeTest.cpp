@@ -20,6 +20,8 @@
 #include "activities/reader/EpubReaderMenuActivity.h"
 #include "activities/reader/ReaderOptionsActivity.h"
 #include "components/UITheme.h"
+#include "components/UIThemeTokens.h"
+#include "components/UiAppHelpers.h"
 #include "simulator/SimulatorHomeKeyInput.h"
 
 extern ActivityManager activityManager;
@@ -358,7 +360,7 @@ class SimulatorSmokeTest {
                                       : safe.y + metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight;
       const int listTop = safe.y + metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight +
                           (tabsAtBottom ? 0 : tabHeight) + metrics.verticalSpacing;
-      const int rowHeight = UITheme::getInstance().getTheme().getListRowStep(false, 2);
+      const int rowHeight = uiThemeTokens(makeUiTarget(renderer)).rowHeight;
       if (rowHeight <= 0) fail("Touch smoke test has invalid list row height");
 
       inputScript.push_back(touchDown(safe.x + safe.width / 2, tabTop + tabHeight / 2));

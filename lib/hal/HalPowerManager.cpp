@@ -101,13 +101,15 @@ void HalPowerManager::startDeepSleep(HalGPIO& gpio) const {
 #endif
 
 #if !SOC_PM_SUPPORT_EXT1_WAKEUP
-  if (gpio.isXteinkDevice() && !gpio.deviceIsX3()) {
-    // X4 GPIO13 is connected to the battery latch MOSFET. Keeping it low powers
-    // the MCU off on battery, while the SDK wake source still handles USB power.
-    constexpr gpio_num_t GPIO_SPIWP = GPIO_NUM_13;
-    gpio_set_direction(GPIO_SPIWP, GPIO_MODE_OUTPUT);
-    gpio_set_level(GPIO_SPIWP, 0);
-    gpio_hold_en(GPIO_SPIWP);
+  // Release every configured battery latch. BoardConfig owns the pin mapping;
+  // the collision guard prevents a stale/mismatched profile from driving a
+  // display or SD bus pin low and holding it through sleep.
+  for (const int8_t pin : {BoardConfig::ACTIVE.power.latch0, BoardConfig::ACTIVE.power.latch1}) {
+    if (pin < 0 || BoardConfig::latchConflictsWithBus(pin)) continue;
+    const auto latch = static_cast<gpio_num_t>(pin);
+    gpio_set_direction(latch, GPIO_MODE_OUTPUT);
+    gpio_set_level(latch, 0);
+    gpio_hold_en(latch);
   }
 #endif
 
@@ -120,7 +122,15 @@ void HalPowerManager::startDeepSleep(HalGPIO& gpio) const {
   // guarantees that ordering).
   freeink::PowerManager::powerDownRailsForSleep();
 
-  freeink::PowerManager::deepSleepUntilPowerButton();
+  // The SDK convenience helper currently isolates every GPIO after arming the
+  // wake source. On the ESP32-C3 that overwrites the power pin's sleep input
+  // configuration, so short presses can be missed. Isolate first, then restore
+  // and arm the board-configured power pin immediately before sleeping.
+  freeink::PowerManager::waitForPowerButtonRelease();
+  esp_sleep_config_gpio_isolate();
+  freeink::PowerManager::armPowerButtonWakeup();
+  gpio_deep_sleep_hold_en();
+  esp_deep_sleep_start();
 }
 
 uint16_t HalPowerManager::getBatteryPercentage() const {

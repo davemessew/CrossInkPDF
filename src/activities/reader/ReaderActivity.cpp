@@ -12,6 +12,7 @@
 #endif
 
 #include "CrossPointSettings.h"
+#include "CrossPointState.h"
 #include "Epub.h"
 #include "EpubReaderActivity.h"
 #include "PdfPrepareActivity.h"
@@ -61,16 +62,18 @@ int ReaderActivity::initialRefreshCountdown() const {
   return refreshFrequency > 1 ? refreshFrequency : 2;
 }
 
-std::unique_ptr<Epub> ReaderActivity::loadEpub(const std::string& path) {
+ReaderActivity::EpubOpenResult ReaderActivity::loadEpub(const std::string& path) {
+  EpubOpenResult result;
   if (!Storage.exists(path.c_str())) {
     LOG_ERR("READER", "File does not exist: %s", path.c_str());
-    return nullptr;
+    return result;
   }
 
   auto epub = makeUniqueNoThrow<Epub>(path, "/.crosspoint");
   if (!epub) {
     LOG_ERR("READER", "Failed to allocate EPUB object");
-    return nullptr;
+    result.failure = Epub::OpenFailure::OutOfMemory;
+    return result;
   }
   // First open: building the spine/TOC index (book.bin) takes a couple of seconds. Show the
   // indexing popup so it isn't a silent wait on the home screen. The cachePath/hash is known at
@@ -81,18 +84,33 @@ std::unique_ptr<Epub> ReaderActivity::loadEpub(const std::string& path) {
     allowFastInitialRefresh = false;
     GUI.drawPopup(renderer, tr(STR_INDEXING));
   }
+  // Keep one settings snapshot for both EPUB preparation and the reader handoff.
+  result.readerSettings = EpubReaderActivity::readBookReaderSettings(*epub);
   // Lend the framebuffer's 48 KB for every EPUB load: even a cached book may
   // rebuild stale/missing CSS and need miniz's ~43 KB streaming workspace. The
   // panel keeps showing its last image, and the next activity redraws fully.
   GfxRenderer::FrameBufferLoan loan(renderer);
-  const bool loaded = epub->load(true, SETTINGS.embeddedStyle == 0);
+  const bool loaded = epub->load(true, result.readerSettings.readerSettings.embeddedStyle == 0);
   loan.end();
   if (loaded) {
-    return epub;
+    result.epub = std::move(epub);
+    result.failure = Epub::OpenFailure::None;
+    return result;
   }
 
   LOG_ERR("READER", "Failed to load epub");
-  return nullptr;
+  result.failure = epub->getLastLoadFailure();
+  return result;
+}
+
+void ReaderActivity::queueEpubOpenAlert(const Epub::OpenFailure failure) {
+  const bool outOfMemory = failure == Epub::OpenFailure::OutOfMemory;
+  const char* title = outOfMemory ? tr(STR_MEMORY_ERROR) : tr(STR_INDEX_FAILED);
+  const char* body = outOfMemory ? tr(STR_EPUB_OPEN_MEMORY_BODY) : tr(STR_EPUB_OPEN_FAILED_BODY);
+  snprintf(APP_STATE.pendingAlertTitle, sizeof(APP_STATE.pendingAlertTitle), "%s", title);
+  snprintf(APP_STATE.pendingAlertBody, sizeof(APP_STATE.pendingAlertBody), "%s", body);
+  APP_STATE.pendingAlertGoHomeOnBack.store(false, std::memory_order_relaxed);
+  APP_STATE.hasPendingAlert.store(true, std::memory_order_release);
 }
 
 std::unique_ptr<Xtc> ReaderActivity::loadXtc(const std::string& path) {
@@ -139,13 +157,25 @@ void ReaderActivity::goToLibrary(const std::string& fromBookPath) {
   activityManager.goToFileBrowser(std::move(initialPath));
 }
 
-void ReaderActivity::onGoToEpubReader(std::unique_ptr<Epub> epub) { onGoToReflowReader(std::move(epub)); }
-
 void ReaderActivity::onGoToReflowReader(std::unique_ptr<ReflowDocument> document) {
   currentBookPath = document->getPath();
   auto reader = makeUniqueNoThrow<EpubReaderActivity>(renderer, mappedInput, std::move(document));
   if (!reader) {
     LOG_ERR("READER", "Failed to allocate reflow reader");
+    onGoBack();
+    return;
+  }
+  activityManager.replaceActivity(std::move(reader));
+}
+
+void ReaderActivity::onGoToEpubReader(std::unique_ptr<Epub> epub,
+                                      EpubReaderActivity::BookReaderSettingsData readerSettings) {
+  const auto epubPath = epub->getPath();
+  currentBookPath = epubPath;
+  auto reader = makeUniqueNoThrow<EpubReaderActivity>(renderer, mappedInput, std::move(epub), readerSettings,
+                                                       initialRefreshCountdown(), cleanImageBaseOnEntry);
+  if (!reader) {
+    LOG_ERR("READER", "Failed to allocate EPUB reader");
     onGoBack();
     return;
   }
@@ -261,12 +291,13 @@ bool ReaderActivity::openPdfRoute() {
 }
 
 bool ReaderActivity::openEpubRoute() {
-  auto epub = loadEpub(initialBookPath);
-  if (!epub) {
+  auto result = loadEpub(initialBookPath);
+  if (!result.epub) {
+    queueEpubOpenAlert(result.failure);
     onGoBack();
     return false;
   }
-  onGoToEpubReader(std::move(epub));
+  onGoToEpubReader(std::move(result.epub), std::move(result.readerSettings));
   return true;
 }
 

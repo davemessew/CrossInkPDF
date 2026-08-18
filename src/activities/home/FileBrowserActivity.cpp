@@ -1290,6 +1290,9 @@ void FileBrowserActivity::buildListScreen(UiApp::ScreenType& screen) {
   props.action = ACTION_ROW;
   props.inputMask = fui::InputTouch;  // physical buttons stay in loop()
   props.valueInset = 8;               // air between the extension and the row edge
+  // A file extension is short, so do not sacrifice most of a two-line title
+  // to visually balance it with the value column.
+  props.balanceWrappedLabelWithValue = false;
   props.topIndex = 0;
   screen.list(props);
   drawListScrollIndicator(screen.target(), listRect, totalEntries, visibleRows, topIndex,

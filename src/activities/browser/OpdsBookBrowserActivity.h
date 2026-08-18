@@ -11,6 +11,7 @@
 
 #include "OpdsServerStore.h"
 #include "activities/Activity.h"
+#include "activities/ScreenTransitionRefresh.h"
 #include "util/ButtonNavigator.h"
 
 /**
@@ -37,6 +38,7 @@ class OpdsBookBrowserActivity final : public Activity {
 
   ButtonNavigator buttonNavigator;
   BrowserState state = BrowserState::LOADING;
+  ScreenTransitionRefresh screenTransitionRefresh;
   std::unique_ptr<OpdsEntry[]> entries;
   size_t entryCount = 0;
   std::vector<std::string> navigationHistory;
@@ -62,6 +64,9 @@ class OpdsBookBrowserActivity final : public Activity {
   // Read by HttpDownloader between chunks; set by the Cancel button handler or
   // a Back press, both pumped from the download's progress callback.
   bool cancelDownload = false;
+  // A blocking downloader consumes the one-shot Home event itself. Defer the
+  // activity exit until HttpDownloader has unwound and closed the partial file.
+  bool goHomeAfterCancel = false;
 
   // Single screen fn dispatching on `state`: every state shares the themed
   // header and gets built through FreeInkUI.

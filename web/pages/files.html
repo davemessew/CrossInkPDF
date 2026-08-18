@@ -85,6 +85,18 @@
           </div>
           <!-- Advanced Settings Content -->
           <div class="advanced-settings-content" id="advancedSettingsContent">
+            <div class="advanced-setting-row section-split-setting-row">
+              <div class="setting-label">
+                <div class="setting-title">Split Long Sections</div>
+                <div class="setting-desc">Break oversized chapters into smaller reader-friendly sections</div>
+              </div>
+              <div class="setting-controls">
+                <label class="toggle-switch">
+                  <input type="checkbox" id="splitLongSectionsToggle" onchange="updateUploadSettingsPersistence()" />
+                  <span class="toggle-slider"></span>
+                </label>
+              </div>
+            </div>
             <!-- JPEG Quality -->
             <div class="advanced-setting-row quality-row">
               <div class="setting-title">📦 JPEG Quality</div>

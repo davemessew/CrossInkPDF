@@ -47,9 +47,16 @@ struct CssAncestorEntry {
 
 class CssParser {
  public:
+  enum class CacheStatus : uint8_t {
+    Missing,
+    Invalid,
+    Complete,
+    Partial,
+  };
+
   // Bump when CSS cache format or rules change; section caches are invalidated when this changes
   static constexpr uint32_t CSS_CACHE_MAGIC = 0x435843FF;  // bytes: 0xFF, "CXC"
-  static constexpr uint8_t CSS_CACHE_VERSION = 16;
+  static constexpr uint8_t CSS_CACHE_VERSION = 15;
 
   static constexpr size_t MAX_DESCENDANT_RULES = 100;
   static constexpr size_t CSS_INDEX_BYTES_PER_RULE = 8;
@@ -124,6 +131,11 @@ class CssParser {
    * Check if CSS rules cache file exists
    */
   bool hasCache() const;
+
+  /**
+   * Validate the cache structure without hydrating any rule containers.
+   */
+  CacheStatus inspectCache() const;
 
   /**
    * Delete CSS rules cache file exists

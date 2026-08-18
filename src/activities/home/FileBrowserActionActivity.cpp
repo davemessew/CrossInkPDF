@@ -2,6 +2,8 @@
 
 #include <I18n.h>
 
+#include <algorithm>
+
 FileBrowserActionActivity::FileBrowserActionActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
                                                      std::string title, std::vector<MenuItem> items,
                                                      const bool ignoreInitialConfirmRelease)
@@ -17,11 +19,9 @@ void FileBrowserActionActivity::onEnter() {
   int touchX = 0;
   int touchY = 0;
   ignoreTouchRelease = mappedInput.isScreenTouchHeld(touchX, touchY);
-  optionLabels.clear();
-  optionLabels.reserve(items.size());
-  for (const auto& item : items) {
-    optionLabels.emplace_back(I18N.get(item.labelId));
-  }
+  optionLabels.resize(items.size());
+  std::transform(items.begin(), items.end(), optionLabels.begin(),
+                 [](const MenuItem& item) { return std::string(I18N.get(item.labelId)); });
   optionPopup.show(title.c_str(), optionLabels, 0, [this](const int index) {
     if (index < 0 || index >= static_cast<int>(items.size())) return;
     selectionMade = true;

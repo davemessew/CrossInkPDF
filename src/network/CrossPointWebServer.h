@@ -56,7 +56,7 @@ class CrossPointWebServer {
 
     // Upload write buffer - batches small writes into larger SD card operations
     // 4KB is a good balance: large enough to reduce syscall overhead, small enough
-    // to keep individual write times short and avoid watchdog issues
+    // to keep individual write times short and the server responsive
     static constexpr size_t UPLOAD_BUFFER_SIZE = 4096;  // 4KB buffer
     std::vector<uint8_t> buffer;
     size_t bufferPos = 0;
@@ -88,7 +88,6 @@ class CrossPointWebServer {
   std::unique_ptr<WebServer> server = nullptr;
   std::unique_ptr<WebSocketsServer> wsServer = nullptr;
   bool running = false;
-  bool watchdogTaskRegistered = false;
   bool apMode = false;  // true when running in AP mode, false for STA mode
   uint16_t port = 80;
   uint16_t wsPort = 81;  // WebSocket port
@@ -101,7 +100,8 @@ class CrossPointWebServer {
   void abortWsUpload(const char* tag);
 
   // File scanning
-  void scanFiles(const char* path, const std::function<void(FileInfo)>& callback) const;
+  using FileVisitor = void (*)(const FileInfo& info, void* context);
+  void scanFiles(const char* path, FileVisitor visitor, void* context) const;
   String formatFileSize(size_t bytes) const;
   bool isEpubFile(const String& filename) const;
 

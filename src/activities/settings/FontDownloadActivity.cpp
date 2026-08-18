@@ -15,6 +15,7 @@
 
 #include "CrossPointSettings.h"
 #include "MappedInputManager.h"
+#include "Memory.h"
 #include "SdCardFontSystem.h"
 #include "SilentRestart.h"
 #include "activities/network/WifiSelectionActivity.h"
@@ -181,6 +182,10 @@ void FontDownloadActivity::onWifiSelectionComplete(const bool success) {
   requestUpdateAndWait();
 
   if (!fetchAndParseManifest()) {
+    if (goHomeRequested_) {
+      onGoHome();
+      return;
+    }
     if (cancelRequested_) {
       finishAfterBackPress();
       return;
@@ -209,6 +214,7 @@ bool FontDownloadActivity::fetchAndParseManifest() {
   baseUrl_.clear();
   clearManifestFamilies();
   cancelRequested_ = false;
+  goHomeRequested_ = false;
 
   // Poll the Cancel (Back) button while the manifest downloads so a slow or
   // failing network can be backed out of. HttpDownloader checks shouldCancel on
@@ -220,6 +226,10 @@ bool FontDownloadActivity::fetchAndParseManifest() {
       return true;
     }
     mappedInput.update();
+    if (mappedInput.wasHomeGesture()) {
+      goHomeRequested_ = true;
+      cancelRequested_ = true;
+    }
     if (mappedInput.isPressed(MappedInputManager::Button::Back) ||
         mappedInput.wasPressed(MappedInputManager::Button::Back) ||
         mappedInput.wasReleased(MappedInputManager::Button::Back)) {
@@ -353,9 +363,22 @@ bool FontDownloadActivity::fetchAndParseManifest() {
   // Second pass: load the installed-font registry and resolve installed/update
   // state now that the manifest JsonDocument has been released, keeping peak
   // heap usage down on devices with many SD fonts installed.
-  fontInstaller_.refreshRegistry();
+  if (!fontInstaller_.refreshRegistry()) {
+    LOG_ERR("FONT", "Not enough contiguous heap to scan installed fonts (free=%u maxAlloc=%u)", ESP.getFreeHeap(),
+            ESP.getMaxAllocHeap());
+    errorMessage_ = tr(STR_MEMORY_ERROR);
+    return false;
+  }
   for (auto& family : families_) {
     resolveInstalledFamilyName(family);
+  }
+
+  if (!rebuildListItems()) {
+    // Do not leave FAMILY_LIST with a populated manifest but no renderable
+    // rows: button navigation would still act on families the UI cannot show.
+    clearManifestFamilies();
+    errorMessage_ = tr(STR_MEMORY_ERROR);
+    return false;
   }
 
   LOG_DBG("FONT", "Manifest loaded: %zu families", families_.size());
@@ -424,7 +447,13 @@ void FontDownloadActivity::resolveInstalledFamilyName(ManifestFamily& family) co
 
 // --- Download ---
 
-void FontDownloadActivity::clearManifestFamilies() { std::vector<ManifestFamily>().swap(families_); }
+void FontDownloadActivity::clearManifestFamilies() {
+  // Storage remains allocated for the activity lifetime, but none of its
+  // borrowed family-string pointers may be used until the next manifest fills
+  // it again.
+  listItemCount_ = 0;
+  std::vector<ManifestFamily>().swap(families_);
+}
 
 void FontDownloadActivity::updateAll() {
   cancelRequested_ = false;
@@ -506,6 +535,60 @@ size_t FontDownloadActivity::totalUpdateSize() const {
     if (f.hasUpdate) total += f.totalSize;
   }
   return total;
+}
+
+bool FontDownloadActivity::rebuildListItems() {
+  const int count = listItemCount();
+  if (count <= 0) {
+    listItemCount_ = 0;
+    return true;
+  }
+
+  const size_t required = static_cast<size_t>(count);
+  if (required > listItemCapacity_) {
+    // This activity-lifetime buffer avoids redraw-time allocation and has an
+    // explicit low-memory fallback. The log reports its exact byte size.
+    auto items = makeUniqueNoThrow<fui::ListItem[]>(required);
+    if (!items) {
+      LOG_ERR("FONT", "Failed to allocate %zu-byte font list (heap=%u maxAlloc=%u)", required * sizeof(fui::ListItem),
+              ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+      listItemCount_ = 0;
+      return false;
+    }
+    listItems_ = std::move(items);
+    listItemCapacity_ = required;
+  }
+
+  size_t itemIndex = 0;
+  if (showUpdateAllRow()) {
+    char sizeLabel[32];
+    formatSize(totalUpdateSize(), sizeLabel, sizeof(sizeLabel));
+    snprintf(updateAllLabel_, sizeof(updateAllLabel_), "%s (%s)", tr(STR_UPDATE_ALL), sizeLabel);
+    listItems_[itemIndex] = fui::ListItem{};
+    listItems_[itemIndex].label = updateAllLabel_;
+    listItems_[itemIndex].actionValue = static_cast<int16_t>(itemIndex);
+    ++itemIndex;
+  }
+
+  for (const auto& family : families_) {
+    fui::ListItem& item = listItems_[itemIndex];
+    item = fui::ListItem{};
+    item.label = family.name.c_str();
+    if (!family.description.empty()) item.subtitle = family.description.c_str();
+    if (family.hasUpdate) {
+      item.value = tr(STR_UPDATE_AVAILABLE);
+    } else if (family.installed) {
+      item.value = tr(STR_INSTALLED);
+      // Dimmed but still tappable (opens the delete prompt): visual-only
+      // disabled state, the row stays enabled for hit registration.
+      item.state = fui::StateDisabled;
+    }
+    item.actionValue = static_cast<int16_t>(itemIndex);
+    ++itemIndex;
+  }
+
+  listItemCount_ = itemIndex;
+  return true;
 }
 
 // Standard CRC32 matching zlib/Python zlib.crc32().
@@ -626,6 +709,7 @@ void FontDownloadActivity::downloadFamily(ManifestFamily& family) {
     downloadAttempt_ = 0;
     downloadAttemptTotal_ = 0;
     cancelRequested_ = false;
+    goHomeRequested_ = false;
   }
   requestUpdateAndWait();
 
@@ -682,6 +766,10 @@ void FontDownloadActivity::downloadFamily(ManifestFamily& family) {
         return true;
       }
       mappedInput.update();
+      if (mappedInput.wasHomeGesture()) {
+        goHomeRequested_ = true;
+        cancelRequested_ = true;
+      }
       if (mappedInput.isPressed(MappedInputManager::Button::Back) ||
           mappedInput.wasPressed(MappedInputManager::Button::Back) ||
           mappedInput.wasReleased(MappedInputManager::Button::Back)) {
@@ -713,6 +801,10 @@ void FontDownloadActivity::downloadFamily(ManifestFamily& family) {
       if (result == HttpDownloader::ABORTED) {
         LOG_INF("FONT", "Download cancelled: %s", file.name.c_str());
         Storage.remove(tempPath);
+        if (goHomeRequested_) {
+          onGoHome();
+          return;
+        }
         // The Back release that confirmed the cancel would otherwise be seen by
         // the family list and treated as a request to leave the screen.
         mappedInput.suppressNextBackRelease();
@@ -838,6 +930,9 @@ void FontDownloadActivity::onDeleteConfirmationResult(const ActivityResult& resu
     fontInstaller_.refreshRegistry();
     family.installed = false;
     family.hasUpdate = false;
+    // Deletion changes the row's visual state. Reuse the existing storage;
+    // the row count cannot grow on this path.
+    rebuildListItems();
   }
 
   requestUpdate();
@@ -890,37 +985,15 @@ void FontDownloadActivity::buildListScreen(UiApp::ScreenType& screen) {
     return;
   }
 
-  const int listSize = listItemCount();
-  // Per-render owned strings for the composed labels; subtitles/values point
-  // at stable family fields and i18n constants.
-  std::vector<std::string> labels(listSize);
-  std::vector<fui::ListItem> items;
-  items.reserve(listSize);
-  for (int i = 0; i < listSize; i++) {
-    fui::ListItem item;
-    if (isUpdateAllRow(i)) {
-      labels[i] = std::string(tr(STR_UPDATE_ALL)) + " (" + formatSize(totalUpdateSize()) + ")";
-      item.label = labels[i].c_str();
-    } else {
-      const auto& family = families_[familyIndexFromList(i)];
-      item.label = family.name.c_str();
-      if (!family.description.empty()) item.subtitle = family.description.c_str();
-      if (family.hasUpdate) {
-        item.value = tr(STR_UPDATE_AVAILABLE);
-      } else if (family.installed) {
-        item.value = tr(STR_INSTALLED);
-        // Dimmed but still tappable (opens the delete prompt): visual-only
-        // disabled state, the row stays enabled for hit registration.
-        item.state = fui::StateDisabled;
-      }
-    }
-    item.actionValue = static_cast<int16_t>(i);
-    items.push_back(item);
+  const int listSize = static_cast<int>(listItemCount_);
+  if (listSize <= 0 || !listItems_) {
+    screen.centeredText(tr(STR_NO_FONTS_AVAILABLE), screen.theme().bodyText);
+    return;
   }
 
   fui::ListProps props;
-  props.items = items.data();
-  props.count = static_cast<uint16_t>(items.size());
+  props.items = listItems_.get();
+  props.count = static_cast<uint16_t>(listItemCount_);
   props.selectedIndex = static_cast<int16_t>(selectedIndex_);
   props.action = ACTION_ROW;
   props.inputMask = fui::InputTouch;  // physical buttons stay in loop()
@@ -1065,16 +1138,15 @@ void FontDownloadActivity::loop() {
 
 // --- Rendering ---
 
-std::string FontDownloadActivity::formatSize(size_t bytes) {
-  char buf[32];
+void FontDownloadActivity::formatSize(const size_t bytes, char* const buffer, const size_t bufferSize) {
+  if (bufferSize == 0) return;
   if (bytes >= 1024 * 1024) {
-    snprintf(buf, sizeof(buf), "%.1f MB", static_cast<double>(bytes) / (1024.0 * 1024.0));
+    snprintf(buffer, bufferSize, "%.1f MB", static_cast<double>(bytes) / (1024.0 * 1024.0));
   } else if (bytes >= 1024) {
-    snprintf(buf, sizeof(buf), "%.0f KB", static_cast<double>(bytes) / 1024.0);
+    snprintf(buffer, bufferSize, "%.0f KB", static_cast<double>(bytes) / 1024.0);
   } else {
-    snprintf(buf, sizeof(buf), "%zu B", bytes);
+    snprintf(buffer, bufferSize, "%zu B", bytes);
   }
-  return buf;
 }
 
 int FontDownloadActivity::fontListPageItems() const {
@@ -1138,7 +1210,9 @@ void FontDownloadActivity::drawFontList(Rect rect) {
     std::string value;
 
     if (isUpdateAllRow(index)) {
-      title = std::string(tr(STR_UPDATE_ALL)) + " (" + formatSize(totalUpdateSize()) + ")";
+      char sizeLabel[32];
+      formatSize(totalUpdateSize(), sizeLabel, sizeof(sizeLabel));
+      title = std::string(tr(STR_UPDATE_ALL)) + " (" + sizeLabel + ")";
     } else {
       const auto& family = families_[familyIndexFromList(index)];
       title = family.name;
@@ -1278,5 +1352,5 @@ void FontDownloadActivity::render(RenderLock&&) {
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
   }
 
-  renderer.displayBuffer();
+  renderer.displayBuffer(screenTransitionRefresh_.modeFor(static_cast<uint8_t>(state_)));
 }

@@ -46,6 +46,33 @@ bool isDictionaryBullet(uint32_t cp) {
   }
 }
 
+int encodeUtf8(uint32_t cp, char out[4]) {
+  if (cp <= 0x7F) {
+    out[0] = static_cast<char>(cp);
+    return 1;
+  }
+  if (cp <= 0x7FF) {
+    out[0] = static_cast<char>(0xC0 | (cp >> 6));
+    out[1] = static_cast<char>(0x80 | (cp & 0x3F));
+    return 2;
+  }
+  if (cp >= 0xD800 && cp <= 0xDFFF) return 0;
+  if (cp <= 0xFFFF) {
+    out[0] = static_cast<char>(0xE0 | (cp >> 12));
+    out[1] = static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+    out[2] = static_cast<char>(0x80 | (cp & 0x3F));
+    return 3;
+  }
+  if (cp <= 0x10FFFF) {
+    out[0] = static_cast<char>(0xF0 | (cp >> 18));
+    out[1] = static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+    out[2] = static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+    out[3] = static_cast<char>(0x80 | (cp & 0x3F));
+    return 4;
+  }
+  return 0;
+}
+
 }  // namespace
 
 DictHtmlRenderer::TagAction DictHtmlRenderer::classify(const XML_Char* name) {
@@ -228,12 +255,11 @@ void DictHtmlRenderer::pushSpan() {
 void DictHtmlRenderer::emitText(const char* s, int len) {
   if (len <= 0) return;
   for (int i = 0; i < len; i++) {
-    if (i + 2 < len && static_cast<unsigned char>(s[i]) >= 0xE0 &&
-        static_cast<unsigned char>(s[i]) <= 0xEF && (static_cast<unsigned char>(s[i + 1]) & 0xC0) == 0x80 &&
+    if (i + 2 < len && static_cast<unsigned char>(s[i]) >= 0xE0 && static_cast<unsigned char>(s[i]) <= 0xEF &&
+        (static_cast<unsigned char>(s[i + 1]) & 0xC0) == 0x80 &&
         (static_cast<unsigned char>(s[i + 2]) & 0xC0) == 0x80) {
       const uint32_t cp = ((static_cast<uint32_t>(s[i]) & 0x0F) << 12) |
-                          ((static_cast<uint32_t>(s[i + 1]) & 0x3F) << 6) |
-                          (static_cast<uint32_t>(s[i + 2]) & 0x3F);
+                          ((static_cast<uint32_t>(s[i + 1]) & 0x3F) << 6) | (static_cast<uint32_t>(s[i + 2]) & 0x3F);
       if (isDictionaryBullet(cp)) {
         pendingText += "\xE2\x80\xA2";  // U+2022 BULLET
         i += 2;
@@ -806,6 +832,119 @@ void DictHtmlRenderer::feedEntityResolved(const char* buf, int len, bool isLast,
   }
 }
 
+void DictHtmlRenderer::feedPlainText(const char* buf, int len, bool isLast, char* carry, int* carryLen) {
+  int i = 0;
+  while (i < len) {
+    if (buf[i] == '<') {
+      const char* close = static_cast<const char*>(memchr(buf + i + 1, '>', static_cast<size_t>(len - i - 1)));
+      if (!close) {
+        // normalizeHtmlChunk() carries incomplete tags, so this is only a
+        // defensive fallback for corrupt input.
+        emitText("<", 1);
+        i++;
+        continue;
+      }
+
+      int nameStart = i + 1;
+      while (nameStart < close - buf && (buf[nameStart] == ' ' || buf[nameStart] == '\t')) nameStart++;
+      if (nameStart < close - buf && buf[nameStart] == '/') nameStart++;
+      const int nameBegin = nameStart;
+      while (nameStart < close - buf) {
+        const char c = buf[nameStart];
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '/') break;
+        nameStart++;
+      }
+
+      const int nameLen = nameStart - nameBegin;
+      const bool isBreak =
+          rangeTagEquals(buf + nameBegin, nameLen, "br") || rangeTagEquals(buf + nameBegin, nameLen, "hr") ||
+          rangeTagEquals(buf + nameBegin, nameLen, "p") || rangeTagEquals(buf + nameBegin, nameLen, "div") ||
+          rangeTagEquals(buf + nameBegin, nameLen, "ol") || rangeTagEquals(buf + nameBegin, nameLen, "ul") ||
+          rangeTagEquals(buf + nameBegin, nameLen, "li") ||
+          (nameLen == 2 && asciiLower(buf[nameBegin]) == 'h' && buf[nameBegin + 1] >= '1' && buf[nameBegin + 1] <= '6');
+      if (isBreak) {
+        flushPending();
+        newlinePending = true;
+      }
+      i = static_cast<int>(close - buf) + 1;
+      continue;
+    }
+
+    if (buf[i] != '&') {
+      const int runStart = i;
+      while (i < len && buf[i] != '<' && buf[i] != '&') i++;
+      emitText(buf + runStart, i - runStart);
+      continue;
+    }
+
+    int end = i + 1;
+    while (end < len && buf[end] != ';' && buf[end] != '&' && buf[end] != '<' && end - i < 33) end++;
+    if (end >= len && !isLast) {
+      if (carry && carryLen) {
+        int remaining = len - i;
+        if (remaining > 63) remaining = 63;
+        memcpy(carry, buf + i, static_cast<size_t>(remaining));
+        *carryLen = remaining;
+      }
+      return;
+    }
+
+    if (end >= len || buf[end] != ';') {
+      emitText("&", 1);
+      i++;
+      continue;
+    }
+
+    const char* name = buf + i + 1;
+    const int nameLen = end - i - 1;
+    const char* replacement = nullptr;
+    if (nameLen == 3 && strncmp(name, "amp", 3) == 0) replacement = "&";
+    if (nameLen == 2 && strncmp(name, "lt", 2) == 0) replacement = "<";
+    if (nameLen == 2 && strncmp(name, "gt", 2) == 0) replacement = ">";
+    if (nameLen == 4 && strncmp(name, "quot", 4) == 0) replacement = "\"";
+    if (nameLen == 4 && strncmp(name, "apos", 4) == 0) replacement = "'";
+    if (!replacement) replacement = lookupHtmlEntity(name, nameLen);
+
+    if (replacement) {
+      emitText(replacement, static_cast<int>(strlen(replacement)));
+    } else if (nameLen > 1 && name[0] == '#') {
+      const bool hex = name[1] == 'x' || name[1] == 'X';
+      uint32_t cp = 0;
+      bool valid = nameLen > (hex ? 2 : 1);
+      for (int digitIndex = hex ? 2 : 1; digitIndex < nameLen; digitIndex++) {
+        const char c = name[digitIndex];
+        uint8_t digit = 0;
+        if (c >= '0' && c <= '9') {
+          digit = static_cast<uint8_t>(c - '0');
+        } else if (hex && c >= 'a' && c <= 'f') {
+          digit = static_cast<uint8_t>(c - 'a' + 10);
+        } else if (hex && c >= 'A' && c <= 'F') {
+          digit = static_cast<uint8_t>(c - 'A' + 10);
+        } else {
+          valid = false;
+          break;
+        }
+        cp = cp * (hex ? 16u : 10u) + digit;
+        if (cp > 0x10FFFF) {
+          valid = false;
+          break;
+        }
+      }
+      char utf8[4];
+      const int utf8Len = valid && cp != 0 ? encodeUtf8(cp, utf8) : 0;
+      if (utf8Len > 0) {
+        emitText(utf8, utf8Len);
+      } else {
+        emitText(buf + i, end - i + 1);
+      }
+    } else {
+      // Unknown entities are more useful visible than silently deleted.
+      emitText(buf + i, end - i + 1);
+    }
+    i = end + 1;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Stream-render from .dict file (definition never held in RAM)
 // ---------------------------------------------------------------------------
@@ -912,6 +1051,54 @@ bool DictHtmlRenderer::renderFromFileStreaming(const char* dictPath, uint32_t of
 
   spanSink_ = SpanSink{};  // streaming never materializes spans/textBuf — nothing to fix up
   return !parseError;
+}
+
+bool DictHtmlRenderer::renderPlainTextFromFileStreaming(const char* dictPath, uint32_t offset, uint32_t size,
+                                                        const SpanSink& sink) {
+  reset();
+  spanSink_ = sink;
+
+  HalFile file;
+  if (!Storage.openFileForRead("DICT", dictPath, file)) {
+    LOG_ERR("DHTML", "Failed to open plain-text fallback: %s", dictPath);
+    spanSink_ = SpanSink{};
+    return false;
+  }
+  if (!file.seekSet(offset)) {
+    LOG_ERR("DHTML", "Failed to seek plain-text fallback: %s", dictPath);
+    file.close();
+    spanSink_ = SpanSink{};
+    return false;
+  }
+
+  // Matches the normal streaming path: one SD read buffer plus a bounded
+  // cross-chunk entity carry. No definition-sized fallback allocation.
+  char chunk[512];
+  char entityCarry[64];
+  int entityCarryLen = 0;
+  uint32_t remaining = size;
+  bool readOk = true;
+  while (remaining > 0) {
+    const uint32_t toRead = remaining < sizeof(chunk) ? remaining : static_cast<uint32_t>(sizeof(chunk));
+    const int n = file.read(reinterpret_cast<uint8_t*>(chunk), static_cast<int>(toRead));
+    if (n <= 0) {
+      readOk = false;
+      break;
+    }
+    remaining -= static_cast<uint32_t>(n);
+    normalizeHtmlChunk(chunk, n, remaining == 0);
+    if (entityCarryLen > 0) normalizedHtml_.insert(0, entityCarry, static_cast<size_t>(entityCarryLen));
+    entityCarryLen = 0;
+    feedPlainText(normalizedHtml_.data(), static_cast<int>(normalizedHtml_.size()),
+                  remaining == 0 && htmlCarry_.empty() && !discardTagUntilClose_, entityCarry, &entityCarryLen);
+  }
+  if (entityCarryLen > 0 && readOk) feedPlainText(entityCarry, entityCarryLen, true, nullptr, nullptr);
+  flushPending();
+  file.close();
+  spanSink_ = SpanSink{};
+
+  if (!readOk) LOG_ERR("DHTML", "Failed reading plain-text fallback: %s", dictPath);
+  return readOk;
 }
 
 // ---------------------------------------------------------------------------

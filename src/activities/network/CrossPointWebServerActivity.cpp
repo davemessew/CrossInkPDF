@@ -6,7 +6,6 @@
 #include <I18n.h>
 #include <Memory.h>
 #include <WiFi.h>
-#include <esp_task_wdt.h>
 
 #include <cstddef>
 
@@ -18,6 +17,7 @@
 #include "activities/ActivityManager.h"
 #include "activities/network/CalibreConnectActivity.h"
 #include "components/CompactHeader.h"
+#include "components/TouchHeaderBackButton.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 #include "util/QrUtils.h"
@@ -147,9 +147,9 @@ void CrossPointWebServerActivity::onNetworkModeSelected(const NetworkMode mode) 
   } else if (mode == NetworkMode::CREATE_HOTSPOT) {
     modeName = "Create Hotspot";
   } else if (mode == NetworkMode::NEARBY_STATS_SYNC) {
-    modeName = "Nearby Stats Sync";
+    modeName = "Sync Stats";
   } else if (mode == NetworkMode::NEARBY_BOOK_RECEIVE) {
-    modeName = "Receive Nearby File";
+    modeName = "Receive File";
   }
   LOG_DBG("WEBACT", "Network mode selected: %s", modeName);
 
@@ -353,6 +353,12 @@ void CrossPointWebServerActivity::stopWebServer() {
 }
 
 void CrossPointWebServerActivity::loop() {
+  if ((state == WebServerActivityState::SERVER_RUNNING || state == WebServerActivityState::AP_STARTING) &&
+      exitRequested()) {
+    exitToOrigin();
+    return;
+  }
+
   // Handle different states
   if (state == WebServerActivityState::SERVER_RUNNING) {
     // Handle DNS requests for captive portal (AP mode only)
@@ -405,7 +411,7 @@ void CrossPointWebServerActivity::loop() {
       }
     }
 
-    // Handle web server requests - maximize throughput with watchdog safety
+    // Handle web server requests while keeping input responsive.
     if (webServer && webServer->isRunning()) {
       const unsigned long timeSinceLastHandleClient = millis() - lastHandleClientTime;
 
@@ -414,38 +420,26 @@ void CrossPointWebServerActivity::loop() {
         LOG_DBG("WEBACT", "WARNING: %lu ms gap since last handleClient", timeSinceLastHandleClient);
       }
 
-      // Reset watchdog BEFORE processing - HTTP header parsing can be slow
-      esp_task_wdt_reset();
-
       // Process HTTP requests in tight loop for maximum throughput
       // More iterations = more data processed per main loop cycle
       constexpr int MAX_ITERATIONS = 500;
       for (int i = 0; i < MAX_ITERATIONS && webServer->isRunning(); i++) {
         webServer->handleClient();
-        // Reset watchdog every 32 iterations
-        if ((i & 0x1F) == 0x1F) {
-          esp_task_wdt_reset();
-        }
         // Yield and check for exit button every 64 iterations
         if ((i & 0x3F) == 0x3F) {
           yield();
           // Force trigger an update of which buttons are being pressed so be have accurate state
           // for back button checking
           mappedInput.update();
-          // Check for exit button inside loop for responsiveness
-          if (mappedInput.wasPressed(MappedInputManager::Button::Back)) {
+          // This local update can consume one-shot exit events before the
+          // ActivityManager sees them, so honor every exit route here.
+          if (exitRequested()) {
             exitToOrigin();
             return;
           }
         }
       }
       lastHandleClientTime = millis();
-    }
-
-    // Handle exit on Back button (also check outside loop)
-    if (mappedInput.wasPressed(MappedInputManager::Button::Back)) {
-      exitToOrigin();
-      return;
     }
   }
 }
@@ -455,30 +449,39 @@ void CrossPointWebServerActivity::render(RenderLock&&) {
   // Subactivities handle their own rendering
   if (state == WebServerActivityState::SERVER_RUNNING || state == WebServerActivityState::AP_STARTING) {
     renderer.clearScreen();
-    const auto& metrics = UITheme::getInstance().getMetrics();
-    const auto pageWidth = renderer.getScreenWidth();
     const auto pageHeight = renderer.getScreenHeight();
 
-    CompactHeader::drawTitle(renderer, isApMode ? tr(STR_HOTSPOT_MODE) : tr(STR_FILE_TRANSFER));
-
     if (state == WebServerActivityState::SERVER_RUNNING) {
-      GUI.drawSubHeader(renderer, Rect{0, CompactHeader::contentTop(metrics), pageWidth, metrics.tabBarHeight},
-                        connectedSSID.c_str());
       renderServerRunning();
     } else {
+      renderHeader();
       const auto height = renderer.getLineHeight(UI_10_FONT_ID);
       const auto top = (pageHeight - height) / 2;
       renderer.drawCenteredText(UI_10_FONT_ID, top, tr(STR_STARTING_HOTSPOT));
     }
-    renderer.displayBuffer();
+    renderer.displayBuffer(screenTransitionRefresh.modeFor(static_cast<uint8_t>(state)));
   }
+}
+
+void CrossPointWebServerActivity::renderHeader() const {
+  const char* title = isApMode ? tr(STR_HOTSPOT_MODE) : tr(STR_FILE_TRANSFER);
+  if (mappedInput.hasTouchHardware()) {
+    TouchHeaderBackButton::drawCompact(renderer, title);
+  } else {
+    CompactHeader::drawTitle(renderer, title);
+  }
+}
+
+bool CrossPointWebServerActivity::exitRequested() const {
+  return TouchHeaderBackButton::wasTapped(mappedInput, renderer) ||
+         mappedInput.wasPressed(MappedInputManager::Button::Back) || mappedInput.wasHomeGesture();
 }
 
 void CrossPointWebServerActivity::renderServerRunning() const {
   const auto& metrics = UITheme::getInstance().getMetrics();
   const auto pageWidth = renderer.getScreenWidth();
 
-  CompactHeader::drawTitle(renderer, isApMode ? tr(STR_HOTSPOT_MODE) : tr(STR_FILE_TRANSFER));
+  renderHeader();
   const int subHeaderTop = CompactHeader::contentTop(metrics);
   GUI.drawSubHeader(renderer, Rect{0, subHeaderTop, pageWidth, metrics.tabBarHeight}, connectedSSID.c_str());
 

@@ -15,7 +15,7 @@
 class DictionarySelectActivity final : public Activity {
  public:
   DictionarySelectActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, std::string bookCachePath = "",
-                           bool disableCurrentSelection = false);
+                           bool disableCurrentSelection = false, bool temporarySelection = false);
 
   void onEnter() override;
   void onExit() override;
@@ -50,6 +50,8 @@ class DictionarySelectActivity final : public Activity {
   // Only populated in per-book mode.
   std::string useGlobalLabel;
   bool disableCurrentSelection = false;
+  // Lookup switchers return the chosen path without writing book/global settings.
+  bool temporarySelection = false;
 
   ButtonNavigator buttonNavigator;
   using UiApp = freeink::ui::FreeInkApp<20, 4>;

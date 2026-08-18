@@ -55,8 +55,11 @@ class DictionaryLookupController {
     }
   }
 
+  // The owning activity keeps its cache path alive longer than the controller.
+  // Borrow it here so constructing a low-memory dictionary activity does not
+  // duplicate the path through a throwing std::string allocation.
   DictionaryLookupController(GfxRenderer& renderer, MappedInputManager& mappedInput, Activity& owner,
-                             std::string cachePath = "");
+                             const std::string& cachePath);
   ~DictionaryLookupController();
 
   // Start a lookup. Transitions Idle → LookingUp and notifies the shared
@@ -92,6 +95,19 @@ class DictionaryLookupController {
   // dictionary lookup is resolving in the background.
   bool isLookingUp() const { return state == LookupState::LookingUp; }
 
+  // Definition modals render lookup progress inside their existing frame so a
+  // chained lookup does not dirty reader pixels outside the modal.
+  void setLookupToastEnabled(bool enabled) { lookupToastEnabled_ = enabled; }
+  bool hasFailureFeedback() const { return state == LookupState::NotFound || state == LookupState::ReadError; }
+  const char* getFailureMessage() const;
+  bool dismissFailureForDictionarySwitch();
+  bool requiresBackgroundRedrawAfterOverlay() const { return state == LookupState::AltFormPrompt; }
+  bool consumeFullScreenChildDisturbance() {
+    const bool disturbed = fullScreenChildWasShown_;
+    fullScreenChildWasShown_ = false;
+    return disturbed;
+  }
+
   // Show the "no word" popup with a 1-second delay, then request update.
   void showNoWordPopup();
 
@@ -125,7 +141,7 @@ class DictionaryLookupController {
   GfxRenderer& renderer;
   MappedInputManager& mappedInput;
   Activity& owner;
-  std::string cachePath;
+  const std::string& cachePath;
 
 #if CROSSINK_APP_CAP_TOUCH
   freeink::ui::GfxRendererTarget altFormUiTarget;
@@ -136,7 +152,11 @@ class DictionaryLookupController {
   LookupState state = LookupState::Idle;
   FoundStatus foundStatus = FoundStatus::Direct;
   bool nextIsSuggestion = false;
+  bool lookupMatchedStem = false;
   bool recordHistory_ = true;
+  bool lookupToastEnabled_ = true;
+  bool fullScreenChildWasShown_ = false;
+  std::string preparedQuickIndexPath;
 
   std::string lookupWord;
   std::string foundWord;

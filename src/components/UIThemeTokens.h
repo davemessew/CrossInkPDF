@@ -51,7 +51,11 @@ inline uint16_t configureUiList(freeink::ui::ListProps& props, const freeink::ui
                                 const freeink::ui::Rect rect, const UiListRowType rowType = UiListRowType::SingleLine) {
   // Button-only menus used compact, single-line rows before their FreeInkUI
   // migration. Keep that layout unless the caller explicitly needs a subtitle.
+#if CROSSINK_APP_CAP_TOUCH
   if (!gpio.hasTouch() && rowType == UiListRowType::SingleLine) props.labelText.maxLines = 1;
+#else
+  if (rowType == UiListRowType::SingleLine) props.labelText.maxLines = 1;
+#endif
   if (props.rowHeight <= 0) props.rowHeight = uiListRowHeight(tokens, rowType);
   // Subtitle rows may wrap their labels, so retain FreeInkUI's font-derived
   // two-line height and avoid overlapping the following item.

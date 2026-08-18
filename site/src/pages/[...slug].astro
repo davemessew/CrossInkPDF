@@ -1,9 +1,9 @@
 ---
 import SiteLayout from '../layouts/SiteLayout.astro';
-import { getDocBySlug, getDocs } from '../lib/docs';
+import { getDocBySlug, getRoutableDocs } from '../lib/docs';
 
 export async function getStaticPaths() {
-  const docs = await getDocs();
+  const docs = await getRoutableDocs();
   return docs.map((doc) => ({
     params: { slug: doc.slug },
     props: { doc }

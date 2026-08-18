@@ -9,6 +9,7 @@
 #include "KOReaderSyncClient.h"
 #include "ProgressMapper.h"
 #include "activities/Activity.h"
+#include "activities/ScreenTransitionRefresh.h"
 
 /**
  * Activity for syncing reading progress with KOReader sync server.
@@ -83,6 +84,7 @@ class KOReaderSyncActivity final : public Activity {
   DocumentMatchMethod remoteMatchMethod;
 
   State state = WIFI_SELECTION;
+  ScreenTransitionRefresh screenTransitionRefresh;
   std::string statusMessage;
   std::string documentHash;
 

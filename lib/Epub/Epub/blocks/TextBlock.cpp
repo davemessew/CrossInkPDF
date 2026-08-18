@@ -269,8 +269,9 @@ void TextBlock::render(const GfxRenderer& renderer, const int fontId, const int 
         groupWidth += renderer.getTextAdvanceX(fontId, wordText(i + j), wordStyle(i + j));
       }
       const int rubyWidth = renderer.getTextAdvanceX(fontId, rubyTexts[i].c_str(), EpdFontFamily::SUP);
-      const int unclampedX = wordX + (groupWidth - rubyWidth) / 2;
-      const int rubyX = std::max(0, std::min(unclampedX, renderer.getScreenWidth() - rubyWidth));
+      // ParsedText reserves any edge overhang in the line layout, so the ruby
+      // can remain centered over its base text without screen-edge clamping.
+      const int rubyX = wordX + (groupWidth - rubyWidth) / 2;
       renderer.drawText(fontId, rubyX, wordY - ascender, rubyTexts[i].c_str(), foregroundBlack, EpdFontFamily::SUP,
                         baseDir);
     }

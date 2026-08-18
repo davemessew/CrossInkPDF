@@ -18,6 +18,7 @@
   --th-bg: #f5f6f1;
   --active-bg: rgba(38, 107, 85, 0.08);
   --btn-primary-fg: #ffffff;
+  --logo-filter: brightness(0);
   font-family:
     Inter,
     ui-sans-serif,
@@ -48,6 +49,7 @@
   --th-bg: #232a2d;
   --active-bg: rgba(215, 220, 216, 0.1);
   --btn-primary-fg: #15181a;
+  --logo-filter: none;
 }
 
 * {
@@ -95,14 +97,10 @@ img {
 }
 
 .brand-mark {
-  display: grid;
-  width: 38px;
   height: 38px;
-  place-items: center;
-  border: 2px solid var(--ink);
-  border-radius: 6px;
-  font-weight: 800;
-  letter-spacing: 0;
+  width: auto;
+  flex-shrink: 0;
+  filter: var(--logo-filter);
 }
 
 .brand strong,
@@ -429,6 +427,92 @@ h1 {
 
 .doc-article h3 {
   margin-top: 30px;
+}
+
+.doc-article .markdown-alert {
+  --alert-color: var(--accent-strong);
+  --alert-background: var(--th-bg);
+  margin: 20px 0;
+  padding: 12px 16px;
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--alert-color);
+  border-radius: 6px;
+  background: var(--alert-background);
+  color: var(--text-soft);
+}
+
+.doc-article .markdown-alert > :last-child {
+  margin-bottom: 0;
+}
+
+.doc-article .markdown-alert .markdown-alert-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 8px;
+  color: var(--alert-color);
+  font-size: 0.82rem;
+  font-weight: 850;
+  line-height: 1.2;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.doc-article .markdown-alert .markdown-alert-title svg {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+  fill: currentColor;
+}
+
+.doc-article .markdown-alert-note {
+  --alert-color: #1d4ed8;
+  --alert-background: rgba(37, 99, 235, 0.06);
+}
+
+.doc-article .markdown-alert-tip {
+  --alert-color: #15803d;
+  --alert-background: rgba(22, 163, 74, 0.06);
+}
+
+.doc-article .markdown-alert-important {
+  --alert-color: #7c3aed;
+  --alert-background: rgba(124, 58, 237, 0.06);
+}
+
+.doc-article .markdown-alert-warning {
+  --alert-color: #a16207;
+  --alert-background: rgba(202, 138, 4, 0.08);
+}
+
+.doc-article .markdown-alert-caution {
+  --alert-color: #b91c1c;
+  --alert-background: rgba(220, 38, 38, 0.06);
+}
+
+:root[data-theme="dark"] .doc-article .markdown-alert-note {
+  --alert-color: #60a5fa;
+  --alert-background: rgba(96, 165, 250, 0.1);
+}
+
+:root[data-theme="dark"] .doc-article .markdown-alert-tip {
+  --alert-color: #4ade80;
+  --alert-background: rgba(74, 222, 128, 0.1);
+}
+
+:root[data-theme="dark"] .doc-article .markdown-alert-important {
+  --alert-color: #c084fc;
+  --alert-background: rgba(192, 132, 252, 0.1);
+}
+
+:root[data-theme="dark"] .doc-article .markdown-alert-warning {
+  --alert-color: #facc15;
+  --alert-background: rgba(250, 204, 21, 0.1);
+}
+
+:root[data-theme="dark"] .doc-article .markdown-alert-caution {
+  --alert-color: #fb7185;
+  --alert-background: rgba(251, 113, 133, 0.1);
 }
 
 .doc-article table {

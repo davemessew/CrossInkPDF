@@ -8,12 +8,15 @@
 #include "components/UITheme.h"
 #include "components/UIThemeTokens.h"
 #include "components/UiAppHelpers.h"
+#include "components/icons/chart.h"
 #include "fontIds.h"
 
 namespace fui = freeink::ui;
 
 namespace {
 constexpr int MENU_ITEM_COUNT = 5;
+constexpr int LIST_ITEM_COUNT = MENU_ITEM_COUNT + 1;
+constexpr int NEARBY_SECTION_INDEX = 3;
 constexpr fui::ActionId ACTION_ROW = 1;
 constexpr StrId menuItems[MENU_ITEM_COUNT] = {StrId::STR_JOIN_NETWORK, StrId::STR_CALIBRE_WIRELESS,
                                               StrId::STR_CREATE_HOTSPOT, StrId::STR_RECEIVE_NEARBY_BOOK,
@@ -22,6 +25,8 @@ constexpr StrId menuDescs[MENU_ITEM_COUNT] = {StrId::STR_JOIN_DESC, StrId::STR_C
                                               StrId::STR_RECEIVE_NEARBY_BOOK_DESC, StrId::STR_NEARBY_STATS_SYNC_DESC};
 constexpr UIIcon menuIcons[MENU_ITEM_COUNT] = {UIIcon::Wifi, UIIcon::Library, UIIcon::Hotspot, UIIcon::Transfer,
                                                UIIcon::Transfer};
+
+int listIndexForMenuIndex(const int menuIndex) { return menuIndex < NEARBY_SECTION_INDEX ? menuIndex : menuIndex + 1; }
 }  // namespace
 
 NetworkModeSelectionActivity::NetworkModeSelectionActivity(GfxRenderer& renderer, MappedInputManager& mappedInput)
@@ -100,13 +105,13 @@ void NetworkModeSelectionActivity::loop() {
   // Handle navigation
   buttonNavigator.onNext([this] {
     selectedIndex = ButtonNavigator::nextIndex(selectedIndex, MENU_ITEM_COUNT);
-    topIndex = followListSelection(selectedIndex, topIndex, visibleRows, MENU_ITEM_COUNT);
+    topIndex = followListSelection(listIndexForMenuIndex(selectedIndex), topIndex, visibleRows, LIST_ITEM_COUNT);
     requestUpdate();
   });
 
   buttonNavigator.onPrevious([this] {
     selectedIndex = ButtonNavigator::previousIndex(selectedIndex, MENU_ITEM_COUNT);
-    topIndex = followListSelection(selectedIndex, topIndex, visibleRows, MENU_ITEM_COUNT);
+    topIndex = followListSelection(listIndexForMenuIndex(selectedIndex), topIndex, visibleRows, LIST_ITEM_COUNT);
     requestUpdate();
   });
 }
@@ -124,12 +129,25 @@ void NetworkModeSelectionActivity::buildListScreen(UiApp::ScreenType& screen) {
   screen.spacer(static_cast<int16_t>(metrics.verticalSpacing));
 
   std::vector<fui::ListItem> items;
-  items.reserve(MENU_ITEM_COUNT);
+  items.reserve(LIST_ITEM_COUNT);
   for (int i = 0; i < MENU_ITEM_COUNT; i++) {
+    if (i == NEARBY_SECTION_INDEX) {
+      fui::ListItem header;
+      header.label = I18N.get(StrId::STR_NEARBY_DEVICE);
+      header.isHeader = true;
+      items.push_back(header);
+    }
+
     fui::ListItem item;
     item.label = I18N.get(menuItems[i]);
     item.subtitle = I18N.get(menuDescs[i]);
-    item.icon = listIconFor(menuIcons[i], 32);  // subtitle rows carry the larger icon
+    if (i == 3) {
+      item.icon = fui::bitmapFromIcon(icon_chevrons_left_right_ellipsis_32);
+    } else if (i == 4) {
+      item.icon = fui::BitmapRef{ChartListIcon, 32, 32, fui::BitmapFormat::Mask1};
+    } else {
+      item.icon = listIconFor(menuIcons[i], 32);  // subtitle rows carry the larger icon
+    }
     item.actionValue = static_cast<int16_t>(i);
     items.push_back(item);
   }
@@ -137,12 +155,22 @@ void NetworkModeSelectionActivity::buildListScreen(UiApp::ScreenType& screen) {
   fui::ListProps props;
   props.items = items.data();
   props.count = static_cast<uint16_t>(items.size());
-  props.selectedIndex = static_cast<int16_t>(selectedIndex);
+  props.selectedIndex = static_cast<int16_t>(listIndexForMenuIndex(selectedIndex));
   props.action = ACTION_ROW;
   props.inputMask = fui::InputTouch;  // physical buttons stay in loop()
+  props.labelText = screen.theme().bodyText;
+  props.labelText.bold = true;
+  props.subtitleText = screen.theme().smallText;
+  props.subtitleText.bold = false;
+  props.headerText = screen.theme().bodyText;
+  props.headerText.bold = true;
+  props.rowGap = 10;
+  // The normal 10px row gap plus this extra 10px separates Nearby Device
+  // from the hotspot group by about 20px.
+  props.sectionGap = 10;
   const auto rows = configureUiList(props, screen.theme(), screen.body(), UiListRowType::WithSubtitle);
   visibleRows = rows > 0 ? rows : 1;
-  topIndex = scrollListBy(topIndex, 0, visibleRows, MENU_ITEM_COUNT);  // clamp to range
+  topIndex = scrollListBy(topIndex, 0, visibleRows, LIST_ITEM_COUNT);  // clamp to range
   props.topIndex = static_cast<uint16_t>(topIndex);
   screen.list(props);
 }
@@ -169,7 +197,7 @@ void NetworkModeSelectionActivity::render(RenderLock&&) {
   const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_SELECT), tr(STR_DIR_UP), tr(STR_DIR_DOWN));
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
 
-  renderer.displayBuffer();
+  renderer.displayBuffer(screenTransitionRefresh.modeFor(0));
 }
 
 void NetworkModeSelectionActivity::onModeSelected(NetworkMode mode) {

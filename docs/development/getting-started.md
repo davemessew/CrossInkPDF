@@ -1,6 +1,6 @@
 ---
 title: Getting Started
-parent: Contributing
+parent: Development
 nav_order: 1
 ---
 
@@ -59,13 +59,6 @@ If you already cloned without submodules:
 git submodule update --init --recursive
 ```
 
-Enable the repository-managed Git hooks (required once per clone):
-
-```sh
-git config core.hooksPath .githooks
-chmod +x .githooks/pre-commit
-```
-
 ## Build
 
 ```sh
@@ -81,7 +74,7 @@ pio run -e default
 pio run -e default --target upload
 ```
 
-## First checks before opening a PR
+## Validation
 
 ```sh
 ./bin/clang-format-fix
@@ -92,5 +85,4 @@ pio run
 ## What to read next
 
 - [Architecture Overview](./architecture.md)
-- [Development Workflow](./development-workflow.md)
 - [Testing and Debugging](./testing-debugging.md)

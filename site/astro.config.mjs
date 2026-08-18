@@ -1,5 +1,6 @@
 import { fileURLToPath } from "node:url";
 import { defineConfig } from "astro/config";
+import { remarkAlert } from "remark-github-blockquote-alert";
 
 // Docs live at the repo root (../docs), outside the Astro project root, so Vite's
 // file watcher never sees them and edits to docs/**/*.md don't hot reload in dev.
@@ -35,9 +36,7 @@ function rewriteMarkdownLinks() {
         return;
       }
 
-      node.url = node.url
-        .replace(/(^|\/)README\.md(#.*)?$/i, "$1index.html$2")
-        .replace(/\.md(#.*)?$/i, ".html$1");
+      node.url = node.url.replace(/(^|\/)README\.md(#.*)?$/i, "$1index.html$2").replace(/\.md(#.*)?$/i, ".html$1");
     });
   };
 }
@@ -57,7 +56,7 @@ export default defineConfig({
     format: "file",
   },
   markdown: {
-    remarkPlugins: [rewriteMarkdownLinks],
+    remarkPlugins: [remarkAlert, rewriteMarkdownLinks],
   },
   vite: {
     plugins: [watchExternalDocs()],

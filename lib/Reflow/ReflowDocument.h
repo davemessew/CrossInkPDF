@@ -112,9 +112,11 @@ struct ReflowReadingPosition {
   int pageNumber = 0;
   int pageCount = 0;
   bool hasPageCount = false;
+  bool hasVisibleTextOffset = false;
   bool hasSemanticPosition = false;
   bool hasWordCursor = false;
   uint32_t globalWordOrdinal = 0;
+  uint32_t visibleTextOffset = 0;
   uint32_t blockWordOffset = 0;
   uint32_t wordCursor = 0;
   char blockAnchor[REFLOW_SEMANTIC_ANCHOR_BYTES] = {};

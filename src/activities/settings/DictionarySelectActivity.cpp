@@ -24,10 +24,12 @@ constexpr fui::ActionId ACTION_ROW = 1;
 }  // namespace
 
 DictionarySelectActivity::DictionarySelectActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
-                                                   std::string bookCachePath, const bool disableCurrentSelection)
+                                                   std::string bookCachePath, const bool disableCurrentSelection,
+                                                   const bool temporarySelection)
     : Activity("DictionarySelect", renderer, mappedInput),
       bookCachePath(std::move(bookCachePath)),
       disableCurrentSelection(disableCurrentSelection),
+      temporarySelection(temporarySelection),
       uiTarget(makeUiTarget(renderer)),
       app(uiTarget, uiTarget.deviceContext()) {}
 
@@ -90,7 +92,7 @@ void DictionarySelectActivity::onEnter() {
 
     // Build augmented "Use Global" label showing the active global dictionary name.
     // Path format: <dictRoot>/<folder>/<stem> — extract <folder>.
-    const std::string globalPath = Dictionary::readDictPath();
+    const std::string globalPath = Dictionary::readConfiguredDictPath();
     std::string globalFolderName;
     if (globalPath.empty()) {
       globalFolderName = tr(STR_DICT_NONE);
@@ -171,7 +173,7 @@ std::string DictionarySelectActivity::folderForIndex(int index) const {
 }
 
 std::string DictionarySelectActivity::effectiveFolderForIndex(int index) const {
-  if (index == 0 && !bookCachePath.empty()) return Dictionary::readDictPath();
+  if (index == 0 && !bookCachePath.empty()) return Dictionary::readConfiguredDictPath();
   return folderForIndex(index);
 }
 
@@ -224,6 +226,18 @@ bool DictionarySelectActivity::applySelection() {
 // ---------------------------------------------------------------------------
 
 void DictionarySelectActivity::finishSelection() {
+  if (temporarySelection) {
+    if (rowIsDisabled(selectedIndex)) {
+      ActivityResult result;
+      result.isCancelled = true;
+      setResult(std::move(result));
+    } else {
+      setResult(ActivityResult{FilePathResult{effectiveFolderForIndex(selectedIndex)}});
+    }
+    finish();
+    return;
+  }
+
   if (!applySelection()) {
     ActivityResult result;
     result.isCancelled = true;

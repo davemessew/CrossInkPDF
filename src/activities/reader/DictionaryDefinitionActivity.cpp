@@ -15,11 +15,13 @@
 #include <cstring>
 #include <memory>
 #include <numeric>
+#include <optional>
 
 #include "../settings/DictionarySelectActivity.h"
 #include "CrossPointSettings.h"
 #include "MappedInputManager.h"
 #include "Memory.h"
+#include "SdCardFontSystem.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 #include "util/Dictionary.h"
@@ -33,16 +35,6 @@ static constexpr const char kEtymologyTreeMarker[] = "Etymology tree";
 static constexpr int kDictionarySwitchTouchHeight = 56;
 
 class DictionaryDefinitionActivity;
-
-static bool dictionaryPageButtonTriggered(MappedInputManager& mappedInput, bool previous) {
-  const bool usePress = SETTINGS.sideButtonLongPress == CrossPointSettings::SIDE_LONG_PRESS::SIDE_LONG_OFF;
-  const auto sideLayout = static_cast<CrossPointSettings::SIDE_BUTTON_LAYOUT>(SETTINGS.sideButtonLayout);
-  const MappedInputManager::Button button =
-      sideLayout == CrossPointSettings::NEXT_NEXT
-          ? (previous ? MappedInputManager::Button::Up : MappedInputManager::Button::Down)
-          : (previous ? MappedInputManager::Button::PageBack : MappedInputManager::Button::PageForward);
-  return usePress ? mappedInput.wasPressed(button) : mappedInput.wasReleased(button);
-}
 
 static std::string dictionaryNameFromPath(const std::string& path) {
   const size_t stemSlash = path.rfind('/');
@@ -337,7 +329,17 @@ static EpdFontFamily::Style styleForSpan(const StyledSpan& span) {
 
 void DictionaryDefinitionActivity::onEnter() {
   Activity::onEnter();
-  definitionFontId_ = SETTINGS.getReaderFontId();
+  const DictionaryFontActivation activation =
+      sdFontSystem.activateDictionaryFont(renderer, dictionaryFontFamilyName_, dictionaryFontPointSize_);
+  definitionFontId_ = activation.fontId;
+  definitionFontSource_ =
+      activation.usingDictionaryFont ? DefinitionFontSource::Dictionary : DefinitionFontSource::Reader;
+  if (renderer.isSdCardFont(definitionFontId_)) {
+    // Dictionary preparation retains advances but deliberately starts without
+    // reader kerning/page caches; the lean policy below reloads ligatures and
+    // exact visible glyph/style data only.
+    renderer.releaseSdCardFontForLowMemory(definitionFontId_, /*preserveAdvanceTable=*/true);
+  }
   wrapText();
   requestUpdate();
   // SD write overlaps the e-ink refresh kicked by requestUpdate() on the render task.
@@ -352,6 +354,8 @@ void DictionaryDefinitionActivity::onEnter() {
 
 void DictionaryDefinitionActivity::onExit() {
   controller.onExit();
+  Dictionary::clearLookupDictPathOverride();
+  sdFontSystem.restoreReaderFont(renderer);
   Activity::onExit();
 }
 
@@ -360,21 +364,69 @@ int DictionaryDefinitionActivity::getDefinitionFontId(bool) const {
 }
 
 void DictionaryDefinitionActivity::useBuiltInDefinitionFontFallback() {
-  if (usingBuiltInDefinitionFontFallback_) return;
-
   const int failedFontId = getDefinitionFontId();
-  definitionFontId_ = SETTINGS.getBuiltInReaderFontId();
-  usingBuiltInDefinitionFontFallback_ = true;
-  LOG_ERR("DICT", "SD font %d failed to prepare dictionary glyphs; using built-in font %d", failedFontId,
-          definitionFontId_);
+  if (definitionFontSource_ == DefinitionFontSource::Dictionary) {
+    definitionFontId_ = sdFontSystem.restoreReaderFont(renderer);
+    definitionFontSource_ = DefinitionFontSource::Reader;
+    LOG_ERR("DICT", "Dictionary SD font %d failed to prepare; retrying with reader font %d", failedFontId,
+            definitionFontId_);
+  } else if (definitionFontSource_ == DefinitionFontSource::Reader) {
+    definitionFontId_ = SETTINGS.getBuiltInReaderFontId();
+    definitionFontSource_ = DefinitionFontSource::BuiltIn;
+    LOG_ERR("DICT", "Reader SD font %d failed to prepare dictionary glyphs; using built-in font %d", failedFontId,
+            definitionFontId_);
+  } else {
+    return;
+  }
+  reflowForDefinitionFontChange();
+  // The failed font was the active owner of the definition bitmap cache. Its
+  // family may also have replaced the reader family while the modal background
+  // was prepared, so redraw the page with the restored reader font before the
+  // fallback definition is rendered. This reuses the existing framebuffer;
+  // retaining the old pixels produces replacement diamonds behind a blank
+  // modal after a large dictionary-font prewarm fails.
+  if (hasModalBackground()) {
+    modalBackgroundNeedsRedraw_ = true;
+    modalCleanRefreshNeeded_ = true;
+  }
+}
 
-  // The fallback font has different metrics. Reflow before the next frame so
-  // line breaks, hit targets, and rendered glyphs all use the same font.
+void DictionaryDefinitionActivity::reflowForDefinitionFontChange() {
   const int requestedPage = currentPage;
   wrapText();
   currentPage = std::min(requestedPage, std::max(0, totalPages - 1));
   if (currentPage > 0) loadPage(currentPage);
   if (hasModalBackground()) sizeModalForCurrentPage();
+}
+
+void DictionaryDefinitionActivity::redrawModalBackground() {
+  if (!hasModalBackground() || !modalBackgroundNeedsRedraw_) return;
+
+  if (definitionFontSource_ == DefinitionFontSource::Dictionary) {
+    sdFontSystem.restoreReaderFont(renderer);
+    backgroundRender_(backgroundContext_);
+    const DictionaryFontActivation activation =
+        sdFontSystem.activateDictionaryFont(renderer, dictionaryFontFamilyName_, dictionaryFontPointSize_);
+    definitionFontId_ = activation.fontId;
+    definitionFontSource_ =
+        activation.usingDictionaryFont ? DefinitionFontSource::Dictionary : DefinitionFontSource::Reader;
+    if (renderer.isSdCardFont(definitionFontId_)) {
+      renderer.releaseSdCardFontForLowMemory(definitionFontId_, /*preserveAdvanceTable=*/true);
+    }
+    // SD font IDs are deterministic, so reloading the same family returns the
+    // same ID even though its advance table was discarded with the old font.
+    // Reflow every restored dictionary font to rebuild those metrics before
+    // drawing; otherwise lines wrapped with stale/narrow widths can overflow.
+    reflowForDefinitionFontChange();
+  } else {
+    backgroundRender_(backgroundContext_);
+  }
+  modalBackgroundNeedsRedraw_ = false;
+}
+
+void DictionaryDefinitionActivity::displayModalBuffer() {
+  renderer.displayBuffer(modalCleanRefreshNeeded_ ? HalDisplay::HALF_REFRESH : HalDisplay::FAST_REFRESH);
+  modalCleanRefreshNeeded_ = false;
 }
 
 bool DictionaryDefinitionActivity::shouldApproximateDefinitionCodepoint(const uint32_t cp) const {
@@ -454,9 +506,15 @@ void DictionaryDefinitionActivity::wrapText() {
   isWordSelectMode = false;
   navigator.reset();
   currentPage = 0;  // new definition always starts at page 0
-  // A new definition can have different modal geometry. Rebuild the book once
-  // so a smaller modal cannot leave pixels from the prior definition behind.
-  if (hasModalBackground()) modalBackgroundNeedsRedraw_ = true;
+  // The initial reader page is already present when opened from word-select.
+  // Chained definitions keep the existing modal covered by growing its frame,
+  // so they do not need to swap back to the reader font for a background draw.
+  if (hasModalBackground()) {
+    if (skipInitialModalBackgroundRedraw_) {
+      modalBackgroundNeedsRedraw_ = false;
+      skipInitialModalBackgroundRedraw_ = false;
+    }
+  }
 
   // Match the folder-name label shown by DictionarySelectActivity.
   dictionaryName_ = dictionaryNameFromPath(foundLocation.folderPath);
@@ -508,6 +566,7 @@ void DictionaryDefinitionActivity::wrapText() {
   definitionOffset_ = slice.offset;
   definitionSize_ = slice.size;
   definitionIsHtml_ = slice.isHtml;
+  definitionHtmlNeedsPlainFallback_ = false;
 
   prepareDefinitionFontAdvances();
   loadPage(currentPage);
@@ -617,8 +676,12 @@ void DictionaryDefinitionActivity::prepareDefinitionFontAdvances() {
   if (definitionIsHtml_) {
     const DictHtmlRenderer::SpanSink sink{this, &DictionaryDefinitionActivity::collectSpanForAdvances};
     if (!htmlRenderer_.renderFromFileStreaming(dictPath.c_str(), definitionOffset_, definitionSize_, sink)) {
-      LOG_ERR("DICT", "Failed to collect SD-font advances from HTML definition");
-      return;
+      definitionHtmlNeedsPlainFallback_ = true;
+      LOG_ERR("DICT", "Malformed HTML definition; collecting SD-font advances from plain text");
+      if (!htmlRenderer_.renderPlainTextFromFileStreaming(dictPath.c_str(), definitionOffset_, definitionSize_, sink)) {
+        LOG_ERR("DICT", "Failed to collect SD-font advances from definition fallback");
+        return;
+      }
     }
   } else {
     HalFile dictFile;
@@ -682,9 +745,18 @@ void DictionaryDefinitionActivity::sizeModalForCurrentPage() {
   const int contentHeight = metrics.optionPopupInnerPadding * 2 + titleLineHeight + metrics.optionPopupTitleGap +
                             visibleLines * getLineHeight() + footerHeight;
 
-  modalHeight_ = std::min(maxHeight, contentHeight);
+  const int desiredHeight = std::min(maxHeight, contentHeight);
+  const int retainedHeight = modalSessionHeight_;
+  if (retainedHeight > 0 && desiredHeight > retainedHeight) {
+    // The new outer frame erases the old black border. A clean waveform keeps
+    // that erased border from appearing as a second modal on the physical panel.
+    modalCleanRefreshNeeded_ = true;
+  }
+  modalSessionHeight_ = std::max(retainedHeight, desiredHeight);
+  modalHeight_ = modalSessionHeight_;
   modalY_ = (renderer.getScreenHeight() - modalHeight_) / 2;
   bodyStartY = modalY_ + metrics.optionPopupInnerPadding + titleLineHeight + metrics.optionPopupTitleGap;
+  LOG_DBG("DICT", "Modal height desired=%d retained=%d final=%d", desiredHeight, retainedHeight, modalHeight_);
 }
 
 void DictionaryDefinitionActivity::collectLineSink(void* ctx, const DictLayout::LayoutLineView& line) {
@@ -748,21 +820,40 @@ void DictionaryDefinitionActivity::wrapHtml() {
   // Wrapper emits completed lines to the page collector, and the collector keeps
   // only the current page. Neither the whole-definition span/textBuf (renderer)
   // nor all pages of lines (here) is ever materialized.
-  DictLayout::Measurer measure{this, &DictionaryDefinitionActivity::measureWidthAdapter};
-  DictLayout::LineSink lineSink{this, &DictionaryDefinitionActivity::collectLineSink};
-  DictLayout::Wrapper wrapper(DictLayout::WrapMetrics{maxWidth, indentStep, bulletWidth}, measure, lineSink);
-
-  // Renderer is a reused activity member (3.1-A): renderFromFileStreaming resets
-  // it each call (XML_ParserReset, not free+create), so no per-turn object/parser
-  // churn. Streaming means it never materializes the whole-definition buffers.
   const std::string dictPath = foundLocation.folderPath + ".dict";
-  DefinitionSpanFeedContext feedCtx{this, &wrapper};
-  const DictHtmlRenderer::SpanSink spanSink{&feedCtx, &DictionaryDefinitionActivity::feedSpanToWrapper};
-  if (!htmlRenderer_.renderFromFileStreaming(dictPath.c_str(), definitionOffset_, definitionSize_, spanSink)) {
-    LOG_ERR("DICT", "Failed to read HTML definition");
-    definitionReadFailed_ = true;
+  const auto streamIntoLayout = [&](const bool plainTextFallback) {
+    DictLayout::Measurer measure{this, &DictionaryDefinitionActivity::measureWidthAdapter};
+    DictLayout::LineSink lineSink{this, &DictionaryDefinitionActivity::collectLineSink};
+    DictLayout::Wrapper wrapper(DictLayout::WrapMetrics{maxWidth, indentStep, bulletWidth}, measure, lineSink);
+    DefinitionSpanFeedContext feedCtx{this, &wrapper};
+    const DictHtmlRenderer::SpanSink spanSink{&feedCtx, &DictionaryDefinitionActivity::feedSpanToWrapper};
+    const bool ok = plainTextFallback ? htmlRenderer_.renderPlainTextFromFileStreaming(
+                                            dictPath.c_str(), definitionOffset_, definitionSize_, spanSink)
+                                      : htmlRenderer_.renderFromFileStreaming(dictPath.c_str(), definitionOffset_,
+                                                                              definitionSize_, spanSink);
+    wrapper.finish();
+    return ok;
+  };
+
+  // Both paths reset and stream one span at a time, so recovery never
+  // materializes the full definition. Once strict parsing fails, page turns
+  // reuse the known-good fallback without repeating the failed parse.
+  if (!definitionHtmlNeedsPlainFallback_ && !streamIntoLayout(false)) {
+    definitionHtmlNeedsPlainFallback_ = true;
+    LOG_ERR("DICT", "Malformed HTML definition; displaying plain text");
   }
-  wrapper.finish();
+  if (definitionHtmlNeedsPlainFallback_) {
+    // The strict pass may already have emitted the valid prefix. Reset the page
+    // collector before replaying the complete definition as plain text.
+    layoutLines.clear();
+    layoutSegments.clear();
+    pagePool_.clear();
+    collectLineCount_ = 0;
+    if (!streamIntoLayout(true)) {
+      LOG_ERR("DICT", "Failed to read definition plain-text fallback");
+      definitionReadFailed_ = true;
+    }
+  }
   // Only the kept page's span text was ever copied into layoutLines.
 }
 
@@ -799,40 +890,16 @@ void DictionaryDefinitionActivity::feedSpanToWrapper(void* ctx, const StyledSpan
 // ---------------------------------------------------------------------------
 
 void DictionaryDefinitionActivity::wrapPlain() {
-  std::vector<IpaTextSpan> ipaRuns;
-  ipaRuns.reserve(4);
   const int screenWidth = renderer.getScreenWidth();
   const int maxWidth = screenWidth - leftPadding - rightPadding;
-  const int spaceWidth = renderer.getSpaceWidth(getDefinitionFontId(), EpdFontFamily::REGULAR);
-
   std::string currentWord;
-  std::string currentLineText;
-  std::string lineTextPool;
-  std::vector<DictLayout::LayoutSegmentRef> lineSegments;
   currentWord.reserve(64);
-  currentLineText.reserve(128);
-  lineTextPool.reserve(128);
-  lineSegments.reserve(4);
-  int currentLineWidth = 0;
 
+  DictLayout::Measurer measure{this, &DictionaryDefinitionActivity::measureWidthAdapter};
   DictLayout::LineSink sink{this, &DictionaryDefinitionActivity::collectLineSink};
-  auto flushLine = [&]() {
-    if (currentLineText.empty()) return;
-    lineTextPool.clear();
-    lineSegments.clear();
-    ipaRuns.clear();
-    splitIpaRuns(currentLineText.c_str(), ipaRuns);
-    for (const auto& run : ipaRuns) {
-      lineSegments.push_back({static_cast<uint16_t>(lineTextPool.size()), static_cast<uint16_t>(run.text.size()),
-                              EpdFontFamily::REGULAR, run.isIpa});
-      lineTextPool += run.text;
-    }
-    sink({lineTextPool.c_str(), lineSegments.data(), static_cast<uint16_t>(lineSegments.size()), 0, false});
-    currentLineText.clear();
-    currentLineWidth = 0;
-  };
+  DictLayout::Wrapper wrapper(DictLayout::WrapMetrics{maxWidth, 0, 0}, measure, sink);
 
-  auto tryAppendWord = [&]() {
+  auto feedWord = [&]() {
     if (currentWord.empty()) return;
     std::string word = (definitionTextNeedsApproximation(currentWord.c_str()) ||
                         definitionTextHasEtymologySpacingArtifact(currentWord.c_str(), false))
@@ -841,23 +908,11 @@ void DictionaryDefinitionActivity::wrapPlain() {
     currentWord.clear();
     if (word.empty()) return;
 
-    const int wordWidth = getMixedWidth(ipaRuns, word.c_str(), EpdFontFamily::REGULAR);
-    if (currentLineText.empty()) {
-      currentLineText = word;
-      currentLineWidth = wordWidth;
-    } else {
-      const int testWidth = currentLineWidth + spaceWidth + wordWidth;
-      if (testWidth <= maxWidth) {
-        currentLineText += ' ';
-        currentLineText += word;
-        currentLineWidth = testWidth;
-      } else {
-        flushLine();
-        currentLineText = word;
-        currentLineWidth = wordWidth;
-      }
-    }
+    const StyledSpan span{.text = word.c_str()};
+    wrapper.onSpan(span);
   };
+
+  const StyledSpan space{.text = " "};
 
   // Stream from .dict file — the full definition is never held in RAM.
   const std::string dictPath = foundLocation.folderPath + ".dict";
@@ -890,20 +945,22 @@ void DictionaryDefinitionActivity::wrapPlain() {
     for (int ci = 0; ci < n; ci++) {
       char c = chunk[ci];
       if (c == '\0') {
-        tryAppendWord();
+        feedWord();
+        wrapper.onSpan(space);
       } else if (c == '\n') {
-        tryAppendWord();
-        flushLine();
+        feedWord();
+        wrapper.lineBreak();
       } else if (c == ' ') {
-        tryAppendWord();
+        feedWord();
+        wrapper.onSpan(space);
       } else {
         currentWord += c;
       }
     }
   }
 
-  tryAppendWord();
-  flushLine();
+  feedWord();
+  wrapper.finish();
   dictFile.close();
 }
 
@@ -977,7 +1034,14 @@ void DictionaryDefinitionActivity::extractWordsFromLayout() {
 }
 
 void DictionaryDefinitionActivity::openDictionarySwitch() {
-  auto picker = makeUniqueNoThrow<DictionarySelectActivity>(renderer, mappedInput, cachePath, true);
+  if (hasModalBackground()) {
+    // Capture the exact frame currently on the panel before the picker covers
+    // it. This is the hard lower bound for every replacement definition, even
+    // if its content or active font would naturally produce a shorter dialog.
+    modalSessionHeight_ = std::max(modalSessionHeight_, modalHeight_);
+    LOG_DBG("DICT", "Dictionary switch retaining modal height=%d", modalSessionHeight_);
+  }
+  auto picker = makeUniqueNoThrow<DictionarySelectActivity>(renderer, mappedInput, cachePath, true, true);
   if (!picker) {
     LOG_ERR("DICT", "OOM: DictionarySelectActivity");
     return;
@@ -988,10 +1052,19 @@ void DictionaryDefinitionActivity::openDictionarySwitch() {
     // this activity is queued for repaint, so restore the reader background on
     // that next frame whether the selection changed or was cancelled.
     modalBackgroundNeedsRedraw_ = true;
+    modalCleanRefreshNeeded_ = true;
     if (result.isCancelled) {
       requestUpdate();
       return;
     }
+    const auto* selection = std::get_if<FilePathResult>(&result.data);
+    if (!selection) {
+      LOG_ERR("DICT", "Dictionary switch returned no path");
+      requestUpdate();
+      return;
+    }
+    Dictionary::setLookupDictPathOverride(selection->path.c_str());
+    dictionaryName_ = dictionaryNameFromPath(selection->path);
     dictionarySwitchLookupInProgress = true;
     controller.startLookup(headword, false);
   });
@@ -1026,29 +1099,47 @@ void DictionaryDefinitionActivity::loop() {
 
   // --- Controller active (LookingUp / AltFormPrompt / NotFound) ---
   if (controller.isActive()) {
+#if CROSSINK_APP_CAP_TOUCH
+    int failureTouchX = 0;
+    int failureTouchY = 0;
+    if (hasModalBackground() && controller.hasFailureFeedback() && showTouchDictionarySwitch() &&
+        mappedInput.wasScreenTapped(failureTouchX, failureTouchY) &&
+        dictionarySwitchButtonContains(failureTouchX, failureTouchY) &&
+        controller.dismissFailureForDictionarySwitch()) {
+      openDictionarySwitch();
+      return;
+    }
+#endif
     switch (controller.handleInput()) {
       case DictionaryLookupController::LookupEvent::FoundDefinition: {
         const bool wasBackNav = chainBackNavInProgress;
         const bool wasDictionarySwitch = dictionarySwitchLookupInProgress;
         const bool willLog = !wasBackNav && controller.getRecordHistory();
-        if (!wasBackNav && !wasDictionarySwitch) {
-          // Forward: push a back-entry for the word being left (current headword,
-          // on currentPage), referencing its history position.
-          chain_.onForward(static_cast<uint16_t>(currentPage), willLog);
+        {
+          // A dictionary-picker return queues a background repaint while the
+          // lookup worker can finish immediately. Serialize reflow with that
+          // repaint: it temporarily unloads the dictionary font, and measuring
+          // against the missing font otherwise collapses pagination to one line.
+          RenderLock lock(*this);
+          if (!wasBackNav && !wasDictionarySwitch) {
+            // Forward: push a back-entry for the word being left (current headword,
+            // on currentPage), referencing its history position.
+            chain_.onForward(static_cast<uint16_t>(currentPage), willLog);
+          }
+          chainBackNavInProgress = false;
+          dictionarySwitchLookupInProgress = false;
+          headword = controller.getFoundWord();
+          foundLocation = controller.getFoundLocation();
+          wrapText();  // resets currentPage to 0 and loads page 0
+          if (wasBackNav) {
+            // Re-derive the now-current word's history position and restore its page.
+            chain_.setCurrentHistIndex(pendingBack_.histIndex);
+            currentPage = (pendingBack_.page < totalPages) ? pendingBack_.page : (totalPages - 1);
+            if (currentPage < 0) currentPage = 0;
+            if (currentPage > 0) loadPage(currentPage);
+          }
+          isWordSelectMode = false;
         }
-        chainBackNavInProgress = false;
-        dictionarySwitchLookupInProgress = false;
-        headword = controller.getFoundWord();
-        foundLocation = controller.getFoundLocation();
-        wrapText();  // resets currentPage to 0 and loads page 0
-        if (wasBackNav) {
-          // Re-derive the now-current word's history position and restore its page.
-          chain_.setCurrentHistIndex(pendingBack_.histIndex);
-          currentPage = (pendingBack_.page < totalPages) ? pendingBack_.page : (totalPages - 1);
-          if (currentPage < 0) currentPage = 0;
-          if (currentPage > 0) loadPage(currentPage);
-        }
-        isWordSelectMode = false;
         requestUpdate();
         // Chain-forward records; chain-back-nav does not.
         LookupHistory::addWordIf(cachePath, controller.getLookupWord(),
@@ -1157,8 +1248,10 @@ void DictionaryDefinitionActivity::loop() {
 #endif
 
   const auto swipe = mappedInput.wasSwipe();
-  const bool prevPage = dictionaryPageButtonTriggered(mappedInput, true) || swipe == MappedInputManager::SwipeDir::Down;
-  const bool nextPage = dictionaryPageButtonTriggered(mappedInput, false) || swipe == MappedInputManager::SwipeDir::Up;
+  const bool prevPage =
+      DictUtils::dictionaryPageButtonTriggered(mappedInput, true) || swipe == MappedInputManager::SwipeDir::Down;
+  const bool nextPage =
+      DictUtils::dictionaryPageButtonTriggered(mappedInput, false) || swipe == MappedInputManager::SwipeDir::Up;
 
   if (prevPage && currentPage > 0) {
     currentPage--;
@@ -1174,6 +1267,17 @@ void DictionaryDefinitionActivity::loop() {
 
   if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
     if (showLookupButton) {
+      if (!hasSharedHighlightSnapshotStorage_ && !ownedHighlightSnapshotStorage_) {
+        // Fixed 4 KB activity-lifetime buffer: too large for the task stack and
+        // only needed when history-launched definitions enter word selection.
+        ownedHighlightSnapshotStorage_ = makeUniqueNoThrow<WordSelectNavigator::HighlightSnapshotStorage>();
+        if (!ownedHighlightSnapshotStorage_) {
+          LOG_ERR("DICT", "OOM allocating definition highlight snapshot (%u bytes)",
+                  static_cast<unsigned>(sizeof(WordSelectNavigator::HighlightSnapshotStorage)));
+        } else {
+          navigator.setHighlightSnapshotStorage(ownedHighlightSnapshotStorage_.get());
+        }
+      }
       extractWordsFromLayout();
       if (!navigator.isEmpty()) {
         isWordSelectMode = true;
@@ -1208,6 +1312,10 @@ void DictionaryDefinitionActivity::loop() {
 // ---------------------------------------------------------------------------
 
 void DictionaryDefinitionActivity::render(RenderLock&&) {
+  if (hasModalBackground() && controller.consumeFullScreenChildDisturbance()) {
+    modalBackgroundNeedsRedraw_ = true;
+    modalCleanRefreshNeeded_ = true;
+  }
   // Differential fast path: only when we're already in word-select mode AND
   // we set it up on the previous frame AND the controller has nothing pending.
   if (isWordSelectMode && nextRenderMode_ == RenderMode::Differential && !controller.isActive()) {
@@ -1216,7 +1324,8 @@ void DictionaryDefinitionActivity::render(RenderLock&&) {
       if (const auto* word = navigator.getWordAt(currIdx); word && renderer.isSdCardFont(word->fontId)) {
         if (auto* fcm = renderer.getFontCacheManager()) {
           const uint8_t styleMask = static_cast<uint8_t>(1u << (static_cast<uint8_t>(word->style) & 0x03));
-          fcm->prewarmCache(word->fontId, navigator.getDisplay(*word), styleMask);
+          fcm->prewarmCache(word->fontId, navigator.getDisplay(*word), styleMask,
+                            FontCacheManager::PreparationPolicy::DictionaryLean);
         }
       }
       const int lineHeight = getLineHeight();
@@ -1233,35 +1342,49 @@ void DictionaryDefinitionActivity::render(RenderLock&&) {
     }
   }
 
-  // Full repaint path. The framebuffer retains the book pixels outside the
-  // opaque, stable modal, so ordinary definition page turns only repaint the
-  // modal. Rebuild the book after another screen or overlay disturbed it.
-  if (hasModalBackground()) {
-    if (modalBackgroundNeedsRedraw_) {
-      backgroundRender_(backgroundContext_);
-      modalBackgroundNeedsRedraw_ = false;
-    }
-  } else {
-    renderer.clearScreen();
-  }
-
-  // After the picker closes, ActivityManager queues a repaint before the
-  // replacement lookup finishes. Repainting the previous definition here
-  // pushes stale glyph pixels through e-ink's fast-refresh waveform, which
-  // briefly distorts the old page. Keep the restored reader background and
-  // show the existing lookup popup until the new definition is ready.
-  if (dictionarySwitchLookupInProgress && controller.isLookingUp()) {
-    GUI.drawPopup(renderer, tr(STR_DICT_LOOKING_UP));
-    // The popup sits outside the definition modal, so rebuild the reader
-    // background before rendering either the new definition or a failure UI.
-    if (hasModalBackground()) modalBackgroundNeedsRedraw_ = true;
+  // Alt-form confirmation intentionally owns the full screen. Leave the reader
+  // font unloaded while it is visible, then rebuild the background once after
+  // the controller returns to the modal flow.
+  if (hasModalBackground() && controller.requiresBackgroundRedrawAfterOverlay()) {
+    controller.render();
+    modalBackgroundNeedsRedraw_ = true;
+    modalCleanRefreshNeeded_ = true;
     nextRenderMode_ = RenderMode::FullPage;
     prevHighlightIdx_ = -1;
     return;
   }
-  if (controller.render()) {
+
+  // Full repaint path. The framebuffer retains the book pixels outside the
+  // opaque, stable modal, so ordinary definition page turns only repaint the
+  // modal. Rebuild the book after another screen or overlay disturbed it.
+  if (hasModalBackground()) {
+    redrawModalBackground();
+  } else {
+    renderer.clearScreen();
+  }
+
+  // After the picker closes, rebuild the reader once but do not redraw stale
+  // definition glyphs. Keep lookup feedback inside the modal; the successful
+  // replacement can then reuse this background without another font swap.
+  if (dictionarySwitchLookupInProgress && controller.isLookingUp()) {
+    if (hasModalBackground()) {
+      drawModalFrame();
+      const int messageY = modalY_ + (modalHeight_ - renderer.getLineHeight(UI_10_FONT_ID)) / 2;
+      renderer.drawCenteredText(UI_10_FONT_ID, messageY, tr(STR_DICT_LOOKING_UP));
+      displayModalBuffer();
+    } else {
+      GUI.drawPopup(renderer, tr(STR_DICT_LOOKING_UP));
+    }
+    nextRenderMode_ = RenderMode::FullPage;
+    prevHighlightIdx_ = -1;
+    return;
+  }
+  const bool inlineFailureFeedback = hasModalBackground() && controller.hasFailureFeedback();
+  if (!inlineFailureFeedback && controller.render()) {
     // Controller drew an overlay; framebuffer state is unknown.
-    if (hasModalBackground()) modalBackgroundNeedsRedraw_ = true;
+    if (hasModalBackground() && controller.requiresBackgroundRedrawAfterOverlay()) {
+      modalBackgroundNeedsRedraw_ = true;
+    }
     nextRenderMode_ = RenderMode::FullPage;
     prevHighlightIdx_ = -1;
     return;
@@ -1349,13 +1472,19 @@ void DictionaryDefinitionActivity::render(RenderLock&&) {
   bool definitionTextRendered = false;
   if (renderer.isSdCardFont(bodyFontId)) {
     if (auto* fcm = renderer.getFontCacheManager()) {
+      // Keep this alive through the word-select overlay below. Its destructor
+      // clears SD glyph bitmaps, and that overlay redraws the selected word.
+      std::optional<FontCacheManager::PrewarmScope> definitionRenderScope;
       const auto prewarmAndRender = [&]() {
-        auto scope = fcm->createPrewarmScope();
+        definitionRenderScope.emplace(*fcm, FontCacheManager::PreparationPolicy::DictionaryLean);
         renderTitle();
         renderBody();  // scan pass
-        if (!scope.endScanAndPrewarm()) return false;
+        if (!definitionRenderScope->endScanAndPrewarm()) {
+          definitionRenderScope.reset();
+          return false;
+        }
         renderTitle();
-        renderBody();  // prepared render; scope keeps glyphs alive until this returns
+        renderBody();  // prepared render
         return true;
       };
 
@@ -1380,7 +1509,23 @@ void DictionaryDefinitionActivity::render(RenderLock&&) {
     renderBody();
   }
 
-  if (definitionReadFailed_) GUI.drawPopup(renderer, tr(STR_DICT_READ_FAILED));
+  const char* inlineStatusMessage = nullptr;
+  if (hasModalBackground() && controller.isLookingUp()) {
+    inlineStatusMessage = tr(STR_DICT_LOOKING_UP);
+  } else if (inlineFailureFeedback) {
+    inlineStatusMessage = controller.getFailureMessage();
+  } else if (hasModalBackground() && definitionReadFailed_) {
+    inlineStatusMessage = tr(STR_DICT_READ_FAILED);
+  }
+  if (inlineStatusMessage) {
+    const int messageHeight = renderer.getLineHeight(UI_10_FONT_ID) + metrics.optionPopupInnerPadding * 2;
+    const int messageY = modalY_ + (modalHeight_ - messageHeight) / 2;
+    renderer.fillRect(modalX_ + metrics.optionPopupInnerPadding, messageY,
+                      modalWidth_ - metrics.optionPopupInnerPadding * 2, messageHeight, false);
+    renderer.drawCenteredText(UI_10_FONT_ID, messageY + metrics.optionPopupInnerPadding, inlineStatusMessage);
+  }
+
+  if (!hasModalBackground() && definitionReadFailed_) GUI.drawPopup(renderer, tr(STR_DICT_READ_FAILED));
 
   if (hasModalBackground() && !dictionaryName_.empty()) {
     const int innerPadding = metrics.optionPopupInnerPadding;
@@ -1431,7 +1576,7 @@ void DictionaryDefinitionActivity::render(RenderLock&&) {
     }
 
     DictUtils::drawWordSelectButtonHints(renderer, mappedInput, navigator);
-    renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+    displayModalBuffer();
 
     prevHighlightIdx_ = currIdx;
     nextRenderMode_ = snapshotPrimed ? RenderMode::Differential : RenderMode::FullPage;
@@ -1444,13 +1589,17 @@ void DictionaryDefinitionActivity::render(RenderLock&&) {
   prevHighlightIdx_ = -1;
 
   // Button hints
-  const char* btn2 = showLookupButton ? tr(STR_LOOKUP_SHORT) : "";
+  const char* btn2 = inlineFailureFeedback ? tr(STR_DONE) : (showLookupButton ? tr(STR_LOOKUP_SHORT) : "");
   const char* btn3 = showLookupButton ? tr(STR_DICT_SWITCH) : "";
   const char* btn4 = "";
   const auto labels = mappedInput.mapLabels(tr(STR_BACK), btn2, btn3, btn4);
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
 
-  renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+  if (hasModalBackground()) {
+    displayModalBuffer();
+  } else {
+    renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+  }
 
   // Skip the full-screen grayscale anti-aliasing overlay here. This modal is
   // short-lived, and the 48KB BW backup it needs can fragment the heap enough

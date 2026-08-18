@@ -21,6 +21,7 @@ class BookStatsActivity final : public Activity {
   float progressPercent = -1.0f;
   bool hasEstimatedTimeLeft = false;
   uint32_t estimatedTimeLeftSeconds = 0;
+  GfxRenderer::Orientation previousOrientation = GfxRenderer::Orientation::Portrait;
   Page page = Page::PerBook;
   int selectedEditField = 0;
   bool didChangeStats = false;

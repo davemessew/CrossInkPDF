@@ -13,8 +13,8 @@ struct DictionaryEntry {
 
 // Discovers installed dictionaries on the SD card. Mirrors SdCardFontRegistry:
 // discover() scans the card and populates entries_; the settings UI enumerates
-// them on both device and web. The *active* selection is not stored here — it
-// lives in dictionary.bin (see Dictionary::readDictPath/saveGlobalDictPath).
+// them on both device and web. The persistent selection is not stored here — it
+// lives in dictionary.bin (see Dictionary::readConfiguredDictPath/saveGlobalDictPath).
 class DictionaryRegistry {
  public:
   // Scan the SD card, populate entries_ (sorted by folder name). Returns true if any found.
@@ -37,7 +37,7 @@ class DictionaryRegistry {
   }
 
  private:
-  void maybeAutoSelectSingleDictionary() const;
+  void maybeAutoSelectDefaultDictionary() const;
 
   std::vector<DictionaryEntry> entries_;  // sorted alphabetically by name
   std::string root_;                      // active dictionary root dir on the SD card

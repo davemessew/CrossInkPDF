@@ -1,6 +1,6 @@
 ---
 title: EPUB Render Modes
-nav_order: 8
+nav_order: 9
 ---
 
 # EPUB Render Modes
