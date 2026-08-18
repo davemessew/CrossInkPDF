@@ -2,7 +2,7 @@
 
 ### Changed
 
-- Updated the underlying CrossInk code to the official 1.5.0 release while retaining PDF Reflow, PDF reading progress, bookmarks, clippings, and device font handling.
+- Updated the underlying CrossInk code to the official 1.5.0 release while retaining CrossInkPDF support, PDF reading progress, bookmarks, clippings, and device font handling.
 
 ### Fixed
 
