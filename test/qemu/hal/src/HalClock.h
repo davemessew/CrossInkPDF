@@ -34,6 +34,7 @@ class HalClock {
   bool formatDate(char* buf, size_t bufSize, uint8_t utcOffsetQuarterHoursBiased = 48,
                   DateFormat dateFormat = MONTH_DAY_YEAR_LONG, char numericSeparator = '/') const;
   bool syncFromNTP();
+  bool syncSystemTimeFromNTP() { return false; }
 
  private:
   bool getDate(uint16_t& year, uint8_t& month, uint8_t& day, uint8_t& hour, uint8_t& minute) const;

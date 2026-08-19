@@ -44,6 +44,7 @@ class PdfPrepareActivity final : public Activity {
   static void resourceEvent(void* context, const PdfResourceEvent& event);
   static const char* errorMessage(PdfError error);
 
+  void beginPreparation();
   void finishPreparation();
   void openPreparedDocument(std::unique_ptr<ReflowDocument> document);
   void setFailure(PdfStatus status);
@@ -54,6 +55,7 @@ class PdfPrepareActivity final : public Activity {
   std::unique_ptr<ReflowDocument> pendingDocument_;
   PdfPreparationPaintGate paintGate_;
   uint32_t warningFlags_ = 0;
+  bool cacheRecoveryAttempted_ = false;
   State state_ = State::Preparing;
   PdfStatus initialFailure_{};
   PdfStatus failure_{};

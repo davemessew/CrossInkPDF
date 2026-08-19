@@ -13,13 +13,13 @@ There is no desktop conversion step and nothing special to do before upload. Cop
 >
 > **Standard text — 10, 12, 14, and 16 pt**
 >
-> **[Download `firmware-tiny-crossinkpdf-v1.5.0.18.bin`](https://github.com/davemessew/CrossInkPDF/releases/download/crossinkpdf-v1.5.0.18/firmware-tiny-crossinkpdf-v1.5.0.18.bin)**
+> **[Download `firmware-tiny-crossinkpdf-v1.5.0.19.bin`](https://github.com/davemessew/CrossInkPDF/releases/download/crossinkpdf-v1.5.0.19/firmware-tiny-crossinkpdf-v1.5.0.19.bin)**
 >
 > **Large text — 16, 18, and 20 pt**
 >
-> **[Download `firmware-xlarge-crossinkpdf-v1.5.0.18.bin`](https://github.com/davemessew/CrossInkPDF/releases/download/crossinkpdf-v1.5.0.18/firmware-xlarge-crossinkpdf-v1.5.0.18.bin)**
+> **[Download `firmware-xlarge-crossinkpdf-v1.5.0.19.bin`](https://github.com/davemessew/CrossInkPDF/releases/download/crossinkpdf-v1.5.0.19/firmware-xlarge-crossinkpdf-v1.5.0.19.bin)**
 >
-> [Release page](https://github.com/davemessew/CrossInkPDF/releases/tag/crossinkpdf-v1.5.0.18) · [Installation guide](./docs/installation.md)
+> [Release page](https://github.com/davemessew/CrossInkPDF/releases/tag/crossinkpdf-v1.5.0.19) · [Installation guide](./docs/installation.md)
 >
 > Both downloads contain the full CrossInk firmware, PDF support, emoji, and symbol support. They are not PDF-only images.
 
@@ -138,7 +138,7 @@ See [Font Build Variants](./docs/font-build-variants.md) for more detail.
 
 The fastest route is [Inky, CrossInk's web installer](https://inky.crossink.dev/#flash-tools):
 
-1. Download the [`tiny` firmware](https://github.com/davemessew/CrossInkPDF/releases/download/crossinkpdf-v1.5.0.18/firmware-tiny-crossinkpdf-v1.5.0.18.bin) for standard text or the [`xlarge` firmware](https://github.com/davemessew/CrossInkPDF/releases/download/crossinkpdf-v1.5.0.18/firmware-xlarge-crossinkpdf-v1.5.0.18.bin) for large text.
+1. Download the [`tiny` firmware](https://github.com/davemessew/CrossInkPDF/releases/download/crossinkpdf-v1.5.0.19/firmware-tiny-crossinkpdf-v1.5.0.19.bin) for standard text or the [`xlarge` firmware](https://github.com/davemessew/CrossInkPDF/releases/download/crossinkpdf-v1.5.0.19/firmware-xlarge-crossinkpdf-v1.5.0.19.bin) for large text.
 2. Open the CrossInk web installer.
 3. Select **Custom .bin**.
 4. Choose the downloaded file and flash it.

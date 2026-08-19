@@ -16,6 +16,7 @@
 #include "MappedInputManager.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
+#include "util/BookCacheUtils.h"
 
 namespace {
 
@@ -46,6 +47,11 @@ const char* resourceName(const PdfResourceKind kind) {
       return "operand_scratch";
   }
   return "unknown";
+}
+
+bool recoverablePreparedCacheError(const PdfError error) {
+  return error == PdfError::InvalidOffset || error == PdfError::UnexpectedEof || error == PdfError::Malformed ||
+         error == PdfError::LimitExceeded || error == PdfError::ExpansionLimit;
 }
 
 }  // namespace
@@ -102,6 +108,10 @@ void PdfPrepareActivity::onEnter() {
     setFailure(initialFailure_);
     return;
   }
+  beginPreparation();
+}
+
+void PdfPrepareActivity::beginPreparation() {
   preparation_ = makeUniqueNoThrow<PdfPreparation>();
   if (!preparation_) {
     setFailure(PdfStatus::failure(PdfError::InsufficientMemory));
@@ -176,6 +186,17 @@ void PdfPrepareActivity::finishPreparation() {
   PdfStatus status{};
   auto document = loadPdfHalReflowDocumentNoThrow(sourcePath_.c_str(), kCacheDirectory, &status);
   if (!document) {
+    if (!cacheRecoveryAttempted_ && recoverablePreparedCacheError(status.error)) {
+      LOG_ERR("PDF", "Prepared PDF cache rejected: error=%u offset=%llu; rebuilding once",
+              static_cast<unsigned>(status.error), static_cast<unsigned long long>(status.offset));
+      cacheRecoveryAttempted_ = true;
+      if (clearBookCachePreservingUserState(sourcePath_)) {
+        paintGate_ = {};
+        beginPreparation();
+        return;
+      }
+      LOG_ERR("PDF", "Failed to clear rejected PDF cache");
+    }
     setFailure(status);
     return;
   }

@@ -81,6 +81,7 @@ struct OneOutlineEntry {
 struct CacheFixture {
   PdfTestCacheIo storage;
   PdfSourceIdentity identity{};
+  RequiredRecords records;
   std::string cacheRoot;
   std::string selectedManifestPath;
   std::string otherManifestPath;
@@ -105,7 +106,7 @@ struct CacheFixture {
     PdfCacheStore cache;
     ASSERT_TRUE(cache.initialize(storage.io(), cacheRoot.c_str()).ok());
     ASSERT_TRUE(cache.ensureGeneration(7).ok());
-    RequiredRecords records;
+    records.values.clear();
     for (uint16_t index = 0; index < sectionCount; ++index) {
       char relative[48]{};
       ASSERT_GT(std::snprintf(relative, sizeof(relative), "gen_7/sections/%06u.xhtml", index), 0);
@@ -348,6 +349,46 @@ TEST(PdfReflowDocumentStorage, ReleasesExactValidationStorageAfterRequiredFileCo
   EXPECT_EQ(document.validationStorageBytesForTest(), 0U);
   EXPECT_EQ(document.getSectionCount(), 0);
   EXPECT_EQ(document.getCapabilities(), 0U);
+  EXPECT_EQ(fixture.storage.openHandleCount(), 0U);
+}
+
+TEST(PdfReflowDocument, FallsBackToOlderCompletedManifestWhenNewestGenerationFilesFailValidation) {
+  CacheFixture fixture;
+  fixture.build();
+
+  PdfCacheStore cache;
+  ASSERT_TRUE(cache.initialize(fixture.storage.io(), fixture.cacheRoot.c_str()).ok());
+  PdfCacheManifestSelection prior;
+  ASSERT_TRUE(cache.loadManifestSlots(fixture.identity, &prior).ok());
+  ASSERT_TRUE(prior.selected);
+
+  RequiredRecords badRecords = fixture.records;
+  ASSERT_FALSE(badRecords.values.empty());
+  badRecords.values[0].crc32 ^= 1U;
+  PdfCacheManifest newest = prior.manifest;
+  ++newest.sequence;
+  newest.requiredFileLedger = PDF_CACHE_FNV64_OFFSET;
+  for (const auto& record : badRecords.values) {
+    newest.requiredFileLedger = pdfUpdateRequiredFileLedger(newest.requiredFileLedger, record);
+  }
+  const PdfCacheCommitEvidence evidence{
+      true,
+      newest.requiredFileCount,
+      newest.requiredFileBytes,
+      newest.requiredFileLedger,
+  };
+  PdfCacheManifestSelection committed;
+  ASSERT_TRUE(cache.commitManifest(newest, badRecords.source(), evidence, prior, &committed).ok());
+  ASSERT_TRUE(committed.selected);
+  ASSERT_NE(committed.selectedSlot, prior.selectedSlot);
+
+  PdfReflowDocument document;
+  ASSERT_TRUE(document.initialize(fixture.storage.io(), kSourcePath, kCacheDirectory).ok());
+  const PdfStatus status = document.loadCompletedCache();
+
+  EXPECT_TRUE(status.ok()) << static_cast<int>(status.error) << "@" << status.offset;
+  EXPECT_EQ(document.getSectionCount(), 1);
+  EXPECT_EQ(document.getTotalWordCount(), 2U);
   EXPECT_EQ(fixture.storage.openHandleCount(), 0U);
 }
 

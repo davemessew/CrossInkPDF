@@ -77,6 +77,7 @@ class HalFile : public Print {
   friend class HalStorage;
   class Impl;
   std::unique_ptr<Impl> impl;
+  bool allocationFailed_ = false;
   explicit HalFile(std::unique_ptr<Impl> impl);
 
  public:
@@ -110,6 +111,7 @@ class HalFile : public Print {
   bool close();
   HalFile openNextFile();
   HalDirectoryNextStatus openNextFile(HalFile& entry);
+  bool allocationFailed() const { return allocationFailed_; }
   bool isOpen() const;
   bool modificationTime(uint64_t* packedFatDateTime);
   operator bool() const;

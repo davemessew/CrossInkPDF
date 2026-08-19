@@ -1163,7 +1163,8 @@ bool loadPersistentState(PersistentAcceptanceState* persistent) {
 void pinReaderSettings(GfxRenderer& renderer) {
   SETTINGS.uiTheme = CrossPointSettings::UI_THEME::CLASSIC;
   SETTINGS.fontFamily = CrossPointSettings::FONT_FAMILY::LEXENDDECA;
-  SETTINGS.fontSize = CrossPointSettings::FONT_SIZE::MEDIUM;
+  SETTINGS.readerFontPointSize =
+      CrossPointSettings::getReaderFontPointSize(CrossPointSettings::FONT_SIZE::MEDIUM);
   SETTINGS.lineHeightPercent = 100;
   SETTINGS.orientation = CrossPointSettings::ORIENTATION::PORTRAIT;
   SETTINGS.screenMargin = 5;

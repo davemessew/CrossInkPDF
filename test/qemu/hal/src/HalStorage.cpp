@@ -291,6 +291,8 @@ HalFile& HalFile::operator=(HalFile&& other) {
   if (this != &other) {
     close();
     impl = std::move(other.impl);
+    allocationFailed_ = other.allocationFailed_;
+    other.allocationFailed_ = false;
   }
   return *this;
 }
@@ -313,7 +315,9 @@ HalFile HalStorage::open(const char* const path, const oflag_t oflag) {
   auto wrapped = makeUniqueNoThrow<HalFile::Impl>(std::move(opened), reader, writable);
   if (!wrapped) {
     opened.close();
-    return {};
+    HalFile failed;
+    failed.allocationFailed_ = true;
+    return failed;
   }
   ++qemuStorageOpenCount;
   if (reader) {
@@ -436,12 +440,14 @@ void HalFile::rewindDirectory() {
 
 bool HalFile::close() {
   if (impl == nullptr) {
+    allocationFailed_ = false;
     return true;
   }
   HalStorage::StorageLock lock;
   const bool reader = impl->reader;
   const bool result = impl->file.close();
   impl.reset();
+  allocationFailed_ = false;
   ++qemuStorageCloseCount;
   if (reader && qemuStorageReaderCount != 0) {
     --qemuStorageReaderCount;
@@ -450,6 +456,7 @@ bool HalFile::close() {
 }
 
 HalFile HalFile::openNextFile() {
+  allocationFailed_ = false;
   if (impl == nullptr || !impl->file.isDirectory()) {
     return {};
   }
@@ -466,6 +473,7 @@ HalFile HalFile::openNextFile() {
   auto wrapped = makeUniqueNoThrow<Impl>(std::move(child), reader, false);
   if (!wrapped) {
     child.close();
+    allocationFailed_ = true;
     return {};
   }
   ++qemuStorageOpenCount;

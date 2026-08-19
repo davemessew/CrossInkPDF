@@ -232,7 +232,8 @@ class PdfReflowDocument : public ReflowDocument {
   PdfStatus validateCachedFile(const char* path, uint64_t expectedSize, uint32_t expectedCrc32,
                                PdfCachedResourceRecord* resource);
   PdfStatus validateResourceFile(uint8_t resourceIndex);
-  PdfStatus selectCompletedManifest(PdfCacheSlot* selectedSlot);
+  PdfStatus selectCompletedManifest(PdfCacheSlot* selectedSlot, uint8_t excludedSlots = 0,
+                                    bool* candidateSelected = nullptr);
   PdfStatus decodeSelectedManifest(PdfCacheSlot selectedSlot);
   PdfStatus loadMetadataCache();
   PdfStatus loadOutlineCache();

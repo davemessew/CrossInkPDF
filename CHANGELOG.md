@@ -1,3 +1,11 @@
+## [Unreleased]
+
+## [v1.5.0.19] - 2026-08-19
+
+### Fixed
+
+- Falls back to the older completed PDF cache generation when the newest one references damaged or incomplete files, then rebuilds only when neither completed generation is usable. Reading progress and saved items are preserved.
+
 ## [v1.5.0.18] - 2026-08-19
 
 ### Fixed

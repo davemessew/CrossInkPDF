@@ -538,9 +538,19 @@ def validate_pdf_ui_failure_warning_contract(
         raise AssertionError(
             "initial PDF error must return immediately without allocating or starting preparation"
         )
-    allocation = on_enter.find("makeUniqueNoThrow<PdfPreparation>")
-    start = on_enter.find("preparation_->begin(")
-    if allocation < failure_end or start < allocation:
+    preparation_start = on_enter.find("beginPreparation();")
+    preparation_scope = on_enter
+    if preparation_start >= 0:
+        if preparation_start < failure_end:
+            raise AssertionError(
+                "initial PDF error screen still allocates or starts preparation"
+            )
+        preparation_scope, _, _ = _cpp_block_after(
+            prepare_source, "void PdfPrepareActivity::beginPreparation()"
+        )
+    allocation = preparation_scope.find("makeUniqueNoThrow<PdfPreparation>")
+    start = preparation_scope.find("preparation_->begin(")
+    if allocation < 0 or start < allocation:
         raise AssertionError(
             "initial PDF error screen still allocates or starts preparation"
         )
@@ -557,7 +567,7 @@ def validate_pdf_ui_failure_warning_contract(
     finish_end = prepare_source.find("void PdfPrepareActivity::loop()", finish_start)
     finish = prepare_source[finish_start:finish_end]
     for required in (
-        "optionalContentWasSkipped()",
+        "warningFlags()",
         "pendingDocument_ = std::move",
         "State::Warning",
     ):
@@ -585,7 +595,7 @@ def validate_pdf_ui_failure_warning_contract(
         raise AssertionError("cached PDF reopen must not show the preparation warning")
     for required in (
         "STR_PDF_OPTIONAL_CONTENT_SKIPPED",
-        "STR_CONTINUE_READING",
+        "STR_CONTINUE",
     ):
         if required not in prepare_source:
             raise AssertionError(f"translated PDF warning UI is missing {required}")

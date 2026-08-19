@@ -105,6 +105,12 @@ bool alignUpSize(const size_t value, const size_t alignment, size_t* const resul
   return true;
 }
 
+bool recoverableCompletedCacheError(const PdfError error) {
+  return error == PdfError::InvalidOffset || error == PdfError::InvalidArgument ||
+         error == PdfError::UnexpectedEof || error == PdfError::Malformed ||
+         error == PdfError::LimitExceeded || error == PdfError::ExpansionLimit;
+}
+
 bool parseDecimal(const char* const bytes, const size_t length, uint32_t* const value) {
   if (bytes == nullptr || value == nullptr || length == 0) {
     return false;
@@ -889,9 +895,13 @@ PdfStatus PdfReflowDocument::validateOutlineEntry(void* context, const uint16_t 
   return PdfStatus::success();
 }
 
-PDF_REFLOW_DOCUMENT_NOINLINE PdfStatus PdfReflowDocument::selectCompletedManifest(PdfCacheSlot* const selectedSlot) {
+PDF_REFLOW_DOCUMENT_NOINLINE PdfStatus PdfReflowDocument::selectCompletedManifest(
+    PdfCacheSlot* const selectedSlot, const uint8_t excludedSlots, bool* const candidateSelected) {
   if (selectedSlot == nullptr) {
     return PdfStatus::failure(PdfError::InvalidArgument);
+  }
+  if (candidateSelected != nullptr) {
+    *candidateSelected = false;
   }
   struct SlotScan {
     PdfCacheManifestSlotState state{};
@@ -912,6 +922,9 @@ PDF_REFLOW_DOCUMENT_NOINLINE PdfStatus PdfReflowDocument::selectCompletedManifes
 
   static constexpr char manifestNames[2][11] = {"manifest.a", "manifest.b"};
   for (uint8_t index = 0; index < 2; ++index) {
+    if ((excludedSlots & static_cast<uint8_t>(1U << index)) != 0) {
+      continue;
+    }
     SlotScan& scan = workspace->slots[index];
     scan.counts.manifest = &scan.state.manifest;
     const int pathLength = std::snprintf(validationPath_.data(), validationPath_.size(), "%s/%s", cacheRoot_.c_str(),
@@ -960,6 +973,10 @@ PDF_REFLOW_DOCUMENT_NOINLINE PdfStatus PdfReflowDocument::selectCompletedManifes
     return PdfStatus::failure(PdfError::InvalidOffset);
   }
   SlotScan& selected = workspace->slots[workspace->selectedIndex];
+  *selectedSlot = workspace->selectedIndex == 0 ? PdfCacheSlot::A : PdfCacheSlot::B;
+  if (candidateSelected != nullptr) {
+    *candidateSelected = true;
+  }
   if (!selected.counts.status) {
     return selected.counts.status;
   }
@@ -974,7 +991,6 @@ PDF_REFLOW_DOCUMENT_NOINLINE PdfStatus PdfReflowDocument::selectCompletedManifes
     return status;
   }
   manifest_ = selected.state.manifest;
-  *selectedSlot = workspace->selectedIndex == 0 ? PdfCacheSlot::A : PdfCacheSlot::B;
   return PdfStatus::success();
 }
 
@@ -1102,23 +1118,59 @@ PdfStatus PdfReflowDocument::loadCompletedCache() {
     return status_;
   }
 
-  PdfCacheSlot selectedSlot = PdfCacheSlot::A;
-  status_ = selectCompletedManifest(&selectedSlot);
-  if (status_) {
+  const PdfSourceIdentity sourceIdentity = sourceIdentity_;
+  PdfStatus candidateFailure = PdfStatus::failure(PdfError::InvalidOffset);
+  uint8_t excludedSlots = 0;
+  bool cacheLoaded = false;
+  bool candidateFailed = false;
+  for (uint8_t attempt = 0; attempt < 2; ++attempt) {
+    if (attempt != 0) {
+      resetLoadedState();
+      sourceIdentity_ = sourceIdentity;
+    }
+    PdfCacheSlot selectedSlot = PdfCacheSlot::A;
+    bool selectedCandidate = false;
+    status_ = selectCompletedManifest(&selectedSlot, excludedSlots, &selectedCandidate);
+    if (!status_) {
+      if (selectedCandidate && recoverableCompletedCacheError(status_.error)) {
+        excludedSlots |= static_cast<uint8_t>(1U << (selectedSlot == PdfCacheSlot::A ? 0U : 1U));
+        candidateFailure = status_;
+        candidateFailed = true;
+        LOG_ERR("PDF", "Completed PDF cache slot %c rejected: error=%u offset=%llu; trying older slot",
+                selectedSlot == PdfCacheSlot::A ? 'A' : 'B', static_cast<unsigned>(status_.error),
+                static_cast<unsigned long long>(status_.offset));
+        continue;
+      }
+      if (candidateFailed) {
+        status_ = candidateFailure;
+      }
+      break;
+    }
+    excludedSlots |= static_cast<uint8_t>(1U << (selectedSlot == PdfCacheSlot::A ? 0U : 1U));
     status_ = decodeSelectedManifest(selectedSlot);
+    if (status_) {
+      status_ = validateCapturedFiles();
+    }
+    if (status_) {
+      status_ = loadMetadataCache();
+    }
+    if (status_) {
+      status_ = loadOutlineCache();
+    }
+    if (status_) {
+      cacheLoaded = true;
+      break;
+    }
+    if (!recoverableCompletedCacheError(status_.error)) {
+      break;
+    }
+    candidateFailure = status_;
+    candidateFailed = true;
+    LOG_ERR("PDF", "Completed PDF cache slot %c rejected: error=%u offset=%llu; trying older slot",
+            selectedSlot == PdfCacheSlot::A ? 'A' : 'B', static_cast<unsigned>(status_.error),
+            static_cast<unsigned long long>(status_.offset));
   }
-  if (!status_) {
-    resetLoadedState();
-    return status_;
-  }
-  status_ = validateCapturedFiles();
-  if (status_) {
-    status_ = loadMetadataCache();
-  }
-  if (status_) {
-    status_ = loadOutlineCache();
-  }
-  if (!status_) {
+  if (!cacheLoaded) {
     resetLoadedState();
     return status_;
   }
