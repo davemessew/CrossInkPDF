@@ -277,7 +277,7 @@ void PdfPrepareActivity::render(RenderLock&&) {
       renderer.drawCenteredText(UI_10_FONT_ID, messageY, I18N.get(messages[index]), true, EpdFontFamily::BOLD);
       messageY += messageGap;
     }
-    const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_CONTINUE_READING), "", "");
+    const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_CONTINUE), "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
   } else {
     renderer.drawCenteredText(UI_10_FONT_ID, height / 2 - 12, errorMessage(failure_.error), true, EpdFontFamily::BOLD);

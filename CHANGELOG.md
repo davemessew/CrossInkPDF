@@ -1,3 +1,9 @@
+## [v1.5.0.18] - 2026-08-19
+
+### Fixed
+
+- Shortened the PDF preparation warning action from “Continue Reading” to “Continue”.
+
 ## [v1.5.0.17] - 2026-08-18
 
 ### Changed
