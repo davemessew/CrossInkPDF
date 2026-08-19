@@ -3,7 +3,7 @@
 <p align="center"><strong>Render PDFs like EPUBs.</strong></p>
 
 <p align="center">
-  On-device PDF reflow for CrossInk on Xteink. Use your reader font, size, spacing, margins, page turns, bookmarks, clippings, and reading progress—without converting files on a computer.
+  On-device PDF reflow for CrossInk on Xteink. Use your reader font, size, spacing, margins, page turns, bookmarks, clippings, and reading progress, without converting files on a computer.
 </p>
 
 <p align="center">
