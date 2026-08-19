@@ -1,33 +1,34 @@
-# CrossInkPDF
+<h1 align="center">CrossPDF</h1>
 
-> **A personal fork of [CrossInk](https://github.com/uxjulia/CrossInk) that makes supported PDFs read like EPUBs directly on the Xteink.**
+<p align="center"><strong>Render PDFs like EPUBs.</strong></p>
 
-I wanted PDF files on the Xteink to feel like books, not screenshots. A normal PDF viewer has to squeeze an entire fixed page onto the small display. The text becomes tiny, and moving around a zoomed page with buttons is not much better.
+<p align="center">
+  On-device PDF reflow for CrossInk on Xteink. Use your reader font, size, spacing, margins, page turns, bookmarks, clippings, and reading progress—without converting files on a computer.
+</p>
 
-This fork takes a different approach. It pulls the reading content out of a supported PDF on the device and passes it through CrossInk's existing reflow reader. The PDF then uses the same font, font size, margins, spacing, orientation, page turns, bookmarks, and reading tools as an EPUB.
+<p align="center">
+  <img src="./docs/images/crosspdf-reader.jpg" width="680" alt="CrossPDF rendering a PDF as reflowed text on an Xteink e-reader">
+</p>
 
-There is no desktop conversion step and nothing special to do before upload. Copy the PDF to the SD card and open it.
+<p align="center">
+  <a href="https://github.com/davemessew/CrossPDF/releases/download/crosspdf-v1.5.0.19/firmware-tiny-crosspdf-v1.5.0.19.bin"><strong>Download Tiny</strong></a>
+  &nbsp;&nbsp;·&nbsp;&nbsp;
+  <a href="https://github.com/davemessew/CrossPDF/releases/download/crosspdf-v1.5.0.19/firmware-xlarge-crosspdf-v1.5.0.19.bin"><strong>Download XLarge</strong></a>
+  &nbsp;&nbsp;·&nbsp;&nbsp;
+  <a href="./docs/installation.md">Installation guide</a>
+</p>
 
-> [!IMPORTANT]
-> ### Download CrossInkPDF
->
-> **Standard text — 10, 12, 14, and 16 pt**
->
-> **[Download `firmware-tiny-crossinkpdf-v1.5.0.19.bin`](https://github.com/davemessew/CrossInkPDF/releases/download/crossinkpdf-v1.5.0.19/firmware-tiny-crossinkpdf-v1.5.0.19.bin)**
->
-> **Large text — 16, 18, and 20 pt**
->
-> **[Download `firmware-xlarge-crossinkpdf-v1.5.0.19.bin`](https://github.com/davemessew/CrossInkPDF/releases/download/crossinkpdf-v1.5.0.19/firmware-xlarge-crossinkpdf-v1.5.0.19.bin)**
->
-> [Release page](https://github.com/davemessew/CrossInkPDF/releases/tag/crossinkpdf-v1.5.0.19) · [Installation guide](./docs/installation.md)
->
-> Both downloads contain the full CrossInk firmware, PDF support, emoji, and symbol support. They are not PDF-only images.
+| **On-device reflow** | **Your reading settings** | **No conversion step** |
+| :---: | :---: | :---: |
+| Prepared directly on the Xteink | Uses CrossInk typography and controls | Copy the PDF to the SD card and open it |
 
-## PDFs should read like books
+Tiny includes 10, 12, 14, and 16 pt text. XLarge includes 16, 18, and 20 pt text. Both downloads contain the full CrossInk firmware, PDF support, emoji, and symbol support.
 
-The point is not to reproduce the printed page. On a display this size, that usually produces something technically accurate but unpleasant to read. The point is to keep the document's reading structure and let the device decide how the text should look.
+## PDF reflow
 
-| A fixed-page PDF viewer | CrossInkPDF |
+CrossPDF extracts the reading content from supported PDFs and passes it through CrossInk's existing reflow reader.
+
+| A fixed-page PDF viewer | CrossPDF |
 | --- | --- |
 | Shrinks the original page | Repaginates the text for the display |
 | Keeps the PDF's font sizes | Uses your CrossInk font and size |
@@ -35,7 +36,7 @@ The point is not to reproduce the printed page. On a display this size, that usu
 | Measures progress in PDF pages | Measures progress by words read |
 | Reopens the original layout | Reuses prepared reading data from the SD card |
 
-The PDF is still the source file. CrossInk does not replace it or modify it.
+The PDF is still the source file. CrossPDF does not replace it or modify it.
 
 ## What is preserved
 
@@ -56,7 +57,7 @@ The PDF's visual font sizes and page dimensions are deliberately ignored. Your s
 
 The first open prepares the book directly on the reader:
 
-1. CrossInk reads the PDF in small pieces.
+1. CrossPDF reads the PDF in small pieces.
 2. Text, navigation, and supported images are written to reusable reading data on the SD card.
 3. The normal reflow reader lays out the text with the current device settings.
 4. Later opens and page turns reuse that saved data instead of parsing the PDF again.
@@ -67,7 +68,7 @@ Preparation is bounded for the ESP32-C3's limited memory. It does not borrow a s
 
 ## Which PDFs work
 
-CrossInkPDF is intended for:
+CrossPDF is intended for:
 
 - Born-digital PDFs with selectable text
 - Scanned PDFs that already contain a usable OCR text layer
@@ -85,7 +86,7 @@ Complex layouts are simplified into a reading order. Optional visual material th
 
 ## If a PDF cannot be prepared
 
-A damaged or unsupported PDF should not take down the rest of the reader. If parsing fails, storage runs out, or the PDF needs more memory than the device can safely provide, preparation stops and the PDF stays closed. CrossInk does not publish a half-built book cache.
+A damaged or unsupported PDF should not take down the rest of the reader. If parsing fails, storage runs out, or the PDF needs more memory than the device can safely provide, preparation stops and the PDF stays closed. CrossPDF does not publish a half-built book cache.
 
 The source PDF is left unchanged, so it can be removed, replaced, or tried again later.
 
@@ -138,7 +139,7 @@ See [Font Build Variants](./docs/font-build-variants.md) for more detail.
 
 The fastest route is [Inky, CrossInk's web installer](https://inky.crossink.dev/#flash-tools):
 
-1. Download the [`tiny` firmware](https://github.com/davemessew/CrossInkPDF/releases/download/crossinkpdf-v1.5.0.19/firmware-tiny-crossinkpdf-v1.5.0.19.bin) for standard text or the [`xlarge` firmware](https://github.com/davemessew/CrossInkPDF/releases/download/crossinkpdf-v1.5.0.19/firmware-xlarge-crossinkpdf-v1.5.0.19.bin) for large text.
+1. Download the [`tiny` firmware](https://github.com/davemessew/CrossPDF/releases/download/crosspdf-v1.5.0.19/firmware-tiny-crosspdf-v1.5.0.19.bin) for standard text or the [`xlarge` firmware](https://github.com/davemessew/CrossPDF/releases/download/crosspdf-v1.5.0.19/firmware-xlarge-crosspdf-v1.5.0.19.bin) for large text.
 2. Open the CrossInk web installer.
 3. Select **Custom .bin**.
 4. Choose the downloaded file and flash it.
@@ -222,7 +223,7 @@ This project is based on [CrossInk](https://github.com/uxjulia/CrossInk), which 
 
 The current firmware base includes the official CrossInk 1.5.0 release.
 
-The aim of this fork is narrow: keep CrossInk's focused, readable e-ink experience and make supported PDFs behave like books instead of miniature printed pages.
+CrossPDF keeps CrossInk's focused e-ink reading experience while adding on-device PDF reflow.
 
 ## Internals
 
